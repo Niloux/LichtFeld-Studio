@@ -1,5 +1,8 @@
 # Standalone training build
 
+Current milestones, the agreed contextcapture configuration and next steps are
+recorded in [the train-only roadmap (中文)](train-only-roadmap.md).
+
 `LFS_BUILD_PROFILE=train` builds `lfs-train` inside this fork. The default
 `studio` profile retains the desktop application. Use separate build directories
 for the two profiles; changing a configured directory's profile is rejected.
