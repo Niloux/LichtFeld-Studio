@@ -683,13 +683,14 @@ namespace lfs::training {
             }
 
             auto& splatData_mutable = const_cast<lfs::core::SplatData&>(splatData);
+            const auto bg_image = background_ ? background_(*cam) : lfs::core::Tensor{};
             RenderOutput r_output;
             if (_params.optimization.gut) {
                 r_output = gsplat_rasterize(*cam, splatData_mutable, background,
-                                            1.0f, false, GsplatRenderMode::RGB, true);
+                                            1.0f, false, GsplatRenderMode::RGB, true, bg_image);
             } else {
                 r_output = fast_rasterize(*cam, splatData_mutable, background,
-                                          _params.optimization.mip_filter, {}, render_normal);
+                                          _params.optimization.mip_filter, bg_image, render_normal);
             }
             const auto render_raw = r_output.image.is_valid()
                                         ? r_output.image.clamp(0.0f, 1.0f)

@@ -142,3 +142,9 @@ The install includes the LFS shared libraries, OpenMesh data library,
 nvImageCodec and its enabled extensions. CUDA runtime libraries and a compatible
 NVIDIA driver must be available on the target machine. Use the same system ABI
 as the build host; this is not a fully portable cross-distribution bundle.
+
+## Outdoor sky training
+
+Use `--sky` with separate white-sky masks to train an auxiliary fixed Gaussian sky while
+exporting only foreground Gaussians. See [sky training](train-sky.md) for the
+fisheye command, mask layout, checkpoint behavior, and supported combinations.

@@ -32,7 +32,21 @@
 
 这些验证不代表完整画质或性能验收。完整 studio、Debug 构建及新 CI 工作流尚未验证。
 
-## 2. 已确定的下一组训练配置
+## 天空辅助建模
+
+已实现独立固定几何天空高斯：+Z 上半球、固定位置/尺度/旋转/opacity，
+仅训练 SH0 颜色；原始 sky mask 约束前景 alpha，不额外腐蚀或对重建损失边界降权。
+天空几何、颜色与 Adam 状态进入 checkpoint，PLY 仅导出前景。
+旧 cubemap checkpoint 不直接迁移，需要新开训练。详见 [天空训练](train-sky.md)。
+
+本机验证：GPU 数值梯度与 Adam 恢复检查通过；两种渲染器各完成
+20→24 步保存恢复；held-out 评估、9 项集成用例和原有 3 项 CTest 通过。
+contextcapture 的 252 张鱼眼图像及 sky mask 校验通过，并以宽度 512、
+1,488,579 点 LiDAR 初始化和 100,000 天空高斯完成 5 步功能验证；
+导出仍为 1,488,579 个前景点。用户试用反馈：相较 cubemap，漂浮点更少、结果更干净；
+这是实际使用反馈，尚无同条件定量画质对比。
+
+## 2. 当前推荐训练配置
 
 数据：`/home/wuyou/3dgeer/data/contextcapture`，252 张鱼眼图像。
 `lidar.ply` 包含 1,488,579 个 XYZ+RGB 点；该点云与相机的坐标和尺度对齐仍需验证。
@@ -45,6 +59,7 @@
 | SH 阶数 | `--sh-degree 0` |
 | 曝光矫正 | `--exposure-correction` |
 | 遮罩 | `--mask-mode ignore`，白色参与损失，黑色忽略 |
+| 天空 | `--sky --sky-mask-dir sky_masks --sky-num-points 100000` |
 | depth / normal | 保持默认关闭 |
 | 训练目标 | 30,000 步，导出 PLY |
 
@@ -54,13 +69,14 @@
 ./build/train/lfs-train \
   -d /home/wuyou/3dgeer/data/contextcapture \
   --init /home/wuyou/3dgeer/data/contextcapture/lidar.ply \
-  -o ./output/contextcapture_lidar_r4_sh0_exposure_mask \
+  -o ./output/contextcapture_lidar_gaussian_sky \
   --gut \
   -r 4 \
   --max-width 0 \
   --sh-degree 0 \
   --exposure-correction \
   --mask-mode ignore \
+  --sky --sky-mask-dir sky_masks --sky-num-points 100000 \
   --iter 30000 \
   --export ply
 ```
@@ -69,30 +85,32 @@
 
 - `masks/L/`、`masks/R/` 自动按图像匹配；黑白含义尚未核实。
   如果白色表示排除区域，应加 `--invert-masks`。
-- `ignore` 仅忽略对应区域的损失；若需要约束排除区域趋于透明，再评估 `segment`。
+- `ignore` 负责有效区域的损失遮罩；独立 sky mask 通过 alpha 惩罚约束天空区前景趋于透明。
+  当前天空组件支持 `none`/`ignore`，不与 `segment` 组合。
 - `--max-cap` 小于初始点数时会随机抽样初始点云；保留全部 LiDAR 点需要至少约 149 万的容量上限。
 - SH 0 只使用与观察方向无关的颜色；全分辨率需显式设 `-r 1 --max-width 0`。
-- 使用新的输出目录，避免覆盖此前训练。上述整套组合目前尚未完成联合验收。
+- 使用新的输出目录，避免覆盖此前训练。当前已完成宽度 512 的联合短跑；`-r 4 --max-width 0` 长训尚未做定量验收。
 
 恢复同一训练时使用项目状态：
 
 ```bash
 ./build/train/lfs-train \
-  --resume ./output/contextcapture_lidar_r4_sh0_exposure_mask/project.licht \
+  --resume ./output/contextcapture_lidar_gaussian_sky/project.licht \
   --iter 30000 \
   --export ply
 ```
 
 `--iter` 是目标总步数；恢复时不需要重新传入 LiDAR 初始化参数。
 
-## 3. 下一阶段：先验证实际训练组合
+## 3. 后续验证
 
-优先把上面的组合跑稳，再增加新损失：
+功能链路已通过短跑，后续重点验证配置恢复和重建质量：
 
 - [ ] 检查若干图像与遮罩，确认黑白含义、左右相机对应和缩放后的对齐。
 - [ ] 检查 LiDAR 点云与相机坐标、尺度及投影是否一致。
-- [ ] 短跑确认实际训练尺寸、初始化点数、遮罩加载和曝光矫正均符合配置。
-- [ ] 验证保存后独立进程恢复，确认配置和优化状态恢复正确。
+- [x] 宽度 512 联合短跑确认初始化点数、天空与有效区域遮罩加载和曝光矫正。
+- [x] 生成数据在 GUT/FastGS 下完成独立进程恢复，确认天空配置和优化状态恢复正确。
+- [ ] 补充实际 LiDAR 长训 checkpoint 的恢复验证。
 - [ ] 完成长训练，记录 loss、模型规模、显存占用和导出结果，检查重建质量。
 - [ ] 在相同数据、初始化、分辨率、SH 和训练配置下，对比曝光矫正开关的效果。
 

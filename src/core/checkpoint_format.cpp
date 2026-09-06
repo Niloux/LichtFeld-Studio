@@ -97,6 +97,8 @@ namespace lfs::core {
         auto known_flags = static_cast<uint32_t>(CheckpointFlags::HAS_BILATERAL_GRID) |
                            static_cast<uint32_t>(CheckpointFlags::HAS_PPISP) |
                            static_cast<uint32_t>(CheckpointFlags::HAS_PPISP_CONTROLLER);
+        if (header.version >= CHECKPOINT_VERSION_HAS_SKY)
+            known_flags |= static_cast<uint32_t>(CheckpointFlags::HAS_SKY_BACKGROUND);
         if (header.version >= CHECKPOINT_VERSION_HAS_SPARSITY) {
             known_flags |= static_cast<uint32_t>(CheckpointFlags::HAS_SPARSITY);
         }

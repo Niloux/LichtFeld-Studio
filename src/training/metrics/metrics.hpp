@@ -149,6 +149,9 @@ namespace lfs::training {
         using AppearanceFn =
             std::function<lfs::core::Tensor(const lfs::core::Tensor& rgb_chw, const lfs::core::Camera& cam)>;
 
+        using BackgroundFn = std::function<lfs::core::Tensor(const lfs::core::Camera&)>;
+        void set_background(BackgroundFn fn) { background_ = std::move(fn); }
+
         void set_appearance(AppearanceFn fn) { appearance_ = std::move(fn); }
         [[nodiscard]] bool has_appearance() const { return static_cast<bool>(appearance_); }
 
@@ -190,6 +193,7 @@ namespace lfs::training {
         std::unique_ptr<SSIM> _ssim_metric;
         std::unique_ptr<MetricsReporter> _reporter;
         AppearanceFn appearance_;
+        BackgroundFn background_;
 
         // Helper functions
         lfs::core::Tensor load_eval_mask(lfs::core::Camera* cam, lfs::core::Tensor& gt_image,

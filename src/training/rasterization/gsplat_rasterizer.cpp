@@ -111,7 +111,8 @@ namespace lfs::training {
         bool antialiased,
         GsplatRenderMode render_mode,
         bool use_gut,
-        const core::Tensor& bg_image) {
+        const core::Tensor& bg_image,
+        float far_plane) {
 
         // Begin arena frame for memory allocation
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -261,7 +262,6 @@ namespace lfs::training {
             // Settings
             constexpr float eps2d = 0.3f;
             constexpr float near_plane = 0.01f;
-            constexpr float far_plane = 10000.0f;
             constexpr float radius_clip = 0.0f;
             constexpr uint32_t tile_size = 16;
             const bool calc_compensations = antialiased;
@@ -624,15 +624,16 @@ namespace lfs::training {
         }
     }
 
-    void gsplat_rasterize_backward(
+    static void gsplat_rasterize_backward_impl(
         const GsplatRasterizeContext& ctx,
         const core::Tensor& grad_image,
         const core::Tensor& grad_alpha,
         core::SplatData& gaussian_model,
-        AdamOptimizer& optimizer,
+        AdamOptimizer* optimizer,
         const core::Tensor& pixel_error_map,
         const core::Tensor& edge_weight_map,
-        core::Tensor edge_score_out) {
+        core::Tensor edge_score_out,
+        core::Tensor* color_only_gradient) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -832,53 +833,55 @@ namespace lfs::training {
             // ============ Accumulate gradients into optimizer using CUDA kernels ============
             // This avoids any tensor operations that might allocate from memory pool
 
-            // Means: [N, 3] -> [N, 3]
-            auto& means_grad = optimizer.get_grad(ParamType::Means);
-            means_grad.set_stream(stream);
-            kernels::launch_grad_accumulate(
-                means_grad.ptr<float>(),
-                v_means_ptr,
-                N * 3,
-                stream);
+            if (!color_only_gradient) {
+                // Means: [N, 3] -> [N, 3]
+                auto& means_grad = optimizer->get_grad(ParamType::Means);
+                means_grad.set_stream(stream);
+                kernels::launch_grad_accumulate(
+                    means_grad.ptr<float>(),
+                    v_means_ptr,
+                    N * 3,
+                    stream);
 
-            // Scales: [N, 3] -> [N, 3]
-            auto& scaling_grad = optimizer.get_grad(ParamType::Scaling);
-            scaling_grad.set_stream(stream);
-            kernels::launch_grad_accumulate(
-                scaling_grad.ptr<float>(),
-                v_scales_ptr,
-                N * 3,
-                stream);
+                // Scales: [N, 3] -> [N, 3]
+                auto& scaling_grad = optimizer->get_grad(ParamType::Scaling);
+                scaling_grad.set_stream(stream);
+                kernels::launch_grad_accumulate(
+                    scaling_grad.ptr<float>(),
+                    v_scales_ptr,
+                    N * 3,
+                    stream);
 
-            // Rotations: [N, 4] -> [N, 4]
-            auto& rotation_grad = optimizer.get_grad(ParamType::Rotation);
-            rotation_grad.set_stream(stream);
-            kernels::launch_grad_accumulate(
-                rotation_grad.ptr<float>(),
-                v_quats_ptr,
-                N * 4,
-                stream);
+                // Rotations: [N, 4] -> [N, 4]
+                auto& rotation_grad = optimizer->get_grad(ParamType::Rotation);
+                rotation_grad.set_stream(stream);
+                kernels::launch_grad_accumulate(
+                    rotation_grad.ptr<float>(),
+                    v_quats_ptr,
+                    N * 4,
+                    stream);
 
-            // Opacities: [N] -> [N, 1] (same memory layout)
-            auto& opacity_grad = optimizer.get_grad(ParamType::Opacity);
-            opacity_grad.set_stream(stream);
-            kernels::launch_grad_accumulate_unsqueeze(
-                opacity_grad.ptr<float>(),
-                v_opacities_ptr,
-                N,
-                stream);
+                // Opacities: [N] -> [N, 1] (same memory layout)
+                auto& opacity_grad = optimizer->get_grad(ParamType::Opacity);
+                opacity_grad.set_stream(stream);
+                kernels::launch_grad_accumulate_unsqueeze(
+                    opacity_grad.ptr<float>(),
+                    v_opacities_ptr,
+                    N,
+                    stream);
+            }
 
             // SH coefficients: [N, K, 3] -> sh0 [N, 1, 3] + swizzled shN.
             float* dst_shN = nullptr;
             if (K > 1) {
-                auto& shN_grad = optimizer.get_grad(ParamType::ShN);
+                auto& shN_grad = optimizer->get_grad(ParamType::ShN);
                 if (shN_grad.is_valid() && shN_grad.numel() > 0) {
                     shN_grad.set_stream(stream);
                     dst_shN = shN_grad.ptr<float>();
                 }
             }
 
-            auto& sh0_grad = optimizer.get_grad(ParamType::Sh0);
+            auto& sh0_grad = color_only_gradient ? *color_only_gradient : optimizer->get_grad(ParamType::Sh0);
             sh0_grad.set_stream(stream);
             kernels::launch_grad_accumulate_sh_swizzled(
                 sh0_grad.ptr<float>(),
@@ -906,6 +909,25 @@ namespace lfs::training {
             arena.end_frame(ctx.frame_id, stream);
             throw;
         }
+    }
+
+    void gsplat_rasterize_backward(const GsplatRasterizeContext& ctx,
+                                   const core::Tensor& grad_image, const core::Tensor& grad_alpha,
+                                   core::SplatData& model, AdamOptimizer& optimizer,
+                                   const core::Tensor& error_map, const core::Tensor& edge_map,
+                                   core::Tensor edge_score) {
+        gsplat_rasterize_backward_impl(ctx, grad_image, grad_alpha, model, &optimizer,
+                                       error_map, edge_map, edge_score, nullptr);
+    }
+
+    void gsplat_rasterize_backward_sh0(const GsplatRasterizeContext& ctx,
+                                       const core::Tensor& grad_image,
+                                       core::SplatData& model, core::Tensor& grad_sh0) {
+        if (ctx.sh_degree != 0 || ctx.K_sh != 1) {
+            core::GlobalArenaManager::instance().get_arena().end_frame(ctx.frame_id, ctx.stream);
+            throw std::invalid_argument("Color-only backward requires SH0");
+        }
+        gsplat_rasterize_backward_impl(ctx, grad_image, {}, model, nullptr, {}, {}, {}, &grad_sh0);
     }
 
     bool release_gsplat_rasterizer_thread_local_caches() noexcept {

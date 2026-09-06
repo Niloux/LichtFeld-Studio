@@ -793,6 +793,20 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.undistort")
             .flags(PROP_NEEDS_RESTART)
             .all_strategies()
+            .bool_prop(&OptimizationParameters::sky_enabled, "sky_enabled", "Learnable Sky", d.sky_enabled, "Learnable Sky")
+            .all_strategies()
+            .string_prop(&OptimizationParameters::sky_mask_dir, "sky_mask_dir", "Sky Mask Directory", d.sky_mask_dir, "Sky Mask Directory")
+            .all_strategies()
+            .int_prop(&OptimizationParameters::sky_num_points, "sky_num_points", "Sky Points", d.sky_num_points, 16, 1000000, "Fixed sky Gaussian count")
+            .all_strategies()
+            .float_prop(&OptimizationParameters::sky_radius, "sky_radius", "Sky Radius", d.sky_radius, 0.001f, 1e10f, "Fixed upper hemisphere radius")
+            .all_strategies()
+            .float_prop(&OptimizationParameters::sky_lr, "sky_lr", "Sky Learning Rate", d.sky_lr, 0.0f, 1.0f, "Sky Learning Rate")
+            .all_strategies()
+            .float_prop(&OptimizationParameters::sky_alpha_weight, "sky_alpha_weight", "Sky Alpha Weight", d.sky_alpha_weight, 0.0f, 10.0f, "Sky Alpha Weight")
+            .all_strategies()
+            .float_prop(&OptimizationParameters::sky_initial_opacity, "sky_initial_opacity", "Sky Opacity", d.sky_initial_opacity, 0.001f, 0.999f, "Fixed sky opacity")
+            .all_strategies()
             .enum_prop(&OptimizationParameters::bg_mode,
                        "bg_mode", "Background Mode", d.bg_mode,
                        {{"SolidColor", BackgroundMode::SolidColor, "training.options.bg.color", "solid_color"},

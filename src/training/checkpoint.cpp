@@ -5,6 +5,7 @@
 #include "components/bilateral_grid.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
+#include "components/sky_background.hpp"
 #include "components/sparsity_optimizer.hpp"
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
@@ -86,7 +87,8 @@ namespace lfs::training {
         const BilateralGrid* bilateral_grid,
         const PPISP* ppisp,
         const PPISPControllerPool* ppisp_controller_pool,
-        const ADMMSparsityOptimizer* sparsity_optimizer) {
+        const ADMMSparsityOptimizer* sparsity_optimizer,
+        const SkyBackground* sky_background) {
         try {
             if (iteration < 0) {
                 return checkpoint_stream_error(
@@ -127,11 +129,14 @@ namespace lfs::training {
             }
 
             CheckpointHeader header{};
+            header.version = sky_background ? lfs::core::CHECKPOINT_VERSION_HAS_SKY : lfs::core::CHECKPOINT_VERSION_FIELDWISE_CONFIGS;
+            if (bool(sky_background) != params.optimization.sky_enabled)
+                throw std::runtime_error("Sky configuration and checkpoint state disagree");
             header.iteration = iteration;
             header.num_gaussians =
                 static_cast<std::uint32_t>(model.size());
             header.sh_degree = model.get_max_sh_degree();
-            header.flags = CheckpointFlags::NONE;
+            header.flags = sky_background ? CheckpointFlags::HAS_SKY_BACKGROUND : CheckpointFlags::NONE;
             if (bilateral_grid)
                 header.flags =
                     header.flags |
@@ -204,6 +209,9 @@ namespace lfs::training {
                     "Sparsity ADMM state staged: {} rows",
                     sparsity_optimizer->state_size());
             }
+
+            if (sky_background)
+                sky_background->serialize(destination);
 
             const auto params_pos = destination.tellp();
             if (params_pos == std::streampos(-1)) {
@@ -317,7 +325,8 @@ namespace lfs::training {
         PPISP* ppisp,
         PPISPControllerPool* ppisp_controller_pool,
         ADMMSparsityOptimizer* sparsity_optimizer,
-        lfs::core::SplatTensorAllocator tensor_allocator) {
+        lfs::core::SplatTensorAllocator tensor_allocator,
+        SkyBackground* sky_background) {
         std::ifstream file;
         if (!lfs::core::open_file_for_read(
                 path, std::ios::binary, file)) {
@@ -338,7 +347,7 @@ namespace lfs::training {
             file, file_size, strategy, params, bilateral_grid,
             ppisp, ppisp_controller_pool, sparsity_optimizer,
             std::move(tensor_allocator),
-            lfs::core::path_to_utf8(path));
+            lfs::core::path_to_utf8(path), nullptr, sky_background);
     }
 
     CheckpointLoadResult load_checkpoint(
@@ -352,7 +361,8 @@ namespace lfs::training {
         ADMMSparsityOptimizer* sparsity_optimizer,
         lfs::core::SplatTensorAllocator tensor_allocator,
         const std::string_view source_name,
-        lfs::core::SplatData* preloaded_model) {
+        lfs::core::SplatData* preloaded_model,
+        SkyBackground* sky_background) {
         try {
             const auto load_started = std::chrono::steady_clock::now();
             const auto milliseconds = [](const auto begin, const auto end) {
@@ -596,6 +606,16 @@ namespace lfs::training {
                 }
             }
 
+            std::unique_ptr<SkyBackground> loaded_sky;
+            const bool has_sky = has_flag(header.flags, CheckpointFlags::HAS_SKY_BACKGROUND);
+            if (has_sky != loaded_params.optimization.sky_enabled || has_sky != bool(sky_background))
+                throw std::runtime_error("Checkpoint sky state must match sky configuration; cannot enable or disable sky on resume");
+            if (has_sky) {
+                loaded_sky = std::make_unique<SkyBackground>(loaded_params.optimization.sky_num_points,
+                                                             loaded_params.optimization.sky_radius, loaded_params.optimization.sky_initial_opacity);
+                loaded_sky->deserialize(file);
+            }
+
             // Reserve capacity for densification after the checkpoint params are resolved.
             if (header.params_json_size > 0) {
                 const auto serialized_state_end = file.tellg();
@@ -647,6 +667,8 @@ namespace lfs::training {
                          ppisp_controller_pool->num_cameras(),
                          ppisp_controller_pool->get_learning_rate());
             }
+            if (loaded_sky)
+                sky_background->adopt_checkpoint_state(*loaded_sky);
             if (loaded_sparsity) {
                 sparsity_optimizer->adopt_checkpoint_state(*loaded_sparsity);
                 LOG_INFO("Sparsity ADMM state restored: {} rows", sparsity_optimizer->state_size());

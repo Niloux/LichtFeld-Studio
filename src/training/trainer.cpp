@@ -1240,6 +1240,7 @@ namespace lfs::training {
 
         // Reset all components
         progress_.reset();
+        sky_background_.reset();
         bilateral_grid_.reset();
         ppisp_.reset();
         ppisp_controller_pool_.reset();
@@ -1306,6 +1307,24 @@ namespace lfs::training {
         if (strategy_) {
             strategy_->set_optimization_params(get_runtime_optimization_params());
         }
+    }
+
+    void Trainer::initialize_sky() {
+        if (!params_.optimization.sky_enabled || sky_background_)
+            return;
+        if (!scene_)
+            throw std::runtime_error("Sky requires a dataset scene");
+        if (params_.optimization.ppisp_use_controller ||
+            (params_.optimization.mask_mode != core::param::MaskMode::None &&
+             params_.optimization.mask_mode != core::param::MaskMode::Ignore))
+            throw std::runtime_error("Sky currently supports mask-mode none/ignore and PPISP without controller");
+        auto sky = std::make_unique<SkyBackground>(params_.optimization.sky_num_points,
+                                                   params_.optimization.sky_radius, params_.optimization.sky_initial_opacity);
+        std::vector<core::Camera*> cameras;
+        for (const auto& camera : scene_->getAllCameras())
+            cameras.push_back(camera.get());
+        sky->configure(params_, cameras);
+        sky_background_ = std::move(sky);
     }
 
     std::expected<void, std::string> Trainer::initialize_bilateral_grid() {
@@ -3110,6 +3129,8 @@ namespace lfs::training {
                 params_.dataset.loading_params.print_cache_status,
                 params_.dataset.loading_params.print_status_freq_num);
 
+            initialize_sky();
+
             // Load background image if specified
             if (params.optimization.bg_mode == lfs::core::param::BackgroundMode::Image &&
                 !params.optimization.bg_image_path.empty() &&
@@ -3149,6 +3170,9 @@ namespace lfs::training {
 
             // Initialize the evaluator - it handles all metrics internally
             evaluator_ = std::make_unique<lfs::training::MetricsEvaluator>(params_);
+            evaluator_->set_background([this](const core::Camera& camera) {
+                return sky_background_ ? sky_background_->render(camera) : core::Tensor{};
+            });
             if (params_.optimization.ppisp_active() && ppisp_ && ppisp_->isFinalized()) {
                 evaluator_->set_appearance([this](const lfs::core::Tensor& rgb, const lfs::core::Camera& cam) {
                     return applyPPISPForEval(rgb, cam);
@@ -3423,14 +3447,15 @@ namespace lfs::training {
             auto& background = background_;
 
             try {
+                const auto sky_bg = sky_background_ ? sky_background_->render(camera) : core::Tensor{};
                 RenderOutput output;
                 if (params.optimization.gut) {
                     output = gsplat_rasterize(
                         camera, model, background,
-                        1.0f, false, GsplatRenderMode::RGB, true);
+                        1.0f, false, GsplatRenderMode::RGB, true, sky_bg);
                 } else {
                     output = fast_rasterize(
-                        camera, model, background, params.optimization.mip_filter);
+                        camera, model, background, params.optimization.mip_filter, sky_bg);
                 }
 
                 rendered = output.image;
@@ -3585,6 +3610,7 @@ namespace lfs::training {
         densification_error_map_ = {};
         clearEdgeWeightCache();
         strategy_.reset();
+        sky_background_.reset();
         bilateral_grid_.reset();
         ppisp_.reset();
         ppisp_controller_pool_.reset();
@@ -3978,6 +4004,7 @@ namespace lfs::training {
                 dynamic_cast<
                     const ADMMSparsityOptimizer*>(
                     sparsity_optimizer_.get()),
+            .sky_background = sky_background_.get(),
             .mutating_streams = mutating_streams,
         };
         return project_snapshot_service_->initialize(
@@ -4283,6 +4310,7 @@ namespace lfs::training {
                 dynamic_cast<
                     const ADMMSparsityOptimizer*>(
                     sparsity_optimizer_.get()),
+            .sky_background = sky_background_.get(),
             .mutating_streams = mutating_streams,
         };
         auto prepared =
@@ -4530,6 +4558,7 @@ namespace lfs::training {
                 dynamic_cast<
                     const ADMMSparsityOptimizer*>(
                     sparsity_optimizer_.get()),
+            .sky_background = sky_background_.get(),
             .mutating_streams = mutating_streams,
             .capture_additional_cpu_state =
                 [this, cpu_state, chapters,
@@ -6041,7 +6070,12 @@ namespace lfs::training {
                 }
                 lfs::core::Tensor& bg = *bg_ptr;
 
-                lfs::core::Tensor bg_image;
+                lfs::core::Tensor bg_image, sky_confidence;
+                if (sky_background_) {
+                    sky_background_->zero_grad();
+                    bg_image = sky_background_->render(*cam);
+                    sky_confidence = sky_background_->masks(*cam);
+                }
                 if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::Image) {
                     LFS_VRAM_SCOPE("train.background_image");
                     LOG_VRAM_DIFF("train.background_image");
@@ -7486,6 +7520,18 @@ namespace lfs::training {
                             record_vram_tensor("train.losses", "edge_map_buffer", edge_map_buffer_);
                         }
 
+                        if (sky_background_) {
+                            core::Tensor valid;
+                            if (mask_tile.is_valid())
+                                valid = mask_tile.to(core::DataType::Float32);
+                            auto [sky_loss, sky_alpha_grad] = sky_background_->alpha_loss(
+                                output.alpha, sky_confidence, valid, params_.optimization.sky_alpha_weight);
+                            tile_loss = tile_loss + sky_loss;
+                            tile_grad_alpha = tile_grad_alpha.is_valid()
+                                                  ? tile_grad_alpha.reshape(output.alpha.shape()).add(sky_alpha_grad)
+                                                  : sky_alpha_grad;
+                        }
+
                         loss_tensor_gpu = loss_tensor_gpu + tile_loss;
                         tiles_processed++;
                         nvtxRangePop();
@@ -7536,6 +7582,11 @@ namespace lfs::training {
                             raster_grad = raster_grad + tile_grad_raw;
                         }
 
+                        // Capture before sky forward reuses the renderer's output/alpha caches.
+                        // Photometric gradients already contain validity masks and exposure backward.
+                        core::Tensor sky_gradient;
+                        if (sky_background_)
+                            sky_gradient = raster_grad.slice(0, 0, 3).mul(output.alpha.mul(-1.f).add(1.f)).contiguous();
                         current_phase = StepPhase::Backward;
                         nvtxRangePush("rasterize_backward");
                         PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::BwdBegin, iter);
@@ -7591,6 +7642,15 @@ namespace lfs::training {
                                     cleanup_tile_context();
                                 }
                             }
+                        }
+                        if (sky_background_) {
+                            if (gsplat_ctx) {
+                                r_output.image = r_output.image.clone();
+                                r_output.alpha = r_output.alpha.clone();
+                                if (r_output.depth.is_valid())
+                                    r_output.depth = r_output.depth.clone();
+                            }
+                            sky_background_->backward(*cam, sky_gradient);
                         }
                         nvtxRangePop();
                     }
@@ -7717,6 +7777,13 @@ namespace lfs::training {
 
                         nvtxRangePop();
                     }
+                }
+
+                if (sky_background_ && !in_controller_phase) {
+                    current_phase = StepPhase::OptimizerCommit;
+                    sky_background_->optimizer_step(params_.optimization.sky_lr);
+                    ++mutation_epoch_;
+                    persistent_commit = true;
                 }
 
                 // Sparsity loss - ALL ON GPU, no CPU sync here
@@ -8088,12 +8155,13 @@ namespace lfs::training {
                                     cam_to_use->load_image_size(params_.dataset.resize_factor, params_.dataset.max_width);
                                 }
 
+                                const auto sky_bg = sky_background_ ? sky_background_->render(*cam_to_use) : core::Tensor{};
                                 RenderOutput rendered_timelapse_output;
                                 if (params_.optimization.gut) {
                                     rendered_timelapse_output = gsplat_rasterize(*cam_to_use, strategy_->get_model(), background_,
-                                                                                 1.0f, false, GsplatRenderMode::RGB, true);
+                                                                                 1.0f, false, GsplatRenderMode::RGB, true, sky_bg);
                                 } else {
-                                    rendered_timelapse_output = fast_rasterize(*cam_to_use, strategy_->get_model(), background_);
+                                    rendered_timelapse_output = fast_rasterize(*cam_to_use, strategy_->get_model(), background_, params_.optimization.mip_filter, sky_bg);
                                 }
 
                                 // Get folder name to save in by stripping file extension
@@ -9306,6 +9374,10 @@ namespace lfs::training {
                 "Embedded checkpoint size is invalid");
         }
 
+        try {
+            initialize_sky();
+        } catch (const std::exception& e) { return std::unexpected(e.what()); }
+
         // Create bilateral grid before loading if needed (checkpoint may contain grid state)
         if (params_.optimization.bilateral_grid_active() && !bilateral_grid_) {
             if (auto init_result = initialize_bilateral_grid(); !init_result) {
@@ -9361,7 +9433,7 @@ namespace lfs::training {
             bilateral_grid_.get(), ppisp_.get(),
             ppisp_controller_pool_.get(),
             dynamic_cast<ADMMSparsityOptimizer*>(sparsity_optimizer_.get()),
-            splat_tensor_allocator_, source_name, preloaded_model);
+            splat_tensor_allocator_, source_name, preloaded_model, sky_background_.get());
         if (!result) {
             return result;
         }

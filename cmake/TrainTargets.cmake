@@ -71,6 +71,9 @@ target_compile_definitions(lfs-train PRIVATE LFS_MIN_SM=${LFS_RUNTIME_MIN_SM})
 
 option(LFS_BUILD_TRAIN_TESTS "Register train profile and CLI contract tests (no GUI dependencies)" OFF)
 if(LFS_BUILD_TRAIN_TESTS)
+    add_executable(lfs-sky-test "${PROJECT_SOURCE_DIR}/tests/test_sky_background.cpp")
+    target_include_directories(lfs-sky-test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(lfs-sky-test PRIVATE lfs_training)
     enable_testing()
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME train_profile_contract

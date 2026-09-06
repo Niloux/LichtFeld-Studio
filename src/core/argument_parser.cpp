@@ -566,6 +566,13 @@ namespace {
             ::args::ValueFlag<std::string> bg_mode(training_group, "mode", lfs::core::args::optimization_cli_help("--bg-mode"), {"bg-mode"});
             ::args::ValueFlag<std::string> bg_color(training_group, "color", "solidcolor background color as #RRGGBB or (R,G,B) with 0-255 channels (default: #000000)", {"bg-color"});
             ::args::ValueFlag<std::string> bg_image_path(training_group, "path", "Background image path (required when --bg-mode image)", {"bg-image-path"});
+            ::args::Flag sky(training_group, "sky", "Train fixed Gaussian sky colors (white sky masks)", {"sky"});
+            ::args::ValueFlag<std::string> sky_mask_dir(training_group, "value", "sky-mask-dir", {"sky-mask-dir"});
+            ::args::ValueFlag<int> sky_num_points(training_group, "value", "sky-num-points", {"sky-num-points"});
+            ::args::ValueFlag<float> sky_radius(training_group, "value", "sky-radius", {"sky-radius"});
+            ::args::ValueFlag<float> sky_lr(training_group, "value", "sky-lr", {"sky-lr"});
+            ::args::ValueFlag<float> sky_alpha_weight(training_group, "value", "sky-alpha-weight", {"sky-alpha-weight"});
+            ::args::ValueFlag<float> sky_initial_opacity(training_group, "value", "sky-initial-opacity", {"sky-initial-opacity"});
 
             // =============================================================================
             // INITIALIZATION
@@ -1269,6 +1276,13 @@ namespace {
                                         debug_python_port_val = cli_option_present({"--debug-python-port"}) ? std::optional<int>(::args::get(debug_python_port)) : std::optional<int>(),
                                         mcp_port_val = per_launch_mcp_port,
                                         no_save_eval_images_flag = bool(no_save_eval_images),
+                                        sky_flag = bool(sky),
+                                        sky_mask_dir_val = cli_option_present({"--sky-mask-dir"}) ? std::optional<std::string>(::args::get(sky_mask_dir)) : std::optional<std::string>(),
+                                        sky_num_points_val = cli_option_present({"--sky-num-points"}) ? std::optional<int>(::args::get(sky_num_points)) : std::optional<int>(),
+                                        sky_radius_val = cli_option_present({"--sky-radius"}) ? std::optional<float>(::args::get(sky_radius)) : std::optional<float>(),
+                                        sky_lr_val = cli_option_present({"--sky-lr"}) ? std::optional<float>(::args::get(sky_lr)) : std::optional<float>(),
+                                        sky_alpha_weight_val = cli_option_present({"--sky-alpha-weight"}) ? std::optional<float>(::args::get(sky_alpha_weight)) : std::optional<float>(),
+                                        sky_initial_opacity_val = cli_option_present({"--sky-initial-opacity"}) ? std::optional<float>(::args::get(sky_initial_opacity)) : std::optional<float>(),
                                         bg_mode_val = parsed_bg_mode,
                                         bg_color_val = parsed_bg_color,
                                         bg_image_path_val = cli_option_present({"--bg-image-path"}) ? std::optional<std::string>(::args::get(bg_image_path)) : std::optional<std::string>(),
@@ -1424,6 +1438,20 @@ namespace {
                 setVal(debug_python_port_val, opt.debug_python_port);
                 if (no_save_eval_images_flag)
                     opt.enable_save_eval_images = false;
+                if (sky_flag)
+                    opt.sky_enabled = true;
+                if (sky_mask_dir_val)
+                    opt.sky_mask_dir = *sky_mask_dir_val;
+                if (sky_num_points_val)
+                    opt.sky_num_points = *sky_num_points_val;
+                if (sky_radius_val)
+                    opt.sky_radius = *sky_radius_val;
+                if (sky_lr_val)
+                    opt.sky_lr = *sky_lr_val;
+                if (sky_alpha_weight_val)
+                    opt.sky_alpha_weight = *sky_alpha_weight_val;
+                if (sky_initial_opacity_val)
+                    opt.sky_initial_opacity = *sky_initial_opacity_val;
                 if (bg_mode_val) {
                     opt.bg_mode = *bg_mode_val;
                     opt.bg_modulation = *bg_mode_val == lfs::core::param::BackgroundMode::Modulation;
@@ -1547,6 +1575,13 @@ namespace {
                 note_opt("debug_python", debug_python_flag);
                 note_opt("debug_python_port", debug_python_port_val.has_value());
                 note_opt("enable_save_eval_images", no_save_eval_images_flag);
+                note_opt("sky_enabled", sky_flag);
+                note_opt("sky_mask_dir", sky_mask_dir_val.has_value());
+                note_opt("sky_num_points", sky_num_points_val.has_value());
+                note_opt("sky_radius", sky_radius_val.has_value());
+                note_opt("sky_lr", sky_lr_val.has_value());
+                note_opt("sky_alpha_weight", sky_alpha_weight_val.has_value());
+                note_opt("sky_initial_opacity", sky_initial_opacity_val.has_value());
                 note_opt("bg_mode", bg_mode_val.has_value());
                 note_opt("bg_modulation", bg_mode_val.has_value());
                 note_opt("bg_color", bg_color_val.has_value());

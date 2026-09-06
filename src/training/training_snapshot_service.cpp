@@ -1914,7 +1914,7 @@ namespace lfs::training {
                     request.strategy, request.params,
                     request.bilateral_grid, request.ppisp,
                     request.ppisp_controller_pool,
-                    request.sparsity_optimizer);
+                    request.sparsity_optimizer, request.sky_background);
                 if (!serialized) {
                     return lfs::Status::failure(
                         std::move(serialized)
@@ -2008,7 +2008,7 @@ namespace lfs::training {
                 request.strategy, request.params,
                 request.bilateral_grid, request.ppisp,
                 request.ppisp_controller_pool,
-                request.sparsity_optimizer);
+                request.sparsity_optimizer, request.sky_background);
             if (!serialized) {
                 return std::move(serialized)
                     .error()
@@ -2286,7 +2286,8 @@ namespace lfs::training {
                         request
                             .ppisp_controller_pool,
                         request
-                            .sparsity_optimizer);
+                            .sparsity_optimizer,
+                        request.sky_background);
                 if (!serialized) {
                     const auto& error =
                         serialized.error();

@@ -10,6 +10,7 @@ add_subdirectory(rasterization/gsplat)
 
 # LibTorch-free CUDA kernels
 set(LFS_TRAINING_KERNEL_SOURCES
+    kernels/sky_background.cu
     kernels/loss_tensor_contract.cpp
     kernels/camera_loss_heatmap.cu
     kernels/ssim.cu
@@ -97,6 +98,7 @@ set(TRAINING_NEW_SOURCES
     rasterization/fast_rasterizer.cpp
     rasterization/gsplat_rasterizer.cpp
     components/config_serialization.cpp
+    components/sky_background.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
     components/ppisp_controller.cu

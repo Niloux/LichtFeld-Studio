@@ -25,6 +25,7 @@
 
 namespace lfs::training {
 
+    class SkyBackground;
     class IStrategy;
     class BilateralGrid;
     class PPISP;
@@ -47,7 +48,8 @@ namespace lfs::training {
         const BilateralGrid* bilateral_grid,
         const PPISP* ppisp,
         const PPISPControllerPool* ppisp_controller_pool,
-        const ADMMSparsityOptimizer* sparsity_optimizer);
+        const ADMMSparsityOptimizer* sparsity_optimizer,
+        const SkyBackground* sky_background = nullptr);
 
     /// Import a standalone legacy checkpoint.
     std::expected<int, std::string> load_checkpoint(
@@ -58,7 +60,8 @@ namespace lfs::training {
         PPISP* ppisp,
         PPISPControllerPool* ppisp_controller_pool,
         ADMMSparsityOptimizer* sparsity_optimizer,
-        lfs::core::SplatTensorAllocator tensor_allocator = {});
+        lfs::core::SplatTensorAllocator tensor_allocator = {},
+        SkyBackground* sky_background = nullptr);
     using CheckpointLoadResult = decltype(load_checkpoint(
         std::filesystem::path{},
         std::declval<IStrategy&>(),
@@ -82,6 +85,7 @@ namespace lfs::training {
         ADMMSparsityOptimizer* sparsity_optimizer,
         lfs::core::SplatTensorAllocator tensor_allocator = {},
         std::string_view source_name = "embedded CKPT",
-        lfs::core::SplatData* preloaded_model = nullptr);
+        lfs::core::SplatData* preloaded_model = nullptr,
+        SkyBackground* sky_background = nullptr);
 
 } // namespace lfs::training

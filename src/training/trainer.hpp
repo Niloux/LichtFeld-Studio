@@ -8,6 +8,7 @@
 #include "components/bilateral_grid.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
+#include "components/sky_background.hpp"
 #include "components/sparsity_optimizer.hpp"
 #include "core/camera.hpp"
 #include "core/error.hpp"
@@ -607,6 +608,7 @@ namespace lfs::training {
         // Cleanup method for re-initialization
         void cleanup();
 
+        void initialize_sky();
         std::expected<void, std::string> initialize_bilateral_grid();
         std::expected<void, std::string> initialize_ppisp();
         std::expected<void, std::string> initialize_ppisp_controller();
@@ -747,6 +749,9 @@ namespace lfs::training {
         lfs::core::Tensor pipelined_mask_;
         lfs::core::Tensor pipelined_depth_;
         lfs::core::Tensor pipelined_normal_;
+
+        // Auxiliary fixed sky model, separate from foreground/exported splats.
+        std::unique_ptr<SkyBackground> sky_background_;
 
         // Bilateral grid for appearance modeling (optional)
         std::unique_ptr<BilateralGrid> bilateral_grid_;

@@ -216,6 +216,13 @@ namespace lfs::core {
             bool mip_filter = false;
 
             // Background settings for training
+            bool sky_enabled = false;
+            std::string sky_mask_dir = "sky_masks";
+            int sky_num_points = 100000;
+            float sky_radius = 10000.f;
+            float sky_lr = 0.0025f;
+            float sky_alpha_weight = 0.1f;
+            float sky_initial_opacity = 0.7f;
             BackgroundMode bg_mode = BackgroundMode::SolidColor; // Which background mode to use
             std::array<float, 3> bg_color = {0.0f, 0.0f, 0.0f};  // RGB background color [0-1]
             std::filesystem::path bg_image_path = {};            // Custom background image path
