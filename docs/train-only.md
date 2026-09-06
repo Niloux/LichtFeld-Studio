@@ -67,6 +67,41 @@ The training argument parser and parameter objects are shared with studio.
 available. Only PLY final export is supported. `.resume` checkpoints are also
 accepted by `--resume`.
 
+### JSON training configuration
+
+From the repository root, the supplied contextcapture/LiDAR/sky preset runs with:
+
+```sh
+./build/train/lfs-train --config configs/contextcapture_gaussian_sky.json
+```
+
+Edit that JSON for subsequent runs. `dataset` contains `data_path`,
+`output_folder` (`output_path` is also accepted), `resize_factor`, `max_width`,
+`test_every` and optional `loading_params`. Top-level `init_path` selects the
+initialization PLY and `export_formats: ["ply"]` selects the final export.
+`optimization` uses the existing parameter JSON names, including sky settings,
+`iterations`, `enable_eval` and `eval_steps`. The supplied file contains a full
+optimization parameter snapshot; retain its fields when editing it. The existing
+full-snapshot reader is unchanged, and missing required optimization fields are
+rejected. Older flat optimization JSON snapshots remain supported with paths
+supplied on the command line.
+
+Command-line values override matching JSON values (a conflicting `--strategy`
+is rejected). For a shorter run and a separate output directory:
+
+```sh
+./build/train/lfs-train --config configs/contextcapture_gaussian_sky.json \
+  --iter 3000 --eval-steps 3000 -o ./output/contextcapture_config_sky_3k
+```
+
+The preset uses 30,000 iterations, 100,000 fixed sky Gaussians, evaluation at
+3,000/7,000/30,000, and writes to `output/contextcapture_config_sky`. Its absolute
+dataset and LiDAR paths refer to the local contextcapture dataset; change them
+on another machine. Relative launch paths resolve from the **working directory**,
+just like CLI paths. `images` and `sky_mask_dir` remain relative to the dataset.
+JSON does not support comments. To disable an option enabled by the preset,
+edit its boolean in JSON when there is no inverse CLI flag.
+
 Projects use the existing snapshot/recovery machinery, including the lifetime
 of the source document and recovery lock. Mesh and sequence assets are rejected;
 arbitrary desktop project compatibility is not promised. Pass `-o` when resuming

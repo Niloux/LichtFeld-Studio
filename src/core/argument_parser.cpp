@@ -22,6 +22,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <print>
@@ -965,9 +966,46 @@ namespace {
                     }
                 }
             }
-            if (init_path) {
-                const auto path_str = ::args::get(init_path);
-                params.init_path = path_str;
+            // Load launch fields before path validation. Optimization parameters
+            // are loaded below by the existing --config reader.
+            params.dataset.resize_factor = 1;
+            if (config_file) {
+                std::ifstream input(lfs::core::utf8_to_path(::args::get(config_file)));
+                if (!input)
+                    return std::unexpected("Cannot open config file: " + ::args::get(config_file));
+                const auto config = nlohmann::json::parse(input);
+                if (!config.is_object())
+                    return std::unexpected("Config must be a JSON object");
+                if (config.contains("dataset")) {
+                    if (!config.at("dataset").is_object())
+                        return std::unexpected("Config dataset must be a JSON object");
+                    lfs::core::param::ExplicitTrainingOverrides dataset_overrides;
+                    dataset_overrides.dataset_json = config.at("dataset").dump();
+                    lfs::core::param::apply_explicit_training_overrides(params, dataset_overrides);
+                    params.dataset.output_path_explicit = !params.dataset.output_path.empty();
+                }
+                if (config.contains("init_path") && !init_path)
+                    params.init_path = config.at("init_path").get<std::string>();
+                if (config.contains("export_formats") && !export_formats) {
+                    const auto names = config.at("export_formats").get<std::vector<std::string>>();
+                    std::string list;
+                    for (const auto& name : names) {
+                        if (!list.empty())
+                            list += ',';
+                        list += name;
+                    }
+                    if (!names.empty()) {
+                        auto formats = parseFormatList(list);
+                        if (!formats)
+                            return std::unexpected(formats.error());
+                        params.export_formats = std::move(*formats);
+                    }
+                }
+            }
+            if (init_path)
+                params.init_path = ::args::get(init_path);
+            if (params.init_path) {
+                const auto& path_str = *params.init_path;
 
                 if (!std::filesystem::exists(lfs::core::utf8_to_path(path_str))) {
                     return std::unexpected(std::format("Initialization file does not exist: {}", path_str));
@@ -1003,8 +1041,14 @@ namespace {
             }
 
             // Training mode
-            const bool has_data_path = data_path && !::args::get(data_path).empty();
-            const bool has_output_path = output_path && !::args::get(output_path).empty();
+            const auto data_path_value = data_path
+                                             ? lfs::core::utf8_to_path(::args::get(data_path))
+                                             : params.dataset.data_path;
+            const auto output_path_value = output_path
+                                               ? lfs::core::utf8_to_path(::args::get(output_path))
+                                               : params.dataset.output_path;
+            const bool has_data_path = !data_path_value.empty();
+            const bool has_output_path = !output_path_value.empty();
             const bool has_resume =
                 params.resume_checkpoint.has_value() ||
                 params.resume_project.has_value();
@@ -1026,9 +1070,6 @@ namespace {
 
             // An untrained .licht on --data-path is a dataset source and, unless
             // --output-path redirects the result, also the project the run trains into.
-            const auto data_path_value = has_data_path
-                                             ? lfs::core::utf8_to_path(::args::get(data_path))
-                                             : std::filesystem::path{};
             auto data_extension = data_path_value.extension().string();
             std::ranges::transform(
                 data_extension, data_extension.begin(),
@@ -1047,12 +1088,13 @@ namespace {
                             lfs::io::project::unpublishedLichtUserMessage(data_path_value));
                     }
                     params.dataset_project = data_path_value;
+                    params.dataset.data_path.clear();
                 } else {
                     params.dataset.data_path = data_path_value;
                 }
 
                 if (has_output_path) {
-                    params.dataset.output_path = lfs::core::utf8_to_path(::args::get(output_path));
+                    params.dataset.output_path = output_path_value;
 
                     // Create output directory
                     std::error_code ec;
@@ -1071,10 +1113,10 @@ namespace {
             } else if (has_resume) {
                 // Resume mode: paths are optional (will be read from checkpoint)
                 if (has_data_path) {
-                    params.dataset.data_path = lfs::core::utf8_to_path(::args::get(data_path));
+                    params.dataset.data_path = data_path_value;
                 }
                 if (has_output_path) {
-                    params.dataset.output_path = lfs::core::utf8_to_path(::args::get(output_path));
+                    params.dataset.output_path = output_path_value;
 
                     // Create output directory if provided
                     std::error_code ec;
@@ -1207,9 +1249,9 @@ namespace {
             auto apply_cmd_overrides = [&params,
                                         // Capture values, not references
                                         iterations_val = cli_option_present({"-i", "--iter"}) ? std::optional<uint32_t>(::args::get(iterations)) : std::optional<uint32_t>(),
-                                        resize_factor_val = resize_factor ? std::optional<int>(::args::get(resize_factor)) : std::optional<int>(1), // default 1
+                                        resize_factor_val = resize_factor ? std::optional<int>(::args::get(resize_factor)) : std::optional<int>(),
                                         resize_factor_explicit = static_cast<bool>(resize_factor),
-                                        max_width_val = max_width ? std::optional<int>(::args::get(max_width)) : std::optional<int>(3840),
+                                        max_width_val = max_width ? std::optional<int>(::args::get(max_width)) : std::optional<int>(),
                                         max_width_explicit = static_cast<bool>(max_width),
                                         min_track_length_val = cli_option_present({"--min-track-length"}) ? std::optional<int>(::args::get(min_track_length)) : std::optional<int>(),
                                         no_cpu_cache_flag = static_cast<bool>(no_cpu_cache),
@@ -1327,11 +1369,21 @@ namespace {
                                             cli_option_present({"--save-project-path"})
                                                 ? std::optional<std::string>(::args::get(save_project_path))
                                                 : std::optional<std::string>(),
-                                        output_path_explicit_val = cli_option_present({"-o", "--output-path"}),
+                                        data_path_cli = cli_option_present({"-d", "--data-path"}),
+                                        output_path_cli = cli_option_present({"-o", "--output-path"}),
+                                        output_path_explicit_val = cli_option_present({"-o", "--output-path"}) || params.dataset.output_path_explicit,
                                         output_name_val = cli_option_present({"--output-name"}) ? std::optional<std::string>(::args::get(output_name)) : std::optional<std::string>()]() {
                 auto& opt = params.optimization;
                 auto& svs = params.server;
                 auto& ds = params.dataset;
+
+                // A .licht source resolves its actual dataset at load time.
+                // Do not later overwrite that root with the project filename.
+                if (params.dataset_project && !params.overrides.dataset_json.empty()) {
+                    auto dataset_overlay = nlohmann::json::parse(params.overrides.dataset_json);
+                    dataset_overlay.erase("data_path");
+                    params.overrides.dataset_json = dataset_overlay.dump();
+                }
 
                 std::vector<const char*> opt_keys;
                 std::vector<const char*> ds_keys;
@@ -1358,7 +1410,7 @@ namespace {
                 // Apply all overrides
                 setVal(iterations_val, opt.iterations);
                 params.cli_iterations_set =
-                    iterations_val.has_value();
+                    iterations_val.has_value() || params.overrides.has_optimization_key("iterations");
                 note_opt("iterations", iterations_val.has_value());
                 setVal(resize_factor_val, ds.resize_factor);
                 note_ds("resize_factor", resize_factor_explicit);
@@ -1536,6 +1588,8 @@ namespace {
                     }
                 }
 
+                note_ds("data_path", data_path_cli && !params.dataset_project);
+                note_ds("output_folder", output_path_cli);
                 note_ds("images", images_folder_val.has_value());
                 note_ds("test_every", test_every_val.has_value());
                 note_ds("timelapse_images", timelapse_images_val.has_value());
@@ -1644,6 +1698,8 @@ namespace {
                         cli_ds["loading_params"]["use_cpu_memory"] = false;
                     if (use_16bit_flag)
                         cli_ds["loading_params"]["use_16bit_color"] = true;
+                    if (output_path_cli)
+                        cli_ds["output_path"] = lfs::core::path_to_utf8(ds.output_path);
                     if (!cli_ds.empty()) {
                         lfs::core::param::merge_explicit_json_overlay(
                             params.overrides.dataset_json, cli_ds.dump());
@@ -1697,8 +1753,8 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[]) {
     }
 
     auto parse_result = parse_arguments(args, *params);
-    const std::string& strategy = params->optimization.strategy;
-    const std::string& config_file = params->optimization.config_file;
+    const std::string strategy = params->optimization.strategy;
+    const std::string config_file = params->optimization.config_file;
 
     if (!parse_result) {
         return std::unexpected(parse_result.error());
@@ -1732,8 +1788,6 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[]) {
         else
             params->optimization = lfs::core::param::OptimizationParameters::mrnf_defaults();
     }
-
-    params->dataset.loading_params = lfs::core::param::LoadingParams{};
 
     if (apply_overrides) {
         apply_overrides();

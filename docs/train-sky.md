@@ -15,6 +15,12 @@ sky pixels; it does not guarantee that all foreground floaters disappear.
 
 ## Dataset and command
 
+The same LiDAR/sky setup is available as
+[`configs/contextcapture_gaussian_sky.json`](../configs/contextcapture_gaussian_sky.json):
+run `./build/train/lfs-train --config configs/contextcapture_gaussian_sky.json`
+from the repository root. See [JSON configuration](train-only.md#json-training-configuration)
+for overrides and path handling.
+
 Keep ordinary validity masks separate from sky masks. White means sky and black
 means foreground. Masks must match the original image dimensions. Channel zero
 supplies coverage for grayscale/RGB masks. The directory mirrors the images:
