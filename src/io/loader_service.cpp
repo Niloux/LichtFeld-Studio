@@ -8,16 +8,19 @@
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "io/error.hpp"
-#include "io/formats/rad.hpp"
 #include "io/loaders/blender_loader.hpp"
 #include "io/loaders/checkpoint_loader.hpp"
 #include "io/loaders/colmap_loader.hpp"
-#include "io/loaders/mesh_loader.hpp"
 #include "io/loaders/ply_loader.hpp"
+
+#ifndef LFS_TRAIN_ONLY
+#include "io/formats/rad.hpp"
+#include "io/loaders/mesh_loader.hpp"
 #include "io/loaders/rad_loader.hpp"
 #include "io/loaders/sogs_loader.hpp"
 #include "io/loaders/spz_loader.hpp"
 #include "io/loaders/usd_loader.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,14 +34,18 @@ namespace lfs::io {
 
         // Register default loaders
         registry_->registerLoader(std::make_unique<PLYLoader>());
+#ifndef LFS_TRAIN_ONLY
         registry_->registerLoader(std::make_unique<SogLoader>());
         registry_->registerLoader(std::make_unique<SpzLoader>());
         registry_->registerLoader(std::make_unique<USDLoader>());
         registry_->registerLoader(std::make_unique<RadLoader>());
+#endif
         registry_->registerLoader(std::make_unique<CheckpointLoader>());
         registry_->registerLoader(std::make_unique<ColmapLoader>());
         registry_->registerLoader(std::make_unique<BlenderLoader>());
+#ifndef LFS_TRAIN_ONLY
         registry_->registerLoader(std::make_unique<MeshLoader>());
+#endif
 
         LOG_DEBUG("LoaderService initialized with {} loaders", registry_->size());
     }
@@ -54,7 +61,12 @@ namespace lfs::io {
         }
 
         [[nodiscard]] bool pagedRadGpuResidencyRequested(const lfs::core::SplatData& model) {
+#ifdef LFS_TRAIN_ONLY
+            (void)model;
+            return false;
+#else
             return lfs::io::rad_paged_load_recommended(model);
+#endif
         }
     } // namespace
 
@@ -185,8 +197,14 @@ namespace lfs::io {
                 message = std::format(
                     "Cannot open '{}' - unsupported file format.\n\n"
                     "Supported formats:\n"
+#ifdef LFS_TRAIN_ONLY
+                    "  - Gaussian Splat files: .ply\n"
+#else
                     "  - Gaussian Splat files: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz\n"
+#endif
+#ifndef LFS_TRAIN_ONLY
                     "  - Mesh files: .obj, .fbx, .gltf, .glb, .stl, .dae\n"
+#endif
                     "  - Training checkpoints: .resume\n"
                     "  - NeRF transforms: .json",
                     filename);

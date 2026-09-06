@@ -111,7 +111,6 @@ set(TRAINING_NEW_SOURCES
         progress.cpp
         training_cropbox_mask.cpp
         trainer.cpp
-        normal_auto_generate.cpp
         vram_ledger.cpp
         perf_bench.cpp
     training_setup.cpp
@@ -151,9 +150,12 @@ target_link_libraries(lfs_training
         gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
-        lfs_preprocessing       # MoGe-2 normal auto-generate
-        lfs_python_utils
 )
+
+if(NOT LFS_TRAIN_ONLY)
+    target_sources(lfs_training PRIVATE normal_auto_generate.cpp)
+    target_link_libraries(lfs_training PRIVATE lfs_preprocessing lfs_python_utils)
+endif()
 
 # Set C++ standard
 set_target_properties(lfs_training PROPERTIES

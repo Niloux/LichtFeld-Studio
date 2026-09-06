@@ -1,0 +1,58 @@
+name: Train-only build
+
+on:
+  pull_request:
+  push:
+    branches: [master, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      VCPKG_ROOT: /tmp/vcpkg
+      VCPKG_MAX_CONCURRENCY: 2
+      VCPKG_DISABLE_METRICS: 1
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y git ca-certificates curl zip unzip tar ninja-build pkg-config \
+            gcc-14 g++-14 python3 python3-venv nasm autoconf automake libtool
+          python3 -m venv /opt/build-tools
+          /opt/build-tools/bin/pip install cmake==4.2.3
+          echo /opt/build-tools/bin >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Bootstrap the pinned vcpkg registry
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          baseline=$(python3 -c 'import json; print(json.load(open("vcpkg.json"))["builtin-baseline"])')
+          git -C "$VCPKG_ROOT" checkout "$baseline"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+      - name: Configure without a GPU or desktop dependencies
+        run: |
+          cmake -S . -B build/train -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
+            -DLFS_BUILD_PROFILE=train -DLFS_BUILD_TRAIN_TESTS=ON \
+            -DBUILD_TESTS=OFF -DBUILD_CUDA_PTX_ONLY=ON \
+            -DLFS_ENABLE_CUDA_DEVICE_DEBUG=OFF
+      - name: Audit configured sources and installed packages
+        run: python3 tools/check_train_build.py build/train
+      - name: Compile standalone trainer
+        run: cmake --build build/train --target lfs-train -j 2
+      - name: Run contracts that do not require the NVIDIA driver
+        run: ctest --test-dir build/train --output-on-failure -R 'train_profile_contract|train_build_graph'

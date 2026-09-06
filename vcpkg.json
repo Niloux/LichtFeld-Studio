@@ -1,86 +1,20 @@
 {
   "builtin-baseline": "c3867e714dd3a51c272826eea77267876517ed99",
   "dependencies": [
-    "cppzmq",
-    "curl",
     "args",
-    "assimp",
-    {
-      "name": "ffmpeg",
-      "features": [
-        "avcodec",
-        "avfilter",
-        "avformat",
-        "nvcodec",
-        "swscale",
-        "x264"
-      ]
-    },
-    "freetype",
     "fmt",
     "glm",
-    {
-      "name": "libarchive",
-      "default-features": false,
-      "features": [
-        "bzip2",
-        "lzma",
-        "zstd"
-      ]
-    },
-    "libdeflate",
     "libjpeg-turbo",
     "libpng",
-    "libplacebo",
     "libwebp",
-    "nanobind",
-    {
-      "name": "nativefiledialog-extended",
-      "platform": "windows | osx"
-    },
     "nlohmann-json",
-    {
-      "name": "python3",
-      "features": [
-        "extensions"
-      ]
-    },
-    {
-      "name": "rmlui",
-      "features": [
-        "svg"
-      ]
-    },
-    {
-      "name": "sdl3",
-      "features": [
-        "vulkan"
-      ]
-    },
     "spdlog",
     "tbb",
     "tiff",
     "tinyexr",
-    "vulkan",
-    {
-      "name": "vulkan-loader",
-      "features": [
-        "xcb",
-        "xlib"
-      ],
-      "platform": "linux"
-    },
-    "vulkan-memory-allocator",
-    "volk",
-    {
-      "name": "glslang",
-      "features": [
-        "tools"
-      ]
-    },
-    "shader-slang",
     "xxhash",
-    "zstd"
+    "zstd",
+    "zlib"
   ],
   "features": {
     "tests": {
@@ -100,6 +34,78 @@
           "host": true
         },
         "vulkan-validationlayers"
+      ]
+    },
+    "studio": {
+      "description": "Desktop editor, video, extra formats, Python and preprocessing",
+      "dependencies": [
+        "cppzmq",
+        "curl",
+        "assimp",
+        {
+          "name": "ffmpeg",
+          "features": [
+            "avcodec",
+            "avfilter",
+            "avformat",
+            "nvcodec",
+            "swscale",
+            "x264"
+          ]
+        },
+        "freetype",
+        {
+          "name": "libarchive",
+          "default-features": false,
+          "features": [
+            "bzip2",
+            "lzma",
+            "zstd"
+          ]
+        },
+        "libdeflate",
+        "libplacebo",
+        "nanobind",
+        {
+          "name": "nativefiledialog-extended",
+          "platform": "windows | osx"
+        },
+        {
+          "name": "python3",
+          "features": [
+            "extensions"
+          ]
+        },
+        {
+          "name": "rmlui",
+          "features": [
+            "svg"
+          ]
+        },
+        {
+          "name": "sdl3",
+          "features": [
+            "vulkan"
+          ]
+        },
+        "vulkan",
+        {
+          "name": "vulkan-loader",
+          "features": [
+            "xcb",
+            "xlib"
+          ],
+          "platform": "linux"
+        },
+        "vulkan-memory-allocator",
+        "volk",
+        {
+          "name": "glslang",
+          "features": [
+            "tools"
+          ]
+        },
+        "shader-slang"
       ]
     }
   },

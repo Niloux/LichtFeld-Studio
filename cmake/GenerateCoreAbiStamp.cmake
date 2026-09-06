@@ -61,6 +61,12 @@ endif()
 
 set(_lfs_core_abi_material
     "${LFS_PROJECT_VERSION}|${_lfs_git_commit_hash_short}|${LFS_BUILD_CONFIG}|${LFS_SYSTEM_NAME}|${LFS_SIZEOF_VOID_P}|${LFS_CXX_COMPILER_ID}|${LFS_CXX_COMPILER_VERSION}|${LFS_CUDA_COMPILER_ID}|${LFS_CUDA_COMPILER_VERSION}|${LFS_CUDA_ARCHITECTURES}|${LFS_VCPKG_TARGET_TRIPLET}")
+# A studio core and a train core may share source hashes but expose different
+# compiled capabilities and defaults. Never accept one in place of the other.
+if(NOT DEFINED LFS_BUILD_PROFILE)
+    set(LFS_BUILD_PROFILE studio)
+endif()
+string(APPEND _lfs_core_abi_material "|profile=${LFS_BUILD_PROFILE}")
 foreach(_lfs_core_build_input IN LISTS LFS_CORE_BUILD_INPUTS)
     file(SHA256 "${_lfs_core_build_input}" _lfs_core_build_input_hash)
     string(APPEND _lfs_core_abi_material "|${_lfs_core_build_input_hash}")

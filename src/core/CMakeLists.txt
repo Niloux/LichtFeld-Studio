@@ -47,9 +47,7 @@ set(TENSOR_SOURCES
         tensor/pinned_memory_allocator.cpp
         tensor/tensor_exports.cu
         nn/ops.cpp
-        nn/weight_file.cpp
         nn/activation_arena.cpp
-        nn/models/moge2.cpp
 )
 
 # Core module sources
@@ -109,12 +107,20 @@ set(CORE_SOURCES
         legacy_settings_migration.cpp
 )
 
+if(NOT LFS_TRAIN_ONLY)
+    list(APPEND TENSOR_SOURCES nn/weight_file.cpp nn/models/moge2.cpp)
+endif()
+
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
 
 add_dependencies(lfs_core lfs_core_abi_stamp)
 target_include_directories(lfs_core BEFORE PRIVATE "${LFS_CORE_ABI_INCLUDE_DIR}")
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
+if(LFS_TRAIN_ONLY)
+    target_compile_definitions(lfs_core PUBLIC LFS_TRAIN_ONLY=1)
+    target_link_libraries(lfs_core PRIVATE ZLIB::ZLIB)
+endif()
 
 target_include_directories(lfs_core
     PUBLIC

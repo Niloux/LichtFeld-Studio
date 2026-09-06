@@ -4,6 +4,7 @@
 
 # External dependencies (EXCLUDE_FROM_ALL to prevent third-party install rules)
 
+if(NOT LFS_TRAIN_ONLY)
 # Zep - embeddable editor core
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/zep/CMakeLists.txt")
     message(STATUS "Adding Zep from external/zep")
@@ -93,9 +94,14 @@ set_target_properties(lfs_tree_sitter_python PROPERTIES
     C_STANDARD_REQUIRED ON
 )
 
+endif()
+
 # OpenMesh - Half-edge mesh data structure
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/OpenMesh/CMakeLists.txt")
     message(STATUS "Adding OpenMesh")
+    if(LFS_TRAIN_ONLY)
+        set(BUILD_APPS OFF CACHE BOOL "Build OpenMesh applications" FORCE)
+    endif()
     set(OPENMESH_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(OPENMESH_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)

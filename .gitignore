@@ -76,3 +76,7 @@ generatedSchema.usda
 # only creates merge-conflict churn).
 src/rendering/rasterizer/vulkan/shader/generated/*.spv
 src/rendering/rasterizer/vulkan/shader/radix_sort/*.spv
+
+# Standalone training build helpers and contracts
+!scripts/prepare_train_cuda_headers.py
+!tests/test_train_profile.py

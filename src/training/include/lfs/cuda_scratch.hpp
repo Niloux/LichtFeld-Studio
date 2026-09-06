@@ -56,9 +56,22 @@ namespace lfs::training::cuda_scratch {
     // Reused by the q16 mutation codec. Mutation calls are serialized by the
     // live-model mutation guard, so one process-local workspace is sufficient.
     struct Q16BlockRunWorkspace {
-        DeviceBuffer flags;
-        DeviceBuffer compact;
-        DeviceBuffer scan;
+        // This process-local cache outlives the streams used by individual
+        // trainers. Its allocations must not retain a stream for deallocation.
+        struct AllocationHooks : VramProfilerAllocationHooks {
+            void after_allocate(void* ptr, size_t bytes, std::string_view label) const noexcept {
+                try {
+                    diagnostics::VramProfiler::instance().recordAllocation(
+                        ptr, bytes, diagnostics::VramAllocationMethod::Direct, label);
+                } catch (...) {
+                }
+            }
+        };
+        using PersistentBuffer = lfs::core::UniqueCudaAllocation<
+            lfs::core::DirectCudaAllocator, AllocationHooks>;
+        PersistentBuffer flags;
+        PersistentBuffer compact;
+        PersistentBuffer scan;
         size_t n_capacity = 0;
         size_t scan_bytes = 0;
 
@@ -66,16 +79,16 @@ namespace lfs::training::cuda_scratch {
                     const size_t required_scan_bytes,
                     const cudaStream_t stream) {
             if (n > n_capacity) {
-                flags = DeviceBuffer(
+                flags = PersistentBuffer(
                     checked_bytes(n, sizeof(std::int32_t), "q16 block-run flags"),
                     stream, "training.q16.block_runs.flags");
-                compact = DeviceBuffer(
+                compact = PersistentBuffer(
                     checked_bytes(n, sizeof(std::int32_t), "q16 block-run compact"),
                     stream, "training.q16.block_runs.compact");
                 n_capacity = n;
             }
             if (required_scan_bytes > scan_bytes) {
-                scan = DeviceBuffer(
+                scan = PersistentBuffer(
                     required_scan_bytes,
                     stream, "training.q16.block_runs.scan");
                 scan_bytes = required_scan_bytes;

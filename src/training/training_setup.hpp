@@ -44,7 +44,7 @@ namespace lfs::training {
 
     /// Write `--export` formats next to project.licht after a terminal project
     /// save. No-op when `params.export_formats` is empty.
-    void export_final_splats(
+    bool export_final_splats(
         const Trainer& trainer,
         const lfs::core::param::TrainingParameters& params);
 

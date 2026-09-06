@@ -470,6 +470,21 @@ namespace {
                 "ENVIRONMENT:\n"
                 "LFS_LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
             parser.helpParams.width = 240;
+#ifdef LFS_TRAIN_ONLY
+            constexpr auto studio_help = ::args::Options::Hidden;
+            constexpr auto init_help = "Initialize from a .ply or .resume splat file";
+            constexpr auto export_help = "Also export the final trained splat as PLY (--export ply)";
+            parser.Description("lfs-train: standalone CUDA Gaussian splat training.\n");
+            parser.Epilog("\nEXAMPLES:\n"
+                          "lfs-train -d ./data -o ./output --export ply\n"
+                          "lfs-train --resume ./output/project.licht --iter 40000\n"
+                          "\nPrecomputed mask/depth/normal files are supported.\n"
+                          "Automatic prior generation and Python scripts are unavailable.\n");
+#else
+            constexpr auto studio_help = ::args::Options::None;
+            constexpr auto init_help = "Initialize from splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume)";
+            constexpr auto export_help = "Also export the final trained splat next to project.licht: comma-separated ply, sog, spz, usd, usda, usdc, html, rad";
+#endif
 
             // =============================================================================
             // MODE SELECTION
@@ -477,9 +492,9 @@ namespace {
             ::args::Group mode_group(parser, "MODE SELECTION:");
             ::args::HelpFlag help(mode_group, "help", "Display help menu", {'h', "help"});
             ::args::Flag version(mode_group, "version", "Display version information", {'V', "version"});
-            ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports projects (.licht), splat (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
+            ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports projects (.licht), splat (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"}, studio_help);
             ::args::ValueFlag<std::string> resume_checkpoint(mode_group, "checkpoint", "Resume training from a .resume checkpoint or .licht project", {"resume"});
-            ::args::ValueFlag<std::string> render_camera_path(mode_group, "path", "Render a JSON camera-keyframe path to video, headless (no GUI/window). Requires --render-load and --render-output; see RENDER PATH options.", {"render-camera-path"});
+            ::args::ValueFlag<std::string> render_camera_path(mode_group, "path", "Render a JSON camera-keyframe path to video, headless (no GUI/window). Requires --render-load and --render-output; see RENDER PATH options.", {"render-camera-path"}, studio_help);
             ::args::CompletionFlag completion(parser, {"complete"});
 
             // =============================================================================
@@ -491,21 +506,21 @@ namespace {
             ::args::ValueFlag<std::string> output_path(paths_group, "output_path", "Directory for project.licht and --export files", {'o', "output-path"});
             ::args::ValueFlag<std::string> output_name(paths_group, "output_name", "Output filename (replaces default splat_ITER.ply stem)", {"output-name"});
             ::args::ValueFlag<std::string> config_file(paths_group, "config_file", "LichtFeldStudio config file (json)", {"config"});
-            ::args::ValueFlag<std::string> init_path(paths_group, "path", "Initialize from splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume)", {"init"});
+            ::args::ValueFlag<std::string> init_path(paths_group, "path", init_help, {"init"});
             ::args::ValueFlagList<std::string> add_splats(paths_group, "path", "Append trained splat file(s) to the training model before optimizer initialization", {"add-splat"});
             ::args::CounterFlag freeze(paths_group, "freeze", "Freeze the immediately preceding --add-splat rows from optimizer gradients and densification", {"freeze"});
             ::args::ValueFlag<float> freeze_lr_scale(paths_group, "scale", "Learning-rate scale for frozen splats (0 = fully frozen, default; try 0.01-0.1 to let frozen splats absorb small appearance mismatch)", {"freeze-lr-scale"});
             ::args::Flag exclude_export(paths_group, "exclude_export", "Exclude frozen --add-splat rows from PLY exports", {"exclude-export"});
             ::args::Flag no_provenance(paths_group, "no-provenance", "Strip identifying metadata (export id, timestamps, training info) from outputs; a minimal build stamp is always embedded", {"no-provenance"});
-            ::args::ValueFlag<std::string> export_formats(paths_group, "formats", "Also export the final trained splat next to project.licht: comma-separated ply, sog, spz, usd, usda, usdc, html, rad", {"export"});
+            ::args::ValueFlag<std::string> export_formats(paths_group, "formats", export_help, {"export"});
 
-            ::args::ValueFlag<std::string> import_cameras(paths_group, "path", "Import COLMAP cameras from sparse folder (no images required)", {"import-cameras"});
+            ::args::ValueFlag<std::string> import_cameras(paths_group, "path", "Import COLMAP cameras from sparse folder (no images required)", {"import-cameras"}, studio_help);
 
             // =============================================================================
             // RENDER PATH (used with --render-camera-path)
             // =============================================================================
-            ::args::Group render_path_sep(parser, " ");
-            ::args::Group render_path_group(parser, "RENDER PATH (used with --render-camera-path):");
+            ::args::Group render_path_sep(parser, " ", ::args::Group::Validators::DontCare, studio_help);
+            ::args::Group render_path_group(parser, "RENDER PATH (used with --render-camera-path):", ::args::Group::Validators::DontCare, studio_help);
             ::args::ValueFlag<std::string> render_load(render_path_group, "path", "Trained scene to render (.ply/.sog/.spz or .resume checkpoint)", {"render-load"});
             ::args::ValueFlag<std::string> render_output(render_path_group, "path", "Output video file (.mp4)", {"render-output"});
             ::args::ValueFlag<int> render_width(render_path_group, "width", "Output width (default 1920)", {"render-width"});
@@ -665,8 +680,8 @@ namespace {
             // =============================================================================
             // UI OPTIONS
             // =============================================================================
-            ::args::Group ui_sep(parser, " ");
-            ::args::Group ui_group(parser, "UI OPTIONS:");
+            ::args::Group ui_sep(parser, " ", ::args::Group::Validators::DontCare, studio_help);
+            ::args::Group ui_group(parser, "UI OPTIONS:", ::args::Group::Validators::DontCare, studio_help);
             ::args::Flag headless(ui_group, "headless", lfs::core::args::optimization_cli_help("--headless"), {"headless"});
             ::args::Flag auto_train(ui_group, "train", "Start training immediately on startup", {"train"});
             ::args::Flag safe_mode(ui_group, "safe_mode", "Start with user plugins disabled (recovery mode)", {"safe-mode"});
@@ -705,15 +720,15 @@ namespace {
             ::args::Flag quiet(logging_group, "quiet", "Suppress non-error output (equivalent to --log-level error)", {'q', "quiet"});
             ::args::ValueFlag<std::string> log_file(logging_group, "file", "Optional log file path", {"log-file"});
             ::args::ValueFlag<std::string> log_filter(logging_group, "pattern", "Filter log messages (glob: *foo*, regex: \\\\d+)", {"log-filter"});
-            ::args::Flag tcp_connection(parser, "tcp_connection", "Use TCP connection for signals and events", {"tcp-connection"});
-            ::args::ValueFlag<int> tcp_server_connection_port(parser, "tcp_server_connection_port", "TCP connection port when tcp connection is in use for server requests, -1 for auto", {"tcp-server-port"});
-            ::args::ValueFlag<int> tcp_broadcast_connection_port(parser, "tcp_broadcast_connection_port", "TCP connection port when tcp connection is in use for broadcasting, -1 for auto", {"tcp-broadcast-port"});
+            ::args::Flag tcp_connection(parser, "tcp_connection", "Use TCP connection for signals and events", {"tcp-connection"}, studio_help);
+            ::args::ValueFlag<int> tcp_server_connection_port(parser, "tcp_server_connection_port", "TCP connection port when tcp connection is in use for server requests, -1 for auto", {"tcp-server-port"}, studio_help);
+            ::args::ValueFlag<int> tcp_broadcast_connection_port(parser, "tcp_broadcast_connection_port", "TCP connection port when tcp connection is in use for broadcasting, -1 for auto", {"tcp-broadcast-port"}, studio_help);
 
             // =============================================================================
             // EXTENSIONS
             // =============================================================================
-            ::args::Group extensions_sep(parser, " ");
-            ::args::Group extensions_group(parser, "EXTENSIONS:");
+            ::args::Group extensions_sep(parser, " ", ::args::Group::Validators::DontCare, studio_help);
+            ::args::Group extensions_group(parser, "EXTENSIONS:", ::args::Group::Validators::DontCare, studio_help);
             ::args::ValueFlagList<std::string> python_scripts(extensions_group, "path", "Python script(s) for custom training callbacks", {"python-script"});
 
             // Parse arguments
@@ -730,6 +745,17 @@ namespace {
                 return std::unexpected(std::format("Parse error: {}\n{}", e.what(), parser.Help()));
             }
 
+#ifdef LFS_TRAIN_ONLY
+            if (view_ply || render_camera_path || import_cameras || render_load || render_output ||
+                render_width || render_height || render_fps || render_crf || debug_python || debug_python_port ||
+                mcp_port || tcp_connection || tcp_server_connection_port || tcp_broadcast_connection_port ||
+                safe_mode || reset_preferences || reset_layout || reset_all_settings) {
+                return std::unexpected("Editor, server and video options are unavailable in lfs-train");
+            }
+            if (python_scripts) {
+                return std::unexpected("Python scripts are unavailable in lfs-train");
+            }
+#endif
             // Initialize logger (CLI args override environment variable)
             {
                 auto level = lfs::core::LogLevel::Info;
@@ -2072,6 +2098,12 @@ std::expected<lfs::core::args::ParsedArgs, std::string>
 lfs::core::args::parse_args(const int argc, const char* const argv[]) {
     if (argc >= 2) {
         const std::string_view arg1 = argv[1];
+#ifdef LFS_TRAIN_ONLY
+        if (arg1 == "convert" || arg1 == "mesh2splat" || arg1 == "mesh-to-splat" ||
+            arg1 == "preprocess" || arg1 == "plugin" || arg1 == "--warmup") {
+            return std::unexpected("lfs-train supports training only; this subcommand is unavailable");
+        }
+#endif
 
         if (arg1 == "-V" || arg1 == "--version") {
             return VersionMode{};

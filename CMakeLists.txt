@@ -12,6 +12,7 @@ if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
 endif()
 
 cmake_minimum_required(VERSION 3.30)
+include(cmake/BuildProfile.cmake)
 
 # Manifest-mode vcpkg runs only while CMake configures. Track overlay-port
 # contents explicitly so the usual `cmake --build` regeneration also reruns
@@ -34,7 +35,7 @@ if(DEFINED LFS_ENABLE_VULKAN_VALIDATION)
 elseif(NOT CMAKE_CONFIGURATION_TYPES AND CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
     set(_lfs_vulkan_validation_feature ON)
 endif()
-if(_lfs_vulkan_validation_feature)
+if(_lfs_vulkan_validation_feature AND NOT LFS_TRAIN_ONLY)
     list(APPEND VCPKG_MANIFEST_FEATURES vulkan-validation)
 endif()
 list(REMOVE_DUPLICATES VCPKG_MANIFEST_FEATURES)
@@ -77,7 +78,9 @@ unset(_LFS_HOST_PROCESSOR_COUNT)
 option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
-lfs_linux_preflight_gui_backends()
+if(NOT LFS_TRAIN_ONLY)
+    lfs_linux_preflight_gui_backends()
+endif()
 
 # Suppress CMake developer warnings
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS ON CACHE BOOL "" FORCE)
@@ -349,7 +352,7 @@ if(WIN32)
 else()
     find_program(NVIDIA_SMI nvidia-smi)
 endif()
-if(NVIDIA_SMI)
+if(NVIDIA_SMI AND NOT (LFS_TRAIN_ONLY AND BUILD_CUDA_PTX_ONLY))
     execute_process(
             COMMAND ${NVIDIA_SMI} --query-gpu=compute_cap --format=csv,noheader
             OUTPUT_VARIABLE DETECTED_COMPUTE_CAP
@@ -377,7 +380,11 @@ if(NVIDIA_SMI)
         set(LichtFeld-Studio_CUDA_ARCH "native")
     endif()
 else()
-    message(WARNING "nvidia-smi not found! We are likely in CI, default to 8.6.")
+    if(LFS_TRAIN_ONLY AND BUILD_CUDA_PTX_ONLY)
+        message(STATUS "Train PTX build: GPU probing is not required")
+    else()
+        message(WARNING "nvidia-smi not found! We are likely in CI, default to 8.6.")
+    endif()
     set(DETECTED_COMPUTE_CAP 8.6)
     set(LichtFeld-Studio_CUDA_ARCH "86")
 endif()
@@ -453,6 +460,9 @@ endif()
 
 message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
 
+if(LFS_TRAIN_ONLY)
+    include(cmake/DependenciesTrain.cmake)
+else()
 # Find packages
 find_package(TBB REQUIRED)
 find_package(Threads REQUIRED)
@@ -481,6 +491,8 @@ find_package(xxHash CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(assimp REQUIRED)
 find_package(RmlUi CONFIG REQUIRED)
+
+endif()
 
 # Vulkan-native depth: glm::perspective/ortho/frustum must emit clip-space z in
 # [0, 1], not OpenGL's [-1, 1]. Keeps gl_FragDepth, the grid pass, the depth-
@@ -515,6 +527,7 @@ add_custom_target(lfs_core_abi_stamp ALL
         "-DLFS_CORE_ABI_TEMPLATE=${CMAKE_SOURCE_DIR}/cmake/lfs_core_abi_stamp.h.in"
         "-DLFS_CORE_ABI_HEADER=${LFS_CORE_ABI_HEADER}"
         "-DLFS_PROJECT_VERSION=${PROJECT_VERSION}"
+        "-DLFS_BUILD_PROFILE=${LFS_BUILD_PROFILE}"
         "-DLFS_CONFIGURED_GIT_COMMIT_HASH_SHORT=${GIT_COMMIT_HASH_SHORT}"
         "-DLFS_BUILD_CONFIG=$<CONFIG>"
         "-DLFS_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
@@ -561,6 +574,11 @@ add_compile_definitions(
     $<$<CONFIG:Debug>:DEBUG_BUILD>
     $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:RELEASE_BUILD>
 )
+
+if(LFS_TRAIN_ONLY)
+    include(cmake/TrainTargets.cmake)
+    return()
+endif()
 
 # =============================================================================
 # LIBRARY MODULES

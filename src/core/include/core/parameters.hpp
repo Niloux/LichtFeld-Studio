@@ -200,7 +200,11 @@ namespace lfs::core {
 
             // Normal supervision
             bool use_normal_loss = false;             // Use dataset normal maps when available
+#ifdef LFS_TRAIN_ONLY
+            bool normal_auto_generate = false;
+#else
             bool normal_auto_generate = true;         // Generate missing/mismatched maps from images/ with MoGe-2
+#endif
             float normal_loss_weight = 0.005f;        // Prior normal supervision weight (sweep: free geometry; raise to ~0.1 when geometry is the product)
             float normal_consistency_weight = 0.001f; // Depth-normal consistency weight
             float normal_flatten_weight = 0.0f;       // L1 on the smallest scale axis; off by default - it suppresses densification under the benchmark refine regime

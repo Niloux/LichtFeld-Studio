@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # CUDA library for IO-specific kernels (morton encoding, k-means)
-add_library(lfs_io_cuda STATIC
+set(LFS_IO_CUDA_SOURCES
         cuda/morton_encoding.hpp
         cuda/morton_encoding.cu
         cuda/kmeans.hpp
@@ -11,6 +11,11 @@ add_library(lfs_io_cuda STATIC
         cuda/image_format_kernels.cuh
         cuda/image_format_kernels.cu
 )
+
+if(LFS_TRAIN_ONLY)
+    list(FILTER LFS_IO_CUDA_SOURCES EXCLUDE REGEX "^cuda/kmeans")
+endif()
+add_library(lfs_io_cuda STATIC ${LFS_IO_CUDA_SOURCES})
 
 target_include_directories(lfs_io_cuda
         PUBLIC
@@ -52,6 +57,7 @@ if(MSVC)
     )
 endif()
 
+if(NOT LFS_TRAIN_ONLY)
 # RAD encode quantization kernels. Kept out of lfs_io_cuda: bit-parity with
 # the CPU PropertyEncoder requires IEEE arithmetic — no -use_fast_math, no
 # FMA contraction (same constraint as lod_page_dequant_cuda.cu).
@@ -229,7 +235,9 @@ else()
     target_compile_options(lfs_tinyusdz PRIVATE -fno-exceptions)
 endif()
 
-add_library(lfs_io STATIC
+endif()
+
+set(LFS_IO_SOURCES
         # Implementation file only (header is in include/io/)
         loader.cpp
 
@@ -327,6 +335,11 @@ add_library(lfs_io STATIC
 
 )
 
+if(LFS_TRAIN_ONLY)
+    list(FILTER LFS_IO_SOURCES EXCLUDE REGEX "^(formats/(sogs|html|rad|spz|usd|usd_flat/|nurec_usdz)|loaders/(sogs|spz|usd|rad|mesh)_loader|mesh/|ply_to_rad_lod)")
+endif()
+add_library(lfs_io STATIC ${LFS_IO_SOURCES})
+
 # Set include directories
 target_include_directories(lfs_io
         PUBLIC
@@ -342,6 +355,7 @@ target_include_directories(lfs_io SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include
 )
 
+if(NOT LFS_TRAIN_ONLY)
 # Find the actual WebP library targets
 if(TARGET WebP::webpdecoder)
     set(WEBP_DECODE_LIB WebP::webpdecoder)
@@ -376,6 +390,8 @@ else()
     set(ARCHIVE_LIB ${ARCHIVE_LIBRARY})
 endif()
 
+endif()
+
 # Ensure CUDA library is built first
 add_dependencies(lfs_io lfs_io_cuda)
 
@@ -388,22 +404,26 @@ target_link_libraries(lfs_io
         TBB::tbb
         spdlog::spdlog
         nlohmann_json::nlohmann_json
+        zstd::libzstd          # .licht project container chunk compression
+        xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
+        CUDA::cudart           # CUDA runtime for nvImageCodec
+        lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
+        lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
+        OpenMeshCore
+)
+if(NOT LFS_TRAIN_ONLY)
+    target_link_libraries(lfs_io PRIVATE
         ${WEBP_DECODE_LIB}     # WebP for SOG decompression
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
         ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
         $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
-        zstd::libzstd          # .licht project container chunk compression
-        xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
-        CUDA::cudart           # CUDA runtime for nvImageCodec
-        lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
         lfs_io_rad_quant_cuda  # RAD encode quantization (bit-exact, no fast math)
-        lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
         lfs_tinyusdz           # USDA parser for flat Gaussian ParticleField interchange
-        OpenMeshCore
         spz_lib                # Niantic SPZ compressed format
-)
+    )
+endif()
 target_compile_definitions(lfs_io PRIVATE nsel_CONFIG_SELECT_EXPECTED=1)
 
 # Link nvImageCodec if available
@@ -463,7 +483,11 @@ if(NOT BUILD_PORTABLE)
             DESTINATION include)
 endif()
 
+if(LFS_TRAIN_ONLY)
+    message(STATUS "Training I/O: COLMAP, NeRF transforms, PLY, checkpoints, .licht and nvImageCodec")
+else()
 message(STATUS "I/O module configured with SOG support")
 message(STATUS "  IO CUDA library: lfs_io_cuda (morton, k-means)")
 message(STATUS "  WebP decoder library: ${WEBP_DECODE_LIB}")
 message(STATUS "  Archive library: ${ARCHIVE_LIB}")
+endif()

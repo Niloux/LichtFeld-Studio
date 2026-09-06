@@ -1332,6 +1332,7 @@ namespace lfs::training {
             switch (format) {
             case OutputFormat::PLY:
                 return lfs::io::save_ply(splat, {.output_path = output, .binary = true, .provenance = provenance});
+#ifndef LFS_TRAIN_ONLY
             case OutputFormat::SOG:
                 return lfs::io::save_sog(splat, {.output_path = output, .kmeans_iterations = 10, .provenance = provenance});
             case OutputFormat::SPZ:
@@ -1344,15 +1345,19 @@ namespace lfs::training {
                 return lfs::io::save_usd(splat, {.output_path = output, .provenance = provenance});
             case OutputFormat::RAD:
                 return lfs::io::save_rad(splat, {.output_path = output, .provenance = provenance});
+#else
+            default:
+                throw std::invalid_argument("lfs-train supports only PLY export");
+#endif
             }
             return lfs::io::save_ply(splat, {.output_path = output, .binary = true, .provenance = provenance});
         }
     } // namespace
 
-    void export_final_splats(const Trainer& trainer,
+    bool export_final_splats(const Trainer& trainer,
                              const lfs::core::param::TrainingParameters& params) {
         if (params.export_formats.empty()) {
-            return;
+            return true;
         }
         const auto& model = trainer.get_strategy().get_model();
         const std::filesystem::path out_dir = params.dataset.output_path;
@@ -1368,15 +1373,18 @@ namespace lfs::training {
             stamp.strategy = params.optimization.strategy;
         }
 
+        bool success = true;
         for (const auto format : params.export_formats) {
             const std::filesystem::path path = out_dir / (stem + final_export_extension(format));
             if (const auto result = save_final_splat(model, path, format, stamp); !result) {
+                success = false;
                 LOG_ERROR("Failed to export final splat to {}: {}",
                           lfs::core::path_to_utf8(path), result.error().message);
             } else {
                 LOG_INFO("Exported final splat: {}", lfs::core::path_to_utf8(path));
             }
         }
+        return success;
     }
 
 } // namespace lfs::training

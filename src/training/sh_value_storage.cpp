@@ -3,6 +3,7 @@
 
 #include "lfs/training/sh_value_storage.hpp"
 
+#include "core/crash_handler.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
@@ -36,6 +37,15 @@ namespace lfs::training::sh_value {
 
         [[nodiscard]] cuda_scratch::Q16BlockRunWorkspace& q16_block_run_workspace() {
             static cuda_scratch::Q16BlockRunWorkspace workspace;
+            // Empty the static holder before CUDA/pool teardown, while the
+            // context is still alive. Trainer streams may already be destroyed.
+            static const bool registered = [] {
+                core::register_gpu_pre_shutdown_hook([]() noexcept {
+                    workspace = {};
+                });
+                return true;
+            }();
+            (void)registered;
             return workspace;
         }
 
