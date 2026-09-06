@@ -55,6 +55,7 @@ namespace lfs::training {
         int num_gaussians = 0;
         int iteration = 0;
         bool valid = false;
+        bool training_views = false;
         std::optional<float> normal_angle_deg;
         std::optional<float> depth_absrel;
         float bias_r = 0.0f;
@@ -70,7 +71,7 @@ namespace lfs::training {
             }
             std::stringstream ss;
             ss << std::fixed << std::setprecision(4);
-            ss << "PSNR: " << psnr
+            ss << (training_views ? "Training-view " : "Validation ") << "PSNR: " << psnr
                << ", SSIM: " << ssim
                << ", Time: " << elapsed_time << "s/image"
                << ", #GS: " << num_gaussians

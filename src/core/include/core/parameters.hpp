@@ -350,6 +350,7 @@ namespace lfs::core {
             std::string images = "images";
             int resize_factor = -1;
             int test_every = 8;
+            bool use_test_split = true; // false: train all views, evaluate a per-camera subsample
             std::vector<std::string> timelapse_images = {};
             int timelapse_every = 50;
             int max_width = 3840;

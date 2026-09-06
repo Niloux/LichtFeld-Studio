@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "core/argument_parser.hpp"
 #include "core/parameters.hpp"
+#include "core/evaluation_sampling.hpp"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -33,6 +34,16 @@ int main(int argc, char** argv) {
         ~Cleanup() { std::filesystem::remove_all(path); }
     } cleanup{root};
     try {
+        const std::vector<int> stereo_ids{1, 2, 1, 2, 1, 2, 1, 2, 1, 2};
+        require(lfs::core::sample_training_views(stereo_ids, 2) == std::vector<size_t>{0, 1, 4, 5, 8, 9},
+                "interleaved cameras are sampled independently");
+        require(lfs::core::sample_training_views({1, 1, 2}, 8) == std::vector<size_t>{0, 2},
+                "short camera sequences each contribute a view");
+        require(lfs::core::sample_training_views({}, 8).empty(), "empty sampling");
+        require(lfs::core::sample_training_views({1, 2, 1}, 1) == std::vector<size_t>{0, 1, 2}, "stride one evaluates all views");
+        auto legacy_dataset = lfs::core::param::DatasetConfig{}.to_json();
+        legacy_dataset.erase("use_test_split");
+        require(lfs::core::param::DatasetConfig::from_json(legacy_dataset).use_test_split, "old configs retain held-out evaluation");
         const auto config_path = root / "train.json";
         const auto init = root / "lidar.ply";
         std::ofstream(init) << "ply\n";
@@ -42,6 +53,7 @@ int main(int argc, char** argv) {
             {"export_formats", {"ply"}},
             {"optimization", {{"strategy", "mrnf"}, {"iterations", 30000}, {"gut", true}, {"sh_degree", 0}, {"use_exposure_correction", true}, {"sky_enabled", true}, {"sky_num_points", 100000}, {"enable_eval", true}, {"eval_steps", {3000, 7000, 30000}}}}};
         auto full_optimization = lfs::core::param::OptimizationParameters::mrnf_defaults().to_json();
+        config["dataset"]["use_test_split"] = false;
         full_optimization.update(config.at("optimization"));
         config["optimization"] = full_optimization;
         auto save = [&]() { std::ofstream(config_path) << config.dump(2); };
@@ -54,6 +66,8 @@ int main(int argc, char** argv) {
         require(p.dataset.output_path_explicit && p.cli_iterations_set, "explicit config intent");
         require(p.dataset.resize_factor == 4 && p.dataset.max_width == 0 && p.dataset.test_every == 5, "config dataset");
         require(!p.dataset.loading_params.use_cpu_memory, "config loading parameters");
+        require(!p.dataset.use_test_split, "training-view evaluation parsed");
+        require(!lfs::core::param::DatasetConfig::from_json(p.dataset.to_json()).use_test_split, "training-view evaluation round trip");
         require(p.init_path == init.string() && p.export_formats == std::vector{lfs::core::param::OutputFormat::PLY}, "config init/export");
         require(p.optimization.gut && p.optimization.sky_enabled && p.optimization.sky_num_points == 100000, "config sky");
         require(p.optimization.iterations == 30000 && p.optimization.max_cap == 5000000, "strategy defaults");
@@ -66,6 +80,7 @@ int main(int argc, char** argv) {
         auto& override = **parsed;
         require(override.optimization.iterations == 3000 && override.dataset.resize_factor == 2 && override.dataset.max_width == 1600, "CLI overrides config");
         lfs::core::param::apply_explicit_training_overrides(override, override.overrides);
+        require(!override.dataset.use_test_split, "resume preserves explicit evaluation mode");
         require(override.dataset.data_path == root / "other-data" && override.dataset.output_path == root / "override" && override.dataset.test_every == 8, "resume overlays preserve CLI paths");
         require(!parse({"--config", config_path.string(), "--strategy", "mcmc"}), "strategy conflict rejected");
 

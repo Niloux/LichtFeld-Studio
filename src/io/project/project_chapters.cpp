@@ -2950,6 +2950,7 @@ namespace lfs::io::project {
                 {"images", value.images},
                 {"resize_factor", value.resize_factor},
                 {"test_every", value.test_every},
+                {"use_test_split", value.use_test_split},
                 {"timelapse_images", value.timelapse_images},
                 {"timelapse_every", value.timelapse_every},
                 {"max_width", value.max_width},
@@ -2975,6 +2976,7 @@ namespace lfs::io::project {
                 required<int>(value, "resize_factor", "PRMS", "dataset");
             auto test_every =
                 required<int>(value, "test_every", "PRMS", "dataset");
+            auto use_test_split = optional<bool>(value, "use_test_split", "PRMS", "dataset");
             auto timelapse_images = required<std::vector<std::string>>(
                 value, "timelapse_images", "PRMS", "dataset");
             auto timelapse_every =
@@ -2991,7 +2993,7 @@ namespace lfs::io::project {
                 value, "centralize_dataset", "PRMS", "dataset");
             const auto loading = value.find("loading_params");
             if (auto error =
-                    first_error(images, resize, test_every, timelapse_images,
+                    first_error(images, resize, test_every, use_test_split, timelapse_images,
                                 timelapse_every, max_width, min_track, invert,
                                 threshold, centralize)) {
                 return std::move(*error);
@@ -3019,6 +3021,7 @@ namespace lfs::io::project {
             result.images = std::move(*images);
             result.resize_factor = *resize;
             result.test_every = *test_every;
+            result.use_test_split = use_test_split->value_or(true);
             result.timelapse_images = std::move(*timelapse_images);
             result.timelapse_every = *timelapse_every;
             result.max_width = *max_width;

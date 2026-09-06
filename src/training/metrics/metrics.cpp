@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -443,6 +444,8 @@ namespace lfs::training {
 
         // Summary statistics
         if (!all_metrics_.empty()) {
+            report_file << "Evaluation split: "
+                        << (all_metrics_.back().training_views ? "training_views (not held out)" : "validation") << "\n\n";
             report_file << "Summary Statistics:\n";
             report_file << "------------------\n";
 
@@ -617,6 +620,7 @@ namespace lfs::training {
         EvalMetrics result;
         result.num_gaussians = static_cast<int>(splatData.size());
         result.iteration = iteration;
+        result.training_views = !_params.dataset.use_test_split;
 
         std::vector<float> psnr_values, ssim_values, normal_values, depth_values;
         std::vector<float> bias_r_values, bias_g_values, bias_b_values;
@@ -628,6 +632,19 @@ namespace lfs::training {
                                                ("eval_step_" + std::to_string(iteration));
         if (_params.optimization.enable_save_eval_images) {
             std::filesystem::create_directories(eval_dir);
+            nlohmann::json manifest{
+                {"iteration", iteration},
+                {"evaluation_split", result.training_views ? "training_views" : "validation"},
+                {"images", nlohmann::json::array()}};
+            for (size_t i = 0; i < val_dataset->size(); ++i) {
+                const auto* camera = val_dataset->get_camera(i);
+                manifest["images"].push_back({
+                    {"index", i}, {"image_name", camera->image_name()},
+                    {"camera_id", camera->camera_id()}, {"output", std::to_string(i) + ".png"}});
+            }
+            std::ofstream manifest_file;
+            if (core::open_file_for_write(eval_dir / "evaluation_manifest.json", manifest_file))
+                manifest_file << manifest.dump(2) << '\n';
         }
 
         const size_t val_dataset_size = val_dataset->size();

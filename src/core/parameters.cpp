@@ -231,6 +231,8 @@ namespace lfs::core {
                     dataset.min_track_length = j["min_track_length"].get<int>();
                 if (j.contains("test_every"))
                     dataset.test_every = j["test_every"].get<int>();
+                if (j.contains("use_test_split"))
+                    dataset.use_test_split = j["use_test_split"].get<bool>();
                 if (j.contains("timelapse_images"))
                     dataset.timelapse_images = j["timelapse_images"].get<std::vector<std::string>>();
                 if (j.contains("timelapse_every"))
@@ -905,6 +907,7 @@ namespace lfs::core {
             json["images"] = images;
             json["resize_factor"] = resize_factor;
             json["test_every"] = test_every;
+            json["use_test_split"] = use_test_split;
             json["timelapse_images"] = timelapse_images;
             json["timelapse_every"] = timelapse_every;
             json["max_width"] = max_width;
@@ -930,6 +933,7 @@ namespace lfs::core {
                 dataset.min_track_length = j["min_track_length"].get<int>();
             }
             dataset.test_every = j["test_every"].get<int>();
+            dataset.use_test_split = j.value("use_test_split", true);
             if (j.contains("timelapse_images")) {
                 dataset.timelapse_images =
                     j["timelapse_images"]

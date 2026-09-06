@@ -62,6 +62,7 @@
 #include "strategies/strategy_factory.hpp"
 #include "strategies/strategy_utils.hpp"
 #include "training/kernels/camera_loss_heatmap.cuh"
+#include "core/evaluation_sampling.hpp"
 #include "training/kernels/depth_loss.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
@@ -2911,7 +2912,9 @@ namespace lfs::training {
                         "Scene has no cameras with image files available for training");
                 }
 
-                if (params.overrides.has_dataset_key("test_every") ||
+                if (!params.dataset.use_test_split ||
+                    params.overrides.has_dataset_key("use_test_split") ||
+                    params.overrides.has_dataset_key("test_every") ||
                     params.overrides.has_optimization_key("enable_eval")) {
                     std::sort(
                         source_cameras.begin(), source_cameras.end(),
@@ -2922,7 +2925,7 @@ namespace lfs::training {
                     const int test_every = std::max(1, params.dataset.test_every);
                     for (size_t i = 0; i < source_cameras.size(); ++i) {
                         const bool is_val =
-                            enable_eval &&
+                            enable_eval && params.dataset.use_test_split &&
                             (i % static_cast<size_t>(test_every)) == 0;
                         source_cameras[i]->set_split(
                             is_val ? lfs::core::CameraSplit::Eval
@@ -2967,7 +2970,22 @@ namespace lfs::training {
 
             // Handle dataset split based on evaluation flag
             if (params.optimization.enable_eval) {
-                if (scene_) {
+                if (!params.dataset.use_test_split) {
+                    std::sort(source_cameras.begin(), source_cameras.end(),
+                              [](const auto& a, const auto& b) { return a->uid() < b->uid(); });
+                    std::vector<int> camera_ids;
+                    for (const auto& camera : source_cameras)
+                        camera_ids.push_back(camera->camera_id());
+                    val_cameras.clear();
+                    for (const auto i : core::sample_training_views(camera_ids, params.dataset.test_every))
+                        val_cameras.push_back(source_cameras[i]);
+                    train_dataset_ = std::make_shared<CameraDataset>(
+                        source_cameras, dataset_config, CameraDataset::Split::ALL);
+                    val_dataset_ = std::make_shared<CameraDataset>(
+                        val_cameras, dataset_config, CameraDataset::Split::ALL);
+                    LOG_INFO("Training-view evaluation: all {} images train, {} sampled images evaluate (every {} per camera; no held-out views)",
+                             train_dataset_->size(), val_dataset_->size(), params.dataset.test_every);
+                } else if (scene_) {
                     train_dataset_ = std::make_shared<CameraDataset>(
                         train_cameras, dataset_config, CameraDataset::Split::ALL);
                     val_dataset_ = std::make_shared<CameraDataset>(
@@ -8091,7 +8109,7 @@ namespace lfs::training {
                         if (evaluator_->has_appearance()) {
                             const int n = eval_ppisp_applied_.load();
                             const int k = eval_ppisp_exif_.load();
-                            LOG_INFO("Eval: PPISP applied to {} held-out frames ({} with EXIF exposure, {} at mean exposure)",
+                            LOG_INFO("Eval: appearance applied to {} frames ({} with EXIF exposure, {} at mean exposure)",
                                      n, k, n - k);
                         }
                         LOG_INFO("{}", metrics.to_string());

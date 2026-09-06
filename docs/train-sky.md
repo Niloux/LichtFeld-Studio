@@ -1,5 +1,24 @@
 # Fixed Gaussian sky
 
+## Evaluate training views without holding out images
+
+Use `./build/train/lfs-train --config configs/contextcapture_allviews_sky.json`
+to train all views while exporting evaluation images and metrics. The preset
+sets `dataset.use_test_split=false` and keeps `optimization.enable_eval=true`.
+In this mode `dataset.test_every=8` samples every eighth image independently
+for each physical camera, in camera UID order. For this 252-image stereo dataset,
+all 252 images train and 32 images evaluate (16 per camera).
+
+These are **training-view metrics**, not held-out validation. The log and the
+text report identify the evaluation split; each `eval_step_*` folder also has
+an `evaluation_manifest.json` mapping images to filenames and camera IDs.
+The new flag defaults to `true`, preserving existing held-out splits. It is
+saved in configs and projects. Disabling `enable_eval` still trains all views
+without evaluation. The preset keeps the original optimization settings and
+writes to `output/contextcapture_allviews_sky`.
+
+## Sky training
+
 `lfs-train --sky` trains a separate set of fixed sky Gaussians behind the
 foreground. Positions form a Fibonacci upper hemisphere around the world origin
 (+Z up). Isotropic scales are nearest-neighbor distances; rotations are identity
