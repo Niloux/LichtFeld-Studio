@@ -126,6 +126,7 @@ const torch::Tensor COLOR_PINV_BLOCK_DIAG = torch::tensor({
         }
 
         if (frame_idx >= 0) {
+            rgb = rgb.clamp_min(0.0f);
             const auto H = computeHomography(color_params, frame_idx);
             const auto r = rgb[0], g = rgb[1], b = rgb[2];
             const auto intensity = r + g + b;

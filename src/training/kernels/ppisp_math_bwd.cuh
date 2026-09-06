@@ -390,8 +390,10 @@ __device__ __forceinline__ void ppisp_apply_color_correction_bwd(const float3& r
                                                                  ColorPPISPParams* grad_color_params) {
     float3x3 H = ppisp_compute_homography(color_params);
 
-    float intensity = rgb_in.x + rgb_in.y + rgb_in.z;
-    float3 rgi_in = make_float3(rgb_in.x, rgb_in.y, intensity);
+    // Match the nonnegative-radiance domain in the forward color transform.
+    const float3 rgb = make_float3(fmaxf(rgb_in.x, 0.0f), fmaxf(rgb_in.y, 0.0f), fmaxf(rgb_in.z, 0.0f));
+    float intensity = rgb.x + rgb.y + rgb.z;
+    float3 rgi_in = make_float3(rgb.x, rgb.y, intensity);
     float3 rgi_out = H * rgi_in;
 
     const float z_safe = fmaxf(rgi_out.z, 0.0f);
@@ -427,6 +429,12 @@ __device__ __forceinline__ void ppisp_apply_color_correction_bwd(const float3& r
     grad_rgb_in.x = grad_rgb_in.x + grad_intensity;
     grad_rgb_in.y = grad_rgb_in.y + grad_intensity;
     grad_rgb_in.z = grad_rgb_in.z + grad_intensity;
+
+    // Do not backpropagate through channels clamped out of the color domain.
+    // Use the zero subgradient at the boundary, as for a ReLU.
+    grad_rgb_in.x = rgb_in.x > 0.0f ? grad_rgb_in.x : 0.0f;
+    grad_rgb_in.y = rgb_in.y > 0.0f ? grad_rgb_in.y : 0.0f;
+    grad_rgb_in.z = rgb_in.z > 0.0f ? grad_rgb_in.z : 0.0f;
 
     ppisp_compute_homography_bwd(color_params, grad_H, grad_color_params);
 }

@@ -148,3 +148,17 @@ as the build host; this is not a fully portable cross-distribution bundle.
 Use `--sky` with separate white-sky masks to train an auxiliary fixed Gaussian sky while
 exporting only foreground Gaussians. See [sky training](train-sky.md) for the
 fisheye command, mask layout, checkpoint behavior, and supported combinations.
+
+## Exposure-correction color regression
+
+The GUT renderer can produce negative RGB values from learned SH coefficients.
+PPISP projects its color-transform input to nonnegative radiance before
+chromaticity normalization, with matching input and parameter gradients. This
+prevents dark signed-RGB pixels from becoming saturated blue/magenta/white
+artifacts in training and held-out evaluation. Existing checkpoints remain
+readable; their stored foreground SH coefficients are not rewritten.
+
+With `LFS_BUILD_TRAIN_TESTS=ON`, run `build/train/lfs-ppisp-test` explicitly on
+a CUDA device. It covers real failing dark-pixel samples, neutral training and
+held-out exposure paths, and finite differences for RGB, color latents and
+exposure. The GPU test is separate from the CPU-only CTest checks.
