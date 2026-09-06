@@ -1,4 +1,7 @@
 .vscode
+# Local code index and downloaded system installers
+/.codegraph/
+/*.deb
 .claude
 CLAUDE.md
 build/
