@@ -48,6 +48,8 @@ set(TENSOR_SOURCES
         tensor/tensor_exports.cu
         nn/ops.cpp
         nn/activation_arena.cpp
+        nn/weight_file.cpp
+        nn/models/lpips.cpp
 )
 
 # Core module sources
@@ -108,7 +110,7 @@ set(CORE_SOURCES
 )
 
 if(NOT LFS_TRAIN_ONLY)
-    list(APPEND TENSOR_SOURCES nn/weight_file.cpp nn/models/moge2.cpp)
+    list(APPEND TENSOR_SOURCES nn/models/moge2.cpp)
 endif()
 
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})

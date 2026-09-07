@@ -10,7 +10,7 @@ import sys
 
 FORBIDDEN_SOURCE = re.compile(
     r"/src/(app|visualizer|rendering|sequencer|python|mcp|tcp|preprocessing)/"
-    r"|/src/core/nn/(models/|weight_file\.cpp)"
+    r"|/src/core/nn/models/(?!lpips\.cpp$)"
     r"|/src/training/normal_auto_generate\.cpp"
     r"|/src/io/(video/|video_|hdr_|mesh/|formats/(sogs|spz|rad|usd|html|nurec_usdz))"
     r"|/external/(zep|tree-sitter|tree-sitter-python|spz|tinyusdz)/")

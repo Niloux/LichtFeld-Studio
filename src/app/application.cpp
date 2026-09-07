@@ -42,6 +42,7 @@
 #include "io/video/video_encoder.hpp"
 #include "mcp/mcp_http_server.hpp"
 #include "mcp/mcp_tools.hpp"
+#include "preprocessing/preprocess.hpp"
 #include "python/runner.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "sequencer/timeline.hpp"
@@ -126,6 +127,16 @@ namespace lfs::app {
                 .detail = std::move(detail),
                 .detection = source,
             });
+        }
+
+        std::optional<std::filesystem::path> prepare_lpips_weights(const bool allow_download) {
+            if (const auto path = core::environment::value("LFS_LPIPS_WEIGHTS"))
+                return core::utf8_to_path(*path);
+            auto result = lfs::preprocessing::ensure_lpips_weights(allow_download);
+            if (result)
+                return std::move(*result);
+            LOG_WARN("LPIPS unavailable: {}", result.error().detail());
+            return std::nullopt;
         }
 
         // --data-path may name an untrained .licht. Resolve its dataset, the
@@ -254,6 +265,7 @@ namespace lfs::app {
             checkpoint_params.optimization.perf_bench = params.optimization.perf_bench;
             checkpoint_params.optimization.perf_bench_warmup = params.optimization.perf_bench_warmup;
             checkpoint_params.cli_iterations_set = params.cli_iterations_set;
+            checkpoint_params.no_download = params.no_download;
             checkpoint_params.cli_bg_color_set = params.cli_bg_color_set;
             if (params.cli_iterations_set)
                 checkpoint_params.optimization.iterations = params.optimization.iterations;
@@ -480,6 +492,7 @@ namespace lfs::app {
                 cli_params.optimization.no_splash;
             checkpoint_params.server =
                 cli_params.server;
+            checkpoint_params.no_download = cli_params.no_download;
             checkpoint_params.python_scripts =
                 cli_params.python_scripts;
             checkpoint_params.resume_checkpoint.reset();
@@ -593,6 +606,8 @@ namespace lfs::app {
                 }
 
                 auto manager = std::make_shared<vis::TrainerManager>();
+                manager->set_evaluation_weights_preparer(
+                    prepare_lpips_weights);
                 {
                     const auto& effective_params =
                         checkpoint_params
@@ -854,6 +869,8 @@ namespace lfs::app {
                     }
                     auto trainer =
                         std::move(installed->trainer);
+                    if (project->params.optimization.enable_eval)
+                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
                     training::grant_headless_project_saves(
                         *trainer, project->params,
                         headless_project_save_destination(
@@ -921,6 +938,8 @@ namespace lfs::app {
                         return 1;
                     }
                     LOG_INFO("Resumed from iteration {}", *ckpt_result);
+                    if (ckpt_params_result->optimization.enable_eval)
+                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
 
                     core::Tensor::trim_memory_pool();
 
@@ -965,6 +984,8 @@ namespace lfs::app {
                         LOG_ERROR("Failed to initialize trainer: {}", result.error());
                         return 1;
                     }
+                    if (params->optimization.enable_eval)
+                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
                     training::grant_headless_project_saves(
                         *trainer, *params,
                         headless_dataset_project_destination(*params));
@@ -1073,10 +1094,10 @@ namespace lfs::app {
                 const float t = std::min(static_cast<float>(frame) / static_cast<float>(cfg.fps), duration);
                 const auto cam_state = timeline.evaluate(t);
 
-                // CameraState is camera-to-world; Camera's R/T are world-to-camera, so invert.
-                const glm::mat3 r_c2w = glm::mat3_cast(cam_state.rotation);
-                const glm::mat3 r_w2c = glm::transpose(r_c2w);
-                const glm::vec3 t_w2c = -(r_w2c * cam_state.position);
+                const glm::mat4 data_view = rendering::dataWorldToCameraFromVisualizerPose(
+                    glm::mat3_cast(cam_state.rotation), cam_state.position);
+                const glm::mat3 r_w2c(data_view);
+                const glm::vec3 t_w2c(data_view[3]);
 
                 std::vector<float> r_flat(9);
                 for (int row = 0; row < 3; ++row) {
@@ -1393,6 +1414,8 @@ namespace lfs::app {
             });
 
             viewer->setParameters(*params);
+            viewer->set_evaluation_weights_preparer(
+                prepare_lpips_weights);
 
             for (const auto& vp : params->view_paths) {
                 if (!std::filesystem::exists(vp)) {

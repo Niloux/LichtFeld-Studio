@@ -320,6 +320,7 @@ set(TEST_FILES
     test_adam_capacity_invariant.cpp
     test_dual_rep_optimizer.cpp
     test_gut_shN_joint_adam.cpp
+    test_gut_undistort_parity.cpp
     test_sparsity_optimizer.cpp
     test_mcmc_tensor_ops.cpp
     test_training_cropbox_mask.cpp
@@ -429,6 +430,7 @@ set(TEST_FILES
     test_scene_upscaler_registry.cpp
     test_selection_rasterization_ops.cpp
     test_rendering_refactor_services.cpp
+    test_point_cloud_raster_orientation.cpp
     test_theme_registry.cpp
     test_preferences_migration.cpp
     test_viewport.cpp
@@ -462,7 +464,7 @@ set(TEST_FILES
     test_tensor_nn_ops.cpp
     test_nn_ops.cpp
     test_moge2.cpp
-    bench_nn_ops.cpp
+    test_lpips.cpp
     test_ppisp_controller.cpp
     test_ppisp_regularization.cpp
     test_ppisp_sidecar.cpp
@@ -895,6 +897,27 @@ set_tests_properties(lichtfeld.discovery PROPERTIES
     TIMEOUT 1800
 )
 
+# The pixel regression uses an independent decoder, not our video player.
+# Set LFS_VIDEO_TEST_FFMPEG explicitly when ffmpeg is outside PATH.
+find_program(LFS_VIDEO_TEST_FFMPEG NAMES ffmpeg)
+if(LFS_VIDEO_TEST_FFMPEG)
+    add_test(NAME video.orientation
+        COMMAND ${Python_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/scripts/verify_video_orientation.py
+            --executable $<TARGET_FILE:${PROJECT_NAME}>
+            --ffmpeg ${LFS_VIDEO_TEST_FFMPEG}
+            --output ${CMAKE_CURRENT_BINARY_DIR}/video-orientation
+    )
+    set_tests_properties(video.orientation PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        LABELS "slow;gpu;video"
+        TIMEOUT 600
+        RUN_SERIAL TRUE
+    )
+else()
+    message(STATUS "Skipping video.orientation: set LFS_VIDEO_TEST_FFMPEG to enable decoded-video regression")
+endif()
+
 # Keep every Python tier explicit so new modules cannot silently drift out of
 # the curated suite.
 set(LFS_PYTHON_FAST_TESTS
@@ -1131,6 +1154,31 @@ target_include_directories(bench_tensor_launch_overhead PRIVATE
 )
 target_link_libraries(bench_tensor_launch_overhead PRIVATE
     lfs_core
+    CUDA::cudart
+)
+
+add_executable(bench_nn_ops EXCLUDE_FROM_ALL
+    bench_nn_ops.cpp
+)
+set_target_properties(bench_nn_ops PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_include_directories(bench_nn_ops PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_compile_definitions(bench_nn_ops PRIVATE
+    PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}"
+)
+target_link_libraries(bench_nn_ops PRIVATE
+    lfs_core
+    GTest::gtest_main
     CUDA::cudart
 )
 
