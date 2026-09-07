@@ -35,12 +35,36 @@ int main(int argc, char** argv) {
     } cleanup{root};
     try {
         const std::vector<int> stereo_ids{1, 2, 1, 2, 1, 2, 1, 2, 1, 2};
-        require(lfs::core::sample_training_views(stereo_ids, 2) == std::vector<size_t>{0, 1, 4, 5, 8, 9},
+        require(lfs::core::sample_evaluation_views(stereo_ids, 2) == std::vector<size_t>{0, 1, 4, 5, 8, 9},
                 "interleaved cameras are sampled independently");
-        require(lfs::core::sample_training_views({1, 1, 2}, 8) == std::vector<size_t>{0, 2},
+        require(lfs::core::sample_evaluation_views({1, 1, 2}, 8) == std::vector<size_t>{0, 2},
                 "short camera sequences each contribute a view");
-        require(lfs::core::sample_training_views({}, 8).empty(), "empty sampling");
-        require(lfs::core::sample_training_views({1, 2, 1}, 1) == std::vector<size_t>{0, 1, 2}, "stride one evaluates all views");
+        require(lfs::core::sample_evaluation_views({}, 8).empty(), "empty sampling");
+        require(lfs::core::sample_evaluation_views({1, 2, 1}, 1) == std::vector<size_t>{0, 1, 2}, "stride one evaluates all views");
+        std::vector<int> exhibition_ids;
+        for (int frame = 0; frame < 110; ++frame) {
+            exhibition_ids.push_back(2); // L
+            exhibition_ids.push_back(1); // R
+        }
+        const auto exhibition_eval = lfs::core::sample_evaluation_views(exhibition_ids, 8);
+        size_t left_count = 0, right_count = 0;
+        for (const auto i : exhibition_eval) {
+            require(i < exhibition_ids.size(), "evaluation index is in range");
+            exhibition_ids[i] == 2 ? ++left_count : ++right_count;
+        }
+        require(left_count == 14 && right_count == 14,
+                "220 interleaved exhibition views hold out 14 per camera, not 28 left views");
+        require(exhibition_eval == lfs::core::sample_evaluation_views(exhibition_ids, 8),
+                "train and validation construction use the same deterministic selection");
+        const auto single_camera = lfs::core::sample_evaluation_views(std::vector<int>(20, 1), 8);
+        require(single_camera == std::vector<size_t>{0, 8, 16}, "single camera preserves stride sampling");
+        bool rejected_stride = false;
+        try {
+            (void)lfs::core::sample_evaluation_views(stereo_ids, 0);
+        } catch (const std::invalid_argument&) {
+            rejected_stride = true;
+        }
+        require(rejected_stride, "invalid evaluation stride is rejected");
         auto legacy_dataset = lfs::core::param::DatasetConfig{}.to_json();
         legacy_dataset.erase("use_test_split");
         require(lfs::core::param::DatasetConfig::from_json(legacy_dataset).use_test_split, "old configs retain held-out evaluation");
@@ -116,9 +140,11 @@ int main(int argc, char** argv) {
             parsed = parse({"--config", config_path.string()});
             if (!parsed)
                 throw std::runtime_error(parsed.error());
-            require((*parsed)->optimization.sky_enabled && (*parsed)->optimization.use_exposure_correction &&
-                        (*parsed)->optimization.sh_degree == 0 && (*parsed)->dataset.resize_factor == 4,
-                    "shipped contextcapture preset");
+            require((*parsed)->optimization.sky_enabled == config["optimization"]["sky_enabled"].get<bool>() &&
+                        (*parsed)->optimization.use_exposure_correction == config["optimization"]["use_exposure_correction"].get<bool>() &&
+                        (*parsed)->optimization.sh_degree == config["optimization"]["sh_degree"].get<int>() &&
+                        (*parsed)->dataset.resize_factor == config["dataset"]["resize_factor"].get<int>(),
+                    "shipped training preset preserves configured values");
         }
         std::cout << "Training config tests passed (CPU only)\n";
     } catch (const std::exception& error) {

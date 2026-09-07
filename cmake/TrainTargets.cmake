@@ -81,7 +81,7 @@ if(LFS_BUILD_TRAIN_TESTS)
     target_link_libraries(lfs-ppisp-test PRIVATE lfs_training)
     enable_testing()
     add_test(NAME train_config COMMAND lfs-config-test
-        "${PROJECT_SOURCE_DIR}/configs/contextcapture_gaussian_sky.json")
+        "${PROJECT_SOURCE_DIR}/configs/展厅.json")
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME train_profile_contract
         COMMAND ${Python3_EXECUTABLE} "${PROJECT_SOURCE_DIR}/tests/test_train_profile.py")

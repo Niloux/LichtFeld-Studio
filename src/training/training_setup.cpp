@@ -790,14 +790,16 @@ namespace lfs::training {
                 }
 
                 const auto& cameras = data.cameras;
-                const bool enable_eval = params.optimization.enable_eval;
-                const int test_every = params.dataset.test_every;
+                const bool enable_eval = params.optimization.enable_eval && params.dataset.use_test_split;
+                const auto eval_mask = enable_eval
+                                           ? evaluation_camera_mask(cameras, params.dataset.test_every)
+                                           : std::vector<bool>(cameras.size(), false);
 
                 size_t train_count = 0;
                 size_t val_count = 0;
                 size_t mask_count = 0;
                 for (size_t i = 0; i < cameras.size(); ++i) {
-                    const bool is_eval = enable_eval && (i % test_every) == 0;
+                    const bool is_eval = eval_mask[i];
                     cameras[i]->set_split(is_eval ? lfs::core::CameraSplit::Eval : lfs::core::CameraSplit::Train);
                     if (is_eval) {
                         val_count++;
@@ -817,7 +819,7 @@ namespace lfs::training {
                     train_count);
 
                 for (size_t i = 0; i < cameras.size(); ++i) {
-                    if (!enable_eval || (i % test_every) != 0) {
+                    if (!eval_mask[i]) {
                         scene.addCamera(cameras[i]->image_name(), train_cameras_id, cameras[i]);
                     }
                 }
@@ -829,7 +831,7 @@ namespace lfs::training {
                         val_count);
 
                     for (size_t i = 0; i < cameras.size(); ++i) {
-                        if ((i % test_every) == 0) {
+                        if (eval_mask[i]) {
                             scene.addCamera(cameras[i]->image_name(), val_cameras_id, cameras[i]);
                         }
                     }
@@ -1140,12 +1142,14 @@ namespace lfs::training {
                 }
 
                 const auto& cameras = data.cameras;
-                const bool enable_eval = params.optimization.enable_eval;
-                const int test_every = params.dataset.test_every;
+                const bool enable_eval = params.optimization.enable_eval && params.dataset.use_test_split;
+                const auto eval_mask = enable_eval
+                                           ? evaluation_camera_mask(cameras, params.dataset.test_every)
+                                           : std::vector<bool>(cameras.size(), false);
 
                 size_t train_count = 0, val_count = 0, mask_count = 0;
                 for (size_t i = 0; i < cameras.size(); ++i) {
-                    const bool is_val = enable_eval && (i % test_every) == 0;
+                    const bool is_val = eval_mask[i];
                     cameras[i]->set_split(is_val ? lfs::core::CameraSplit::Eval : lfs::core::CameraSplit::Train);
                     is_val ? ++val_count : ++train_count;
                     if (cameras[i]->has_mask())
@@ -1157,7 +1161,7 @@ namespace lfs::training {
                     "Training", cameras_group_id, train_count);
 
                 for (size_t i = 0; i < cameras.size(); ++i) {
-                    if (!enable_eval || (i % test_every) != 0) {
+                    if (!eval_mask[i]) {
                         scene.addCamera(cameras[i]->image_name(), train_cameras_id, cameras[i]);
                     }
                 }
@@ -1166,7 +1170,7 @@ namespace lfs::training {
                     const auto val_cameras_id = scene.addCameraGroup(
                         "Validation", cameras_group_id, val_count);
                     for (size_t i = 0; i < cameras.size(); ++i) {
-                        if ((i % test_every) == 0) {
+                        if (eval_mask[i]) {
                             scene.addCamera(cameras[i]->image_name(), val_cameras_id, cameras[i]);
                         }
                     }

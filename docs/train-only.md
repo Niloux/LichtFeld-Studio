@@ -69,10 +69,19 @@ accepted by `--resume`.
 
 ### JSON training configuration
 
-From the repository root, the supplied contextcapture/LiDAR/sky preset runs with:
+With `dataset.use_test_split=true`, automatic validation selection samples every
+`dataset.test_every` images independently within each `camera_id`. For example,
+110 L and 110 R images with `test_every=8` yield 14 validation images per camera
+and 192 training images. This avoids selecting only one side of an interleaved
+stereo sequence. Explicit image lists and saved scene splits remain authoritative
+unless split parameters are overridden. Changing a split requires a fresh training
+run for comparable held-out metrics; evaluating newly held-out images from an old
+checkpoint may include images that checkpoint already trained on.
+
+From the repository root, the supplied exhibition preset runs with:
 
 ```sh
-./build/train/lfs-train --config configs/contextcapture_gaussian_sky.json
+./build/train/lfs-train --config configs/展厅.json
 ```
 
 Edit that JSON for subsequent runs. `dataset` contains `data_path`,
@@ -90,14 +99,13 @@ Command-line values override matching JSON values (a conflicting `--strategy`
 is rejected). For a shorter run and a separate output directory:
 
 ```sh
-./build/train/lfs-train --config configs/contextcapture_gaussian_sky.json \
-  --iter 3000 --eval-steps 3000 -o ./output/contextcapture_config_sky_3k
+./build/train/lfs-train --config configs/展厅.json \
+  --iter 3000 --eval-steps 3000 -o ./output/展厅_3k
 ```
 
-The preset uses 30,000 iterations, 100,000 fixed sky Gaussians, evaluation at
-3,000/7,000/30,000, and writes to `output/contextcapture_config_sky`. Its absolute
-dataset and LiDAR paths refer to the local contextcapture dataset; change them
-on another machine. Relative launch paths resolve from the **working directory**,
+The exhibition preset disables sky training. Its absolute dataset and LiDAR
+paths refer to the local exhibition dataset; change them on another machine.
+Choose an output directory appropriate for each run. Relative launch paths resolve from the **working directory**,
 just like CLI paths. `images` and `sky_mask_dir` remain relative to the dataset.
 JSON does not support comments. To disable an option enabled by the preset,
 edit its boolean in JSON when there is no inverse CLI flag.

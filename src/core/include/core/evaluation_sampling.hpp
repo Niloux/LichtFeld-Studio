@@ -8,7 +8,7 @@
 namespace lfs::core {
     // Source order is stable (camera UID order). Sampling each physical camera
     // independently avoids aliasing an interleaved stereo sequence with stride 8.
-    inline std::vector<size_t> sample_training_views(
+    inline std::vector<size_t> sample_evaluation_views(
         const std::vector<int>& camera_ids, int every) {
         if (every <= 0)
             throw std::invalid_argument("Evaluation sampling stride must be positive");

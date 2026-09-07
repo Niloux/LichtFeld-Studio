@@ -6,6 +6,7 @@
 
 #include "core/alloc_counter.hpp"
 #include "core/camera.hpp"
+#include "core/evaluation_sampling.hpp"
 #include "core/logger.hpp"
 #include "core/tensor.hpp"
 #include "io/pipelined_image_loader.hpp"
@@ -231,6 +232,24 @@ namespace lfs::training {
         int test_every = 8;
     };
 
+    // Share the same per-camera sampling between dataset, scene import and
+    // explicit split overrides. Missing images must not advance the stride.
+    inline std::vector<bool> evaluation_camera_mask(
+        const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras, int every) {
+        std::vector<int> camera_ids;
+        std::vector<size_t> source_indices;
+        for (size_t i = 0; i < cameras.size(); ++i) {
+            if (cameras[i] && cameras[i]->has_image()) {
+                camera_ids.push_back(cameras[i]->camera_id());
+                source_indices.push_back(i);
+            }
+        }
+        std::vector<bool> selected(cameras.size(), false);
+        for (const auto i : lfs::core::sample_evaluation_views(camera_ids, every))
+            selected[source_indices[i]] = true;
+        return selected;
+    }
+
     /// Camera dataset - loads images from cameras
     class CameraDataset {
     public:
@@ -269,11 +288,14 @@ namespace lfs::training {
                     }
                 }
             } else {
+                const auto eval_mask = split_ == Split::ALL
+                                           ? std::vector<bool>(cameras_.size(), false)
+                                           : evaluation_camera_mask(cameras_, config.test_every);
                 for (size_t i = 0; i < cameras_.size(); ++i) {
                     if (!cameras_[i]->has_image()) {
                         continue;
                     }
-                    const bool is_test = (i % config.test_every) == 0;
+                    const bool is_test = eval_mask[i];
 
                     if (split_ == Split::ALL || (split_ == Split::TRAIN && !is_test) ||
                         (split_ == Split::VAL && is_test)) {

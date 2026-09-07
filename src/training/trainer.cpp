@@ -2922,11 +2922,13 @@ namespace lfs::training {
                             return lhs->uid() < rhs->uid();
                         });
                     const bool enable_eval = params.optimization.enable_eval;
-                    const int test_every = std::max(1, params.dataset.test_every);
+                    const auto eval_mask = enable_eval && params.dataset.use_test_split
+                                               ? evaluation_camera_mask(source_cameras, params.dataset.test_every)
+                                               : std::vector<bool>(source_cameras.size(), false);
                     for (size_t i = 0; i < source_cameras.size(); ++i) {
                         const bool is_val =
                             enable_eval && params.dataset.use_test_split &&
-                            (i % static_cast<size_t>(test_every)) == 0;
+                            eval_mask[i];
                         source_cameras[i]->set_split(
                             is_val ? lfs::core::CameraSplit::Eval
                                    : lfs::core::CameraSplit::Train);
@@ -2977,7 +2979,7 @@ namespace lfs::training {
                     for (const auto& camera : source_cameras)
                         camera_ids.push_back(camera->camera_id());
                     val_cameras.clear();
-                    for (const auto i : core::sample_training_views(camera_ids, params.dataset.test_every))
+                    for (const auto i : core::sample_evaluation_views(camera_ids, params.dataset.test_every))
                         val_cameras.push_back(source_cameras[i]);
                     train_dataset_ = std::make_shared<CameraDataset>(
                         source_cameras, dataset_config, CameraDataset::Split::ALL);

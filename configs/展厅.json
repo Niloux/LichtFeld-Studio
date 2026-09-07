@@ -1,6 +1,6 @@
 {
   "dataset": {
-    "data_path": "/home/wuyou/3dgeer/data/contextcapture",
+    "data_path": "/home/wuyou/3dgeer/data/展厅",
     "images": "images",
     "invert_masks": false,
     "loading_params": {
@@ -14,13 +14,14 @@
     "mask_threshold": 0.5,
     "max_width": 0,
     "min_track_length": 0,
-    "output_folder": "./output/contextcapture_config_sky",
-    "resize_factor": 4,
+    "output_folder": "./output/展厅-2",
+    "resize_factor": 2,
     "test_every": 8,
     "timelapse_every": 50,
-    "timelapse_images": []
+    "timelapse_images": [],
+    "use_test_split": true
   },
-  "init_path": "/home/wuyou/3dgeer/data/contextcapture/lidar.ply",
+  "init_path": "/home/wuyou/3dgeer/data/展厅/lidar.ply",
   "export_formats": [
     "ply"
   ],
@@ -49,6 +50,7 @@
     "eval_steps": [
       3000,
       7000,
+      15000,
       30000
     ],
     "exposure_correction_grid_start_iter": 1000,
@@ -68,7 +70,7 @@
     "init_rho": 0.0005000000237487257,
     "init_scaling": 0.10000000149011612,
     "invert_masks": false,
-    "iterations": 30000,
+    "iterations": 15000,
     "lambda_dssim": 0.20000000298023224,
     "mask_mode": "ignore",
     "mask_opacity_penalty_power": 2.0,
@@ -111,6 +113,7 @@
     "rotation_lr": 0.0020000000949949026,
     "save_steps": [
       7000,
+      15000,
       30000
     ],
     "scale_decay": 0.0020000000949949026,
@@ -122,7 +125,7 @@
     "sh_degree_interval": 1000,
     "shs_lr": 0.0020000000949949026,
     "sky_alpha_weight": 0.1,
-    "sky_enabled": true,
+    "sky_enabled": false,
     "sky_initial_opacity": 0.7,
     "sky_lr": 0.0025,
     "sky_mask_dir": "sky_masks",

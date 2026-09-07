@@ -2,20 +2,19 @@
 
 ## Evaluate training views without holding out images
 
-Use `./build/train/lfs-train --config configs/contextcapture_allviews_sky.json`
-to train all views while exporting evaluation images and metrics. The preset
-sets `dataset.use_test_split=false` and keeps `optimization.enable_eval=true`.
-In this mode `dataset.test_every=8` samples every eighth image independently
-for each physical camera, in camera UID order. For this 252-image stereo dataset,
-all 252 images train and 32 images evaluate (16 per camera).
+To train all views while exporting evaluation images and metrics, set
+`dataset.use_test_split=false` and `optimization.enable_eval=true` in your JSON
+configuration. In this mode `dataset.test_every=8` samples every eighth image
+independently for each physical camera, in camera UID order. For example, a
+252-image stereo dataset with 126 images per camera trains all 252 images and
+evaluates 32 images (16 per camera).
 
 These are **training-view metrics**, not held-out validation. The log and the
 text report identify the evaluation split; each `eval_step_*` folder also has
 an `evaluation_manifest.json` mapping images to filenames and camera IDs.
 The new flag defaults to `true`, preserving existing held-out splits. It is
 saved in configs and projects. Disabling `enable_eval` still trains all views
-without evaluation. The preset keeps the original optimization settings and
-writes to `output/contextcapture_allviews_sky`.
+without evaluation. Use a separate output directory for each experiment.
 
 ## Sky training
 
@@ -34,10 +33,10 @@ sky pixels; it does not guarantee that all foreground floaters disappear.
 
 ## Dataset and command
 
-The same LiDAR/sky setup is available as
-[`configs/contextcapture_gaussian_sky.json`](../configs/contextcapture_gaussian_sky.json):
-run `./build/train/lfs-train --config configs/contextcapture_gaussian_sky.json`
-from the repository root. See [JSON configuration](train-only.md#json-training-configuration)
+Configure your dataset, initialization PLY and sky mask paths in a full JSON
+parameter snapshot, then enable `optimization.sky_enabled`. The current
+[`configs/展厅.json`](../configs/展厅.json) is an indoor example with sky disabled;
+it does not provide sky masks. See [JSON configuration](train-only.md#json-training-configuration)
 for overrides and path handling.
 
 Keep ordinary validity masks separate from sky masks. White means sky and black
