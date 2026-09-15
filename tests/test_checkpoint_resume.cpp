@@ -35,12 +35,14 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "core/uuid.hpp"
+#include "io/embedded_dataset.hpp"
 #include "io/exporter.hpp"
 #include "io/loader.hpp"
 #include "io/loaders/checkpoint_loader.hpp"
 #include "io/project_document.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
+#include "licht_test_support.hpp"
 #include "training/checkpoint.hpp"
 #include "training/components/sparsity_optimizer.hpp"
 #include "training/optimizer/adam_optimizer.hpp"
@@ -51,6 +53,12 @@
 #include "training/training_setup.hpp"
 
 namespace lfs::training {
+    struct TrainerBilateralGridTestAccess {
+        static BilateralGrid& grid(Trainer& trainer) {
+            return *trainer.bilateral_grid_;
+        }
+    };
+
     struct TrainerRetryTestAccess {
         static bool should_retry(const lfs::Error& error, const unsigned attempts) {
             const Trainer::MutationStamp stamp{
@@ -1052,6 +1060,84 @@ namespace {
         params.optimization.sh_degree = 0;
         params.optimization.max_cap = 16;
         return params;
+    }
+
+    TEST(TrainerBilateralGridTest, PreservesSparseCameraSlotsAcrossFilteringAndCheckpoint) {
+        using lfs::core::Camera;
+        using lfs::core::DataType;
+        using lfs::core::Device;
+        using lfs::core::Tensor;
+        using lfs::training::TrainerBilateralGridTestAccess;
+
+        for (const bool exposure : {false, true}) {
+            for (const int excluded_uid : {0, 7, 19}) {
+                for (const int filter : {0, 1, 2}) {
+                    SCOPED_TRACE(std::format("exposure={} excluded={} filter={}", exposure, excluded_uid, filter));
+                    const auto root = std::filesystem::temp_directory_path() /
+                                      ("lfs_grid_slots_" + lfs::core::generate_uuid_v4().to_string());
+                    std::filesystem::create_directories(root);
+                    auto params = make_params_json_test_params(root);
+                    params.dataset.data_path = root;
+                    params.optimization.enable_eval = filter == 2;
+                    params.optimization.use_bilateral_grid = !exposure;
+                    params.optimization.use_exposure_correction = exposure;
+                    params.optimization.bilateral_grid_X = 2;
+                    params.optimization.bilateral_grid_Y = 2;
+                    params.optimization.bilateral_grid_W = 2;
+
+                    lfs::core::Scene scene;
+                    const auto group = scene.addGroup("Cameras");
+                    for (const int uid : {0, 7, 19}) {
+                        const auto name = std::format("camera_{}.png", uid);
+                        auto camera = std::make_shared<Camera>(
+                            Tensor::eye(3, Device::CPU), Tensor::zeros({3}, Device::CPU),
+                            100.0f, 100.0f, 32.0f, 32.0f, Tensor{}, Tensor{},
+                            lfs::core::CameraModelType::PINHOLE, name,
+                            std::filesystem::path{}, std::filesystem::path{}, 64, 64, uid);
+                        camera->set_has_image(filter != 1 || uid != excluded_uid);
+                        camera->set_split(filter == 2 && uid == excluded_uid
+                                              ? lfs::core::CameraSplit::Eval
+                                              : lfs::core::CameraSplit::Train);
+                        scene.addCamera(name, group, std::move(camera));
+                        scene.setCameraTrainingEnabled(name, filter != 0 || uid != excluded_uid);
+                    }
+                    scene.addSplat("Model", make_checkpoint_test_splat(4, Device::CUDA));
+                    scene.setTrainingModelNode("Model");
+                    lfs::training::Trainer trainer(scene);
+                    const auto initialized = trainer.initialize(params);
+                    ASSERT_TRUE(initialized.has_value()) << initialized.error();
+                    auto& grid = TrainerBilateralGridTestAccess::grid(trainer);
+                    EXPECT_EQ(grid.num_images(), 20);
+
+                    const auto rgb = Tensor::full({3, 4, 4}, 0.4f, Device::CUDA);
+                    const auto grad = Tensor::full({3, 4, 4}, 0.01f, Device::CUDA);
+                    for (const auto& camera : scene.getActiveCameras()) {
+                        const int uid = camera->uid();
+                        EXPECT_TRUE(grid.apply(rgb, uid).is_valid());
+                        EXPECT_TRUE(grid.backward(rgb, grad, uid).is_valid());
+                        EXPECT_TRUE(grid.tv_loss_gpu(uid).is_valid());
+                        grid.step_image(uid, 0.01f);
+                    }
+                    const auto before = grid.apply(rgb, 19).cpu().to_vector();
+                    const auto stored_grids = grid.grids().cpu().to_vector();
+                    std::stringstream checkpoint(std::ios::in | std::ios::out | std::ios::binary);
+                    grid.serialize(checkpoint);
+                    lfs::training::BilateralGrid loaded(1, 1, 1, 1, 1);
+                    loaded.deserialize(checkpoint);
+                    grid.adopt_checkpoint_state(loaded);
+                    EXPECT_EQ(grid.num_images(), 20);
+                    EXPECT_EQ(grid.grids().cpu().to_vector(), stored_grids);
+                    const auto after = grid.apply(rgb, 19).cpu().to_vector();
+                    ASSERT_EQ(after.size(), before.size());
+                    // Deserialization recomputes the floating-point projection state.
+                    for (size_t i = 0; i < after.size(); ++i) {
+                        EXPECT_NEAR(after[i], before[i], 1e-6f);
+                    }
+                    trainer.shutdown();
+                    std::filesystem::remove_all(root);
+                }
+            }
+        }
     }
 
     TEST(CheckpointFrozenRangesRoundTripTest, EmbeddedSplatRangesSurviveFullCheckpoint) {
@@ -2465,6 +2551,148 @@ namespace {
         trainer->shutdown();
 
         std::filesystem::remove_all(output_path, ec);
+    }
+
+    TEST_F(ProjectCheckpointTrainerInstall,
+           HeadlessRedirectPreservesEmbeddedDatasetForDatasetAndResume) {
+        int device_count = 0;
+        const auto cuda_status = cudaGetDeviceCount(&device_count);
+        if (cuda_status != cudaSuccess || device_count == 0) {
+            GTEST_SKIP() << "Requires CUDA: " << cudaGetErrorString(cuda_status);
+        }
+        using namespace lfs::io::project;
+        using namespace lfs::test::licht;
+        TemporaryDirectory temporary;
+        auto params = make_tiny_headless_params(temporary.path / "dataset-out", 1);
+        params.optimization.enable_eval = false;
+        params.optimization.save_steps.clear();
+
+        // Embed real fixture files, including both stored image and compressed
+        // sparse payloads. Assertions do not depend on optimizer numerics.
+        const auto image = first_dataset_image(params.dataset);
+        ASSERT_TRUE(image);
+        const auto sparse = params.dataset.data_path / "sparse" / "0" / "cameras.bin";
+        EmbeddedDatasetManifest manifest{
+            .schema_version = 1,
+            .images_folder = TEST_IMAGES,
+            .complete = true,
+            .entries = {}};
+        std::vector<DatasetEmbedSource> sources;
+        for (const auto& file : {*image, sparse}) {
+            const auto bytes = read_file_bytes(file);
+            EmbeddedDatasetEntry entry{
+                .rel_path = std::filesystem::relative(file, params.dataset.data_path).generic_string(),
+                .kind = file == sparse ? "sparse" : "image",
+                .chunk_uuid = fixed_uuid(2600 + sources.size()),
+                .bytes = bytes.size(),
+                .xxh3_128 = xxh3_128(bytes)};
+            manifest.entries.push_back(entry);
+            sources.push_back({.entry = entry, .source_path = file});
+        }
+        auto source = require_result_ptr(ProjectDocument::create(fixed_uuid(2602), 100));
+        const auto reference = require_result(upsert_path_reference(
+            source->edit_references(), temporary.path, params.dataset.data_path, "dataset", "dataset"));
+        require_status(source->edit_project().set_dataset_reference(reference));
+        auto source_path = temporary.path / "source.licht";
+        (void)require_result(source->save(source_path, deterministic_document_save_options(2032, 2603, 200)));
+        (void)require_result(source->embed_dataset_batch(manifest, sources, deterministic_document_save_options(2032, 2604, 300)));
+        source.reset();
+
+        for (const bool resume : {false, true}) {
+            SCOPED_TRACE(resume ? "--resume source.licht -o fresh" : "-d source.licht -o fresh");
+            const auto output_path = temporary.path / (resume ? "resume-out" : "dataset-out");
+            const auto destination = output_path / "project.licht";
+            params.dataset.output_path = output_path;
+            ASSERT_FALSE(std::filesystem::exists(destination));
+            const int target_iteration = resume ? 2 : 1;
+            params.optimization.iterations = target_iteration;
+            const auto source_hash = require_result(hash_dataset_file(source_path));
+            lfs::core::Scene scene;
+            std::unique_ptr<lfs::training::Trainer> trainer;
+            if (resume) {
+                source = require_result_ptr(ProjectDocument::open(source_path));
+                const auto hydration = require_result(source->hydrate(scene));
+                ASSERT_TRUE(hydration.checkpoint_uuid);
+                auto installed = lfs::training::installTrainerFromProjectCheckpoint(
+                    scene, *source, *hydration.checkpoint_uuid, params,
+                    lfs::core::path_to_utf8(source_path), 1);
+                ASSERT_TRUE(installed) << installed.error();
+                trainer = std::move(installed->trainer);
+            } else {
+                ASSERT_TRUE(lfs::training::loadTrainingDataIntoScene(params, scene));
+                ASSERT_TRUE(lfs::training::initializeTrainingModel(params, scene));
+                trainer = std::make_unique<lfs::training::Trainer>(scene);
+                ASSERT_TRUE(trainer->initialize(params));
+            }
+            lfs::training::grant_headless_project_saves(*trainer, params, destination, source_path);
+            // Publish explicitly below so verification waits for the writer,
+            // and the first save exercises transfer into a fresh destination.
+            auto save_policy = trainer->trainer_project_save_policy();
+            save_policy.on_completion = false;
+            trainer->set_trainer_project_save_policy(save_policy);
+            auto trained = trainer->train();
+            ASSERT_TRUE(trained) << lfs::format_for_developer(trained.error());
+            ASSERT_FALSE(std::filesystem::exists(destination));
+            auto saved = trainer->save_project_to(destination, target_iteration);
+            ASSERT_TRUE(saved) << saved.error();
+            const auto verify = [&] {
+                auto output = require_result_ptr(ProjectDocument::open(destination));
+                EXPECT_EQ(require_result(output->parameters().embedded_dataset()), manifest);
+                const auto dataset_ref = require_result(output->project().dataset_reference());
+                ASSERT_TRUE(dataset_ref);
+                EXPECT_EQ(resolve_path_reference(
+                              output->references(), destination.parent_path(), *dataset_ref),
+                          std::filesystem::absolute(params.dataset.data_path));
+                auto reader = require_result(ProjectReader::open(destination));
+                for (const auto& entry : manifest.entries) {
+                    const auto* row = reader.find(FOURCC_DSRC, entry.chunk_uuid);
+                    ASSERT_NE(row, nullptr);
+                    EXPECT_TRUE(row->is_live());
+                    EXPECT_EQ(require_result(reader.read_chunk(*row)),
+                              read_file_bytes(params.dataset.data_path / entry.rel_path));
+                }
+                const auto checkpoint = require_result(output->bound_checkpoint_uuid());
+                ASSERT_TRUE(checkpoint);
+                EXPECT_EQ(*checkpoint, reader.commit().snapshot_uuid);
+                lfs::core::Scene restored;
+                const auto hydration = require_result(output->hydrate(restored));
+                ASSERT_TRUE(hydration.checkpoint_header);
+                EXPECT_EQ(hydration.checkpoint_header->iteration, target_iteration);
+                EXPECT_EQ(restored.getTrainingModel()->size(), scene.getTrainingModel()->size());
+                EXPECT_NE(output->project_uuid(), fixed_uuid(2602));
+            };
+            ASSERT_NO_FATAL_FAILURE(verify());
+            EXPECT_EQ(require_result(hash_dataset_file(source_path)), source_hash);
+            source.reset();
+            // The second publish must work with the source unavailable and
+            // retain the destination's DSRC spans and container identity.
+            const auto before = require_result(ProjectReader::open(destination));
+            std::filesystem::rename(source_path, source_path.string() + ".hidden");
+            saved = trainer->save_project_to(destination, target_iteration);
+            ASSERT_TRUE(saved) << saved.error();
+            ASSERT_NO_FATAL_FAILURE(verify());
+            const auto after = require_result(ProjectReader::open(destination));
+            EXPECT_EQ(before.superblock().project_uuid, after.superblock().project_uuid);
+            EXPECT_GT(after.commit().generation, before.commit().generation);
+            for (const auto& entry : manifest.entries) {
+                EXPECT_EQ(before.find(FOURCC_DSRC, entry.chunk_uuid)->payload_offset,
+                          after.find(FOURCC_DSRC, entry.chunk_uuid)->payload_offset);
+            }
+            const auto failed_destination = output_path / "missing-source.licht";
+            lfs::training::grant_headless_project_saves(*trainer, params, failed_destination, source_path);
+            EXPECT_FALSE(trainer->save_project_to(failed_destination, target_iteration));
+            EXPECT_FALSE(std::filesystem::exists(failed_destination));
+            // A dataset override supplies no source descriptor. Regranting
+            // must clear the old binding rather than carry foreign DSRC rows.
+            const auto overridden_destination = output_path / "override.licht";
+            lfs::training::grant_headless_project_saves(*trainer, params, overridden_destination);
+            ASSERT_TRUE(trainer->save_project_to(overridden_destination, target_iteration));
+            auto overridden = require_result_ptr(ProjectDocument::open(overridden_destination));
+            EXPECT_FALSE(require_result(overridden->parameters().embedded_dataset()));
+            EXPECT_TRUE(overridden->dataset_source_uuids().empty());
+            trainer->shutdown();
+            source_path = destination;
+        }
     }
 
     TEST_F(ProjectCheckpointTrainerInstall,

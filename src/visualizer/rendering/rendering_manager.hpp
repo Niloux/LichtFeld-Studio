@@ -24,6 +24,7 @@
 #include "rendering_types.hpp"
 #include "spark_lod_controller.hpp"
 #include "split_view_service.hpp"
+#include "stale_frame_guard.hpp"
 #include "viewport_appearance_correction.hpp"
 #include "viewport_artifact_service.hpp"
 #include "viewport_frame_lifecycle_service.hpp"
@@ -284,6 +285,7 @@ namespace lfs::vis {
         [[nodiscard]] std::optional<SplitViewInfo> getSplitViewInfoIfChanged(std::uint64_t& generation) const;
         [[nodiscard]] bool isSplitViewActive() const;
         [[nodiscard]] bool isGTComparisonActive() const;
+        [[nodiscard]] bool isPLYComparisonActive() const;
         [[nodiscard]] bool isIndependentSplitViewActive() const;
         [[nodiscard]] GTComparisonMode getGTComparisonMode() const;
         [[nodiscard]] SplitViewMode getSplitViewMode() const;
@@ -417,6 +419,7 @@ namespace lfs::vis {
             float focal_length_mm = lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
             bool orthographic = false;
             float ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
+            std::optional<SplitViewPanelId> panel;
         };
         // Renders a fresh expected-depth preview for precise picking on sparse or low-opacity splats.
         float renderExpectedDepthAtPixel(const ExpectedDepthSampleRequest& request);
@@ -789,6 +792,7 @@ namespace lfs::vis {
         std::shared_ptr<const lfs::core::Tensor> vulkan_viewport_image_;
         std::uint64_t vulkan_viewport_image_generation_ = 0;
         std::string last_logged_vksplat_render_error_;
+        StaleFrameGuard vksplat_stale_frame_guard_;
         std::uint64_t viewport_projection_generation_ = 1;
         std::unique_ptr<VksplatViewportRenderer> vksplat_viewport_renderer_;
         std::unique_ptr<PointCloudVulkanRenderer> point_cloud_vulkan_renderer_;

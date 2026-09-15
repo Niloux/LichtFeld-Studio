@@ -42,6 +42,8 @@ namespace lfs::vis {
     LFS_VIS_API void preloadVkSplatSpirvFiles();
 
     class VksplatViewportRenderer {
+        friend struct VksplatScratchReleaseTestAccess;
+
     public:
         struct RenderResult {
             VkImage image = VK_NULL_HANDLE;
@@ -132,8 +134,8 @@ namespace lfs::vis {
             OutputSlot output_slot = OutputSlot::Main;
         };
 
-        VksplatViewportRenderer();
-        ~VksplatViewportRenderer();
+        LFS_VIS_API VksplatViewportRenderer();
+        LFS_VIS_API ~VksplatViewportRenderer();
 
         VksplatViewportRenderer(const VksplatViewportRenderer&) = delete;
         VksplatViewportRenderer& operator=(const VksplatViewportRenderer&) = delete;
@@ -180,6 +182,11 @@ namespace lfs::vis {
         // Release viewer-owned scratch after an idle boundary. Shared training
         // scratch is released only when the caller explicitly permits it.
         void releaseScratchOnIdle(bool release_shared, bool allow_shared_reclaim = false);
+        // Retain the next idle arena window after a bounded contention timeout.
+        // The arena also expires the request, so an abandoned retry cannot stall
+        // training indefinitely.
+        void requestArenaHandoff();
+        void cancelArenaHandoff();
 
         // Invoked with the completion value immediately after each live-model
         // submit, BEFORE the shared arena frame is released — the trainer's
@@ -468,8 +475,9 @@ namespace lfs::vis {
                                       std::size_t sort_capacity,
                                       std::size_t image_width,
                                       std::size_t image_height);
-        void releasePrivateScratchBuffers();
+        LFS_VIS_API void releasePrivateScratchBuffers();
         void releaseGpuLodTreeStorage();
+        void renewArenaHandoff();
         void detachSharedScratchBuffers();
         void releaseSharedScratchImportOnly();
         void releaseSharedScratchArena();
@@ -738,6 +746,7 @@ namespace lfs::vis {
         CudaTimelineHandoff selection_query_timeline_{};
 
         cudaStream_t render_stream_ = nullptr;
+        std::uint64_t arena_handoff_token_ = 0;
 
         std::function<void(std::uint64_t)> live_submit_callback_;
 

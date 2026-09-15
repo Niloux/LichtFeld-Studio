@@ -21,6 +21,8 @@
 
 #include "core/cuda/memory_arena.hpp"
 #include "core/logger.hpp"
+#include "visualizer/rendering/stale_frame_guard.hpp"
+#include "visualizer/rendering/vksplat_shared_scratch_install.hpp"
 
 using lfs::core::RasterizerMemoryArena;
 
@@ -122,6 +124,151 @@ TEST_F(ArenaMetricsContentionTest, TrainerMetricsOppositeOrderNoDeadlock) {
     const auto next = arena.try_begin_frame(nullptr, false);
     ASSERT_TRUE(next.has_value());
     arena.end_frame(*next, nullptr, false);
+}
+
+TEST_F(ArenaMetricsContentionTest, RenderHandoffReservesNextIdleWindowAfterLockUnwind) {
+    RasterizerMemoryArena arena;
+    std::shared_mutex render_mutex;
+    const auto held = arena.begin_frame(nullptr, false);
+
+    const auto token = arena.request_render_handoff();
+    ASSERT_NE(token, 0u);
+    std::atomic<bool> trainer_waiting_for_exclusive{false};
+    std::atomic<bool> trainer_finished{false};
+    std::thread trainer;
+    {
+        std::shared_lock viewer_lock(render_mutex);
+        trainer = std::thread([&] {
+            EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
+            trainer_waiting_for_exclusive.store(true, std::memory_order_release);
+            std::unique_lock trainer_lock(render_mutex);
+            arena.end_frame(held, nullptr, false);
+            trainer_finished.store(true, std::memory_order_release);
+        });
+        while (!trainer_waiting_for_exclusive.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        // Reproduce the production inversion window: the trainer owns the arena
+        // while waiting for the renderer's shared model lock. The bounded arena
+        // attempt must return so this scope can release that lock.
+        EXPECT_FALSE(arena.try_begin_render_frame_for(15, token));
+    }
+    trainer.join();
+    ASSERT_TRUE(trainer_finished.load(std::memory_order_acquire));
+
+    // The trainer cannot immediately win another iteration while the renderer's
+    // bounded request is live. The renderer consumes that exact reservation.
+    EXPECT_FALSE(arena.try_begin_frame(nullptr, false));
+    const auto rendered = arena.try_begin_render_frame_for(50, token);
+    ASSERT_TRUE(rendered.has_value());
+    arena.end_frame(*rendered, nullptr, true);
+    EXPECT_FALSE(arena.has_render_handoff(token));
+
+    const auto next_training = arena.try_begin_frame(nullptr, false);
+    ASSERT_TRUE(next_training.has_value());
+    arena.end_frame(*next_training, nullptr, false);
+}
+
+TEST_F(ArenaMetricsContentionTest, ArenaContentionNeverDropsValidCachedFrame) {
+    lfs::vis::StaleFrameGuard guard;
+    for (std::uint32_t attempt = 0;
+         attempt < lfs::vis::StaleFrameGuard::kMaxCachedDeferrals * 3;
+         ++attempt) {
+        EXPECT_FALSE(guard.onDeferral(
+            lfs::vis::StaleFrameGuard::DeferralKind::ArenaContention));
+        EXPECT_TRUE(guard.canUseCachedFrame());
+        EXPECT_FALSE(guard.takeRecoveryRequest());
+    }
+
+    // Non-contention failures keep the existing bounded recovery behavior.
+    for (std::uint32_t attempt = 1;
+         attempt <= lfs::vis::StaleFrameGuard::kMaxCachedDeferrals;
+         ++attempt) {
+        EXPECT_EQ(guard.onDeferral(),
+                  attempt == lfs::vis::StaleFrameGuard::kMaxCachedDeferrals);
+    }
+    EXPECT_FALSE(guard.canUseCachedFrame());
+    EXPECT_TRUE(guard.takeRecoveryRequest());
+}
+
+TEST_F(ArenaMetricsContentionTest, AbandonedRenderHandoffExpiresAndWakesTrainer) {
+    RasterizerMemoryArena arena;
+    const auto token = arena.request_render_handoff();
+    ASSERT_NE(token, 0u);
+
+    std::atomic<bool> trainer_finished{false};
+    std::promise<void> trainer_done;
+    auto trainer_done_future = trainer_done.get_future();
+    const auto started = std::chrono::steady_clock::now();
+    std::thread trainer([&] {
+        EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
+        const auto frame = arena.begin_frame(nullptr, false);
+        arena.end_frame(frame, nullptr, false);
+        trainer_finished.store(true, std::memory_order_release);
+        trainer_done.set_value();
+    });
+    const bool woke_on_expiry =
+        trainer_done_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    if (!woke_on_expiry) {
+        arena.cancel_render_handoff(token);
+    }
+    trainer.join();
+
+    EXPECT_TRUE(woke_on_expiry) << "blocked trainer did not wake when the render lease expired";
+    EXPECT_TRUE(trainer_finished.load(std::memory_order_acquire));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(RasterizerMemoryArena::kRenderHandoffLeaseMs - 10));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    EXPECT_FALSE(arena.has_render_handoff(token));
+}
+
+TEST_F(ArenaMetricsContentionTest, AbandonedHandoffAlsoWakesTokenlessRenderer) {
+    RasterizerMemoryArena arena;
+    const auto token = arena.request_render_handoff();
+    ASSERT_NE(token, 0u);
+
+    std::atomic<bool> renderer_finished{false};
+    std::promise<void> renderer_done;
+    auto renderer_done_future = renderer_done.get_future();
+    const auto started = std::chrono::steady_clock::now();
+    std::thread renderer([&] {
+        EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
+        const auto frame = arena.begin_frame(nullptr, true);
+        arena.end_frame(frame, nullptr, true);
+        renderer_finished.store(true, std::memory_order_release);
+        renderer_done.set_value();
+    });
+    const bool woke_on_expiry =
+        renderer_done_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    if (!woke_on_expiry) {
+        arena.cancel_render_handoff(token);
+    }
+    renderer.join();
+
+    EXPECT_TRUE(woke_on_expiry) << "tokenless renderer did not wake when the lease expired";
+    EXPECT_TRUE(renderer_finished.load(std::memory_order_acquire));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(RasterizerMemoryArena::kRenderHandoffLeaseMs - 10));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+}
+
+TEST_F(ArenaMetricsContentionTest, OldRenderTokenCannotCancelNewReservation) {
+    RasterizerMemoryArena arena;
+    const auto old_token = arena.request_render_handoff();
+    ASSERT_NE(old_token, 0u);
+    arena.cancel_render_handoff(old_token);
+
+    const auto new_token = arena.request_render_handoff();
+    ASSERT_NE(new_token, 0u);
+    ASSERT_NE(new_token, old_token);
+    arena.cancel_render_handoff(old_token);
+    EXPECT_TRUE(arena.has_render_handoff(new_token));
+    EXPECT_FALSE(arena.try_begin_frame(nullptr, false));
+
+    arena.cancel_render_handoff(new_token);
+    const auto training = arena.try_begin_frame(nullptr, false);
+    ASSERT_TRUE(training.has_value());
+    arena.end_frame(*training, nullptr, false);
 }
 
 TEST_F(ArenaMetricsContentionTest, ExternalGrowWaitsForPendingRender) {
@@ -341,6 +488,110 @@ TEST_F(ArenaMetricsContentionTest, DetachedViewerBackingCanBeReinstalledAndGrown
 
     arena.clear_external_backing();
     EXPECT_FALSE(arena.using_external_backing(device_ptr));
+}
+
+class VkSplatSharedScratch : public ArenaMetricsContentionTest {};
+
+TEST_F(VkSplatSharedScratch, PauseDetachThenLargerScratchRequestReinstallsBeforeGrow) {
+    constexpr size_t MiB = 1024 * 1024;
+    void* device_ptr = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_ptr, 2 * MiB), cudaSuccess);
+    auto retained_block = std::shared_ptr<void>(device_ptr, [](void* ptr) {
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    });
+    // A local real arena keeps this test isolated from the global trainer.
+    // B3's GlobalArenaManager::clear_external_backing forwards to this method.
+    RasterizerMemoryArena arena;
+    const RasterizerMemoryArena::ExternalBacking backing{
+        .device_ptr = device_ptr,
+        .size = MiB,
+        .device = 0,
+        .owner = retained_block,
+        .label = "test.vksplat.retained_scratch",
+    };
+    ASSERT_TRUE(arena.install_external_backing(backing));
+    bool renderer_installed = true;
+    size_t renderer_capacity = MiB;
+    arena.clear_external_backing();
+    ASSERT_FALSE(arena.using_external_backing(device_ptr));
+    ASSERT_TRUE(renderer_installed); // The viewer did not observe B3 detachment.
+
+    constexpr size_t requested_capacity = 2 * MiB;
+    ASSERT_GT(requested_capacity, renderer_capacity);
+    int reinstall_count = 0;
+    // This is the production renderer seam, called before its capacity/grow
+    // branches. No Vulkan device or import is needed for the ownership decision.
+    ASSERT_TRUE(lfs::vis::ensureRetainedSharedScratchInstalled(
+        renderer_installed,
+        [&] { return arena.using_external_backing(retained_block.get()); },
+        [&] {
+            ++reinstall_count;
+            return arena.try_install_external_backing(backing);
+        }));
+
+    bool committed = false;
+    using GrowFailure = RasterizerMemoryArena::ExternalGrowFailure;
+    GrowFailure failure = GrowFailure::None;
+    EXPECT_TRUE(arena.grow_external_backing(
+        retained_block.get(), requested_capacity,
+        [&](const size_t bytes) {
+            committed = true;
+            renderer_capacity = bytes;
+            return true;
+        },
+        0, &failure));
+    EXPECT_EQ(failure, GrowFailure::None); // Neither BackingMissing nor Busy.
+    EXPECT_TRUE(committed);
+    EXPECT_EQ(reinstall_count, 1);
+    EXPECT_TRUE(renderer_installed);
+    EXPECT_TRUE(arena.using_external_backing(retained_block.get()));
+    EXPECT_EQ(renderer_capacity, requested_capacity);
+    EXPECT_EQ(arena.get_statistics().capacity, requested_capacity);
+    EXPECT_EQ(cudaMemset(retained_block.get(), 0, requested_capacity), cudaSuccess);
+}
+
+TEST_F(VkSplatSharedScratch, DetachedBackingDefersWhileTrainingOwnsArenaThenRetries) {
+    constexpr size_t MiB = 1024 * 1024;
+    void* device_ptr = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_ptr, MiB), cudaSuccess);
+    auto retained_block = std::shared_ptr<void>(device_ptr, [](void* ptr) {
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    });
+    RasterizerMemoryArena arena;
+    const RasterizerMemoryArena::ExternalBacking backing{
+        .device_ptr = device_ptr,
+        .size = MiB,
+        .device = 0,
+        .owner = retained_block,
+        .label = "test.vksplat.busy_scratch",
+    };
+    ASSERT_TRUE(arena.install_external_backing(backing));
+    bool renderer_installed = true;
+    arena.clear_external_backing();
+    const auto held = arena.begin_frame(nullptr, false);
+    int reinstall_count = 0;
+    const auto ensure_installed = [&] {
+        return lfs::vis::ensureRetainedSharedScratchInstalled(
+            renderer_installed,
+            [&] { return arena.using_external_backing(device_ptr); },
+            [&] {
+                ++reinstall_count;
+                return arena.try_install_external_backing(backing);
+            });
+    };
+    const bool ready = ensure_installed();
+    arena.end_frame(held, nullptr, false);
+    EXPECT_FALSE(ready);
+    EXPECT_FALSE(renderer_installed);
+    EXPECT_EQ(reinstall_count, 1);
+    EXPECT_TRUE(ensure_installed());
+    EXPECT_TRUE(renderer_installed);
+    EXPECT_TRUE(arena.using_external_backing(device_ptr));
+    EXPECT_EQ(reinstall_count, 2);
+    // The capacity-sufficient path must revalidate too, but an attached backing
+    // needs no additional installation.
+    EXPECT_TRUE(ensure_installed());
+    EXPECT_EQ(reinstall_count, 2);
 }
 
 TEST_F(ArenaMetricsContentionTest, ViewerGrowTimeoutReleasesReservation) {

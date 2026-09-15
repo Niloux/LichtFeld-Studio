@@ -8,12 +8,13 @@ set(LFS_IO_CUDA_SOURCES
         cuda/morton_encoding.cu
         cuda/kmeans.hpp
         cuda/kmeans.cu
+        cuda/splat_decimate.cu
         cuda/image_format_kernels.cuh
         cuda/image_format_kernels.cu
 )
 
 if(LFS_TRAIN_ONLY)
-    list(FILTER LFS_IO_CUDA_SOURCES EXCLUDE REGEX "^cuda/kmeans")
+    list(FILTER LFS_IO_CUDA_SOURCES EXCLUDE REGEX "^cuda/(kmeans|splat_decimate)")
 endif()
 add_library(lfs_io_cuda STATIC ${LFS_IO_CUDA_SOURCES})
 
@@ -132,6 +133,8 @@ add_library(lfs_video STATIC
         video/video_encoder.cpp
         video/color_convert.cuh
         video/color_convert.cu
+        video/cuda_frame_handoff.hpp
+        video/cuda_frame_handoff.cpp
         video_frame_extractor.hpp
         video_frame_extractor.cpp
         hdr_tonemap.hpp
@@ -161,6 +164,7 @@ target_link_libraries(lfs_video
         PkgConfig::FFMPEG
         spdlog::spdlog
         CUDA::cudart
+        CUDA::cuda_driver
 )
 
 # libplacebo's static pkg-config dependency chain includes shaderc and
@@ -240,6 +244,7 @@ endif()
 set(LFS_IO_SOURCES
         # Implementation file only (header is in include/io/)
         loader.cpp
+        splat_decimate.cpp
 
         # Internal implementation files
         # Core interfaces and types
@@ -257,6 +262,8 @@ set(LFS_IO_SOURCES
         formats/transforms.cpp
         formats/sogs.hpp
         formats/sogs.cpp
+        formats/ssog.hpp
+        formats/ssog.cpp
         formats/html.hpp
         formats/html.cpp
         formats/rad.hpp
@@ -290,6 +297,8 @@ set(LFS_IO_SOURCES
         loaders/blender_loader.cpp
         loaders/sogs_loader.hpp
         loaders/sogs_loader.cpp
+        loaders/ssog_loader.hpp
+        loaders/ssog_loader.cpp
         loaders/spz_loader.hpp
         loaders/spz_loader.cpp
         loaders/usd_loader.hpp
@@ -336,7 +345,7 @@ set(LFS_IO_SOURCES
 )
 
 if(LFS_TRAIN_ONLY)
-    list(FILTER LFS_IO_SOURCES EXCLUDE REGEX "^(formats/(sogs|html|rad|spz|usd|usd_flat/|nurec_usdz)|loaders/(sogs|spz|usd|rad|mesh)_loader|mesh/|ply_to_rad_lod)")
+    list(FILTER LFS_IO_SOURCES EXCLUDE REGEX "^(formats/(sogs|ssog|html|rad|spz|usd|usd_flat/|nurec_usdz)|loaders/(sogs|ssog|spz|usd|rad|mesh)_loader|mesh/|ply_to_rad_lod|splat_decimate.cpp)")
 endif()
 add_library(lfs_io STATIC ${LFS_IO_SOURCES})
 
@@ -491,3 +500,9 @@ message(STATUS "  IO CUDA library: lfs_io_cuda (morton, k-means)")
 message(STATUS "  WebP decoder library: ${WEBP_DECODE_LIB}")
 message(STATUS "  Archive library: ${ARCHIVE_LIB}")
 endif()
+
+# Reference decimation needs IEEE arithmetic despite the IO CUDA fast-math defaults.
+set_source_files_properties(cuda/splat_decimate.cu PROPERTIES
+    COMPILE_OPTIONS "--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true")
+set_source_files_properties(splat_decimate.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")

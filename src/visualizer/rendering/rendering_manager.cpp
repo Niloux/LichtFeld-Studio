@@ -396,6 +396,7 @@ namespace lfs::vis {
     }
 
     void RenderingManager::releaseSceneRenderResources() {
+        vksplat_stale_frame_guard_.onSuccess();
         viewport_artifact_service_.clearViewportOutput();
         invalidateGTComparisonImageCache();
         clearVulkanViewportImageState();
@@ -649,6 +650,11 @@ namespace lfs::vis {
     bool RenderingManager::isGTComparisonActive() const {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         return split_view_service_.isGTComparisonActive(settings_);
+    }
+
+    bool RenderingManager::isPLYComparisonActive() const {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        return splitViewUsesPLYComparison(settings_.split_view_mode);
     }
 
     GTComparisonMode RenderingManager::getGTComparisonMode() const {

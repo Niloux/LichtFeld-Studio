@@ -1984,6 +1984,11 @@ def save_sog_file_dialog(default_name: str = 'export') -> str:
     Open a save file dialog for SOG files. Returns empty string if cancelled.
     """
 
+def save_ssog_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for SSOG files. Returns empty string if cancelled.
+    """
+
 def save_spz_file_dialog(default_name: str = 'export') -> str:
     """
     Open a save file dialog for SPZ files. Returns empty string if cancelled.
@@ -2373,6 +2378,9 @@ def get_import_state() -> dict:
 def dismiss_import() -> None:
     """Dismiss the import completion overlay"""
 
+def cancel_gallery_import() -> bool:
+    """Request gallery import cancellation without waiting for its worker"""
+
 def get_video_export_state() -> dict:
     """Get current video export progress state"""
 
@@ -2451,6 +2459,14 @@ def get_sequencer_state() -> SequencerUIState:
 
 def has_keyframes() -> bool:
     """Check if sequencer has any keyframes"""
+
+def get_camera_path() -> object:
+    """
+    Get the native camera path with clip duration, loop mode and playback speed
+    """
+
+def set_camera_path(value: dict) -> bool:
+    """Restore a native camera path including loop mode and playback speed"""
 
 def save_camera_path(path: str) -> bool:
     """Save camera path to JSON file"""

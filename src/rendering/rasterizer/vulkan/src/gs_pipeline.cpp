@@ -1,4 +1,5 @@
 #include "gs_pipeline.h"
+#include "gs_renderer.h"
 #include "perf_timer.h"
 
 #include "core/error.hpp"
@@ -24,7 +25,7 @@
 #undef min
 #endif
 
-static const size_t MAX_UNIFORM_SIZE = 192;
+static constexpr size_t MAX_UNIFORM_SIZE = sizeof(VulkanGSRendererUniforms);
 
 // The pre-wave renderer fits in the legacy 96-query budget. Each armed depth
 // wave adds one independently accumulated cumsum interval (begin + end), and
@@ -156,7 +157,7 @@ namespace {
         code = lfs::ErrorCode::Cancelled;
         break;
     case lfs::rendering::WaitOutcome::Quarantined:
-        code = lfs::ErrorCode::Unavailable;
+        code = lfs::ErrorCode::DeadlineExceeded;
         break;
     }
     throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
@@ -1149,17 +1150,17 @@ void VulkanGSPipeline::collectTimestampResults(CommandBatchSlot& slot,
     if (timestamp_count == 0)
         return;
     [[maybe_unused]] auto cpu_timer = timeCpuStage("vksplat.command_batch.query_results");
-    VkPhysicalDeviceProperties deviceProperties;
-    vkGetPhysicalDeviceProperties(physical_device, &deviceProperties);
-    double timestampPeriod = deviceProperties.limits.timestampPeriod;
-
     std::vector<uint64_t> timestamps(timestamp_count);
-    const VkResult result = vkGetQueryPoolResults(
+    const VkResult result = vulkan_dispatch_.get_query_pool_results(
         device, slot.timestamp_query_pool,
         0, timestamp_count,
         sizeof(uint64_t) * timestamp_count,
         timestamps.data(), sizeof(uint64_t),
-        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        VK_QUERY_RESULT_64_BIT);
+    // Profiling must never add an unbounded wait after batch retirement.
+    // Missing timestamps can be dropped without affecting the rendered image.
+    if (result == VK_NOT_READY)
+        return;
     if (result != VK_SUCCESS) {
         lfs::rendering::throw_vk_result(
             result,
@@ -1173,6 +1174,10 @@ void VulkanGSPipeline::collectTimestampResults(CommandBatchSlot& slot,
                 static_cast<int>(result)),
             LFS_SOURCE_SITE_CURRENT());
     }
+    VkPhysicalDeviceProperties deviceProperties;
+    vkGetPhysicalDeviceProperties(physical_device, &deviceProperties);
+    double timestampPeriod = deviceProperties.limits.timestampPeriod;
+
     std::vector<double> times(timestamp_count);
     for (uint32_t i = 0; i < timestamp_count; i++)
         times[i] = 1e-9 * double(timestamps[i] - timestamps[0]) * timestampPeriod;

@@ -182,7 +182,7 @@ namespace lfs::training {
         const NormalEstimator& estimator) {
         NormalAutoGenerateOutcome outcome;
         const auto& opt = params.optimization;
-        if (!opt.use_normal_loss || opt.normal_loss_weight <= 0.0f)
+        if (!training_normal_priors_enabled(opt))
             return outcome;
 
         for (const auto& cam : cameras) {

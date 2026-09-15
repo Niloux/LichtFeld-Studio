@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/camera.hpp"
+#include "core/cuda/memory_arena.hpp"
 #include "core/cuda/undistort/undistort.hpp"
 #include "core/image_loader.hpp"
 #include "core/logger.hpp"
@@ -24,6 +25,7 @@
 #include "viewport_appearance_correction.hpp"
 #include "viewport_region_utils.hpp"
 #include "viewport_request_builder.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include "vksplat_viewport_renderer.hpp"
 #include "vulkan_external_tensor.hpp"
 #include <algorithm>
@@ -579,24 +581,6 @@ namespace lfs::vis {
                 {std::size_t{3}, static_cast<std::size_t>(size.y), static_cast<std::size_t>(size.x)},
                 lfs::core::Device::CPU);
             return std::make_shared<lfs::core::Tensor>(std::move(tensor));
-        }
-
-        [[nodiscard]] std::optional<std::pair<size_t, size_t>>
-        plyComparisonPairForOffset(const size_t node_count, const size_t offset) {
-            if (node_count < 2) {
-                return std::nullopt;
-            }
-
-            size_t remaining = offset % ((node_count * (node_count - 1)) / 2);
-            for (size_t left = 0; left + 1 < node_count; ++left) {
-                const size_t row_count = node_count - left - 1;
-                if (remaining < row_count) {
-                    return std::pair<size_t, size_t>{left, left + 1 + remaining};
-                }
-                remaining -= row_count;
-            }
-
-            return std::nullopt;
         }
 
         [[nodiscard]] std::vector<ViewportInteractionPanel> buildVulkanInteractionPanels(
@@ -1648,6 +1632,16 @@ namespace lfs::vis {
 
     RenderingManager::VulkanFrameResult RenderingManager::renderVulkanFrame(const RenderContext& context) {
         LOG_TIMER("renderVulkanFrame");
+        if (vksplat_stale_frame_guard_.takeRecoveryRequest() && vksplat_viewport_renderer_) {
+            // clear_external_backing waits for the arena to be idle. Do this
+            // before taking either trainer lock, after the failed frame's borrow
+            // publisher has run, so training can finish its active frame. Detach
+            // first, outside releaseScratchOnIdle's readback mutex: the arena's
+            // shrink callback takes that mutex while holding the arena gate.
+            vksplat_viewport_renderer_->cancelArenaHandoff();
+            lfs::core::GlobalArenaManager::instance().clear_external_backing();
+            vksplat_viewport_renderer_->releaseScratchOnIdle(true);
+        }
         const RenderSettings frame_settings = [this] {
             std::lock_guard lock(settings_mutex_);
             return settings_;
@@ -1662,6 +1656,7 @@ namespace lfs::vis {
             // Clear a callback capturing the previous trainer before any cached or
             // minimized-frame early return can leave it reachable by an auxiliary submit.
             vksplat_viewport_renderer_->setLiveSubmitCallback({});
+            vksplat_viewport_renderer_->cancelArenaHandoff();
         }
         if (context.vulkan_context) {
             last_vulkan_context_ = context.vulkan_context;
@@ -1698,6 +1693,7 @@ namespace lfs::vis {
         if (current_size.x <= 0 || current_size.y <= 0) {
             if (vksplat_viewport_renderer_) {
                 vksplat_viewport_renderer_->setLiveSubmitCallback({});
+                vksplat_viewport_renderer_->cancelArenaHandoff();
             }
             releaseResizeTrainingPause();
             return {.image = vulkan_viewport_image_,
@@ -1708,6 +1704,9 @@ namespace lfs::vis {
 
         std::optional<lfs::core::CUDAStreamGuard> frame_stream_guard;
         const auto cached_frame_result = [this, current_size]() -> VulkanFrameResult {
+            if (!vksplat_stale_frame_guard_.canUseCachedFrame()) {
+                return {};
+            }
             if (vulkan_external_viewport_image_ != VK_NULL_HANDLE) {
                 return {.image = {},
                         .external_image = vulkan_external_viewport_image_,
@@ -1737,6 +1736,26 @@ namespace lfs::vis {
                     .flip_y = vulkan_viewport_image_flip_y_,
                     .matches_viewport_extent =
                         vulkan_viewport_coordinate_size_ == current_size};
+        };
+        const auto defer_shared_scratch = [this](const std::string& reason) {
+            if (reason.find("arena is busy") != std::string::npos) {
+                if (vksplat_viewport_renderer_) {
+                    vksplat_viewport_renderer_->requestArenaHandoff();
+                }
+                (void)vksplat_stale_frame_guard_.onDeferral(
+                    StaleFrameGuard::DeferralKind::ArenaContention);
+                return;
+            }
+            if (vksplat_stale_frame_guard_.onDeferral()) {
+                LOG_WARN("VkSplat shared scratch deferred {} viewport attempts; dropping stale viewport and resetting scratch before the next attempt: {}",
+                         StaleFrameGuard::kMaxCachedDeferrals, reason);
+                // Reset alone still needs arena access on the next render.
+                // Hide the old publication until fresh output is available;
+                // the renderer retains its output allocations and GPU fences.
+                clearVulkanViewportImageState();
+                clearVulkanMeshFrame();
+                viewport_artifact_service_.clearViewportOutput();
+            }
         };
         const auto update_cached_split_position = [this, &frame_settings](const bool require_position_change) -> bool {
             if (!split_view_service_.isActive(frame_settings)) {
@@ -1906,13 +1925,43 @@ namespace lfs::vis {
 
         const lfs::core::SplatData* model = nullptr;
         SceneRenderState scene_state;
+        size_t comparison_identity = 0;
         auto sample_model_under_lock = [&]() {
-            model = scene_manager ? scene_manager->getModelForRendering() : nullptr;
             scene_state = {};
-            if (scene_manager) {
-                LOG_TIMER("renderVulkanFrame.buildRenderState");
-                scene_state = scene_manager->buildRenderState();
+            comparison_identity = 0;
+            if (!scene_manager) {
+                model = nullptr;
+                return;
             }
+            LOG_TIMER("renderVulkanFrame.buildRenderState");
+            if (splitViewUsesPLYComparison(frame_settings.split_view_mode)) {
+                // Comparison draws owned node models. Do not concatenate them
+                // into a hidden combined copy just to fill FrameContext.model.
+                scene_manager->getScene().discardUnconsolidatedModelCache();
+                scene_state = scene_manager->buildRenderState({.metadata_only = true});
+                model = nullptr;
+                const auto visible_nodes = scene_manager->getScene().getVisibleSplatNodeSlots();
+                const auto pair =
+                    plyComparisonPairForOffset(visible_nodes.size(), frame_settings.split_view_offset);
+                if (pair) {
+                    const auto* const left_node = visible_nodes[pair->first].node;
+                    const auto* const right_node = visible_nodes[pair->second].node;
+                    comparison_identity =
+                        reinterpret_cast<size_t>(left_node) ^
+                        (reinterpret_cast<size_t>(right_node) << 1);
+                    if (left_node && left_node->model) {
+                        comparison_identity ^=
+                            reinterpret_cast<size_t>(left_node->model.get());
+                    }
+                    if (right_node && right_node->model) {
+                        comparison_identity ^=
+                            reinterpret_cast<size_t>(right_node->model.get());
+                    }
+                }
+                return;
+            }
+            model = scene_manager->getModelForRendering();
+            scene_state = scene_manager->buildRenderState();
         };
         if (!render_lock_contended) {
             sample_model_under_lock();
@@ -1927,6 +1976,21 @@ namespace lfs::vis {
             has_renderable_model = hasRenderableGaussians(model);
             has_visible_gaussian_model =
                 has_renderable_model && scene_state.visible_splat_count > 0;
+            if (!has_visible_gaussian_model &&
+                splitViewUsesPLYComparison(frame_settings.split_view_mode) && scene_manager) {
+                const auto visible_nodes = scene_manager->getScene().getVisibleSplatNodeSlots();
+                has_visible_gaussian_model = std::any_of(
+                    visible_nodes.begin(),
+                    visible_nodes.end(),
+                    [](const auto& slot) {
+                        return slot.node && hasRenderableGaussians(slot.node->model.get());
+                    });
+                if (!has_visible_gaussian_model) {
+                    has_visible_gaussian_model = hasRenderableGaussians(
+                        scene_manager->getScene().peekCombinedModel());
+                }
+                has_renderable_model = has_visible_gaussian_model;
+            }
             has_point_cloud =
                 scene_state.point_cloud != nullptr && scene_state.point_cloud->size() > 0;
             has_meshes = std::any_of(scene_state.meshes.begin(),
@@ -1937,7 +2001,8 @@ namespace lfs::vis {
                 has_visible_gaussian_model || has_point_cloud || has_meshes || has_environment;
         };
         refresh_content_flags();
-        size_t model_ptr = reinterpret_cast<size_t>(model);
+        size_t model_ptr = comparison_identity != 0 ? comparison_identity
+                                                    : reinterpret_cast<size_t>(model);
         // Edit-mode handoff moves the same SplatData into a scene node. Its
         // address does not change, but the trainer's GPU handshake is gone.
         // Use dataset ownership, not Running/Paused, so completion alone does
@@ -2494,7 +2559,7 @@ namespace lfs::vis {
                                ? *request_override
                                : [&] {
                                      if (frame_settings.split_view_mode == SplitViewMode::PLYComparison &&
-                                         node_visibility_override && panel_id) {
+                                         panel_id) {
                                          const auto layouts = makePlyComparisonPanelLayouts(
                                              render_size.x, frame_settings.split_position);
                                          const auto& layout = layouts[splitViewPanelIndex(*panel_id)];
@@ -2512,8 +2577,29 @@ namespace lfs::vis {
                                      return buildViewportRenderRequest(
                                          frame_ctx, panel_size, &source_viewport, panel_id);
                                  }();
+            if (model_override && scene_manager &&
+                splitViewUsesPLYComparison(frame_settings.split_view_mode)) {
+                const auto visible_nodes = scene_manager->getScene().getVisibleSplatNodeSlots();
+                for (const auto& slot : visible_nodes) {
+                    if (slot.node && slot.node->model.get() == model_override) {
+                        applyPlyComparisonNodeScope(
+                            request.filters,
+                            request.overlay,
+                            frame_ctx,
+                            *slot.node,
+                            static_cast<int>(slot.slot_index));
+                        break;
+                    }
+                }
+            }
+            if (node_visibility_override && scene_manager && !request.scene.transform_indices) {
+                request.scene.transform_indices =
+                    scene_manager->getScene().peekTransformIndices();
+            }
             std::vector<std::uint32_t> lod_touched_chunks;
-            if (lod_controller_ && lod_controller_->hasTree()) {
+            const bool skip_combined_lod =
+                model_override != nullptr && model_override != model;
+            if (!skip_combined_lod && lod_controller_ && lod_controller_->hasTree()) {
                 lod_controller_->advanceTransition();
                 const bool lod_transition_active = lod_controller_->transitionActive();
                 if (lod_transition_active) {
@@ -2621,8 +2707,14 @@ namespace lfs::vis {
                const float end,
                const bool normalize_x_to_panel) {
                 const glm::ivec2 valid = panel.size;
+                // Readback tensors are tightly sized. Only the external image
+                // retains the renderer's allocation padding; cached frames may
+                // display the tensor through the staging-upload fallback.
                 const glm::ivec2 alloc =
-                    panel.alloc_size.x > 0 && panel.alloc_size.y > 0 ? panel.alloc_size : valid;
+                    panel.external_image_view != VK_NULL_HANDLE &&
+                            panel.alloc_size.x > 0 && panel.alloc_size.y > 0
+                        ? panel.alloc_size
+                        : valid;
                 return VulkanSplitViewPanel{
                     .image = panel.image,
                     .start_position = start,
@@ -3313,22 +3405,61 @@ namespace lfs::vis {
                 }
             }
         } else if (splitViewUsesPLYComparison(frame_settings.split_view_mode) && scene_manager && has_visible_gaussian_model) {
-            const auto visible_nodes = scene_manager->getScene().getVisibleSplatNodeSlots();
+            const auto& scene = scene_manager->getScene();
+            const auto visible_nodes = scene.getVisibleSplatNodeSlots();
             const auto pair = plyComparisonPairForOffset(visible_nodes.size(), frame_settings.split_view_offset);
             if (pair) {
                 const auto& left_node = visible_nodes[pair->first];
                 const auto& right_node = visible_nodes[pair->second];
+                const auto* const left_owned =
+                    left_node.node && hasRenderableGaussians(left_node.node->model.get())
+                        ? left_node.node->model.get()
+                        : nullptr;
+                const auto* const right_owned =
+                    right_node.node && hasRenderableGaussians(right_node.node->model.get())
+                        ? right_node.node->model.get()
+                        : nullptr;
+                const auto* const prepared_combined = scene.peekCombinedModel();
+                const bool render_owned_nodes = left_owned && right_owned;
                 const size_t slot_count = std::max(frame_ctx.scene_state.model_transforms.size(),
                                                    frame_ctx.scene_state.node_visibility_mask.size());
-                if (!left_node.node || !right_node.node ||
-                    left_node.slot_index >= slot_count ||
-                    right_node.slot_index >= slot_count) {
+                if (!left_node.node || !right_node.node) {
+                    render_error = "PLY comparison render slots are unavailable";
+                } else if (!render_owned_nodes &&
+                           (!hasRenderableGaussians(prepared_combined) ||
+                            left_node.slot_index >= slot_count ||
+                            right_node.slot_index >= slot_count)) {
                     render_error = "PLY comparison render slots are unavailable";
                 } else {
-                    std::vector<bool> left_mask(slot_count, false);
-                    std::vector<bool> right_mask(slot_count, false);
-                    left_mask[left_node.slot_index] = true;
-                    right_mask[right_node.slot_index] = true;
+                    std::vector<bool> left_mask;
+                    std::vector<bool> right_mask;
+                    std::vector<glm::mat4> left_transforms;
+                    std::vector<glm::mat4> right_transforms;
+                    const lfs::core::SplatData* left_model = nullptr;
+                    const lfs::core::SplatData* right_model = nullptr;
+                    const std::vector<glm::mat4>* left_transform_override = nullptr;
+                    const std::vector<glm::mat4>* right_transform_override = nullptr;
+                    std::optional<std::vector<bool>> left_visibility;
+                    std::optional<std::vector<bool>> right_visibility;
+                    if (render_owned_nodes) {
+                        left_model = left_owned;
+                        right_model = right_owned;
+                        left_transforms = {scene_coords::nodeVisualizerWorldTransform(
+                            scene, left_node.node->id)};
+                        right_transforms = {scene_coords::nodeVisualizerWorldTransform(
+                            scene, right_node.node->id)};
+                        left_transform_override = &left_transforms;
+                        right_transform_override = &right_transforms;
+                    } else {
+                        left_model = prepared_combined;
+                        right_model = prepared_combined;
+                        left_mask.assign(slot_count, false);
+                        right_mask.assign(slot_count, false);
+                        left_mask[left_node.slot_index] = true;
+                        right_mask[right_node.slot_index] = true;
+                        left_visibility = left_mask;
+                        right_visibility = right_mask;
+                    }
 
                     const auto ply_layouts = makePlyComparisonPanelLayouts(
                         render_size.x, frame_settings.split_position);
@@ -3339,17 +3470,17 @@ namespace lfs::vis {
                         context.viewport,
                         {std::max(left_layout.panel.width, 1), render_size.y},
                         SplitViewPanelId::Left,
-                        std::optional<std::vector<bool>>(left_mask),
-                        nullptr,
-                        nullptr,
+                        left_visibility,
+                        left_model,
+                        left_transform_override,
                         VksplatViewportRenderer::OutputSlot::SplitLeft);
                     auto right = render_panel_image(
                         context.viewport,
                         {std::max(right_layout.panel.width, 1), render_size.y},
                         SplitViewPanelId::Right,
-                        std::optional<std::vector<bool>>(right_mask),
-                        nullptr,
-                        nullptr,
+                        right_visibility,
+                        right_model,
+                        right_transform_override,
                         VksplatViewportRenderer::OutputSlot::SplitRight);
                     if (left && right) {
                         pending_split_view.enabled = true;
@@ -3391,6 +3522,7 @@ namespace lfs::vis {
             isRetryableSharedScratchUnavailable(render_error)) {
             dirty_mask_.fetch_or(frame_dirty != 0 ? frame_dirty : DirtyFlag::SPLATS,
                                  std::memory_order_relaxed);
+            defer_shared_scratch(render_error);
             render_lock.reset();
             LOG_DEBUG("Split-view shared scratch unavailable ({}); returning cached split image",
                       render_error);
@@ -3561,6 +3693,7 @@ namespace lfs::vis {
                 }
 
                 render_lock.reset();
+                vksplat_stale_frame_guard_.onSuccess();
                 clearVulkanViewportImageState(render_result->size, render_result->flip_y);
                 vulkan_external_viewport_image_ = render_result->image;
                 vulkan_external_viewport_image_view_ = render_result->image_view;
@@ -3854,6 +3987,7 @@ namespace lfs::vis {
                         vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
                     }
                     const auto publish_vksplat_result = [&](const VksplatViewportRenderer::RenderResult& render_result) -> VulkanFrameResult {
+                        vksplat_stale_frame_guard_.onSuccess();
                         render_lock.reset();
                         note_lod_page_generation(render_result.lod_page_generation);
                         note_vksplat_render_progress(render_result);
@@ -4176,6 +4310,7 @@ namespace lfs::vis {
                                   "VkSplat shared scratch unavailable",
                                   render_result.error(),
                                   retry_dirty);
+                        defer_shared_scratch(render_result.error());
                         render_lock.reset();
                         return cached_frame_result();
                     }
@@ -4233,6 +4368,9 @@ namespace lfs::vis {
             pending_split_view.enabled;
 
         if (!rendered_image && has_gpu_only_pass) {
+            if (pending_split_view.enabled || render_error.empty()) {
+                vksplat_stale_frame_guard_.onSuccess();
+            }
             clearVulkanViewportImageState(render_size, false);
             vulkan_gt_comparison_content_size_ =
                 rendered_image_contains_ground_truth ? rendered_gt_content_size : glm::ivec2{0, 0};
@@ -4405,7 +4543,15 @@ namespace lfs::vis {
                               "VkSplat shared scratch unavailable",
                               render_error,
                               retry_dirty);
+                    defer_shared_scratch(render_error);
                     return cached_frame_result();
+                }
+                if (render_error.find("arena is busy") != std::string::npos &&
+                    vksplat_viewport_renderer_) {
+                    // Cold start and resize have no matching publication to
+                    // return, but still need the same bounded priority on their
+                    // next attempt.
+                    vksplat_viewport_renderer_->requestArenaHandoff();
                 }
 
                 LOG_DEBUG("{} ({}); skipping viewport frame, retry_dirty=0x{:x}, cached_output={}, vksplat_resize={}, cached_size={}x{}, render_size={}x{}",
@@ -4451,6 +4597,7 @@ namespace lfs::vis {
         }
 
         auto viewport_image = std::move(rendered_image);
+        vksplat_stale_frame_guard_.onSuccess();
         vulkan_viewport_image_ = viewport_image;
         ++vulkan_viewport_image_generation_;
         if (vulkan_viewport_image_generation_ == 0)

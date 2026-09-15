@@ -4,6 +4,7 @@
 
 #include "visualizer_impl.hpp"
 #include "core/animatable_property.hpp"
+#include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
 #include "core/data_loading_service.hpp"
 #include "core/error.hpp"
@@ -552,16 +553,21 @@ namespace lfs::vis {
                 state.progress = tasks.getExportProgress();
                 state.stage = tasks.getExportStage();
                 state.outcome = tasks.getExportOutcome();
+                state.path = core::path_to_utf8(tasks.getExportPath());
+                state.error = tasks.getExportError();
+                state.commit_uuid = tasks.getExportCommitUuid();
                 const auto fmt = tasks.getExportFormat();
-                state.format = fmt == core::ExportFormat::PLY           ? "PLY"
-                               : fmt == core::ExportFormat::SOG         ? "SOG"
-                               : fmt == core::ExportFormat::SPZ         ? "SPZ"
-                               : fmt == core::ExportFormat::HTML_VIEWER ? "HTML"
-                               : fmt == core::ExportFormat::USD         ? "USD"
-                               : fmt == core::ExportFormat::NUREC_USDZ  ? "USDZ"
-                               : fmt == core::ExportFormat::RAD         ? "RAD"
-                               : fmt == core::ExportFormat::COLMAP      ? "COLMAP"
-                                                                        : "file";
+                state.format = fmt == core::ExportFormat::PLY                                                                                                                                              ? "PLY"
+                               : (fmt == core::ExportFormat::GALLERY_SCENE || fmt == core::ExportFormat::GALLERY_SOG || fmt == core::ExportFormat::GALLERY_SSOG || fmt == core::ExportFormat::GALLERY_SPZ) ? ".licht"
+                               : fmt == core::ExportFormat::SSOG                                                                                                                                           ? "SSOG"
+                               : fmt == core::ExportFormat::SOG                                                                                                                                            ? "SOG"
+                               : fmt == core::ExportFormat::SPZ                                                                                                                                            ? "SPZ"
+                               : fmt == core::ExportFormat::HTML_VIEWER                                                                                                                                    ? "HTML"
+                               : fmt == core::ExportFormat::USD                                                                                                                                            ? "USD"
+                               : fmt == core::ExportFormat::NUREC_USDZ                                                                                                                                     ? "USDZ"
+                               : fmt == core::ExportFormat::RAD                                                                                                                                            ? "RAD"
+                               : fmt == core::ExportFormat::COLMAP                                                                                                                                         ? "COLMAP"
+                                                                                                                                                                                                           : "file";
                 return state;
             },
             []() {
@@ -708,6 +714,49 @@ namespace lfs::vis {
             });
         callback_cleanup_.add([] { python::set_sequencer_timeline_callbacks(nullptr, nullptr, nullptr, nullptr, nullptr); });
 
+        python::set_camera_path_data_callbacks(
+            []() -> std::string {
+                auto* gm = python::get_gui_manager();
+                if (!gm || gm->sequencer().timeline().realKeyframeCount() == 0)
+                    return "null";
+                const auto& controller = gm->sequencer();
+                const auto saved = controller.saveToJson();
+                const auto mode = controller.loopMode();
+                return nlohmann::json{{"version", 1}, {"keyframes", saved.at("keyframes")}, {"duration", controller.timeline().clipDuration()}, {"loopMode", mode == LoopMode::LOOP ? "loop" : mode == LoopMode::PING_PONG ? "ping_pong"
+                                                                                                                                                                                                                           : "once"},
+                                      {"playbackSpeed", controller.playbackSpeed()}}
+                    .dump();
+            },
+            [](const std::string& value) -> bool {
+                auto* gm = python::get_gui_manager();
+                if (!gm)
+                    return false;
+                try {
+                    const auto saved = nlohmann::json::parse(value);
+                    if (saved.at("version") != 1)
+                        return false;
+                    const std::string mode = saved.at("loopMode");
+                    if (mode != "once" && mode != "loop" && mode != "ping_pong")
+                        return false;
+                    const float speed = saved.at("playbackSpeed");
+                    if (!std::isfinite(speed) || speed < MIN_PLAYBACK_SPEED || speed > MAX_PLAYBACK_SPEED)
+                        return false;
+                    const nlohmann::json timeline{{"version", 4}, {"clip_duration", saved.at("duration")}, {"keyframes", saved.at("keyframes")}};
+                    if (!gm->sequencer().loadFromJson(timeline))
+                        return false;
+                    gm->sequencer().setLoopMode(mode == "loop" ? LoopMode::LOOP : mode == "ping_pong" ? LoopMode::PING_PONG
+                                                                                                      : LoopMode::ONCE);
+                    gm->sequencer().setPlaybackSpeed(speed);
+                    gm->getSequencerUIState().playback_speed = speed;
+                    lfs::core::events::state::KeyframeListChanged{.count = gm->sequencer().timeline().realKeyframeCount()}.emit();
+                    return true;
+                } catch (const std::exception& e) {
+                    LOG_WARN("Cannot restore camera path: {}", e.what());
+                    return false;
+                }
+            });
+        callback_cleanup_.add([] { python::set_camera_path_data_callbacks(nullptr, nullptr); });
+
         sequencer_ui_state_ = std::make_unique<python::SequencerUIStateData>();
         python::set_sequencer_ui_state_callback([this]() -> python::SequencerUIStateData* {
             auto* gm = python::get_gui_manager();
@@ -822,7 +871,8 @@ namespace lfs::vis {
         python::set_export_callback([](int format, const char* path, const char** node_names,
                                        int node_count, int sh_degree, bool rad_flip_y,
                                        bool rad_streamable, int spz_version,
-                                       bool include_provenance) {
+                                       bool include_provenance,
+                                       int lod_levels, float lod_ratio, int chunk_count_k, float chunk_extent, int chunk_min_k, int kmeans_iterations) {
             if (auto* gm = python::get_gui_manager()) {
                 std::vector<std::string> names;
                 names.reserve(node_count);
@@ -834,7 +884,7 @@ namespace lfs::vis {
                                                rad_flip_y,
                                                rad_streamable,
                                                spz_version,
-                                               include_provenance);
+                                               include_provenance, lod_levels, lod_ratio, chunk_count_k, chunk_extent, chunk_min_k, kmeans_iterations);
             }
         });
         callback_cleanup_.add([] { python::set_export_callback(nullptr); });
@@ -865,7 +915,7 @@ namespace lfs::vis {
             info.height = viewport_.windowSize.y;
             info.fov = lfs::rendering::focalLengthToVFov(settings.focal_length_mm);
             info.orthographic = settings.orthographic;
-            info.ortho_scale = settings.ortho_scale;
+            info.ortho_scale = viewport_.ortho_scale_override.value_or(settings.ortho_scale);
             return info;
         });
         callback_cleanup_.add([] { vis::set_view_callback(nullptr); });
@@ -900,7 +950,7 @@ namespace lfs::vis {
             info.height = viewport_.windowSize.y;
             info.fov = lfs::rendering::focalLengthToVFov(settings.focal_length_mm);
             info.orthographic = settings.orthographic;
-            info.ortho_scale = settings.ortho_scale;
+            info.ortho_scale = vp.ortho_scale_override.value_or(settings.ortho_scale);
             return info;
         });
         callback_cleanup_.add([] { vis::set_view_for_panel_callback(nullptr); });
@@ -953,11 +1003,24 @@ namespace lfs::vis {
         });
         callback_cleanup_.add([] { vis::set_set_fov_callback(nullptr); });
 
+        vis::set_set_ortho_scale_callback([this](std::optional<float> scale) {
+            viewport_.ortho_scale_override = scale;
+            if (rendering_manager_)
+                rendering_manager_->markCameraPoseChanged();
+        });
+        callback_cleanup_.add([] { vis::set_set_ortho_scale_callback(nullptr); });
+
         const auto get_screen_positions = [this]() -> std::shared_ptr<lfs::core::Tensor> {
             if (!scene_manager_) {
                 return nullptr;
             }
-            if (!hasRenderableGaussians(scene_manager_->getModelForRendering())) {
+            const bool ply_comparison =
+                rendering_manager_ && rendering_manager_->isPLYComparisonActive();
+            // Idle viewport-render polling must not concatenate a combined model
+            // just to decide whether screen positions exist. Selection tools still
+            // go through SelectionService.
+            if (!ply_comparison &&
+                !hasRenderableGaussians(scene_manager_->getModelForRendering())) {
                 return nullptr;
             }
             if (const auto* tm = scene_manager_->getTrainerManager()) {
@@ -1231,22 +1294,19 @@ namespace lfs::vis {
             code, lfs::ErrorDomain::Vulkan, lfs::Severity::Fatal, lfs::ErrorSurface::Modal,
             LOC(body_key), std::move(detail), std::move(actions), LFS_SOURCE_SITE_CURRENT()));
 
-        if (device_lost) {
-            SDL_Window* const window = window_manager_ ? window_manager_->getWindow() : nullptr;
-            if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-                                          LOC(ErrModalKeys::RENDERER_DEVICE_LOST),
-                                          LOC(ErrModalKeys::RENDERER_DEVICE_LOST_BODY), window)) {
-                LOG_ERROR("Failed to present device-lost dialog: {}", SDL_GetError());
-            }
-        }
+        if (auto* window = window_manager_ ? window_manager_->getWindow() : nullptr)
+            SDL_SetWindowTitle(window, LOC(device_lost ? ErrModalKeys::RENDERER_DEVICE_LOST
+                                                       : ErrModalKeys::RENDERER_STALLED));
+        lfs::core::flush_diagnostics_noexcept();
     }
 
     void VisualizerImpl::onFrameCompleted() noexcept {
         frame_state_.on_frame_success();
-        lfs::core::MemoryPressureCoordinator::instance().maybe_recover();
         if (auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr) {
             applyFrameStateEffects(frame_state_.on_renderer_terminal(ctx->rendererTerminalState()));
         }
+        if (frame_state_.state() != FrameStateMachine::State::RendererDead)
+            lfs::core::MemoryPressureCoordinator::instance().maybe_recover();
     }
 
     void VisualizerImpl::beginShutdown([[maybe_unused]] const std::string_view reason) {
@@ -1377,12 +1437,15 @@ namespace lfs::vis {
         cmd::ProjectCreate::when(
             [this](const auto& command) {
                 pending_project_dataset_embed_ = false;
-                handleCreateProject(
+                last_project_create_succeeded_ = false;
+                const auto created = handleCreateProject(
                     command.path,
                     command.discard_changes
                         ? ProjectSwitchDisposition::DiscardChanges
                         : ProjectSwitchDisposition::RequireClean,
-                    command.stop_training);
+                    command.stop_training,
+                    command.allow_existing_destination_replacement);
+                last_project_create_succeeded_ = created.has_value();
             });
 
         cmd::SwitchToEditMode::when(
@@ -1532,7 +1595,8 @@ namespace lfs::vis {
                 LOG_INFO(
                     "Dataset embed command received (importing={})",
                     importing);
-                if (importing) {
+                if (importing || pending_training_action_ == PendingTrainingAction::CreateProject ||
+                    pending_training_action_ == PendingTrainingAction::LoadDataset) {
                     pending_project_dataset_embed_ = true;
                     LOG_INFO(
                         "Dataset embedding deferred until dataset load completes");
@@ -2053,7 +2117,8 @@ namespace lfs::vis {
 
         if (pipeline_cache_flush_due_ && update_started_at >= *pipeline_cache_flush_due_) {
             pipeline_cache_flush_due_.reset();
-            if (auto* const context = window_manager_->getVulkanContext())
+            if (auto* const context = window_manager_->getVulkanContext();
+                context && context->rendererTerminalState() == RendererTerminalState::Running)
                 context->flushPipelineCache();
         }
 
@@ -2192,6 +2257,10 @@ namespace lfs::vis {
         if (render_work.empty())
             return;
 
+        if (frame_state_.state() == FrameStateMachine::State::RendererDead) {
+            cancelRemainingWork(render_work, 0, "render", viewer_thread_id_);
+            return;
+        }
         processing_render_work_ = true;
         runPostedWork(render_work, "render", viewer_thread_id_);
         processing_render_work_ = false;
@@ -2267,7 +2336,7 @@ namespace lfs::vis {
 
         if (selection_tool_ && selection_tool_->isEnabled() && gui_manager_ &&
             gui_manager_->isPositionInViewport(input.mouse_x, input.mouse_y)) {
-            return !gui_manager_->selectionRingCursorActive(input.mouse_x, input.mouse_y);
+            return gui_manager_->selectionCursorNeedsRender(input.mouse_x, input.mouse_y);
         }
 
         if (gui_manager_ && gui_manager_->passiveMouseMoveNeedsRender(input.mouse_x, input.mouse_y)) {
@@ -2394,6 +2463,16 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::render() {
+
+        if (auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
+            applyFrameStateEffects(frame_state_.on_renderer_terminal(ctx->rendererTerminalState()));
+        if (frame_state_.state() == FrameStateMachine::State::RendererDead) {
+            // Keep the CPU event and MCP queues responsive without issuing another GPU frame.
+            processRenderWorkQueue();
+            if (window_manager_)
+                window_manager_->waitEvents(0.1);
+            return;
+        }
 
         if (motion_only_wake_skipped_) {
             motion_only_wake_skipped_ = false;
@@ -3089,14 +3168,21 @@ namespace lfs::vis {
 
     bool VisualizerImpl::deferLoadFileForTraining(
         const lfs::core::events::cmd::LoadFile& cmd) {
-        if (!cmd.stop_training) {
-            return false;
-        }
         if (pending_training_action_ ==
                 PendingTrainingAction::CloseSave ||
             pending_training_action_ ==
                 PendingTrainingAction::CloseDiscard) {
             return true;
+        }
+        if (pending_training_action_ ==
+            PendingTrainingAction::CreateProject) {
+            auto queued = cmd;
+            queued.stop_training = false;
+            pending_load_files_.push_back(std::move(queued));
+            return true;
+        }
+        if (!cmd.stop_training) {
+            return false;
         }
         const bool already_queued =
             pending_training_action_ ==
@@ -3269,7 +3355,7 @@ namespace lfs::vis {
             return;
         }
         if (gui_manager_) {
-            gui_manager_->asyncTasks().cancelImport();
+            gui_manager_->asyncTasks().cancelImport(false);
         }
 
         pending_view_paths_.clear();
@@ -3316,18 +3402,46 @@ namespace lfs::vis {
         }
     }
 
-    void VisualizerImpl::handleCreateProject(
+    lfs::Result<void> VisualizerImpl::handleCreateProject(
         const std::filesystem::path& path,
         const ProjectSwitchDisposition disposition,
-        const bool stop_training) {
+        const bool stop_training,
+        const bool allow_existing_destination_replacement) {
         if (pending_training_action_ ==
                 PendingTrainingAction::CloseSave ||
             pending_training_action_ ==
                 PendingTrainingAction::CloseDiscard) {
-            return;
+            return visualizerFailure<void>(
+                lfs::ErrorCode::FailedPrecondition,
+                "The current project is still being saved.",
+                "Project creation waits for the close save to finish",
+                "project.save");
         }
         if (!project_lifecycle_) {
-            return;
+            return visualizerFailure<void>(
+                lfs::ErrorCode::Unavailable,
+                "Project lifecycle is unavailable.",
+                "The visualizer did not initialize its project lifecycle service",
+                "project.lifecycle");
+        }
+        if (auto destination =
+                project_lifecycle_->preflightCreateDestination(
+                    path, allow_existing_destination_replacement);
+            !destination) {
+            LOG_ERROR(
+                "Create Project destination preflight failed: {}",
+                lfs::format_for_developer(destination.error()));
+            if (destination.error().code() !=
+                lfs::ErrorCode::AlreadyExists) {
+                lfs::Error contextual = destination.error();
+                lfs::ErrorBus::instance().publish(lfs::ErrorNotification{
+                    .error = std::move(contextual).with_context(gui::error_op::kNewProject, LFS_SOURCE_SITE_CURRENT()),
+                    .surface = lfs::ErrorSurface::Toast,
+                    .actions = {},
+                    .operation_id = lfs::OperationId::generate(),
+                });
+            }
+            return destination;
         }
         if (auto preflight = project_lifecycle_->preflightSwitch(
                 disposition, stop_training);
@@ -3336,9 +3450,11 @@ namespace lfs::vis {
                 lfs::core::events::cmd::ShowProjectSwitchConfirmation{
                     .new_project = true,
                     .path = {},
-                    .create_path = path}
+                    .create_path = path,
+                    .allow_existing_destination_replacement =
+                        allow_existing_destination_replacement}
                     .emit();
-                return;
+                return preflight;
             }
             if (!stop_training &&
                 isTrainingProjectSwitchError(preflight.error()) &&
@@ -3350,9 +3466,11 @@ namespace lfs::vis {
                     .discard_changes =
                         disposition ==
                         ProjectSwitchDisposition::DiscardChanges,
-                    .create_path = path}
+                    .create_path = path,
+                    .allow_existing_destination_replacement =
+                        allow_existing_destination_replacement}
                     .emit();
-                return;
+                return preflight;
             }
             LOG_ERROR(
                 "Create Project preflight failed: {}",
@@ -3364,10 +3482,10 @@ namespace lfs::vis {
                 .actions = {},
                 .operation_id = lfs::OperationId::generate(),
             });
-            return;
+            return preflight;
         }
         if (gui_manager_) {
-            gui_manager_->asyncTasks().cancelImport();
+            gui_manager_->asyncTasks().cancelImport(false);
         }
         pending_view_paths_.clear();
         pending_dataset_path_.clear();
@@ -3376,24 +3494,38 @@ namespace lfs::vis {
             pending_training_action_ =
                 PendingTrainingAction::CreateProject;
             pending_create_project_path_ = path;
+            pending_create_allow_existing_destination_replacement_ =
+                allow_existing_destination_replacement;
             pending_new_project_disposition_ = disposition;
             requestStopThenPendingAction();
-            return;
+            return visualizerFailure<void>(
+                lfs::ErrorCode::FailedPrecondition,
+                "The project could not be created yet.",
+                "Project creation waits for training to stop",
+                "project.create_pending");
         }
         pending_training_action_ = PendingTrainingAction::None;
         pending_create_project_path_.clear();
-        performCreateProject(path, disposition);
+        pending_create_allow_existing_destination_replacement_ = false;
+        return performCreateProject(
+            path, disposition, allow_existing_destination_replacement);
     }
 
-    void VisualizerImpl::performCreateProject(
+    lfs::Result<void> VisualizerImpl::performCreateProject(
         const std::filesystem::path& path,
-        const ProjectSwitchDisposition disposition) {
+        const ProjectSwitchDisposition disposition,
+        const bool allow_existing_destination_replacement) {
         keep_asset_manager_open_after_restore_ = false;
         if (!project_lifecycle_) {
-            return;
+            return visualizerFailure<void>(
+                lfs::ErrorCode::Unavailable,
+                "Project lifecycle is unavailable.",
+                "The visualizer did not initialize its project lifecycle service",
+                "project.lifecycle");
         }
         if (auto created = project_lifecycle_->createProjectAt(
-                path, disposition);
+                path, disposition,
+                allow_existing_destination_replacement);
             !created) {
             LOG_ERROR(
                 "Create Project failed: {}",
@@ -3405,7 +3537,9 @@ namespace lfs::vis {
                 .actions = {},
                 .operation_id = lfs::OperationId::generate(),
             });
+            return created;
         }
+        return {};
     }
 
     void VisualizerImpl::handleOpenProject(
@@ -3470,7 +3604,7 @@ namespace lfs::vis {
             return;
         }
         if (gui_manager_) {
-            gui_manager_->asyncTasks().cancelImport();
+            gui_manager_->asyncTasks().cancelImport(false);
         }
 
         if (shouldDeferProjectSwitchForTraining()) {
@@ -3548,6 +3682,7 @@ namespace lfs::vis {
             ProjectSwitchDisposition::RequireClean;
         pending_open_keep_asset_manager_open_ = false;
         pending_create_project_path_.clear();
+        pending_create_allow_existing_destination_replacement_ = false;
         pending_load_files_.clear();
         gui_session_restore_.clear();
         pending_project_tools_restore_.reset();
@@ -3879,7 +4014,8 @@ namespace lfs::vis {
     lfs::Result<void>
     VisualizerImpl::projectCreateAt(
         const std::filesystem::path& path,
-        const ProjectSwitchDisposition disposition) {
+        const ProjectSwitchDisposition disposition,
+        const bool allow_existing_destination_replacement) {
         if (!project_lifecycle_) {
             return visualizerFailure<void>(
                 lfs::ErrorCode::Unavailable,
@@ -3888,7 +4024,8 @@ namespace lfs::vis {
                 "project.lifecycle");
         }
         return project_lifecycle_->createProjectAt(
-            path, disposition);
+            path, disposition,
+            allow_existing_destination_replacement);
     }
 
     lfs::Result<void>
@@ -4119,6 +4256,15 @@ namespace lfs::vis {
         return project_save_started_.exchange(false);
     }
 
+    bool VisualizerImpl::consumeProjectCreateSucceeded() {
+        return std::exchange(last_project_create_succeeded_, false);
+    }
+
+    bool VisualizerImpl::projectCreatePending() const {
+        return pending_training_action_ ==
+               PendingTrainingAction::CreateProject;
+    }
+
     void VisualizerImpl::projectWaitWrite() {
         if (!project_lifecycle_) {
             return;
@@ -4343,8 +4489,22 @@ namespace lfs::vis {
             const auto disposition = std::exchange(
                 pending_new_project_disposition_,
                 ProjectSwitchDisposition::RequireClean);
+            const bool allow_existing = std::exchange(
+                pending_create_allow_existing_destination_replacement_,
+                false);
             if (!path.empty()) {
-                performCreateProject(path, disposition);
+                const auto created = performCreateProject(
+                    path, disposition, allow_existing);
+                if (!created) {
+                    pending_load_files_.clear();
+                    pending_project_dataset_embed_ = false;
+                    break;
+                }
+                if (!pending_load_files_.empty()) {
+                    pending_training_action_ =
+                        PendingTrainingAction::LoadDataset;
+                    schedulePendingTrainingAction();
+                }
             }
             break;
         }

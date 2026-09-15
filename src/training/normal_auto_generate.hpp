@@ -31,6 +31,12 @@ namespace lfs::training {
         std::span<const NormalAutoGenerateJob> jobs,
         const NormalGenerateProgress& progress)>;
 
+    // Prior loading and generation require a backend with a normal channel.
+    [[nodiscard]] inline bool training_normal_priors_enabled(
+        const lfs::core::param::OptimizationParameters& opt) {
+        return !opt.gut && opt.use_normal_loss && opt.normal_loss_weight > 0.0f;
+    }
+
     [[nodiscard]] bool normal_auto_generate_needed(
         bool use_normal_loss,
         bool normal_auto_generate,
