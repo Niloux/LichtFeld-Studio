@@ -316,9 +316,9 @@ __device__ __forceinline__ void ppisp_apply_color_correction(const float3& rgb_i
                                                              const ColorPPISPParams* color_params, float3& rgb_out) {
     float3x3 H = ppisp_compute_homography(color_params);
 
-    // SH renderers can produce signed RGB. Chromaticity normalization requires
-    // nonnegative radiance: a negative intensity would otherwise be divided by
-    // epsilon and turn dark pixels into saturated, inverted colors.
+    // SH evaluation can produce negative radiance. Chromaticity normalization
+    // requires nonnegative channels; a negative intensity would otherwise be
+    // divided by epsilon and turn dark pixels into saturated colors.
     const float3 rgb = make_float3(fmaxf(rgb_in.x, 0.0f), fmaxf(rgb_in.y, 0.0f), fmaxf(rgb_in.z, 0.0f));
     float intensity = rgb.x + rgb.y + rgb.z;
     float3 rgi_in = make_float3(rgb.x, rgb.y, intensity);
