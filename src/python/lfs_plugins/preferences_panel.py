@@ -777,7 +777,7 @@ class PreferencesPanel(Panel):
     def _project_location_hint(self):
         template = (
             lf.ui.tr("preferences.project_location_hint")
-            or "New projects and the Asset Manager Default folder: {path}"
+            or "New projects and the Default folder: {path}"
         )
         return template.replace("{path}", self._applied_project_location)
 
@@ -1109,8 +1109,6 @@ class PreferencesPanel(Panel):
     def _set_gallery_preference(self, key, value):
         from .gallery_preferences import set_preference
         try:
-            if key == "askBeforePublic":
-                value = self._coerce_bool(value)
             set_preference(key, value)
             self._gallery_preferences_error = ""
         except (ValueError, OSError):

@@ -31,6 +31,25 @@ endif()
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
 
+if(BUILD_PANEL_LAYOUT_TESTS)
+    add_executable(panel_layout_tests EXCLUDE_FROM_ALL
+        test_panel_layout_render_demand.cpp
+        test_panel_registry_animation_demand.cpp
+        test_panel_registry_default_closed.cpp
+    )
+    target_compile_features(panel_layout_tests PRIVATE cxx_std_23)
+    target_include_directories(panel_layout_tests PRIVATE
+        $<TARGET_PROPERTY:${PROJECT_NAME},INCLUDE_DIRECTORIES>
+    )
+    target_link_libraries(panel_layout_tests PRIVATE
+        $<TARGET_PROPERTY:${PROJECT_NAME},LINK_LIBRARIES>
+        GTest::gtest_main
+    )
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY)
+        return()
+    endif()
+endif()
+
 # =============================================================================
 # Unicode Path Test Only (no CUDA dependencies)
 # =============================================================================
@@ -114,6 +133,12 @@ set(LICHT_FORMAT_WINDOWS_FILES
 
 set(LICHT_FORMAT_NON_WINDOWS_FILES
     ${LICHT_FORMAT_WINDOWS_FILES}
+    test_project_inspector.cpp
+    test_project_operations.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/user_paths.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/environment.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/project/project_inspector.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/project/project_operations.cpp
     test_selection_chapter.cpp
     test_p8_compatibility.cpp
     licht_format_tensor_runtime.cpp
@@ -143,6 +168,7 @@ target_include_directories(lichtfeld_format_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/rendering/include
     ${CMAKE_SOURCE_DIR}/tests
     ${CMAKE_BINARY_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 if(NOT WIN32)
     target_include_directories(lichtfeld_format_tests PRIVATE
@@ -150,7 +176,6 @@ if(NOT WIN32)
         ${CMAKE_SOURCE_DIR}/src/training
         ${CMAKE_SOURCE_DIR}/src/training/include
         ${CMAKE_SOURCE_DIR}/src/visualizer
-        ${CUDAToolkit_INCLUDE_DIRS}
     )
 endif()
 target_compile_definitions(lichtfeld_format_tests PRIVATE
@@ -360,6 +385,7 @@ set(TEST_FILES
     test_geometry_payload.cpp
     test_selection_chapter.cpp
     test_project_document.cpp
+    test_project_thumbnail_sources.cpp
     test_gallery_scene_publication.cpp
     test_project_lifecycle.cpp
     test_p8_compatibility.cpp
@@ -467,6 +493,7 @@ set(TEST_FILES
     test_sdl_rml_key_mapping.cpp
     test_rml_path_utils.cpp
     test_rml_drag_payload.cpp
+    test_context_menu_placement.cpp
     test_rml_static_style_boundaries.cpp
     test_sequencer_regressions.cpp
     test_tensor_storage_version.cpp
@@ -489,6 +516,7 @@ set(TEST_FILES
     test_metrics_evaluator_appearance.cpp
     test_export_env_composite.cpp
     test_image_io.cpp
+    test_project_thumbnail_image.cpp
     test_camera_thumbnail_policy.cpp
     test_undistort.cpp
     test_viewport_region_utils.cpp
@@ -505,6 +533,7 @@ set(TEST_FILES
     test_colmap_binary_parallel_parse.cpp
     test_splat_simplify.cpp
     test_rml_text_input_handler.cpp
+    test_rml_text_input_native_keys.cpp
     test_scene_graph_dnd.cpp
     test_rml_im_mode_layout.cpp
     test_rml_python_listener_lifetime.cpp
@@ -950,6 +979,7 @@ set(LFS_PYTHON_FAST_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_mesh2splat_panel.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_operator_properties.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_operator_rich_returns.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/python/test_project_operations.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_api_surface.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_marketplace_panel.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_system.py
@@ -1214,3 +1244,13 @@ add_test(NAME lichtfeld.decimate.perf
     COMMAND lichtfeld_tests --gtest_filter=SplatDecimate.DecimatePerfSmoke)
 set_tests_properties(lichtfeld.decimate.perf PROPERTIES
     LABELS "nightly;gpu" ENVIRONMENT "LFS_DECIMATE_PERF=1" TIMEOUT 60)
+
+# Focused CUDA renderer contracts.
+add_executable(gsplat_tests test_main.cpp test_gsplat_rasterizer.cpp)
+target_compile_features(gsplat_tests PRIVATE cxx_std_23)
+target_include_directories(gsplat_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/training ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(gsplat_tests PRIVATE lfs_training lfs_core GTest::gtest CUDA::cudart)
+if(COMMAND lfs_enable_fast_cxx_compile)
+    lfs_enable_fast_cxx_compile(gsplat_tests)
+endif()

@@ -8,15 +8,18 @@ import json
 import logging
 import os
 import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from lfs_plugins import portal_account
+from lfs_plugins.ui.store import RuntimeState
 
 
 class FakeResponse:
@@ -73,6 +76,24 @@ def token_pair(access="access-new", refresh="refresh-new"):
     }
 
 
+@pytest.mark.parametrize("worker", ["_flow_thread", "_sync_thread", "_sign_out_thread"])
+def test_busy_tracks_account_worker_lifetime(tmp_path, worker):
+    account = portal_account.PortalAccountService(credentials_path=tmp_path / "credentials.json")
+    assert account.busy is False
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait)
+    setattr(account, worker, thread)
+    assert account.busy is False
+    thread.start()
+    try:
+        assert account.busy is True
+    finally:
+        release.set()
+        account.wait_for_idle()
+    assert not thread.is_alive()
+    assert account.busy is False
+
+
 def test_gallery_request_rejects_different_session_before_network(tmp_path, monkeypatch):
     path = tmp_path / "credentials.json"
     write_credentials(path)
@@ -85,7 +106,7 @@ def test_gallery_request_rejects_different_session_before_network(tmp_path, monk
     assert network.requests == []
 
 
-def test_gallery_delete_preserves_revision_body_through_token_refresh(tmp_path, monkeypatch):
+def test_gallery_delete_preserves_revision_body_on_explicit_retry_after_refresh(tmp_path, monkeypatch):
     from dataclasses import replace
     from lfs_plugins.portal_gallery import PortalGalleryClient
     path = tmp_path / 'credentials.json'
@@ -99,6 +120,9 @@ def test_gallery_delete_preserves_revision_body_through_token_refresh(tmp_path, 
         return 'ok'
     monkeypatch.setattr(account, '_refresh_tokens', refresh)
     client = PortalGalleryClient(account, expected_session=(old.email, old.connected_since), revision_domains=1)
+    with pytest.raises(portal_account.PortalHTTPError, match='access_refreshed'):
+        client.delete('7e812ba8-6cfb-4307-a0bc-da8e395bb721', {'contentRevision': 'content', 'metadataRevision': 'metadata'})
+    assert len(network.requests) == 1
     client.delete('7e812ba8-6cfb-4307-a0bc-da8e395bb721', {'contentRevision': 'content', 'metadataRevision': 'metadata'})
     assert len(network.requests) == 2
     assert all(r.method == 'DELETE' and json.loads(r.data) == {'baseRevisions': {'content': 'content', 'metadata': 'metadata'}}
@@ -200,6 +224,24 @@ def make_service(tmp_path, *, waiter=None, base_url=None):
         platform="TestOS",
         waiter=waiter,
     )
+
+
+def test_account_runtime_state_publishes_session_identity_as_it_arrives(tmp_path, monkeypatch):
+    monkeypatch.setattr("lfs_plugins.ui.store._native_store", lambda: None)
+    service = make_service(tmp_path)
+    service._snapshot = replace(
+        service.snapshot(), signed_in=True, email="", connected_since=""
+    )
+    service._publish_account_state()
+    assert (RuntimeState.account_state.value["email"], RuntimeState.account_state.value["connected_since"]) == ("", "")
+
+    service._snapshot = replace(service.snapshot(), email="ada@example.com")
+    service._publish_account_state()
+    assert (RuntimeState.account_state.value["email"], RuntimeState.account_state.value["connected_since"]) == ("ada@example.com", "")
+
+    service._snapshot = replace(service.snapshot(), connected_since="session-1")
+    service._publish_account_state()
+    assert (RuntimeState.account_state.value["email"], RuntimeState.account_state.value["connected_since"]) == ("ada@example.com", "session-1")
 
 
 def test_device_flow_state_machine_polls_and_caches_profile(tmp_path, monkeypatch):
