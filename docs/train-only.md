@@ -106,7 +106,7 @@ is rejected). For a shorter run and a separate output directory:
 The exhibition preset disables sky training. Its absolute dataset and LiDAR
 paths refer to the local exhibition dataset; change them on another machine.
 Choose an output directory appropriate for each run. Relative launch paths resolve from the **working directory**,
-just like CLI paths. `images` and `sky_mask_dir` remain relative to the dataset.
+just like CLI paths. `images` remains relative to the dataset.
 JSON does not support comments. To disable an option enabled by the preset,
 edit its boolean in JSON when there is no inverse CLI flag.
 

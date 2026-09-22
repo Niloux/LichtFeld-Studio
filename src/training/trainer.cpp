@@ -6035,11 +6035,10 @@ namespace lfs::training {
                 }
                 lfs::core::Tensor& bg = *bg_ptr;
 
-                lfs::core::Tensor bg_image, sky_confidence;
+                lfs::core::Tensor bg_image;
                 if (sky_background_) {
                     sky_background_->zero_grad();
                     bg_image = sky_background_->render(*cam);
-                    sky_confidence = sky_background_->masks(*cam);
                 }
                 if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::Image) {
                     LFS_VRAM_SCOPE("train.background_image");
@@ -7503,18 +7502,6 @@ namespace lfs::training {
                                                 ssim_map_workspace_bytes(densification_ssim_workspace_));
                             record_vram_tensor("train.losses", "densification_error_map.buffer", densification_error_map_);
                             record_vram_tensor("train.losses", "edge_map_buffer", edge_map_buffer_);
-                        }
-
-                        if (sky_background_) {
-                            core::Tensor valid;
-                            if (mask_tile.is_valid())
-                                valid = mask_tile.to(core::DataType::Float32);
-                            auto [sky_loss, sky_alpha_grad] = sky_background_->alpha_loss(
-                                output.alpha, sky_confidence, valid, params_.optimization.sky_alpha_weight);
-                            tile_loss = tile_loss + sky_loss;
-                            tile_grad_alpha = tile_grad_alpha.is_valid()
-                                                  ? tile_grad_alpha.reshape(output.alpha.shape()).add(sky_alpha_grad)
-                                                  : sky_alpha_grad;
                         }
 
                         loss_tensor_gpu = loss_tensor_gpu + tile_loss;

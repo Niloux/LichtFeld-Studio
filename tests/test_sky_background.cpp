@@ -2,11 +2,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
-#include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "training/components/sky_background.hpp"
 #include "training/rasterization/gsplat_rasterizer.hpp"
-#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -27,40 +25,6 @@ static void near(float a, float b, float tolerance, const char* message) {
 }
 static float objective(const Tensor& image, const Tensor& grad, const Tensor& alpha) {
     return image.mul(grad).mul(alpha.mul(-1.f).add(1.f)).sum().item<float>();
-}
-static void test_masks() {
-    const auto root = std::filesystem::temp_directory_path() /
-                      ("lfs-sky-mask-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::filesystem::create_directories(root / "images/L");
-    std::filesystem::create_directories(root / "sky_masks/L");
-    struct Cleanup {
-        std::filesystem::path path;
-        ~Cleanup() {
-            std::error_code error;
-            std::filesystem::remove_all(path, error);
-        }
-    } cleanup{root};
-    std::vector<uint8_t> pixels(64, 128), mask(64);
-    for (int i = 0; i < 32; ++i)
-        mask[i] = 255;
-    check(save_png(root / "images/L/frame.png", pixels.data(), 8, 8, 1, 8, 1), "write image fixture");
-    check(save_png(root / "sky_masks/L/frame.png.png", mask.data(), 8, 8, 1, 8, 1), "write mask fixture");
-    auto r = Tensor::zeros({3, 3}, Device::CPU);
-    r.ptr<float>()[0] = r.ptr<float>()[4] = r.ptr<float>()[8] = 1;
-    Camera camera(r, Tensor::zeros({3}, Device::CPU), 8, 8, 4, 4, {}, {}, lfs::core::CameraModelType::PINHOLE,
-                  "L/frame.png", root / "images/L/frame.png", {}, 8, 8, 0);
-    camera.set_image_dimensions(4, 4);
-    lfs::core::param::TrainingParameters params;
-    params.dataset.data_path = root;
-    params.optimization.sky_enabled = true;
-    SkyBackground sky(16);
-    sky.configure(params, {&camera});
-    auto weights = sky.masks(camera).cpu();
-    for (int i = 0; i < 16; ++i) {
-        near(weights.ptr<float>()[i], i < 8 ? 1.f : 0.f, 1e-6f, "original sky mask retained");
-    }
-    check(sky.render(camera).mean().item<float>() > .5f, "component camera render");
-    near(sky.masks(camera).sub(weights.cuda()).abs().max().item<float>(), 0, 0, "cached masks");
 }
 
 // Verify the foreground opacity receives the derivative of the complete
@@ -109,7 +73,6 @@ int main() {
         ~Shutdown() { lfs::core::teardown_gpu_before_exit(); }
     } shutdown;
     try {
-        test_masks();
         test_foreground_composition();
         SkyBackground sky(1024);
         auto r = Tensor::zeros({3, 3}, Device::CPU);
@@ -152,15 +115,6 @@ int main() {
         }
         auto means = sky.model().means().clone(), scales = sky.model().scaling_raw().clone();
         auto rotations = sky.model().rotation_raw().clone(), opacity = sky.model().opacity_raw().clone();
-        auto alpha = Tensor::full({1, 2, 2}, .4f, Device::CUDA);
-        auto coverage = Tensor::ones({2, 2}, Device::CUDA);
-        auto valid = Tensor::ones({2, 2}, Device::CUDA);
-        auto [loss, gradient] = sky.alpha_loss(alpha, coverage, valid, .2f);
-        near(loss.item<float>(), .08f, 1e-6f, "alpha loss");
-        near(gradient.sum().item<float>(), .2f, 1e-6f, "alpha gradient");
-        auto [empty_loss, empty_grad] = sky.alpha_loss(alpha, coverage, Tensor::zeros({2, 2}, Device::CUDA), .2f);
-        near(empty_loss.item<float>(), 0, 1e-6f, "empty valid mask");
-        near(empty_grad.sum().item<float>(), 0, 1e-6f, "empty gradient");
         auto& gradient_state = const_cast<Tensor&>(sky.gradients());
         gradient_state.fill_(.03f);
         sky.optimizer_step(.0025f);
@@ -190,10 +144,9 @@ int main() {
         lfs::core::param::OptimizationParameters params;
         params.sky_enabled = true;
         params.sky_num_points = 1024;
-        params.sky_mask_dir = "separate_sky";
         const auto json = params.to_json();
         check(json["sky_enabled"].get<bool>() && json["sky_num_points"].get<int>() == 1024, "sky config serialization");
-        std::cout << "Gaussian sky tests passed: camera models, gradients, masks, fixed geometry, Adam resume\n";
+        std::cout << "Gaussian sky tests passed: camera models, gradients, fixed geometry, Adam resume\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

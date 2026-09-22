@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "sky_background.hpp"
 #include "config_serialization.hpp"
-#include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "nanoflann.hpp"
@@ -71,40 +70,13 @@ namespace lfs::training {
         const auto& opt = params.optimization;
         if (opt.undistort || opt.bg_mode != core::param::BackgroundMode::SolidColor)
             throw std::invalid_argument("Sky requires native camera images (--gut for distorted cameras) and solid background mode");
-        if (!std::isfinite(opt.sky_lr) || opt.sky_lr <= 0 ||
-            !std::isfinite(opt.sky_alpha_weight) || opt.sky_alpha_weight < 0)
-            throw std::invalid_argument("Invalid sky optimizer or mask settings");
-        auto root = std::filesystem::path(opt.sky_mask_dir);
-        if (root.is_relative())
-            root = params.dataset.data_path / root;
-        cameras_.clear();
-        mask_cache_.clear();
-        mask_cache_bytes_ = 0;
+        if (!std::isfinite(opt.sky_lr) || opt.sky_lr <= 0)
+            throw std::invalid_argument("Invalid sky optimizer settings");
         for (const auto* cam : cameras) {
             if (cam->camera_model_type() == core::CameraModelType::ORTHO)
                 throw std::invalid_argument("Sky does not support orthographic cameras");
-            std::filesystem::path mask_path;
-            auto relative = cam->image_path().lexically_relative(params.dataset.data_path / params.dataset.images);
-            if (relative.empty() || *relative.begin() == "..")
-                relative = cam->image_name();
-            auto base = root / relative;
-            auto png = base;
-            png.replace_extension(".png");
-            for (const auto& candidate : {std::filesystem::path(base.string() + ".png"), png, base}) {
-                if (std::filesystem::is_regular_file(candidate)) {
-                    mask_path = candidate;
-                    break;
-                }
-            }
-            if (mask_path.empty())
-                throw std::runtime_error("Missing sky mask for " + cam->image_path().string());
-            const auto [mw, mh, mc] = core::get_image_info(mask_path);
-            const auto [iw, ih, ic] = core::get_image_info(cam->image_path());
-            if (mw != iw || mh != ih || mw <= 0 || mh <= 0)
-                throw std::runtime_error("Sky mask dimensions must match the original image: " + mask_path.string());
-            cameras_.emplace(cam->uid(), std::move(mask_path));
         }
-        LOG_INFO("Gaussian sky: {} fixed points, radius {}, opacity {}, SH0 colors; {} camera masks; excluded from PLY", count_, radius_, opacity_, cameras_.size());
+        LOG_INFO("Gaussian sky: {} fixed points, radius {}, opacity {}, SH0 colors; excluded from PLY", count_, radius_, opacity_);
     }
 
     Tensor SkyBackground::render(const core::Camera& cam) const {
@@ -118,50 +90,6 @@ namespace lfs::training {
         return result->first.image.clone();
     }
 
-    Tensor SkyBackground::masks(const core::Camera& cam) {
-        const int w = cam.image_width(), h = cam.image_height();
-        auto it = mask_cache_.find(cam.uid());
-        if (it == mask_cache_.end() || it->second.width != w || it->second.height != h) {
-            if (it != mask_cache_.end()) {
-                mask_cache_bytes_ -= it->second.cpu.numel() * sizeof(float);
-                mask_cache_.erase(it);
-            }
-            auto [raw, sw, sh, channels] = core::load_image_float(cameras_.at(cam.uid()));
-            std::unique_ptr<float, decltype(&core::free_image_float)> pixels(raw, core::free_image_float);
-            if (!raw || w <= 0 || h <= 0)
-                throw std::runtime_error("Could not decode sky mask");
-            // Keep the original mask coverage, including mixed boundary pixels.
-            auto cpu = Tensor::empty({size_t(h), size_t(w)}, Device::CPU, DataType::Float32);
-            auto* data = cpu.ptr<float>();
-            for (int y = 0; y < h; ++y)
-                for (int x = 0; x < w; ++x) {
-                    const double x0 = double(x) * sw / w, x1 = double(x + 1) * sw / w;
-                    const double y0 = double(y) * sh / h, y1 = double(y + 1) * sh / h;
-                    double total = 0;
-                    for (int sy = int(y0); sy < std::min(sh, int(std::ceil(y1))); ++sy)
-                        for (int sx = int(x0); sx < std::min(sw, int(std::ceil(x1))); ++sx) {
-                            const float value = raw[(size_t(sy) * sw + sx) * channels];
-                            if (!std::isfinite(value) || value < 0 || value > 1)
-                                throw std::runtime_error("Sky mask values must be finite in [0,1]");
-                            total += value * (std::min(x1, double(sx + 1)) - std::max(x0, double(sx))) *
-                                     (std::min(y1, double(sy + 1)) - std::max(y0, double(sy)));
-                        }
-                    total /= (x1 - x0) * (y1 - y0);
-                    data[y * w + x] = static_cast<float>(total);
-                }
-            constexpr size_t budget = 256 * 1024 * 1024;
-            while (!mask_cache_.empty() && mask_cache_bytes_ + cpu.numel() * sizeof(float) > budget) {
-                auto oldest = std::min_element(mask_cache_.begin(), mask_cache_.end(), [](const auto& a, const auto& b) { return a.second.last_use < b.second.last_use; });
-                mask_cache_bytes_ -= oldest->second.cpu.numel() * sizeof(float);
-                mask_cache_.erase(oldest);
-            }
-            mask_cache_bytes_ += cpu.numel() * sizeof(float);
-            it = mask_cache_.emplace(cam.uid(), MaskCacheEntry{std::move(cpu), w, h, ++cache_clock_}).first;
-        }
-        it->second.last_use = ++cache_clock_;
-        return it->second.cpu.to(Device::CUDA, core::getCurrentCUDAStream());
-    }
-
     void SkyBackground::backward(const core::Camera& cam, const Tensor& grad_sky) {
         auto black = Tensor::zeros({3}, Device::CUDA);
         auto result = gsplat_rasterize_forward(const_cast<core::Camera&>(cam), *model_, black,
@@ -169,14 +97,6 @@ namespace lfs::training {
         if (!result)
             throw std::runtime_error(result.error());
         gsplat_rasterize_backward_sh0(result->second, grad_sky, *model_, gradients_);
-    }
-    std::pair<Tensor, Tensor> SkyBackground::alpha_loss(const Tensor& alpha, const Tensor& confidence,
-                                                        const Tensor& valid, float weight) const {
-        Tensor mask = confidence.reshape(alpha.shape());
-        if (valid.is_valid())
-            mask = mask.mul(valid.reshape(alpha.shape()));
-        auto gradient = mask.div(mask.sum().clamp_min(1.f)).mul(weight);
-        return {alpha.mul(gradient).sum(), gradient};
     }
     void SkyBackground::zero_grad() { gradients_.zero_(); }
     void SkyBackground::optimizer_step(float lr) {

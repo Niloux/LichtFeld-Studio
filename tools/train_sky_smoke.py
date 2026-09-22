@@ -21,11 +21,8 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     dataset = root / "dataset"
     make_scene(dataset)
-    (dataset / "sky_masks").mkdir()
     (dataset / "masks").mkdir()
     for path in (dataset / "images").iterdir():
-        write_png(dataset / "sky_masks" / (path.name + ".png"), 64, 64, 1,
-                  [255 if y < 22 else 0 for y in range(64) for x in range(64)])
         write_png(dataset / "masks" / path.name, 64, 64, 1,
                   [255 if x > 2 else 0 for y in range(64) for x in range(64)])
     env = os.environ.copy()
@@ -63,8 +60,6 @@ def main():
         assert (root / (backend + "_resume") / "splat_24.ply").is_file()
     run("wrong_resume_geometry", ["--resume", root / "gut/project.licht", "-o", root / "wrong-resume",
                                     "--iter", 24, "--sky-num-points", 2048], "Cannot change Gaussian sky geometry")
-    run("missing_sky_mask", [*base, "-o", root / "missing", "--iter", 1,
-                             "--sky-mask-dir", "missing_sky"], "Missing sky mask")
     run("invalid_opacity", [*base, "-o", root / "bad-boundary", "--iter", 1,
                              "--sky-initial-opacity", 1.5], "Invalid Gaussian sky geometry")
     # Feature-off still loads and saves the old checkpoint layout.

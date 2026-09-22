@@ -7,11 +7,8 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include <cstdint>
-#include <filesystem>
 #include <iosfwd>
 #include <memory>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace lfs::training {
@@ -23,13 +20,8 @@ namespace lfs::training {
         void configure(const core::param::TrainingParameters& params,
                        const std::vector<core::Camera*>& cameras);
         core::Tensor render(const core::Camera& camera) const;
-        // Area-resampled original sky coverage, [H,W]. No extra erosion.
-        core::Tensor masks(const core::Camera& camera);
         // Must run AFTER foreground backward: the renderer reuses TLS caches.
         void backward(const core::Camera& camera, const core::Tensor& grad_sky);
-        std::pair<core::Tensor, core::Tensor> alpha_loss(
-            const core::Tensor& alpha, const core::Tensor& coverage,
-            const core::Tensor& valid_mask, float weight) const;
         void optimizer_step(float learning_rate);
         void zero_grad();
         void serialize(std::ostream& stream) const;
@@ -44,19 +36,10 @@ namespace lfs::training {
         const core::Tensor& gradients() const { return gradients_; }
 
     private:
-        struct MaskCacheEntry {
-            core::Tensor cpu;
-            int width = 0, height = 0;
-            std::uint64_t last_use = 0;
-        };
         int count_;
         float radius_, opacity_;
         std::uint64_t step_ = 0;
         std::unique_ptr<core::SplatData> model_;
         core::Tensor gradients_, exp_avg_, exp_avg_sq_;
-        std::unordered_map<int, std::filesystem::path> cameras_;
-        std::unordered_map<int, MaskCacheEntry> mask_cache_;
-        std::size_t mask_cache_bytes_ = 0;
-        std::uint64_t cache_clock_ = 0;
     };
 } // namespace lfs::training

@@ -59,7 +59,7 @@ contextcapture 的 252 张鱼眼图像及 sky mask 校验通过，并以宽度 5
 | SH 阶数 | `--sh-degree 0` |
 | 曝光矫正 | `--exposure-correction` |
 | 遮罩 | `--mask-mode ignore`，白色参与损失，黑色忽略 |
-| 天空 | `--sky --sky-mask-dir sky_masks --sky-num-points 100000` |
+| 天空 | `--sky --sky-num-points 100000` |
 | depth / normal | 保持默认关闭 |
 | 训练目标 | 30,000 步，导出 PLY |
 
@@ -76,7 +76,7 @@ contextcapture 的 252 张鱼眼图像及 sky mask 校验通过，并以宽度 5
   --sh-degree 0 \
   --exposure-correction \
   --mask-mode ignore \
-  --sky --sky-mask-dir sky_masks --sky-num-points 100000 \
+  --sky --sky-num-points 100000 \
   --iter 30000 \
   --export ply
 ```
