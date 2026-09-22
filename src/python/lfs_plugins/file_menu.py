@@ -207,12 +207,13 @@ def format_recent_project_entry(path: str, tr) -> tuple[str, str]:
 
 class NewProjectOperator(Operator):
     label = "menu.file.new_project"
-    description = "Create a new project"
+    description = "Start a blank, unsaved project"
 
     def execute(self, context) -> set:
-        from .import_panels import open_new_project_panel
-
-        open_new_project_panel("")
+        confirm_discard_work_then(
+            lf.ui.tr("menu.file.new_project"),
+            lambda stop_training: _new_project(True, stop_training),
+        )
         return {"FINISHED"}
 
 
@@ -243,6 +244,16 @@ class SaveProjectAsOperator(Operator):
 
     def execute(self, context) -> set:
         lf.project_save_as("")
+        return {"FINISHED"}
+
+
+class CleanProjectOperator(Operator):
+    label = "project_cleanup.title"
+    description = "Remove older saves and checkpoints while keeping the current project"
+
+    def execute(self, context) -> set:
+        from .project_cleanup import open_project_cleanup
+        open_project_cleanup()
         return {"FINISHED"}
 
 
@@ -549,7 +560,7 @@ def _can_compact_project() -> bool:
     return _project_has_path()
 
 
-def _publish_current_project_to_gallery() -> None:
+def _publish_current_project_to_gallery(*, refresh_once: bool = True) -> None:
     """Open the shared Gallery review for the active saved project."""
     from .gallery_messages import tr as gallery_tr
 
@@ -581,8 +592,6 @@ def _publish_current_project_to_gallery() -> None:
         if link:
             scene = next((row for row in state.get("scenes", [])
                           if row.get("id") == link.get("sceneId")), None)
-            if scene is None:
-                raise ValueError(gallery_tr("error.refresh"))
         linked_fields = ((link or {}).get("localFields") or (link or {}).get("sharedFields")
                          or scene or {})
         project_name = str(getattr(card, "title", None) or project_path.stem)
@@ -643,8 +652,19 @@ def _publish_current_project_to_gallery() -> None:
             action = primary["id"]
             details = {key: fields[key] for key in ("title", "description", "visibility")}
             if action == "check":
+                if not refresh_once:
+                    return
+                expected_identity = controller.service.identity()
+
+                def continue_after_refresh():
+                    if controller.service.identity() != expected_identity:
+                        return
+                    current = str(lf.project_poll_write().get("path") or "")
+                    if current and Path(current).resolve() == project_path:
+                        _publish_current_project_to_gallery(refresh_once=False)
+
+                controller._after_service = continue_after_refresh
                 controller.refresh()
-                lf.ui.message_dialog(title, gallery_tr("error.refresh"), "info")
                 return
             if action in ("resolve", "apply"):
                 controller.resolve_asset(asset, details, apply_only=action == "apply")
@@ -731,6 +751,7 @@ class FileMenu:
                 enabled=_can_compact_project(),
             ),
             menu_operator(EmbedDatasetOperator, enabled=bool(getattr(lf, "project_can_embed_dataset", lambda: False)())),
+            menu_operator(CleanProjectOperator, enabled=_can_compact_project()),
             menu_operator(
                 CompactProjectOperator,
                 enabled=_can_compact_project(),
@@ -771,6 +792,7 @@ _operator_classes = [
     SaveProjectOperator,
     SaveProjectAsOperator,
     EmbedDatasetOperator,
+    CleanProjectOperator,
     CompactProjectOperator,
     ImportDatasetOperator,
     ImportPlyOperator,

@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/checkpoint_format.hpp"
+#include "core/path_utils.hpp"
 #include "core/user_paths.hpp"
 #include "io/project_document.hpp"
 #include "io/project_operations.hpp"
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 
 namespace {
@@ -45,6 +47,32 @@ namespace {
         return path;
     }
 
+    void flip_byte(const fs::path& path, const std::uint64_t offset) {
+        std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(stream);
+        stream.seekg(static_cast<std::streamoff>(offset));
+        char byte = 0;
+        stream.read(&byte, 1);
+        ASSERT_EQ(stream.gcount(), 1);
+        stream.seekp(static_cast<std::streamoff>(offset));
+        byte ^= static_cast<char>(0x5a);
+        stream.write(&byte, 1);
+        ASSERT_TRUE(stream);
+    }
+
+    void write_u64(const fs::path& path, const std::uint64_t offset,
+                   const std::uint64_t value) {
+        std::array<std::byte, 8> bytes{};
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            bytes[index] = static_cast<std::byte>((value >> (index * 8)) & 0xff);
+        }
+        std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(stream);
+        stream.seekp(static_cast<std::streamoff>(offset));
+        stream.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        ASSERT_TRUE(stream);
+    }
+
     TEST(ProjectOperations, RestoreOlderSaveRekeysAndRefusesCollision) {
         TemporaryDirectory temporary;
         const auto source = make_document(temporary.path / "source.licht");
@@ -64,6 +92,179 @@ namespace {
         const auto collision = restore_save(source, 1, destination);
         ASSERT_FALSE(collision);
         EXPECT_EQ(collision.error().code(), lfs::ErrorCode::AlreadyExists);
+    }
+
+    TEST(ProjectOperations, RestoreSaveResurrectsDeletedCheckpoint) {
+        TemporaryDirectory temporary;
+        const auto source = make_document(temporary.path / "deleted-checkpoint.licht");
+        const auto checkpoint_id = fixed_uuid(3500);
+        const auto payload = checkpoint_payload(2200);
+        {
+            auto document = require_result(ProjectDocument::open(source));
+            require_status(document.set_checkpoint(checkpoint_id, require_result(LazyChunkValue::from_owned(payload, checkpoint_id))));
+            static_cast<void>(require_result(save_document(document, source)));
+        }
+        {
+            auto document = require_result(ProjectDocument::open(source));
+            ASSERT_TRUE(document.remove_checkpoint(checkpoint_id));
+            static_cast<void>(require_result(save_document(document, source)));
+        }
+        const auto before = require_result(inspect_project_card(source));
+        ASSERT_EQ(before.generation, 3u);
+        auto deleted = require_result(ProjectReader::open(source));
+        ASSERT_NE(deleted.find(FOURCC_CKPT, checkpoint_id), nullptr);
+        ASSERT_EQ(deleted.find(FOURCC_CKPT, checkpoint_id)->row_kind, RowKind::Tombstone);
+        const auto restored = require_result(restore_save(source, 2, source));
+        EXPECT_EQ(restored.project_uuid, before.project_uuid);
+        EXPECT_EQ(restored.generation, 4u);
+        auto reader = require_result(ProjectReader::open(source));
+        const auto* checkpoint = reader.find(FOURCC_CKPT, checkpoint_id);
+        ASSERT_NE(checkpoint, nullptr);
+        EXPECT_EQ(require_result(reader.read_chunk(*checkpoint)), payload);
+
+        // Historical tombstones may be replaced, but never a resolution made
+        // during the current append, whether it copied or deleted the key.
+        for (const bool erase_first : {false, true}) {
+            auto writer = require_result(ProjectWriter::append(source));
+            require_status(writer.plan_commit());
+            require_status(writer.preflight(payload.size()));
+            if (erase_first) {
+                require_status(writer.erase(checkpoint->key));
+            } else {
+                require_status(writer.copy_chunk_verbatim(reader, *checkpoint));
+            }
+            const auto duplicate = writer.copy_chunk_verbatim(reader, *checkpoint);
+            ASSERT_FALSE(duplicate);
+            EXPECT_EQ(duplicate.error().code(), lfs::ErrorCode::AlreadyExists);
+        }
+    }
+
+    TEST(ProjectOperations, RestoreSaveWithRetainedThumbnailChunks) {
+        TemporaryDirectory temporary;
+        const auto source = make_document(temporary.path / "thumbnail-history.licht");
+        const auto selected_preview = std::vector<std::byte>{
+            std::byte{'p'}, std::byte{'n'}, std::byte{'g'}};
+        const auto retained_thumbnail = std::vector<std::byte>{
+            std::byte{'o'}, std::byte{'l'}, std::byte{'d'}};
+        const auto newer_preview = std::vector<std::byte>{
+            std::byte{'n'}, std::byte{'e'}, std::byte{'w'}};
+        {
+            auto reader = require_result(ProjectReader::open(source));
+            auto writer = require_result(ProjectWriter::append(source));
+            require_status(writer.plan_commit());
+            std::uint64_t planned_bytes = selected_preview.size() + retained_thumbnail.size();
+            for (const auto& row : reader.chunks()) {
+                if (row.is_live())
+                    planned_bytes += row.stored_bytes;
+            }
+            require_status(writer.preflight(planned_bytes));
+            for (const auto& row : reader.chunks()) {
+                if (row.is_live())
+                    require_status(writer.copy_chunk_verbatim(reader, row));
+            }
+            require_status(writer.write_chunk(
+                ChunkKey{FOURCC_THMB, fixed_uuid(1001)}, retained_thumbnail));
+            require_status(writer.set_preview(selected_preview));
+            require_status(writer.commit());
+        }
+        static_cast<void>(require_result(set_project_preview(source, newer_preview)));
+
+        auto historical_reader = require_result(ProjectReader::open_generation(source, 2));
+        ASSERT_TRUE(historical_reader.preview().has_value());
+        EXPECT_EQ(require_result(historical_reader.read_preview()), selected_preview);
+
+        const auto restored_path = temporary.path / "restored-thumbnail-history.licht";
+        static_cast<void>(require_result(restore_save(source, 2, restored_path)));
+        auto restored_reader = require_result(ProjectReader::open(restored_path));
+        EXPECT_EQ(require_result(restored_reader.read_preview()), selected_preview);
+        EXPECT_EQ(std::ranges::count_if(restored_reader.chunks(), [](const auto& row) {
+                      return row.is_live() && row.key.fourcc == FOURCC_THMB;
+                  }),
+                  2);
+
+        const auto damaged = temporary.path / "damaged-thumbnail-history.licht";
+        fs::copy_file(source, damaged);
+        flip_byte(damaged, HEAD_SLOT_OFFSETS[0] + 200);
+        flip_byte(damaged, HEAD_SLOT_OFFSETS[1] + 200);
+        const auto repaired_path = temporary.path / "repaired-thumbnail-history.licht";
+        static_cast<void>(require_result(repair_project(damaged, repaired_path)));
+        auto repaired = require_result(ProjectReader::open(repaired_path));
+        EXPECT_EQ(require_result(repaired.read_preview()), newer_preview);
+        EXPECT_EQ(std::ranges::count_if(
+                      repaired.chunks(), [](const ChunkInfo& row) {
+                          return row.is_live() && row.key.fourcc == FOURCC_THMB;
+                      }),
+                  2);
+
+        static_cast<void>(require_result(restore_save(source, 2, source)));
+        auto source_reader = require_result(ProjectReader::open(source));
+        EXPECT_EQ(require_result(source_reader.read_preview()), selected_preview);
+        EXPECT_EQ(std::ranges::count_if(source_reader.chunks(), [](const auto& row) {
+                      return row.is_live() && row.key.fourcc == FOURCC_THMB;
+                  }),
+                  2);
+
+        const auto older_destination = temporary.path / "older-preview.licht";
+        static_cast<void>(require_result(restore_save(source, 2, older_destination)));
+        auto older = require_result(ProjectReader::open(older_destination));
+        EXPECT_FALSE(older.preview().has_value());
+        const auto* retained = older.find(FOURCC_THMB, fixed_uuid(1001));
+        ASSERT_NE(retained, nullptr);
+        EXPECT_EQ(require_result(older.read_chunk(*retained)), retained_thumbnail);
+        const auto* original = older.find(FOURCC_THMB, fixed_uuid(1000));
+        ASSERT_NE(original, nullptr);
+        EXPECT_EQ(require_result(older.read_chunk(*original)), selected_preview);
+        require_status(older.verify_all());
+
+        const auto ambiguous_repair_source =
+            temporary.path / "ambiguous-repair-thumbnail-history.licht";
+        fs::copy_file(source, ambiguous_repair_source);
+        for (const auto offset : HEAD_SLOT_OFFSETS) {
+            write_u64(ambiguous_repair_source, offset + 112, 1);
+            flip_byte(ambiguous_repair_source, offset + 200);
+        }
+        const auto ambiguous_repair_destination =
+            temporary.path / "ambiguous-repair-result.licht";
+        const auto ambiguous_repair =
+            repair_project(ambiguous_repair_source, ambiguous_repair_destination);
+        ASSERT_FALSE(ambiguous_repair);
+        EXPECT_EQ(ambiguous_repair.error().code(), lfs::ErrorCode::FailedPrecondition);
+        EXPECT_EQ(ambiguous_repair.error().user_message(),
+                  "The recovered project preview is ambiguous.");
+        EXPECT_FALSE(fs::exists(ambiguous_repair_destination));
+    }
+
+    TEST(ProjectOperations, RestoreOlderSaveWithoutPublishedPreviewLocator) {
+        TemporaryDirectory temporary;
+        const std::vector<std::byte> preview{std::byte{'p'}, std::byte{'n'}, std::byte{'g'}};
+        for (const bool in_place : {false, true}) {
+            const auto source = make_document(temporary.path / (in_place ? "in-place.licht" : "source.licht"));
+            static_cast<void>(require_result(set_project_title(source, "Selected save")));
+            const auto selected = require_result(set_project_preview(source, preview));
+            static_cast<void>(require_result(set_project_title(source, "Newer save")));
+            const auto latest = require_result(set_project_title(source, "Latest save"));
+            ASSERT_FALSE(require_result(ProjectReader::open_generation(source, selected.generation)).preview());
+
+            const auto destination = in_place ? source : temporary.path / "restored.licht";
+            const auto restored = require_result(restore_save(source, selected.generation, destination));
+            EXPECT_EQ(restored.title, "Selected save");
+            EXPECT_EQ(restored.generation, in_place ? latest.generation + 1 : 1);
+            if (in_place)
+                EXPECT_EQ(restored.project_uuid, selected.project_uuid);
+            auto reader = require_result(ProjectReader::open(destination));
+            EXPECT_FALSE(reader.preview());
+            const auto* thumbnail = reader.find(FOURCC_THMB, fixed_uuid(1000));
+            ASSERT_NE(thumbnail, nullptr);
+            EXPECT_EQ(require_result(reader.read_chunk(*thumbnail)), preview);
+            require_status(reader.verify_all());
+
+            // A normal save may generate a new thumbnail after restoration.
+            const std::vector<std::byte> updated_preview{std::byte{'n'}, std::byte{'e'}, std::byte{'w'}};
+            static_cast<void>(require_result(set_project_preview(destination, updated_preview)));
+            auto updated = require_result(ProjectReader::open(destination));
+            EXPECT_EQ(require_result(updated.read_preview()), updated_preview);
+            require_status(updated.verify_all());
+        }
     }
 
     TEST(ProjectOperations, RebindCheckpointKeepsRecoveryCopy) {
@@ -167,6 +368,107 @@ namespace {
         ASSERT_EQ(details.retained_checkpoints.size(), 1u);
         EXPECT_TRUE(details.retained_checkpoints.front().binds_scene_graph);
         EXPECT_EQ(details.retained_checkpoints.front().instance_uuid, bound_uuid);
+    }
+
+    TEST(ProjectOperations, CleanProjectPreservesCurrentStateAndResumePoint) {
+        for (const bool copy : {false, true}) {
+            TemporaryDirectory temporary;
+            const auto source = temporary.path / "source.licht";
+            const auto destination = copy ? temporary.path / "copy.licht" : source;
+            auto document = require_result(ProjectDocument::create(fixed_uuid(7000)));
+            const auto bound = fixed_uuid(7001);
+            const auto old = fixed_uuid(7002);
+            const auto node = fixed_uuid(7003);
+            require_status(document.set_checkpoint(bound, require_result(LazyChunkValue::from_owned(checkpoint_payload(20), bound))));
+            require_status(document.set_checkpoint(old, require_result(LazyChunkValue::from_owned(checkpoint_payload(10), old))));
+            require_status(document.edit_scene_graph().upsert_node(SceneNodeRecord{
+                .uuid = node,
+                .type = "splat",
+                .name = "Current training model",
+                .payload = PayloadBinding{.fourcc = "CKPT", .instance_uuid = bound, .source_kind = "checkpoint"},
+            }));
+            require_status(document.edit_scene_graph().set_training_model_uuid(node));
+            static_cast<void>(require_result(save_document(document, source)));
+            require_status(document.edit_project().dom().set("title", "Keep this title"));
+            static_cast<void>(require_result(save_document(document, source)));
+            const auto original = read_file_bytes(source);
+            const auto before = require_result(inspect_project_card(source));
+            // Existing Compact removes save history but retains old checkpoints.
+            const auto control = temporary.path / "compact-only.licht";
+            fs::copy_file(source, control);
+            static_cast<void>(require_result(compact_project_file(control)));
+            EXPECT_EQ(require_result(inspect_project_details(control)).retained_checkpoints.size(), 2u);
+            const auto cleaned = require_result(clean_project_file(source, copy ? destination : fs::path{}, before.commit_uuid));
+            EXPECT_EQ(cleaned.project_uuid == before.project_uuid, !copy);
+            auto reader = require_result(ProjectReader::open(destination));
+            require_status(reader.verify_all());
+            ASSERT_NE(reader.find(FOURCC_CKPT, bound), nullptr);
+            EXPECT_EQ(require_result(reader.read_chunk(*reader.find(FOURCC_CKPT, bound))), checkpoint_payload(20));
+            EXPECT_EQ(reader.find(FOURCC_CKPT, old), nullptr);
+            const auto details = require_result(inspect_project_details(destination));
+            EXPECT_EQ(details.save_history.size(), 1u);
+            ASSERT_EQ(details.retained_checkpoints.size(), 1u);
+            EXPECT_TRUE(details.retained_checkpoints.front().binds_scene_graph);
+            EXPECT_EQ(details.card.title, "Keep this title");
+            EXPECT_LT(fs::file_size(destination), original.size());
+            if (copy)
+                EXPECT_EQ(read_file_bytes(source), original);
+            auto reopened = require_result(ProjectDocument::open(destination));
+            require_status(reopened.edit_project().dom().set("title", "Still editable"));
+            static_cast<void>(require_result(save_document(reopened, destination)));
+        }
+    }
+
+    TEST(ProjectOperations, CleanedCopyKeepsReferencesToOriginalFolder) {
+        TemporaryDirectory temporary;
+        fs::create_directories(temporary.path / "original");
+        fs::create_directories(temporary.path / "copies");
+        const auto source = temporary.path / "original" / "source.licht";
+        const auto destination = temporary.path / "copies" / "clean.licht";
+        auto document = require_result(ProjectDocument::create(fixed_uuid(7100)));
+        ReferenceRecord reference{
+            .uuid = fixed_uuid(7101),
+            .key = "dataset.root",
+            .kind = "dataset",
+            .locator = {.preferred = "missing-dataset", .base = LocatorBase::Project},
+            .unresolved = true,
+        };
+        require_status(document.edit_references().upsert(reference));
+        static_cast<void>(require_result(save_document(document, source)));
+        const auto original = read_file_bytes(source);
+        static_cast<void>(require_result(clean_project_file(source, destination)));
+        const auto cleaned = require_result(ProjectDocument::open(destination));
+        const auto copied = require_result(cleaned.references().find(reference.uuid));
+        ASSERT_TRUE(copied);
+        EXPECT_EQ(copied->locator.base, LocatorBase::Absolute);
+        EXPECT_EQ(copied->locator.preferred, lfs::core::path_to_utf8(source.parent_path() / "missing-dataset"));
+        EXPECT_EQ(copied->fingerprint, reference.fingerprint);
+        EXPECT_TRUE(copied->unresolved);
+        EXPECT_EQ(read_file_bytes(source), original);
+    }
+
+    TEST(ProjectOperations, CleanProjectCancellationAndStalePlanLeaveOriginalUnchanged) {
+        TemporaryDirectory temporary;
+        const auto source = make_document(temporary.path / "source.licht");
+        const auto original = read_file_bytes(source);
+        const auto stale = clean_project_file(source, {}, fixed_uuid(8888));
+        ASSERT_FALSE(stale);
+        EXPECT_EQ(stale.error().code(), lfs::ErrorCode::FailedPrecondition);
+        for (const bool copy : {false, true}) {
+            bool copying = false;
+            const auto destination = copy ? temporary.path / "copy.licht" : fs::path{};
+            const auto canceled = clean_project_file(source, destination, {}, [&](float, const std::string&) { copying = true; }, [&] { return copying; });
+            ASSERT_FALSE(canceled);
+            EXPECT_EQ(canceled.error().code(), lfs::ErrorCode::Cancelled);
+            EXPECT_EQ(read_file_bytes(source), original);
+            if (copy)
+                EXPECT_FALSE(fs::exists(destination));
+        }
+        const auto collision = temporary.path / "exists.licht";
+        fs::copy_file(source, collision);
+        EXPECT_FALSE(clean_project_file(source, collision));
+        EXPECT_EQ(read_file_bytes(collision), original);
+        EXPECT_EQ(read_file_bytes(source), original);
     }
 
     TEST(ProjectOperations, ExportVisibleWriterFixtureAndRejectTruncatedRepair) {
@@ -274,6 +576,115 @@ namespace {
         EXPECT_EQ(result.error().code(), lfs::ErrorCode::Unavailable);
         EXPECT_EQ(result.error().user_message(),
                   "The project is open for writing in another LichtFeld Studio");
+    }
+
+    TEST(ProjectOperations, ClosedFilePreviewWriteDoesNotIncludeUnsavedLiveEdits) {
+        TemporaryDirectory temporary;
+        const auto path = make_document(temporary.path / "stale-preview.licht");
+        auto live = require_result(ProjectDocument::open(path));
+        require_status(live.edit_project().dom().set("marker", "unsaved"));
+        const std::vector<std::byte> preview{
+            std::byte{'p'}, std::byte{'n'}, std::byte{'g'}};
+        static_cast<void>(require_result(set_project_preview(path, preview)));
+        auto disk = require_result(ProjectDocument::open(path));
+        const auto marker = disk.project().dom().get<std::string>("marker");
+        EXPECT_TRUE(!marker.has_value() || *marker != "unsaved");
+        EXPECT_EQ(
+            require_result(require_result(ProjectReader::open(path)).read_preview()),
+            preview);
+        EXPECT_EQ(live.project().dom().get<std::string>("marker"),
+                  std::optional<std::string>{"unsaved"});
+    }
+
+    TEST(ProjectOperations, LiveDocumentThumbnailOnlyWritePreservesDirtyChapters) {
+        TemporaryDirectory temporary;
+        const auto path = make_document(temporary.path / "thumb-only.licht");
+        auto live = require_result(ProjectDocument::open(path));
+        require_status(live.edit_project().dom().set("marker", "unsaved"));
+        ASSERT_TRUE(live.dirty());
+        const std::vector<std::byte> preview{
+            std::byte{'p'}, std::byte{'n'}, std::byte{'g'}};
+        ProjectDocumentSaveOptions options;
+        options.index_compression = IndexCompression::StoredForDeterministicTests;
+        options.disk_reserve_bytes = 0;
+        options.regenerate_dataset_preview = false;
+        static_cast<void>(require_result(live.save_preview(preview, options)));
+        EXPECT_TRUE(live.dirty());
+        EXPECT_EQ(live.project().dom().get<std::string>("marker"),
+                  std::optional<std::string>{"unsaved"});
+        auto disk = require_result(ProjectDocument::open(path));
+        const auto disk_marker = disk.project().dom().get<std::string>("marker");
+        EXPECT_TRUE(!disk_marker.has_value() || *disk_marker != "unsaved");
+        EXPECT_EQ(
+            require_result(require_result(ProjectReader::open(path)).read_preview()),
+            preview);
+        static_cast<void>(require_result(live.save(path, options)));
+        auto saved = require_result(ProjectDocument::open(path));
+        const auto saved_marker = saved.project().dom().get<std::string>("marker");
+        ASSERT_TRUE(saved_marker.has_value());
+        EXPECT_EQ(*saved_marker, "unsaved");
+        EXPECT_EQ(
+            require_result(require_result(ProjectReader::open(path)).read_preview()),
+            preview);
+    }
+
+    TEST(ProjectOperations, ThumbnailPreservesUnsavedLazyPayloadsAndRemovals) {
+        TemporaryDirectory temporary;
+        const auto path = make_document(temporary.path / "thumb-payloads.licht");
+        auto live = require_result(ProjectDocument::open(path));
+        const auto removed = fixed_uuid(6101);
+        const auto changed = fixed_uuid(6102);
+        const auto added = fixed_uuid(6103);
+        const auto old_payload = checkpoint_payload(1);
+        const auto new_payload = checkpoint_payload(2);
+        for (const auto id : {removed, changed}) {
+            require_status(live.set_checkpoint(id, require_result(LazyChunkValue::from_owned(old_payload, id))));
+        }
+        static_cast<void>(require_result(save_document(live, path)));
+        ASSERT_TRUE(live.remove_checkpoint(removed));
+        for (const auto id : {changed, added}) {
+            require_status(live.set_checkpoint(id, require_result(LazyChunkValue::from_owned(new_payload, id))));
+        }
+        const std::vector<std::byte> preview{std::byte{'p'}, std::byte{'n'}, std::byte{'g'}};
+        static_cast<void>(require_result(live.save_preview(preview)));
+        ASSERT_TRUE(live.dirty());
+        EXPECT_EQ(live.find_checkpoint(removed), nullptr);
+        ASSERT_NE(live.find_checkpoint(added), nullptr);
+        auto disk = require_result(ProjectReader::open(path));
+        ASSERT_NE(disk.find(FOURCC_CKPT, removed), nullptr);
+        EXPECT_EQ(disk.find(FOURCC_CKPT, removed)->row_kind, RowKind::Live);
+        EXPECT_EQ(require_result(disk.read_chunk(*disk.find(FOURCC_CKPT, changed))), old_payload);
+        EXPECT_EQ(disk.find(FOURCC_CKPT, added), nullptr);
+        static_cast<void>(require_result(save_document(live, path)));
+        auto saved = require_result(ProjectReader::open(path));
+        EXPECT_EQ(saved.find(FOURCC_CKPT, removed)->row_kind, RowKind::Tombstone);
+        for (const auto id : {changed, added}) {
+            ASSERT_NE(saved.find(FOURCC_CKPT, id), nullptr);
+            EXPECT_EQ(require_result(saved.read_chunk(*saved.find(FOURCC_CKPT, id))), new_payload);
+        }
+        EXPECT_EQ(require_result(saved.read_preview()), preview);
+    }
+
+    TEST(ProjectOperations, LiveDocumentPreviewSaveKeepsUnsavedEdits) {
+        TemporaryDirectory temporary;
+        const auto path = make_document(temporary.path / "live-preview.licht");
+        auto live = require_result(ProjectDocument::open(path));
+        require_status(live.edit_project().dom().set("marker", "unsaved"));
+        const std::vector<std::byte> preview{
+            std::byte{'p'}, std::byte{'n'}, std::byte{'g'}};
+        ProjectDocumentSaveOptions options;
+        options.index_compression = IndexCompression::StoredForDeterministicTests;
+        options.disk_reserve_bytes = 0;
+        options.preview_png = preview;
+        options.regenerate_dataset_preview = false;
+        static_cast<void>(require_result(live.save(path, options)));
+        auto disk = require_result(ProjectDocument::open(path));
+        const auto marker = disk.project().dom().get<std::string>("marker");
+        ASSERT_TRUE(marker.has_value());
+        EXPECT_EQ(*marker, "unsaved");
+        EXPECT_EQ(
+            require_result(require_result(ProjectReader::open(path)).read_preview()),
+            preview);
     }
 
 } // namespace

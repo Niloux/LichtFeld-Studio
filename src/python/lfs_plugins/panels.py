@@ -33,7 +33,7 @@ PANEL_SPECS = {
     "new_project": _PanelSpec(
         "lfs_plugins.import_panels", "NewProjectPanel", "lfs.new_project",
         "New Project", "FLOATING", 11, "rmlui/new_project_panel.rml",
-        "CONTENT", (560, 0), update_policy="dirty",
+        "CONTENT", (560, 0), update_policy="dirty", has_poll=True,
     ),
     "resume_checkpoint": _PanelSpec(
         "lfs_plugins.import_panels", "ResumeCheckpointPanel", "lfs.resume_checkpoint",
@@ -325,6 +325,14 @@ def _build_builtin_panel_steps(lf):
     def asset_manager_panel():
         _register_lazy_panel(lf, "asset_manager")
         _register_lazy_panel(lf, "gallery_file")
+        from .project_manager_preferences import read_preferences
+
+        preferences = read_preferences()
+        # When the startup overlay is visible, native UI opens Projects only
+        # after the user dismisses it. If the overlay is disabled, preserve the
+        # same preference by opening the panel as soon as it is registered.
+        if preferences["openAtStartup"] and not lf.ui.is_startup_visible():
+            lf.ui.set_panel_enabled("lfs.asset_manager", True)
 
     def overlays():
         from .overlays import register as register_overlays

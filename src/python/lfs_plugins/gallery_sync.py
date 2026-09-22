@@ -951,11 +951,17 @@ class GallerySync:
                 self._client()
                 with self._lock:
                     job.update(completed=done, total=total)
+                    if job.get("kind") == "download" and job.get("serverProcessing"):
+                        job["serverProcessing"] = False
+                        if job["message"] == "Preparing viewing copy":
+                            job["message"] = "Downloading"
+                            self.message = job["message"]
                     self.version += 1
 
             def processing(state):
                 label = {"queued": "Waiting for the portal", "assembling": "Assembling upload",
-                    "validating": "Checking scene", "publishing": "Publishing scene"}[state["stage"]]
+                    "validating": "Checking scene", "publishing": "Publishing scene",
+                    "preparing_download": "Preparing viewing copy"}[state["stage"]]
                 with self._lock:
                     job.update(serverProcessing=True, completed=state["completed"], total=state["total"], message=label)
                     if getattr(client, 'processing_deadline', None) and job.get('processingDeadline') != client.processing_deadline:
@@ -1090,6 +1096,7 @@ class GallerySync:
                     log_stage("export_staged", path=staged_path, bytes=staged_path.stat().st_size,
                               sha256=_fingerprint(staged_path), project_id=job["project"])
                     self._save()
+                client.processing_deadline = job.get('processingDeadline')
                 if job.get("kind") == "download":
                     def download_message(message):
                         with self._lock:
@@ -1098,11 +1105,12 @@ class GallerySync:
                             self.version += 1
                     scene = client.download(job["sceneId"], job["path"], on_progress=progress, cancel=self._cancel,
                         checkpoint=job.get('checkpoint'), on_checkpoint=checkpoint, on_message=download_message,
-                        final_destination=self._download_destination(job))
+                        final_destination=self._download_destination(job), on_processing=processing)
                     self._client()
                     with self._lock:
                         self._completion = {"id": str(uuid.uuid4()), "kind": "download"}
-                        job.update(status="completed", sha256=(job.get("checkpoint") or {}).get("sha256", ""),
+                        job.update(status="completed", serverProcessing=False,
+                                   sha256=(job.get("checkpoint") or {}).get("sha256", ""),
                                    downloadProject=_project_uuid(job["path"]), result=scene,
                                    message="Downloaded. Open as a new project when ready.")
                         self.message = job["message"]
@@ -1110,7 +1118,6 @@ class GallerySync:
                               bytes=job.get("total", 0), status="completed")
                     self._save()
                     return
-                client.processing_deadline = job.get('processingDeadline')
                 if not job.get("preparation"):
                     upload_path = Path(job["path"])
                     log_stage("export_staged", path=upload_path, bytes=upload_path.stat().st_size,
@@ -1173,8 +1180,9 @@ class GallerySync:
                 action()
         self._launch(run)
 
-    def link_download(self, job_id, project_id, commit_uuid="", *, project_path=None):
+    def link_download(self, job_id, project_id, commit_uuid="", *, project_path=None, local_fields=None):
         self._client()
+        local_fields = copy.deepcopy(local_fields)
         job, bucket = self._job(job_id), self._bucket()
         if job.get("kind") != "download" or job["status"] != "completed" or job.get("retired") or job.get("cleanupPending"):
             raise ValueError("Finish downloading this scene first.")
@@ -1194,6 +1202,8 @@ class GallerySync:
                 with self._lock:
                     scene = job["result"]
                     bucket["links"][project_id] = exchange_link(scene, commit_uuid)
+                    if local_fields is not None:
+                        bucket["links"][project_id]["localFields"] = local_fields
                     if job.get("localUpdate", {}).get("backupPath"):
                         update = job["localUpdate"]
                         update.update(state="applied", appliedStamp=file_stamp(update["path"]), appliedCommit=commit_uuid,
@@ -1202,7 +1212,8 @@ class GallerySync:
                         bucket["links"][project_id]["viewingCopy"] = True
                     job["project"] = project_id
                     job["linkOperation"] = {"id": operation, "state": "ready"}
-                self._save(project_checks=((path_identity, project_id),))
+                with self._supersede_failed_local_updates(job):
+                    self._save(project_checks=((path_identity, project_id),))
             except Exception as exc:
                 log_failure("link_saved", exc, project_id=project_id, operation_id=operation)
                 with self._lock:
@@ -1783,9 +1794,32 @@ class GallerySync:
             self._save()
         self._launch_metadata(action)
 
+    @contextmanager
+    def _supersede_failed_local_updates(self, current):
+        """A successful retry clears old failures without deleting recovery files."""
+        previous = []
+        for job in self._bucket()["jobs"]:
+            update = job.get("localUpdate", {})
+            if (job is not current and not job.get("retired")
+                    and job.get("project") == current.get("project")
+                    and job.get("sceneId") == current.get("sceneId")
+                    and job.get("status") == "completed"
+                    and (update.get("state") == "failed" or update.get("interrupted"))):
+                previous.append((job, job.get("retired")))
+                job["retired"] = True
+        try:
+            yield
+        except Exception:
+            for job, retired in previous:
+                if retired is None:
+                    job.pop("retired", None)
+                else:
+                    job["retired"] = retired
+            raise
 
 
-    def finish_settings_update(self, job_id, commit_uuid, stamp, fields, *, acknowledge=True):
+
+    def finish_settings_update(self, job_id, commit_uuid, stamp, fields, *, acknowledge=True, preserve_local_content=False):
         fields = copy.deepcopy(fields)
         def action():
             bucket = self._bucket()
@@ -1805,14 +1839,17 @@ class GallerySync:
             link["localFields"] = fields
             if acknowledge:
                 link.update(metadataRevision=job["result"]["metadataRevision"],
-                            sharedFields=shared_fields(job["result"]), commitUuid=commit_uuid,
+                            sharedFields=shared_fields(job["result"]),
                             metadata=copy.deepcopy(job["result"]), exchangedAt=time.time())
+                if not preserve_local_content:
+                    link["commitUuid"] = commit_uuid
             update.update(state="applied", appliedStamp=list(stamp), appliedCommit=commit_uuid,
                           appliedIdentity=list(self.identity()), appliedLink=copy.deepcopy(link))
             job.update(message="Gallery changes applied. Recovery copy kept.")
             self.message = job["message"]
             try:
-                self._save(project_checks=((path_identity, job["project"]),))
+                with self._supersede_failed_local_updates(job):
+                    self._save(project_checks=((path_identity, job["project"]),))
             except Exception:
                 link.clear()
                 link.update(before_link)

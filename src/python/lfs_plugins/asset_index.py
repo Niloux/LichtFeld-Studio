@@ -65,6 +65,8 @@ _PROJECT_STORAGE_FIELDS = frozenset(
         "role",
         "open_state",
         "has_preview",
+        "preview_width",
+        "preview_height",
         "status",
         "iteration",
         "name_origin",
@@ -319,6 +321,7 @@ def is_supported_asset_path(path: str) -> bool:
 class Folder:
     id: str
     path: str
+    recursive: bool = True
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -327,15 +330,21 @@ class Folder:
         return directory.name or str(directory)
 
     def to_storage_dict(self) -> Dict[str, Any]:
-        return {**self.extra, "path": self.path}
+        record = {**self.extra, "path": self.path}
+        if not self.recursive:
+            record["recursive"] = False
+        return record
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        record = {
             "id": self.id,
             "name": self.name,
             "path": self.path,
             "is_default": self.id == DEFAULT_FOLDER_ID,
         }
+        if not self.recursive:
+            record["recursive"] = False
+        return record
 
 
 @dataclass
@@ -355,6 +364,8 @@ class Project:
     role: str = ""
     open_state: str = ""
     has_preview: bool = False
+    preview_width: int = 0
+    preview_height: int = 0
     iteration: Optional[int] = None
     exists: bool = False
     available: bool = False
@@ -409,6 +420,8 @@ class Project:
                     "role": self.role,
                     "open_state": self.open_state,
                     "has_preview": self.has_preview,
+                    "preview_width": self.preview_width,
+                    "preview_height": self.preview_height,
                     "status": self.status,
                     "iteration": self.iteration,
                 }
@@ -430,6 +443,8 @@ class Project:
             "role": self.role,
             "open_state": self.open_state,
             "has_preview": self.has_preview,
+            "preview_width": self.preview_width,
+            "preview_height": self.preview_height,
             "exists": self.exists,
             "available": self.available,
             "status": self.status,
@@ -667,6 +682,8 @@ class AssetIndex:
         project.role = _enum_name(inspection.role)
         project.open_state = _enum_name(inspection.open_state)
         project.has_preview = bool(inspection.has_preview)
+        project.preview_width = int(getattr(inspection, "preview_width", 0) or 0)
+        project.preview_height = int(getattr(inspection, "preview_height", 0) or 0)
         iteration = getattr(inspection, "iteration", None)
         if iteration is not None:
             try:
@@ -720,6 +737,8 @@ class AssetIndex:
         project.role = str(value["role"] or "")
         project.open_state = str(value["open_state"] or "")
         project.has_preview = bool(value["has_preview"])
+        project.preview_width = int(value.get("preview_width", 0) or 0)
+        project.preview_height = int(value.get("preview_height", 0) or 0)
         project.iteration = value.get("iteration")
         if project.iteration is not None:
             project.iteration = int(project.iteration)
@@ -754,6 +773,8 @@ class AssetIndex:
             project.role = ""
             project.open_state = ""
             project.has_preview = False
+            project.preview_width = 0
+            project.preview_height = 0
         project.fallback_preview_path = ""
         project.exists = status != "MISSING"
         project.available = False
@@ -1053,10 +1074,26 @@ class AssetIndex:
                 changed = True
 
             scope = set(str(folder_id) for folder_id in (folder_ids or []))
-            for project in self._projects.values():
+            for project_uuid, project in list(self._projects.items()):
                 if scope and project.folder_id not in scope:
                     continue
                 if project.project_uuid in observed_by_uuid:
+                    continue
+                folder = self._folders.get(project.folder_id)
+                if (
+                    folder is not None
+                    and not folder.recursive
+                    and self._path_key(Path(project.path).parent)
+                    != self._path_key(folder.path)
+                ):
+                    self._remember_identity(
+                        project.path,
+                        project.project_uuid,
+                        allow_missing=True,
+                    )
+                    self._projects.pop(project_uuid, None)
+                    self._project_by_path.pop(self._path_key(project.path), None)
+                    changed = True
                     continue
                 if _stat_identity(project.path) is None:
                     self._remember_identity(project.path, None)
@@ -1187,13 +1224,19 @@ class AssetIndex:
         normalized = False
 
         stored_default_path = ""
+        stored_default_recursive = True
         stored_default_extra: Dict[str, Any] = {}
         for folder_id, value in folders_data.items():
             if not isinstance(folder_id, str) or not isinstance(value, dict):
                 raise ValueError("Invalid Asset Manager folder record")
             folder_extra = {
-                key: item for key, item in value.items() if key != "path"
+                key: item
+                for key, item in value.items()
+                if key not in {"path", "recursive"}
             }
+            raw_recursive = value.get("recursive", True)
+            recursive = raw_recursive if isinstance(raw_recursive, bool) else True
+            normalized = normalized or not isinstance(raw_recursive, bool)
             raw_path = str(value.get("path") or "").strip()
             if not raw_path:
                 normalized = True
@@ -1202,6 +1245,7 @@ class AssetIndex:
             normalized = normalized or path != raw_path
             if folder_id == DEFAULT_FOLDER_ID:
                 stored_default_path = path
+                stored_default_recursive = recursive
                 stored_default_extra = folder_extra
                 continue
             if self._path_key(path) == self._path_key(self._default_folder_path):
@@ -1209,17 +1253,20 @@ class AssetIndex:
                 continue
             before = len(self._folders)
             added_folder = self._add_folder_record(path, preferred_id=folder_id)
+            added_folder.recursive = recursive
             added_folder.extra.update(folder_extra)
             normalized = normalized or len(self._folders) == before or path != raw_path
 
         self._ensure_default_folder()
+        self._folders[DEFAULT_FOLDER_ID].recursive = stored_default_recursive
         self._folders[DEFAULT_FOLDER_ID].extra.update(stored_default_extra)
         if (
             stored_default_path
             and self._path_key(stored_default_path)
             != self._path_key(self._default_folder_path)
         ):
-            self._add_folder_record(stored_default_path)
+            migrated_folder = self._add_folder_record(stored_default_path)
+            migrated_folder.recursive = stored_default_recursive
             normalized = True
 
         seen_paths = set()
@@ -1626,7 +1673,12 @@ class AssetIndex:
                 temp_path.unlink(missing_ok=True)
 
     @_synchronized
-    def add_folder(self, directory: str) -> Optional[Folder]:
+    def add_folder(
+        self,
+        directory: str,
+        *,
+        recursive: Optional[bool] = None,
+    ) -> Optional[Folder]:
         path = Path(_normalize_path(directory))
         if not path.is_dir():
             return None
@@ -1639,9 +1691,17 @@ class AssetIndex:
             None,
         )
         if existing is not None:
+            if recursive is None or existing.recursive == bool(recursive):
+                return existing
+            previous_state = self._snapshot_state(folder_ids=[existing.id])
+            existing.recursive = bool(recursive)
+            if not self.save():
+                self._restore_state(previous_state)
+                return None
             return existing
         previous_state = self._snapshot_state()
         folder = self._add_folder_record(str(path))
+        folder.recursive = True if recursive is None else bool(recursive)
         if not self.save():
             self._restore_state(previous_state)
             return None

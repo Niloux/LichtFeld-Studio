@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from pathlib import Path
 import copy
+import json
 import struct
 
 import pytest
@@ -1363,3 +1364,606 @@ def test_saved_legacy_visibility_does_not_mark_local_changes(gallery):
     link = dict(sceneId="scene", commitUuid="saved", contentRevision="c", metadataRevision="m",
         sharedFields=dict(fields, visibility="public"), localFields=fields)
     assert asset_sync_state({"id": "project", "commit_uuid": "saved"}, link, remote)["freshness"] == "equal"
+
+
+@pytest.mark.parametrize("has_review", [False, True])
+def test_project_layout_restore_preserves_gallery_review_visibility(gallery, monkeypatch, tmp_path, has_review):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+
+    controller, _, _ = gallery
+    module = import_module("lfs_plugins.gallery_file_panel")
+    enabled = {}
+    monkeypatch.setattr(module.lf.ui, "set_panel_enabled", lambda identifier, value: enabled.update({identifier: value}), raising=False)
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _identifier: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    panel = GalleryFilePanel()
+    if has_review:
+        panel.show(controller=controller,
+                   asset={"id": "project", "path": str(tmp_path / "project.licht"), "name": "Project"},
+                   scene=None, action="conflict", fields={}, mode="conflict")
+    review = panel._review
+    # Native project loading restores saved panel visibility before chrome.
+    enabled[panel.id] = not has_review
+    from lfs_plugins.panels import apply_panel_chrome
+    apply_panel_chrome(panel, {})
+    assert enabled[panel.id] is has_review
+    assert panel._review is review
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_failed_gallery_apply_has_a_way_to_review_again(gallery, ready):
+    from lfs_plugins.gallery_controller import asset_sync_state
+
+    project = {"id": "project", "path": "/project.licht", "commit_uuid": "local"}
+    link = {"sceneId": "remote", "commitUuid": "base", "contentRevision": "c1", "metadataRevision": "m1"}
+    remote = {"id": "remote", "contentRevision": "c1", "metadataRevision": "m2", "status": "ready" if ready else "processing"}
+    job = {"id": "failed", "project": "project", "sceneId": "remote", "kind": "download", "status": "completed",
+           "localUpdate": {"state": "failed", "backupPath": "/backup.licht"}}
+    facts = asset_sync_state(project, link, remote, [job])
+    actions = [action["id"] for action in facts["actions"]]
+    assert "open_recovery" in actions
+    assert ("resolve" in actions) is ready
+
+
+@pytest.mark.parametrize("changed_account", [False, True])
+def test_failed_settings_apply_refreshes_before_another_review(gallery, monkeypatch, changed_account):
+    controller, state, actions = gallery
+    controller._settings_pending = dict(job="failed", identity=state["identity"])
+    if changed_account:
+        state["identity"] = ("https://portal.example", "other@example.com", "second", True)
+    def fail(job, reason):
+        actions.append((job, reason))
+        controller.service.busy = True
+    controller.service.fail_local_update = fail
+    monkeypatch.setattr(controller, "_schedule_poll", lambda: None)
+    controller._fail_settings_apply(ValueError("Gallery changed"))
+    assert controller._settings_pending is None
+    assert bool(actions) is not changed_account
+    assert controller._refresh_requested is not changed_account
+    assert controller._refresh_force_requested is not changed_account
+
+
+@pytest.mark.parametrize("panel_available", [True, False])
+@pytest.mark.parametrize("local_only", [True, False])
+@pytest.mark.parametrize("content", ["mine", "gallery"])
+def test_conflict_review_controls_whether_changes_are_published(gallery, monkeypatch, tmp_path, local_only, content, panel_available):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+    controller, state, actions = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    panel_module = import_module("lfs_plugins.gallery_file_panel")
+    path = tmp_path / "project.licht"
+    path.write_bytes(b"saved project")
+    remote = scene(viewerSettings={})
+    state.update(scenes=[remote], links={"project": {"sceneId": remote["id"],
+        "commitUuid": "base", "contentRevision": "base", "metadataRevision": "base",
+        "localFields": {"title": "Local"}, "sharedFields": {"title": "Base"}}})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    controller._project_identity = lambda: ("project", str(path))
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": str(path)}, raising=False)
+    monkeypatch.setattr(module.lf, "project_is_dirty", lambda: False, raising=False)
+    monkeypatch.setattr(module, "capture_view", lambda _: {})
+    panel = GalleryFilePanel()
+    monkeypatch.setattr(panel_module.lf.ui, "get_panel_object", lambda key: panel if key == panel.id else None, raising=False)
+    monkeypatch.setattr(panel_module.lf.ui, "set_panel_enabled", lambda *_: None, raising=False)
+    monkeypatch.setattr(panel_module.lf.ui, "request_redraw", lambda: None, raising=False)
+    controller._begin_settings_apply = lambda *args, **kw: actions.append((args, kw))
+    controller.pull_asset = lambda *args: actions.append("pull")
+    asset = {"id": "project", "path": str(path), "commit_uuid": "local"}
+    details = {"title": "Local", "description": ""}
+    if not panel_available:
+        monkeypatch.setattr(panel_module.lf.ui, "get_panel_object", lambda _: None)
+        with pytest.raises(ValueError, match="review"):
+            controller.resolve_asset(asset, details)
+        assert not controller._decision_pending
+        return
+    controller.resolve_asset(asset, details)
+    for row in panel._review["groups"]:
+        row["choice"] = content if row["id"] == "content" else "gallery"
+    panel._submit(local_only=local_only)
+    assert not panel._error
+    assert panel._review is None
+    assert not controller._decision_pending
+    if content == "gallery":
+        assert actions == ["pull"]
+        assert controller._pull_overrides[3] is (not local_only)
+    else:
+        assert len(actions) == 1
+        args, kwargs = actions[0]
+        assert args[2]["title"] == remote["title"]
+        assert kwargs["publish"] is (not local_only)
+        assert kwargs["replace_content"] is (not local_only)
+
+
+def test_reopening_hidden_review_shows_it_without_losing_choices(gallery, monkeypatch):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+    module = import_module("lfs_plugins.gallery_file_panel")
+    controller, _, _ = gallery
+    enabled = []
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "set_panel_enabled", lambda key, value: enabled.append(value), raising=False)
+    monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    panel = GalleryFilePanel()
+    review = dict(controller=controller, asset={"id": "project"}, scene=scene(), action="conflict",
+                  fields={}, mode="conflict", groups=[dict(id="text", choice="mine")])
+    panel.show(**review)
+    panel._review["groups"][0]["choice"] = "gallery"
+    enabled.clear()
+    panel.show(**review)
+    assert enabled == [True]
+    assert panel._review["groups"][0]["choice"] == "gallery"
+
+
+def test_unavailable_review_panel_reports_error(gallery, monkeypatch):
+    module = import_module("lfs_plugins.gallery_file_panel")
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: None, raising=False)
+    with pytest.raises(ValueError, match="review"):
+        module.open_gallery_file_panel()
+
+
+def test_gallery_content_uses_chosen_local_environment_and_title(gallery, monkeypatch, tmp_path):
+    controller, _, actions = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path = tmp_path / "project.licht"
+    path.write_bytes(b"saved")
+    project = ("project", str(path))
+    controller._project_identity = lambda: project
+    controller.service.environment_path = lambda _: "gallery.hdr"
+    monkeypatch.setattr(module, "restore_view", lambda *a, **kw: actions.append(kw["environment_path"]))
+    monkeypatch.setattr(module.lf, "set_node_visibility", lambda *_: None, raising=False)
+    monkeypatch.setattr(module.lf, "project_save", lambda **_: True, raising=False)
+    tree = SimpleNamespace(get_node=lambda _: None, rename_node=lambda *args: actions.append(args))
+    job = {"result": {"title": "Gallery title", "viewerSettings": {}},
+           "_local_fields": {"title": "Local title", "viewerSettings": {}}, "_local_environment_path": "local.hdr"}
+    controller._apply_local_update(tree, SimpleNamespace(name="incoming", uuid="id"), job,
+                                   {"project": project, "stamp": module.file_stamp(path), "old_nodes": []})
+    assert actions == ["local.hdr", ("incoming", "Local title")]
+
+
+def test_deleted_gallery_item_with_failed_upload_does_not_offer_conflict(gallery):
+    from lfs_plugins.gallery_controller import asset_sync_state
+    project = {"id": "project", "commit_uuid": "local", "exists": True}
+    link = {"sceneId": "deleted", "remoteDeleted": True, "commitUuid": "old"}
+    job = {"id": "failed", "project": "project", "status": "conflict", "kind": "upload",
+           "metadata": {"replaceSceneId": "deleted"}}
+    facts = asset_sync_state(project, link, None, [job], checked=True)
+    assert "resolve" not in [a["id"] for a in facts["actions"]]
+    assert facts["action"] == "cancel"
+    assert asset_sync_state(project, link, None, checked=True)["action"] == "publish_again"
+
+
+def test_apply_gallery_review_can_switch_to_conflict_actions(gallery, monkeypatch):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+    module = import_module("lfs_plugins.gallery_file_panel")
+    controller, _, _ = gallery
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "set_panel_enabled", lambda *_: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    panel = GalleryFilePanel()
+    review = dict(controller=controller, asset={"id": "project"}, scene=scene(), action="conflict", fields={}, mode="conflict")
+    panel.show(**review, apply_only=True)
+    panel.show(**review, apply_only=False)
+    assert panel._review["apply_only"] is False
+
+
+@pytest.mark.parametrize("action,expected", [("apply_local", {"local_only": True}), ("cancel", "canceled")])
+def test_enter_on_conflict_action_does_not_publish(gallery, monkeypatch, action, expected):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+    from lfs_plugins.rml_keys import KI_RETURN
+    from test_asset_manager_panel import _Document
+    module = import_module("lfs_plugins.gallery_file_panel")
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    panel = GalleryFilePanel()
+    calls = []
+    panel._submit = lambda **kw: calls.append(kw)
+    panel._close = lambda _: calls.append("canceled")
+    doc = _Document()
+    panel.on_mount(doc)
+    target = SimpleNamespace(tag_name="button", get_attribute=lambda key, default="": action)
+    event = SimpleNamespace(get_parameter=lambda *args: str(KI_RETURN), target=lambda: target, stop_propagation=lambda: None)
+    doc.listeners["keydown"](event)
+    assert calls == [expected]
+
+
+def test_pull_keeps_remote_snapshot_separate_from_local_choices(gallery, monkeypatch, tmp_path):
+    controller, _, _ = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    project = ("project", str(tmp_path / "project.licht"))
+    controller._project_identity = lambda: project
+    controller._visible_splats = lambda: []
+    controller._acquire_native_use = lambda _: None
+    controller._schedule_poll = lambda: None
+    controller.service.stage_download = lambda _: "stage"
+    monkeypatch.setattr(module.lf, "is_training_active", lambda: False, raising=False)
+    monkeypatch.setattr(module.lf.ui, "get_import_state", lambda: {"active": False}, raising=False)
+    remote = scene(viewerSettings={"exposure": 0})
+    chosen = {"title": "Local title", "description": "", "viewerSettings": {"exposure": 2}}
+    controller._pull_overrides = (remote["id"], chosen, controller._identity, False, "local.hdr")
+    job = {"id": "download", "kind": "download", "status": "completed", "result": copy.deepcopy(remote)}
+    controller._begin_local_update(job, project)
+    assert controller._import_pending["result"] == remote
+    assert controller._import_pending["_local_fields"] == chosen
+    assert controller._import_pending["_local_environment_path"] == "local.hdr"
+    assert job["result"] == remote and "_local_fields" not in job
+
+
+def _english_tr(monkeypatch):
+    translations = json.loads(
+        (Path(__file__).resolve().parents[2] / "src/visualizer/gui/resources/locales/en.json").read_text()
+    )
+    monkeypatch.setattr(import_module("lfs_plugins.gallery_controller").lf.ui, "tr",
+                        lambda key: translations.get(key, key))
+    return translations
+
+
+def test_remote_gallery_title_change_names_the_title_field(gallery, monkeypatch):
+    from lfs_plugins.gallery_controller import asset_sync_state, conflict_groups
+    from lfs_plugins.gallery_sync import shared_fields
+    _english_tr(monkeypatch)
+
+    base = scene(viewerSettings={"exposure": 1})
+    link = dict(sceneId=base["id"], commitUuid="saved", sharedFields=shared_fields(base),
+                contentRevision=base["contentRevision"], metadataRevision=base["metadataRevision"])
+    remote = dict(base, title="Portal title", metadataRevision="title-edit")
+    facts = asset_sync_state(dict(id="project", commit_uuid="saved", exists=True), link, remote)
+    local = dict(shared_fields(base))
+    groups = conflict_groups({"id": "project", "commit_uuid": "saved"}, link, local, remote, apply_only=True)
+
+    assert facts["state"] == "remote"
+    assert facts["action"] == "apply"
+    assert [row["id"] for row in groups] == ["text"]
+    assert "My scene" in groups[0]["mine_value"] and "Portal title" in groups[0]["gallery_value"]
+    assert facts["change_fields"] == ["Title"]
+    assert "View settings" not in facts["change_fields"]
+    assert "Scene content" not in facts["change_fields"]
+    assert "Portal title" in facts["change_detail"]
+
+
+def test_remote_gallery_description_and_view_changes_name_those_fields(gallery, monkeypatch):
+    from lfs_plugins.gallery_controller import asset_sync_state
+    from lfs_plugins.gallery_sync import shared_fields
+    _english_tr(monkeypatch)
+
+    base = scene(viewerSettings={"exposure": 1, "cameraPath": {"keyframes": [{"t": 0}]}})
+    link = dict(sceneId=base["id"], commitUuid="saved", sharedFields=shared_fields(base),
+                contentRevision=base["contentRevision"], metadataRevision=base["metadataRevision"])
+    described = dict(base, description="Edited on the portal", metadataRevision="description-edit")
+    viewed = dict(base, viewerSettings={"exposure": 3, "cameraPath": {"keyframes": [{"t": 0}]}},
+                  metadataRevision="view-edit")
+    tracked = dict(base, viewerSettings={"exposure": 1, "cameraPath": {"keyframes": [{"t": 0}, {"t": 1}]}},
+                   metadataRevision="track-edit")
+
+    description_facts = asset_sync_state(dict(id="project", commit_uuid="saved", exists=True), link, described)
+    view_facts = asset_sync_state(dict(id="project", commit_uuid="saved", exists=True), link, viewed)
+    track_facts = asset_sync_state(dict(id="project", commit_uuid="saved", exists=True), link, tracked)
+
+    assert description_facts["change_fields"] == ["Description"]
+    assert "Edited on the portal" in description_facts["change_detail"]
+    assert view_facts["change_fields"] == ["View settings"]
+    assert track_facts["change_fields"] == ["Camera track"]
+
+
+def test_gallery_title_review_does_not_open_the_project(gallery, monkeypatch, tmp_path):
+    from lfs_plugins.gallery_sync import shared_fields
+    from test_gallery_product_regressions import _capture_review
+
+    controller, state, _ = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path = tmp_path / "published.licht"
+    other = tmp_path / "other.licht"
+    path.write_bytes(b"published project")
+    other.write_bytes(b"another project")
+    remote = scene(viewerSettings={"exposure": 1})
+    remote.update(title="Portal title", metadataRevision="title-edit")
+    link = dict(sceneId=remote["id"], commitUuid="saved", sharedFields=shared_fields(scene(viewerSettings={"exposure": 1})),
+                contentRevision=remote["contentRevision"], metadataRevision="original")
+    state.update(scenes=[remote], links={"project": link})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": str(other)}, raising=False)
+    monkeypatch.setattr(module.lf, "project_has_path", lambda: True, raising=False)
+    monkeypatch.setattr(module.lf, "project_open",
+                        lambda *args, **kwargs: pytest.fail("Opened a project to inspect gallery changes"),
+                        raising=False)
+    monkeypatch.setattr(module, "capture_view",
+                        lambda _lf: pytest.fail("Captured a live view to inspect gallery changes"))
+    monkeypatch.setattr(import_module("lfs_plugins.training_confirm"), "confirm_discard_work_then",
+                        lambda title, callback: pytest.fail("Asked to switch projects to inspect gallery changes"))
+    reviews = _capture_review(monkeypatch)
+    asset = {"id": "project", "path": str(path), "commit_uuid": "saved"}
+
+    controller.resolve_asset(asset, {"title": "My scene", "description": ""}, apply_only=True)
+
+    assert controller._decision_pending
+    assert len(reviews) == 1
+    groups = {row["id"]: row for row in reviews[0]["groups"]}
+    assert set(groups) == {"text"}
+    assert "Portal title" in groups["text"]["gallery_value"]
+    assert reviews[0]["apply_only"] is True
+
+
+def test_applying_inspected_gallery_changes_opens_the_project(gallery, monkeypatch, tmp_path):
+    from lfs_plugins.gallery_sync import shared_fields
+    from test_gallery_product_regressions import _capture_review
+
+    controller, state, _ = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path = tmp_path / "published.licht"
+    other = tmp_path / "other.licht"
+    path.write_bytes(b"published project")
+    other.write_bytes(b"another project")
+    remote = scene(viewerSettings={})
+    remote.update(title="Portal title", metadataRevision="title-edit")
+    state.update(scenes=[remote], links={"project": dict(
+        sceneId=remote["id"], commitUuid="saved", sharedFields=shared_fields(scene()),
+        contentRevision=remote["contentRevision"], metadataRevision="original")})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": str(other)}, raising=False)
+    monkeypatch.setattr(module.lf, "project_has_path", lambda: True, raising=False)
+    opened = []
+    monkeypatch.setattr(module.lf, "project_open",
+                        lambda *args, **kwargs: opened.append(args[0]), raising=False)
+    monkeypatch.setattr(import_module("lfs_plugins.training_confirm"), "confirm_discard_work_then",
+                        lambda title, callback: callback(False))
+    reviews = _capture_review(monkeypatch)
+    asset = {"id": "project", "path": str(path), "commit_uuid": "saved"}
+    controller.resolve_asset(asset, {"title": "My scene", "description": ""}, apply_only=True)
+    assert opened == []
+
+    reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+
+    assert opened == [str(path)]
+    assert controller._open_continuation[0] == str(path)
+
+
+def _closed_title_review(gallery, monkeypatch, tmp_path):
+    from lfs_plugins.gallery_sync import shared_fields
+    from test_gallery_product_regressions import _capture_review
+
+    controller, state, actions = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path = tmp_path / "published.licht"
+    other = tmp_path / "other.licht"
+    path.write_bytes(b"published project")
+    other.write_bytes(b"another project")
+    remote = scene(viewerSettings={})
+    remote.update(title="Portal title", metadataRevision="title-edit")
+    state.update(scenes=[remote], links={"project": dict(
+        sceneId=remote["id"], commitUuid="saved", sharedFields=shared_fields(scene()),
+        contentRevision=remote["contentRevision"], metadataRevision="original")})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    current = [str(other)]
+    opened = []
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": current[0]}, raising=False)
+    monkeypatch.setattr(module.lf, "project_has_path", lambda: True, raising=False)
+    monkeypatch.setattr(module.lf, "project_open",
+                        lambda *args, **kwargs: opened.append(args[0]) or current.__setitem__(0, args[0]),
+                        raising=False)
+    monkeypatch.setattr(import_module("lfs_plugins.training_confirm"), "confirm_discard_work_then",
+                        lambda title, callback: callback(False))
+    reviews = _capture_review(monkeypatch)
+    asset = {"id": "project", "path": str(path), "commit_uuid": "saved"}
+    controller.resolve_asset(asset, {"title": "My scene", "description": ""}, apply_only=True)
+    return controller, module, path, other, opened, current, reviews, actions, asset
+
+
+def test_canceling_gallery_review_does_not_open_or_change_the_project(gallery, monkeypatch, tmp_path):
+    controller, _, path, other, opened, current, reviews, actions, _ = _closed_title_review(
+        gallery, monkeypatch, tmp_path)
+    before = path.read_bytes()
+
+    reviews[0]["on_done"](False)
+
+    assert opened == []
+    assert current == [str(other)]
+    assert controller._open_continuation is None
+    assert not controller._decision_pending
+    assert actions == []
+    assert path.read_bytes() == before
+    assert other.read_bytes() == b"another project"
+
+
+def test_delayed_apply_rejects_a_changed_file_stamp(gallery, monkeypatch, tmp_path):
+    controller, _, path, other, opened, current, reviews, actions, _ = _closed_title_review(
+        gallery, monkeypatch, tmp_path)
+    path.write_bytes(b"changed on disk during review")
+
+    with pytest.raises(ValueError, match="changed"):
+        reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+
+    assert opened == []
+    assert controller._open_continuation is None
+    assert actions == []
+    assert current == [str(other)]
+
+
+def test_delayed_apply_rejects_account_change_before_open(gallery, monkeypatch, tmp_path):
+    controller, _, _, other, opened, current, reviews, actions, _ = _closed_title_review(
+        gallery, monkeypatch, tmp_path)
+    controller._state["identity"] = ("https://portal.example", "other@example.com", "second", True)
+
+    with pytest.raises(ValueError, match="changed"):
+        reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+
+    assert opened == []
+    assert controller._open_continuation is None
+    assert actions == []
+    assert current == [str(other)]
+
+
+def test_delayed_apply_rejects_an_identity_mismatch_after_open(gallery, monkeypatch, tmp_path):
+    controller, _, path, _, opened, _, reviews, actions, _ = _closed_title_review(
+        gallery, monkeypatch, tmp_path)
+    controller._project_identity = lambda: ("other-project", str(path.resolve()))
+
+    reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+    with pytest.raises(ValueError, match="changed"):
+        controller._open_continuation[2]()
+
+    assert opened == [str(path)]
+    assert actions == []
+
+
+def test_open_project_review_rejects_a_switched_project(gallery, monkeypatch, tmp_path):
+    from lfs_plugins.gallery_sync import shared_fields
+    from test_gallery_product_regressions import _capture_review
+
+    controller, state, actions = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path = tmp_path / "published.licht"
+    other = tmp_path / "other.licht"
+    path.write_bytes(b"published project")
+    other.write_bytes(b"another project")
+    remote = scene(viewerSettings={})
+    remote.update(title="Portal title", metadataRevision="title-edit")
+    state.update(scenes=[remote], links={"project": dict(
+        sceneId=remote["id"], commitUuid="saved", sharedFields=shared_fields(scene()),
+        contentRevision=remote["contentRevision"], metadataRevision="original")})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    current = [str(path)]
+    opened = []
+    controller._project_identity = lambda: (
+        ("project", str(path.resolve())) if Path(current[0]).resolve() == path.resolve()
+        else ("other-project", str(Path(current[0]).resolve())))
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": current[0]}, raising=False)
+    monkeypatch.setattr(module.lf, "project_has_path", lambda: True, raising=False)
+    monkeypatch.setattr(module.lf, "project_is_dirty", lambda: False, raising=False)
+    monkeypatch.setattr(module.lf, "project_open",
+                        lambda *args, **kwargs: opened.append(args[0]), raising=False)
+    monkeypatch.setattr(module, "capture_view", lambda _lf: {})
+    monkeypatch.setattr(import_module("lfs_plugins.training_confirm"), "confirm_discard_work_then",
+                        lambda title, callback: pytest.fail("Reopened the reviewed project after a switch"))
+    reviews = _capture_review(monkeypatch)
+    asset = {"id": "project", "path": str(path), "commit_uuid": "saved"}
+    controller.resolve_asset(asset, {"title": "My scene", "description": ""}, apply_only=True)
+    current[0] = str(other)
+
+    with pytest.raises(ValueError, match="changed"):
+        reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+
+    assert opened == []
+    assert controller._open_continuation is None
+    assert actions == []
+    assert path.read_bytes() == b"published project"
+
+
+def test_open_project_review_still_guards_dirty_and_view(gallery, monkeypatch, tmp_path):
+    from lfs_plugins.gallery_sync import shared_fields
+    from test_gallery_product_regressions import _capture_review
+
+    controller, state, actions = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path = tmp_path / "published.licht"
+    path.write_bytes(b"published project")
+    remote = scene(viewerSettings={})
+    remote.update(title="Portal title", metadataRevision="title-edit")
+    state.update(scenes=[remote], links={"project": dict(
+        sceneId=remote["id"], commitUuid="saved", sharedFields=shared_fields(scene()),
+        contentRevision=remote["contentRevision"], metadataRevision="original")})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    controller._project_identity = lambda: ("project", str(path.resolve()))
+    dirty = [False]
+    view = [{}]
+    opened = []
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": str(path)}, raising=False)
+    monkeypatch.setattr(module.lf, "project_has_path", lambda: True, raising=False)
+    monkeypatch.setattr(module.lf, "project_is_dirty", lambda: dirty[0], raising=False)
+    monkeypatch.setattr(module.lf, "project_open",
+                        lambda *args, **kwargs: opened.append(args[0]), raising=False)
+    monkeypatch.setattr(module, "capture_view", lambda _lf: copy.deepcopy(view[0]))
+    reviews = _capture_review(monkeypatch)
+    asset = {"id": "project", "path": str(path), "commit_uuid": "saved"}
+    controller.resolve_asset(asset, {"title": "My scene", "description": ""}, apply_only=True)
+    dirty[0] = True
+    with pytest.raises(ValueError, match="changed"):
+        reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+    dirty[0] = False
+    view[0] = {"exposure": 3}
+    with pytest.raises(ValueError, match="changed"):
+        reviews[0]["on_submit"]({row["id"]: "gallery" for row in reviews[0]["groups"]})
+    assert opened == []
+    assert actions == []
+    assert path.read_bytes() == b"published project"
+
+
+@pytest.mark.parametrize("view_choice,track_choice,dirty,has_track", [
+    (None, None, False, True),
+    ("gallery", None, False, True),
+    (None, "gallery", False, True),
+    (None, "both", False, True),
+    (None, "both", False, False),
+    (None, None, True, True),
+])
+def test_closed_review_preserves_saved_local_view(
+        gallery, monkeypatch, tmp_path, view_choice, track_choice, dirty, has_track):
+    from lfs_plugins.gallery_sync import shared_fields
+    from test_gallery_product_regressions import _capture_review
+
+    controller, state, actions = gallery
+    module = import_module("lfs_plugins.gallery_controller")
+    path, other = tmp_path / "saved.licht", tmp_path / "other.licht"
+    path.write_bytes(b"locally saved view with exposure=2")
+    other.write_bytes(b"other project")
+    old_track = {"duration": 1, "keyframes": [{"time": 0, "label": "published"}]}
+    saved_track = {"duration": 2, "keyframes": [{"time": 1, "label": "saved"}]}
+    remote_track = {"duration": 3, "keyframes": [{"time": 0, "label": "gallery"}]}
+    published = scene(viewerSettings={"exposure": 1, "cameraPath": old_track})
+    remote = scene(viewerSettings={"exposure": 3 if view_choice == "gallery" else 1, "cameraPath": remote_track})
+    remote.update(title="New Gallery title", metadataRevision="new-title")
+    state.update(scenes=[remote], links={"project": dict(
+        sceneId=remote["id"], commitUuid="published-commit", sharedFields=shared_fields(published),
+        contentRevision="original", metadataRevision="original")})
+    controller._state = state
+    controller._refresh_model = lambda: None
+    controller._schedule_poll = lambda: None
+    current = [str(other)]
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": current[0]}, raising=False)
+    monkeypatch.setattr(module.lf, "project_has_path", lambda: True, raising=False)
+    monkeypatch.setattr(module.lf, "project_is_dirty", lambda: False, raising=False)
+    monkeypatch.setattr(module.lf, "project_open",
+                        lambda p, *a, **kw: current.__setitem__(0, p), raising=False)
+    def capture_opened_view(_lf):
+        assert current[0] == str(path), "The previous project's view must not be captured"
+        return dict(exposure=2, **({"cameraPath": copy.deepcopy(saved_track)} if has_track else {}))
+    monkeypatch.setattr(module, "capture_view", capture_opened_view)
+    monkeypatch.setattr(import_module("lfs_plugins.training_confirm"), "confirm_discard_work_then",
+                        lambda title, cb: cb(False))
+    controller._resolve_pending_uploads = lambda project, scene, identity, cb: cb()
+    controller._begin_settings_apply = lambda asset, scene, metadata, **kw: actions.append(metadata)
+    reviews = _capture_review(monkeypatch)
+    controller.resolve_asset({"id": "project", "path": str(path), "commit_uuid": "new-local-save"},
+                             {"title": published["title"], "description": published["description"]}, apply_only=True)
+    assert current == [str(other)]
+    decisions = {"text": "gallery"}
+    if view_choice:
+        decisions["view"] = view_choice
+    if track_choice:
+        decisions["track"] = track_choice
+    reviews[0]["on_submit"](decisions)
+    assert actions == []
+    monkeypatch.setattr(module.lf, "project_is_dirty", lambda: dirty, raising=False)
+    if dirty or (track_choice == "both" and not has_track):
+        with pytest.raises(ValueError, match="changed"):
+            controller._open_continuation[2]()
+        assert actions == []
+        return
+    controller._open_continuation[2]()
+    assert len(actions) == 1
+    assert actions[0]["title"] == "New Gallery title"
+    assert actions[0]["viewerSettings"]["exposure"] == (3 if view_choice == "gallery" else 2)
+    expected_track = remote_track if track_choice == "gallery" else saved_track
+    if track_choice == "both":
+        expected_track = {"duration": 5, "keyframes": [
+            {"time": 1, "label": "saved"}, {"time": 2, "label": "gallery"}]}
+    assert actions[0]["viewerSettings"]["cameraPath"] == expected_track

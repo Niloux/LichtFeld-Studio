@@ -216,6 +216,8 @@ namespace lfs::python {
             io::project::ContainerRole role = io::project::ContainerRole::Master;
             io::project::OpenState open_state = io::project::OpenState::HardFail;
             bool has_preview = false;
+            std::uint32_t preview_width = 0;
+            std::uint32_t preview_height = 0;
             std::string fallback_preview_path;
         };
 
@@ -498,6 +500,8 @@ namespace lfs::python {
             .def_ro("role", &PyProjectInspection::role)
             .def_ro("open_state", &PyProjectInspection::open_state)
             .def_ro("has_preview", &PyProjectInspection::has_preview)
+            .def_ro("preview_width", &PyProjectInspection::preview_width)
+            .def_ro("preview_height", &PyProjectInspection::preview_height)
             .def_ro("fallback_preview_path", &PyProjectInspection::fallback_preview_path);
 
         nb::class_<project::OpenClassification>(m, "ProjectOpenClassification")
@@ -536,6 +540,8 @@ namespace lfs::python {
             .def_ro("validation_scope", &project::ProjectInspectorCard::validation_scope)
             .def_ro("has_preview", &project::ProjectInspectorCard::has_preview)
             .def_ro("preview_bytes", &project::ProjectInspectorCard::preview_bytes)
+            .def_ro("preview_width", &project::ProjectInspectorCard::preview_width)
+            .def_ro("preview_height", &project::ProjectInspectorCard::preview_height)
             .def_ro("title", &project::ProjectInspectorCard::title)
             .def_ro("min_reader_version", &project::ProjectInspectorCard::min_reader_version)
             .def_ro("min_safe_writer_version", &project::ProjectInspectorCard::min_safe_writer_version)
@@ -822,6 +828,15 @@ namespace lfs::python {
             }
             return unwrap(std::move(*result)); }, nb::arg("path"), nb::arg("progress") = nb::none(), nb::arg("cancel") = nb::none());
 
+        m.def("clean_project_file", [](const std::filesystem::path& path, const std::filesystem::path& destination, const std::string& expected_commit, nb::object progress, nb::object cancel) {
+            const auto expected = expected_commit.empty() ? lfs::core::Uuid{} : parse_reference_uuid(expected_commit);
+            PyProgressCallback progress_callback{std::move(progress)};
+            PyCancelCallback cancel_callback{std::move(cancel)};
+            nb::gil_scoped_release release;
+            return unwrap(project::clean_project_file(path, destination, expected,
+                progress_callback.callback && !progress_callback.callback.is_none() ? project::ProjectOperationProgress(progress_callback) : project::ProjectOperationProgress{},
+                cancel_callback.callback && !cancel_callback.callback.is_none() ? project::ProjectOperationCancel(cancel_callback) : project::ProjectOperationCancel{})); }, nb::arg("path"), nb::arg("destination") = "", nb::arg("expected_commit") = "", nb::arg("progress") = nb::none(), nb::arg("cancel") = nb::none());
+
         m.def("plan_reduce_size", [](const std::filesystem::path& path) {
             std::optional<lfs::Result<project::ProjectReducePlan>> result;
             {
@@ -951,6 +966,33 @@ namespace lfs::python {
             }
             return unwrap(std::move(*result)); }, nb::arg("path"), nb::arg("png_bytes"));
 
+        m.def("encode_preview_from_image_file", [](const std::filesystem::path& image_path) {
+            std::optional<lfs::Result<std::vector<std::byte>>> result;
+            {
+                nb::gil_scoped_release release;
+                result = project::encode_preview_from_image_file(image_path);
+            }
+            const auto bytes = unwrap(std::move(*result));
+            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()); }, nb::arg("image_path"));
+
+        m.def("encode_preview_from_first_dataset_image", [](const std::filesystem::path& path) {
+            std::optional<lfs::Result<std::vector<std::byte>>> result;
+            {
+                nb::gil_scoped_release release;
+                result = project::encode_preview_from_first_dataset_image(path);
+            }
+            const auto bytes = unwrap(std::move(*result));
+            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()); }, nb::arg("path"));
+
+        m.def("encode_preview_from_first_embedded_image", [](const std::filesystem::path& path) {
+            std::optional<lfs::Result<std::vector<std::byte>>> result;
+            {
+                nb::gil_scoped_release release;
+                result = project::encode_preview_from_first_embedded_image(path);
+            }
+            const auto bytes = unwrap(std::move(*result));
+            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()); }, nb::arg("path"));
+
         m.def("inspect_project_thumbnail_sources", [](const std::filesystem::path& path) {
             std::optional<lfs::Result<project::ProjectThumbnailSourceAvailability>> result;
             {
@@ -1014,6 +1056,8 @@ namespace lfs::python {
                 options.allow_unsupported_inspection = true;
                 std::optional<lfs::Result<project::ProjectReader>> opened;
                 std::string fallback_preview_path;
+                std::uint32_t preview_width = 0;
+                std::uint32_t preview_height = 0;
                 {
                     nb::gil_scoped_release release;
                     opened = project::ProjectReader::open(path, options);
@@ -1053,6 +1097,29 @@ namespace lfs::python {
                             }
                         }
                     }
+                    if (opened && opened->has_value()) {
+                        std::tie(preview_width, preview_height) =
+                            project::project_preview_dimensions(**opened);
+                        if ((preview_width == 0 || preview_height == 0) &&
+                            !fallback_preview_path.empty()) {
+                            try {
+                                const auto info = lfs::core::get_image_info(
+                                    lfs::core::utf8_to_path(fallback_preview_path));
+                                const int width = std::get<0>(info);
+                                const int height = std::get<1>(info);
+                                preview_width = width > 0
+                                                    ? static_cast<std::uint32_t>(width)
+                                                    : 0;
+                                preview_height = height > 0
+                                                     ? static_cast<std::uint32_t>(height)
+                                                     : 0;
+                            } catch (...) {
+                                // LFS-CENSUS-OK(empty-catch): optional preview metadata must not make project inspection fail.
+                                preview_width = 0;
+                                preview_height = 0;
+                            }
+                        }
+                    }
                 }
                 auto reader = unwrap(std::move(*opened));
                 return PyProjectInspection{
@@ -1066,6 +1133,8 @@ namespace lfs::python {
                     .role = reader.superblock().role,
                     .open_state = reader.open_state(),
                     .has_preview = reader.preview().has_value(),
+                    .preview_width = preview_width,
+                    .preview_height = preview_height,
                     .fallback_preview_path = std::move(fallback_preview_path),
                 };
             },

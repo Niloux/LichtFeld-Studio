@@ -49,6 +49,7 @@ set(TENSOR_SOURCES
         nn/ops.cpp
         nn/activation_arena.cpp
         nn/weight_file.cpp
+        nn/weight_file_open.cpp
         nn/models/lpips.cpp
 )
 

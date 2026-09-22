@@ -170,10 +170,17 @@ class _DirectoryScanCache:
                 mtime_ns = raw_entry.get("mtime_ns")
                 dirs = raw_entry.get("dirs")
                 licht = raw_entry.get("licht")
+                recursive = raw_entry.get("recursive")
+                if recursive is None:
+                    # Entries written before scan depth became part of the
+                    # cache contract cannot reveal how they were produced.
+                    self._changed = True
+                    continue
                 if (
                     not isinstance(mtime_ns, int)
                     or not isinstance(dirs, list)
                     or not isinstance(licht, list)
+                    or not isinstance(recursive, bool)
                     or not all(isinstance(name, str) and Path(name).name == name for name in dirs)
                     or not all(isinstance(name, str) and Path(name).name == name for name in licht)
                 ):
@@ -182,6 +189,7 @@ class _DirectoryScanCache:
                     "mtime_ns": int(mtime_ns),
                     "dirs": list(dirs),
                     "licht": list(licht),
+                    "recursive": recursive,
                 }
             self._entries = entries
         except FileNotFoundError:
@@ -190,14 +198,24 @@ class _DirectoryScanCache:
             self._entries = {}
             _log.warning("Ignoring invalid Asset Manager scan cache %s: %s", self._path, exc)
 
-    def trusted(self, directory: str, mtime_ns: int) -> dict[str, Any] | None:
+    def trusted(
+        self,
+        directory: str,
+        mtime_ns: int,
+        *,
+        recursive: bool,
+    ) -> dict[str, Any] | None:
         self._load()
         key = _directory_key(directory)
         if _directory_mtime_is_recent(mtime_ns):
             self.drop(key, recursive=False)
             return None
         entry = self._entries.get(key)
-        if entry is None or entry["mtime_ns"] != int(mtime_ns):
+        if (
+            entry is None
+            or entry["mtime_ns"] != int(mtime_ns)
+            or entry["recursive"] is not recursive
+        ):
             return None
         return entry
 
@@ -219,7 +237,15 @@ class _DirectoryScanCache:
         if removed:
             self._changed = True
 
-    def replace(self, directory: str, mtime_ns: int, dirs: list[str], licht: list[str]) -> None:
+    def replace(
+        self,
+        directory: str,
+        mtime_ns: int,
+        dirs: list[str],
+        licht: list[str],
+        *,
+        recursive: bool,
+    ) -> None:
         self._load()
         key = _directory_key(directory)
         previous = self._entries.get(key)
@@ -231,7 +257,12 @@ class _DirectoryScanCache:
         if _directory_mtime_is_recent(mtime_ns):
             self.drop(key, recursive=False)
             return
-        entry = {"mtime_ns": int(mtime_ns), "dirs": list(dirs), "licht": list(licht)}
+        entry = {
+            "mtime_ns": int(mtime_ns),
+            "dirs": list(dirs),
+            "licht": list(licht),
+            "recursive": recursive,
+        }
         if previous != entry:
             self._entries[key] = entry
             self._changed = True
@@ -350,7 +381,11 @@ def iter_licht_projects(
                 "Asset folder %s is very large (>10000 directories); consider a smaller folder",
                 root,
             )
-        cached = cache.trusted(current_text, int(stat.st_mtime_ns))
+        cached = cache.trusted(
+            current_text,
+            int(stat.st_mtime_ns),
+            recursive=recursive,
+        )
         if cached is not None:
             for name in cached["licht"]:
                 if cancel_event is not None and cancel_event.is_set():
@@ -418,6 +453,7 @@ def iter_licht_projects(
             int(stat.st_mtime_ns),
             [path.name for path in kept_directories],
             licht_names,
+            recursive=recursive,
         )
         pending.extend(reversed(kept_directories))
 
@@ -450,14 +486,12 @@ def scan_asset_folder(
             )
             was_cancelled = cancel_event is not None and cancel_event.is_set()
             added, already, failed, _ = _commit_registration_batch(
-                index, [(path, folder_id) for path in discovered], None
+                index, [(path, folder_id) for path in discovered], cancel_event,
+                folder_ids={folder_id}, save=True,
             )
             was_cancelled = was_cancelled or (
                 cancel_event is not None and cancel_event.is_set()
             )
-            if added and not index.save():
-                failed += added
-                added = 0
             return AssetFolderScanResult(
                 discovered=len(discovered), added=added, already_cataloged=already,
                 failed=failed, cancelled=was_cancelled,
@@ -484,7 +518,7 @@ def scan_all_asset_folders(
     progress: AssetFolderScanProgress | None = None,
 ) -> AssetFolderScanResult:
     """Scan every real folder, assigning projects to the most-specific root."""
-    roots: list[tuple[Path, str]] = []
+    roots: list[tuple[Path, str, bool]] = []
     seen_roots = set()
     for folder_id, folder in (getattr(index, "folders", {}) or {}).items():
         directory = str(folder.get("path") or "").strip()
@@ -499,7 +533,7 @@ def scan_all_asset_folders(
         if key in seen_roots:
             continue
         seen_roots.add(key)
-        roots.append((root, folder_id))
+        roots.append((root, folder_id, folder.get("recursive", True) is not False))
 
     roots.sort(
         key=lambda item: (
@@ -513,13 +547,14 @@ def scan_all_asset_folders(
 
     def _iter_all() -> Iterator[tuple[str, str]]:
         seen_paths: set[str] = set()
-        for root, assigned_folder_id in roots:
+        for root, assigned_folder_id, recursive in roots:
             if cancel_event is not None and cancel_event.is_set():
                 return
             if progress is not None:
                 progress.report(current_root=str(root))
             for path in iter_licht_projects(
-                str(root), cancel_event, progress, scan_cache=cache
+                str(root), cancel_event, progress,
+                scan_cache=cache, recursive=recursive,
             ):
                 path_key = os.path.normcase(path)
                 if path_key in seen_paths:
@@ -529,17 +564,20 @@ def scan_all_asset_folders(
 
     if cancel_event is not None and cancel_event.is_set():
         return AssetFolderScanResult(cancelled=True)
+    if not roots:
+        return AssetFolderScanResult()
     try:
         if callable(getattr(index, "reconcile_observations", None)):
             discovered = list(_iter_all())
             was_cancelled = cancel_event is not None and cancel_event.is_set()
-            added, already, failed, _ = _commit_registration_batch(index, discovered, None)
+            added, already, failed, _ = _commit_registration_batch(
+                index, discovered, cancel_event,
+                folder_ids={folder_id for _root, folder_id, _recursive in roots},
+                save=True,
+            )
             was_cancelled = was_cancelled or (
                 cancel_event is not None and cancel_event.is_set()
             )
-            if added and not index.save():
-                failed += added
-                added = 0
             return AssetFolderScanResult(
                 discovered=len(discovered), added=added, already_cataloged=already,
                 failed=failed, cancelled=was_cancelled,
@@ -732,9 +770,12 @@ def _commit_registration_batch(
     index: Any,
     batch: list[tuple[str, str]],
     cancel_event: threading.Event | None,
+    *,
+    folder_ids: set[str] | None = None,
+    save: bool = False,
 ) -> tuple[int, int, int, bool]:
     """Commit one discovered batch. Cancel drops this batch if it is not committed."""
-    if not batch:
+    if not batch and folder_ids is None:
         return 0, 0, 0, False
     if cancel_event is not None and cancel_event.is_set():
         return 0, 0, 0, True
@@ -815,8 +856,8 @@ def _commit_registration_batch(
         ]
         result = reconcile(
             observations,
-            folder_ids={folder_id for _path, folder_id in batch},
-            save=False,
+            folder_ids=folder_ids if folder_ids is not None else {folder_id for _path, folder_id in batch},
+            save=save,
         )
         return (
             int(result.get("added", 0)),

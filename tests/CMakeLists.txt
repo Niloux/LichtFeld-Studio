@@ -23,13 +23,62 @@ if(BUILD_LOCALIZATION_TESTS)
         USES_TERMINAL
     )
     message(STATUS "Registered headless localization contract tests (no LibTorch)")
-    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS)
         return()
     endif()
 endif()
 
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
+
+# =============================================================================
+# CPU-only visualizer tests (no LibTorch)
+# =============================================================================
+if(BUILD_VISUALIZER_TESTS)
+    # The focused menu-bar suite exercises no GPU code. Windows CI installs
+    # the CUDA toolkit but has no display driver, so defer loading nvcuda.dll
+    # until a driver API is actually called. Normal application builds retain
+    # their existing eager driver dependency.
+    if(MSVC)
+        target_link_options(lfs_core PRIVATE "/DELAYLOAD:nvcuda.dll")
+        target_link_libraries(lfs_core PRIVATE delayimp)
+        target_link_options(lfs_visualizer PRIVATE "/DELAYLOAD:nvcuda.dll")
+        target_link_libraries(lfs_visualizer PRIVATE delayimp)
+    endif()
+
+    set(LICHTFELD_VISUALIZER_TEST_SOURCES
+        test_menu_bar_title.cpp
+        test_panel_layout_render_demand.cpp
+        test_preferences_migration.cpp
+    )
+    add_executable(lichtfeld_visualizer_tests EXCLUDE_FROM_ALL
+        ${LICHTFELD_VISUALIZER_TEST_SOURCES}
+    )
+    target_compile_features(lichtfeld_visualizer_tests PRIVATE cxx_std_23)
+    target_include_directories(lichtfeld_visualizer_tests PRIVATE
+        $<TARGET_PROPERTY:lfs_visualizer,INCLUDE_DIRECTORIES>
+    )
+    target_compile_definitions(lichtfeld_visualizer_tests PRIVATE
+        PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}"
+    )
+    target_link_libraries(lichtfeld_visualizer_tests PRIVATE
+        lfs_visualizer
+        lfs_core
+        lfs_python_runtime
+        GTest::gtest_main
+    )
+    add_test(
+        NAME lichtfeld_visualizer_tests
+        COMMAND lichtfeld_visualizer_tests
+    )
+    set_tests_properties(lichtfeld_visualizer_tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        TIMEOUT 30
+    )
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_PANEL_LAYOUT_TESTS)
+        return()
+    endif()
+endif()
 
 if(BUILD_PANEL_LAYOUT_TESTS)
     add_executable(panel_layout_tests EXCLUDE_FROM_ALL
@@ -45,19 +94,34 @@ if(BUILD_PANEL_LAYOUT_TESTS)
         $<TARGET_PROPERTY:${PROJECT_NAME},LINK_LIBRARIES>
         GTest::gtest_main
     )
-    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY)
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_VISUALIZER_TESTS)
         return()
     endif()
 endif()
 
 # =============================================================================
-# Unicode Path Test Only (no CUDA dependencies)
+# Unicode Path Test Only (no CUDA runtime linkage)
 # =============================================================================
 if(BUILD_UNICODE_TEST_ONLY)
-    # Standalone Unicode path test without CUDA
+    # Standalone Unicode path tests without CUDA runtime linkage
     add_executable(unicode_path_test
         test_unicode_paths_windows.cpp
+        test_project_save_as_paths.cpp
+        test_weight_file_paths.cpp
+        test_crash_handler.cpp
+        test_converter_output_paths.cpp
+        test_converter_overwrite.cpp
+        licht_format_test_runtime.cpp
+        ${CMAKE_SOURCE_DIR}/src/app/converter_output_paths.cpp
+        ${CMAKE_SOURCE_DIR}/src/app/converter_overwrite.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/crash_handler.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/error.cpp
         ${CMAKE_SOURCE_DIR}/src/core/environment.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/failure_report.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/mapped_file.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/memory_domain.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/nn/weight_file_open.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/user_paths.cpp
         ${CMAKE_SOURCE_DIR}/src/io/stb_image_impl.cpp
     )
 
@@ -68,14 +132,20 @@ if(BUILD_UNICODE_TEST_ONLY)
         ${CMAKE_SOURCE_DIR}/src/core/include
         ${CMAKE_SOURCE_DIR}/src/io/include
         ${CMAKE_SOURCE_DIR}/external
+        ${CUDAToolkit_INCLUDE_DIRS}
     )
 
     target_link_libraries(unicode_path_test PRIVATE
         GTest::gtest
         GTest::gtest_main
+        nlohmann_json::nlohmann_json
     )
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+       CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+        target_link_libraries(unicode_path_test PRIVATE stdc++exp)
+    endif()
     target_compile_definitions(unicode_path_test PRIVATE
-        LFS_CORE_EXPORTS
+        LFS_STATIC_BUILD
         LFS_UNICODE_TEST_STANDALONE)
 
     # C++23 standard
@@ -102,9 +172,9 @@ if(BUILD_UNICODE_TEST_ONLY)
         PROPERTIES TIMEOUT 30
     )
 
-    message(STATUS "Building standalone Unicode path test (no CUDA)")
-    if(NOT BUILD_TESTS)
-        return()  # Skip LibTorch-dependent tests when only Unicode coverage was requested.
+    message(STATUS "Building standalone Unicode path tests (no CUDA runtime linkage)")
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS)
+        return()  # Skip the remaining targets when only standalone coverage was requested.
     endif()
 endif()
 
@@ -368,6 +438,8 @@ set(TEST_FILES
     test_provenance.cpp
     test_converter_usd.cpp
     test_converter_licht.cpp
+    test_converter_output_paths.cpp
+    test_converter_overwrite.cpp
     test_usd_format.cpp
     test_nurec_usdz_format.cpp
     test_unicode_paths_windows.cpp
@@ -457,6 +529,7 @@ set(TEST_FILES
     test_extended_unary_ops_vs_torch.cpp
     test_scene_validity.cpp
     test_training_scene_init_concurrency.cpp
+    test_training_init_centering.cpp
     test_scene_consolidation.cpp
     test_scene_graph_fuzz.cpp
     test_uuid.cpp
@@ -467,7 +540,6 @@ set(TEST_FILES
     test_rendering_refactor_services.cpp
     test_point_cloud_raster_orientation.cpp
     test_theme_registry.cpp
-    test_preferences_migration.cpp
     test_viewport.cpp
     test_input_controller_focus.cpp
     test_input_controller_dataset_load.cpp
@@ -500,6 +572,7 @@ set(TEST_FILES
     test_modal_registry_regression.cpp
     test_tensor_nn_ops.cpp
     test_nn_ops.cpp
+    test_weight_file_paths.cpp
     test_moge2.cpp
     test_lpips.cpp
     test_ppisp_controller.cpp
@@ -538,6 +611,7 @@ set(TEST_FILES
     test_rml_im_mode_layout.cpp
     test_rml_python_listener_lifetime.cpp
     test_status_bar_fit.cpp
+    test_menu_bar_title.cpp
     test_status_bar_mining.cpp
     test_rotated_sh_correctness.cpp
     test_splat_raw_payload.cpp
@@ -561,6 +635,13 @@ set(TEST_FILES
     test_tcp_responder.cpp
     test_error_envelope.cpp
 )
+
+# Preference tests are part of the focused CPU visualizer suite when that
+# target is enabled (notably on Windows CI), and remain in the full suite on
+# configurations that do not build the focused target.
+if(NOT BUILD_VISUALIZER_TESTS)
+    list(APPEND TEST_FILES test_preferences_migration.cpp)
+endif()
 list(APPEND TEST_FILES test_vksplat_input_packer.cpp)
 list(APPEND TEST_FILES test_viewer_sh_zerocopy_triad.cpp)
 # Phase 7A: bounded-wait machine + SubmissionState + QW-6 (GPU-free).
@@ -604,6 +685,8 @@ list(APPEND TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/app/mcp_sequencer_tools.cpp
     ${CMAKE_SOURCE_DIR}/src/app/mcp_operator_schema.cpp
     ${CMAKE_SOURCE_DIR}/src/app/converter.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/converter_output_paths.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/converter_overwrite.cpp
     ${CMAKE_SOURCE_DIR}/src/python/lfs/py_params.cpp
 )
 
@@ -1054,6 +1137,15 @@ set_tests_properties(lichtfeld.cmake.vcpkg_profiles PROPERTIES
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     LABELS "fast"
     TIMEOUT 60
+)
+
+add_test(NAME lichtfeld.cmake.native_file_dialog_port
+    COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_native_file_dialog_port.cmake"
+)
+set_tests_properties(lichtfeld.cmake.native_file_dialog_port PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    LABELS "fast"
+    TIMEOUT 10
 )
 
 add_test(NAME lichtfeld.python.fast

@@ -36,9 +36,6 @@
           <button class="asset-button asset-button--text asset-sort-button" data-event-click="open_sort_menu" data-attr-title="sort_tooltip">
             <span class="asset-button-text">{{sort_label}}</span>
           </button>
-          <button class="asset-button asset-button--text asset-toolbar-view" data-event-click="open_view_menu">
-            <span class="asset-button-text">{{view_menu_label}}</span>
-          </button>
           <div class="asset-view-toggle asset-view-toggle-icons">
             <button class="asset-button asset-button--icon asset-view-button"
                     data-class-is-active="is_gallery_view"
@@ -65,6 +62,10 @@
             <span class="asset-check-gallery-icon" aria-hidden="true">&#x21BB;</span>
             <span class="asset-button-text">{{check_gallery_label}}</span>
             <span class="gallery-checked text-muted">{{gallery_checked}}</span>
+          </button>
+          <button class="asset-button asset-button--icon asset-toolbar-view" data-event-click="open_view_menu"
+                  data-tooltip="common.more" aria-label="{{view_menu_label}}">
+            <img src="../icon/more-vertical.png"/>
           </button>
           <button class="asset-button asset-button--text asset-button--primary asset-import-button"
                   data-event-click="on_import_project" data-attr-title="import_project_tooltip">
@@ -151,7 +152,7 @@
         <div class="asset-resize-handle asset-resize-handle--vertical" data-resize="navigator" tabindex="0" aria-label="{{resize_navigator_label}}"></div>
 
         <div class="asset-results-stack">
-        <section id="asset-gallery">
+        <section id="asset-gallery" data-class-is-loading="catalog_loading">
           <div id="asset-results-header" class="asset-gallery-header">
             <div class="asset-gallery-header-row">
               <div class="asset-gallery-header-copy">
@@ -184,16 +185,20 @@
             <div class="gallery-empty" data-if="gallery_empty">@tr:projects.gallery.empty.published</div>
             <div class="gallery-empty" data-if="gallery_local_empty"><button class="btn btn--secondary" data-event-click="add_asset_folder">@tr:projects.action.add_folder</button></div>
           </div>
+          <div class="asset-catalog-loading" data-if="catalog_loading" role="status">
+            <span class="asset-loading-label">@tr:status.loading</span>
+            <div class="asset-loading-track"><span class="asset-loading-fill"></span></div>
+          </div>
           <div class="asset-list-header" data-if="is_list_view"
                data-class-is-wide="asset_list_wide"
                data-class-show-folder="asset_list_show_folder"
                data-class-gallery-compact="asset_list_gallery_compact">
             <span class="asset-list-thumb asset-list-header-spacer" aria-hidden="true"></span>
             <span class="asset-col asset-col-name"><button class="asset-button asset-button--text asset-button--toolbar24 asset-list-sort" data-event-click="sort_list_column('name')" data-attr-title="col_name_label"><span class="asset-list-header-label">{{col_name_label}}</span></button><span class="asset-list-column-handle" data-resize="list-column:name"></span></span>
-            <span class="asset-col asset-col-gallery" data-style-width="asset_list_gallery_width"><button class="asset-button asset-button--text asset-button--toolbar24 asset-list-sort" data-event-click="sort_list_column('gallery')" data-attr-title="col_gallery_label"><span class="asset-list-header-label">{{col_gallery_label}}</span><img class="asset-list-header-gallery-icon" src="../icon/gallery-cloud.png"/></button><span class="asset-list-column-handle" data-resize="list-column:gallery"></span></span>
             <span class="asset-col asset-col-size" data-class-hidden="!asset_list_show_size" data-style-width="asset_list_size_width"><button class="asset-button asset-button--text asset-button--toolbar24 asset-list-sort" data-event-click="sort_list_column('size')" data-attr-title="col_size_label"><span class="asset-list-header-label">{{col_size_label}}</span></button><span class="asset-list-column-handle" data-resize="list-column:size"></span></span>
             <span class="asset-col asset-col-modified" data-class-hidden="!asset_list_wide" data-style-width="asset_list_modified_width"><button class="asset-button asset-button--text asset-button--toolbar24 asset-list-sort" data-event-click="sort_list_column('modified')" data-attr-title="col_modified_label"><span class="asset-list-header-label">{{col_modified_label}}</span></button><span class="asset-list-column-handle" data-resize="list-column:modified"></span></span>
             <span class="asset-col asset-col-folder" data-class-hidden="!asset_list_show_folder" data-style-width="asset_list_folder_width"><button class="asset-button asset-button--text asset-button--toolbar24 asset-list-sort" data-event-click="sort_list_column('folder')" data-attr-title="col_folder_label"><span class="asset-list-header-label">{{col_folder_label}}</span></button><span class="asset-list-column-handle" data-resize="list-column:folder"></span></span>
+            <span class="asset-col asset-col-gallery" data-style-width="asset_list_gallery_width"><button class="asset-button asset-button--text asset-button--toolbar24 asset-list-sort" data-event-click="sort_list_column('gallery')" data-attr-title="col_gallery_label"><span class="asset-list-header-label">{{col_gallery_label}}</span><img class="asset-list-header-gallery-icon" src="../icon/gallery-cloud.png"/></button><span class="asset-list-column-handle" data-resize="list-column:gallery"></span></span>
             <span class="asset-list-menu-spacer" aria-hidden="true"></span>
           </div>
 
@@ -252,14 +257,13 @@
                         <span class="asset-list-primary" data-attr-title="asset.display_name">{{asset.display_name}}</span>
                         <span class="asset-list-secondary text-muted" data-attr-title="asset.gallery_tooltip">{{asset.gallery_label}}</span>
                       </span>
-                      <span class="asset-col asset-col-gallery" data-style-width="asset_list_gallery_width" data-attr-title="asset.gallery_tooltip">
-                        <img class="gallery-list-icon" data-if="asset.gallery_has_badge" data-attr-src="asset.gallery_icon"
-                             data-attr-class="'gallery-list-icon ' + asset.gallery_tone"/>
-                        <span data-if="!asset.has_problem" data-attr-title="asset.gallery_tooltip">{{asset.gallery_label}}</span><span data-if="asset.has_problem" data-attr-title="asset.health_label">{{asset.health_label}}</span>
-                      </span>
                       <span class="asset-col asset-col-size" data-class-hidden="!asset_list_show_size" data-style-width="asset_list_size_width" data-attr-title="asset.size_label">{{asset.size_label}}</span>
                       <span class="asset-col asset-col-modified" data-class-hidden="!asset_list_wide" data-style-width="asset_list_modified_width" data-attr-title="asset.saved_label">{{asset.saved_label}}</span>
                       <span class="asset-col asset-col-folder" data-class-hidden="!asset_list_show_folder" data-style-width="asset_list_folder_width" data-attr-title="asset.folder_name">{{asset.folder_name}}</span>
+                      <span class="asset-col asset-col-gallery" data-style-width="asset_list_gallery_width" data-attr-title="asset.gallery_tooltip">
+                        <img class="gallery-list-icon" data-attr-src="asset.gallery_icon"
+                             data-attr-class="'gallery-list-icon ' + asset.gallery_tone"/>
+                      </span>
                       <button class="asset-button asset-button--small-icon asset-list-menu" data-attr-data-asset-id="asset.id"
                               data-asset-action="menu" data-tooltip="common.more" aria-label="{{view_menu_label}}">
                         <img src="../icon/more-vertical.png"/>
@@ -278,9 +282,9 @@
 
         <div class="asset-resize-handle asset-resize-handle--vertical inspector-resize-handle" data-resize="inspector"
              tabindex="0" aria-label="{{resize_inspector_label}}"></div>
+        <div class="asset-resize-handle asset-resize-handle--horizontal" data-class-dragging="bottom_panel_resize_dragging" data-resize="inspector-height"
+             tabindex="0" aria-label="{{resize_inspector_height_label}}"><span class="asset-resize-handle-line" aria-hidden="true"></span></div>
         <aside id="asset-inspector" class="asset-inspector" data-style-width="inspector_style_width" data-style-height="inspector_style_height">
-          <div class="asset-resize-handle asset-resize-handle--horizontal" data-resize="inspector-height"
-               tabindex="0" aria-label="{{resize_inspector_height_label}}"></div>
           <div id="asset-inspector-content" class="asset-inspector-content">
             <div class="asset-info-empty" data-if="show_selection_none"><span class="asset-info-empty-text">{{select_item_hint}}</span></div>
             <div class="asset-info-empty inspector-multi" data-if="show_selection_multiple">

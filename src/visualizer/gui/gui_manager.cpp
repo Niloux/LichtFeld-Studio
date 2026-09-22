@@ -4555,6 +4555,10 @@ namespace lfs::vis::gui {
         lfs::python::set_rml_manager(&rmlui_manager_);
         initDevResourceHotReload();
 
+        startup_overlay_.setUserDismissCallback([] {
+            if (UserPreferences::instance().openProjectManagerAtStartup())
+                PanelRegistry::instance().set_panel_enabled("lfs.asset_manager", true);
+        });
         startup_overlay_.init(&rmlui_manager_);
         const bool startup_overlay_enabled = viewer_->options_.show_startup_overlay;
         if (!startup_overlay_enabled) {
@@ -6037,6 +6041,9 @@ namespace lfs::vis::gui {
         if (menu_bar_) {
             LOG_TIMER_THRESHOLD("gui_render.panel_setup.menu_bar", 0.25);
             menu_bar_->render();
+
+            const auto project_display = viewer_->projectGetDisplayInfo();
+            rml_menu_bar_.updateProjectDisplay(project_display);
 
             const auto menu_entries_version = menu_bar_->menuEntriesVersion();
             const auto menu_language_generation = app_store().language_generation.get();
