@@ -871,7 +871,8 @@ namespace lfs::vis {
                                                     const std::string& name_hint,
                                                     const bool is_visible,
                                                     lfs::io::LoadResult load_result,
-                                                    const bool replace_scene) {
+                                                    const bool replace_scene,
+                                                    const bool defer_import_license) {
         LOG_TIMER("SceneManager::attachLoadedSplatFile");
         (void)is_visible;
 
@@ -1065,6 +1066,8 @@ namespace lfs::vis {
                 .voxel_size = DEFAULT_VOXEL_SIZE}
                 .emit();
 
+            if (!defer_import_license && load_result.license_bytes && import_license_callback_)
+                import_license_callback_(load_result.license_bytes);
             return attached_name;
 
         } catch (const std::exception& e) {
@@ -1135,7 +1138,8 @@ namespace lfs::vis {
                                                     const std::string& name_hint,
                                                     const bool is_visible,
                                                     lfs::io::LoadResult load_result,
-                                                    const bool preserve_raw, const core::NodeId parent) {
+                                                    const bool preserve_raw, const core::NodeId parent,
+                                                    const bool defer_import_license) {
         LOG_TIMER_TRACE("SceneManager::attachLoadedSplatNode");
 
         try {
@@ -1256,6 +1260,8 @@ namespace lfs::vis {
             }
 
             LOG_DEBUG("Added '{}' ({} gaussians)", added_name, gaussian_count);
+            if (!defer_import_license && load_result.license_bytes && import_license_callback_)
+                import_license_callback_(load_result.license_bytes);
             return added_name;
 
         } catch (const std::exception& e) {
@@ -2239,7 +2245,7 @@ namespace lfs::vis {
             }
 
             glm::vec3 vertex(int64_t i) const {
-                assert(i >= 0 && i < verts_cpu.size(0));
+                assert(i >= 0 && static_cast<uint64_t>(i) < verts_cpu.size(0));
                 const float* p = verts_cpu.ptr<float>() + i * 3;
                 return {p[0], p[1], p[2]};
             }
@@ -3558,7 +3564,7 @@ namespace lfs::vis {
             for (auto& transform : state.model_transforms) {
                 transform = rendering::dataWorldTransformToVisualizerWorld(transform);
             }
-            if (!options.metadata_only) {
+            if (!options.metadata_only && state.model_transforms.size() > 1) {
                 state.transform_indices = scene_.getTransformIndices();
             }
 
@@ -3680,6 +3686,8 @@ namespace lfs::vis {
                     info.source_type = "PLY";
                 } else if (ext == ".spz") {
                     info.source_type = "SPZ";
+                } else if (ext == ".glb") {
+                    info.source_type = "GLB";
                 } else if (ext == ".rad") {
                     info.source_type = "RAD";
                 }

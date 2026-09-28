@@ -8,6 +8,7 @@
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/number_format.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
@@ -24,7 +25,6 @@
 #include "internal/resource_paths.hpp"
 #include "io/exporter.hpp"
 #include "io/formats/colmap.hpp"
-#include "io/project_document.hpp"
 #include "project/session_state.hpp"
 #include "python/python_runtime.hpp"
 #include "python/runner.hpp"
@@ -122,6 +122,7 @@ namespace lfs::vis::gui {
         case ExportFormat::SOG: return "SOG";
         case ExportFormat::SSOG: return "SSOG";
         case ExportFormat::SPZ: return "SPZ";
+        case ExportFormat::GLB: return "GLB";
         case ExportFormat::HTML_VIEWER: return "HTML";
         case ExportFormat::USD: return "USD";
         case ExportFormat::NUREC_USDZ: return "USDZ";
@@ -1140,7 +1141,8 @@ namespace lfs::vis::gui {
                         completion.request.path,
                         completion.request.name_hint,
                         splat_load_state_.gallery ? false : completion.request.is_visible,
-                        std::move(*completion.result), splat_load_state_.gallery.has_value(), gallery_group);
+                        std::move(*completion.result), splat_load_state_.gallery.has_value(), gallery_group,
+                        splat_load_state_.gallery.has_value());
                     if (splat_load_state_.gallery) {
                         scene_manager->getScene().setNodeTransform(node_name, completion.request.transform);
                         scene_manager->getScene().setNodeVisibility(node_name, true);
@@ -1669,6 +1671,10 @@ namespace lfs::vis::gui {
                 throw std::runtime_error("The scene changed while it was being prepared.");
             const auto document =
                 viewer_->project_lifecycle_ ? viewer_->project_lifecycle_->boundDocument() : nullptr;
+            auto current_license = viewer_->projectGetLicense();
+            if (!current_license)
+                throw std::runtime_error(std::string(current_license.error().user_message()));
+            publication.published_license = *current_license;
             publication.nodes.reserve(snapshots.size());
             for (size_t i = 0; i < snapshots.size(); ++i) {
                 publication.nodes.push_back(GalleryScenePublishNode{
@@ -1980,12 +1986,14 @@ namespace lfs::vis::gui {
                             }
                             break;
                         }
+                        case ExportFormat::GLB:
                         case ExportFormat::SPZ: {
                             const lfs::io::SpzSaveOptions options{
                                 .output_path = path,
                                 .version = spz_version,
                                 .progress_callback = update_progress,
-                                .provenance = provenance};
+                                .provenance = provenance,
+                                .glb = format == ExportFormat::GLB};
                             if (auto result = lfs::io::save_spz(*splat_data, options); result) {
                                 success = true;
                             } else {
@@ -2971,7 +2979,7 @@ namespace lfs::vis::gui {
                         static_cast<float>(frame + 1) /
                             static_cast<float>(
                                 total_frames),
-                        LOCF(lichtfeld::Strings::Runtime::VIDEO_ENCODING_FRAME, frame + 1, total_frames));
+                        LOCF(lichtfeld::Strings::Runtime::VIDEO_ENCODING_FRAME, lfs::core::format_count(frame + 1), lfs::core::format_count(total_frames)));
                     publishVideoExportOverlayState();
                 }
 

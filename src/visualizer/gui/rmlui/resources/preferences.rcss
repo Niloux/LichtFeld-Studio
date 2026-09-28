@@ -50,6 +50,10 @@ body.floating-panel {
     opacity: 0.8;
 }
 
+.preferences-portal-link { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16dp; margin-top: 16dp; }
+.preferences-portal-code { display: block; margin-top: 5dp; font-size: 30dp; letter-spacing: 3dp; }
+.preferences-portal-qr { width: 180dp; height: 180dp; }
+
 .preferences-warning,
 .preferences-error {
     margin: 4dp 0 8dp 0;
@@ -364,3 +368,8 @@ body.floating-panel {
 .preferences-conflict-buttons .btn {
     min-width: 80dp;
 }
+
+.preferences-project-folder { display: flex; align-items: center; gap: 8dp; padding: 6dp 0; border-bottom-width: 1dp; }
+.preferences-project-folder-details { display: flex; flex-direction: column; flex: 1; min-width: 0; overflow: hidden; }
+.preferences-project-folder-details > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preferences-project-folder-actions { display: flex; gap: 8dp; padding: 8dp 0; }

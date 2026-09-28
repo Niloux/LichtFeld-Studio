@@ -3,16 +3,22 @@
 """Application-level appearance and language preferences."""
 
 import lichtfeld as lf
+import threading
+
+from .asset_index import AssetIndex, resolve_asset_manager_storage_path, resolve_default_asset_directory
+from .asset_watch import scan_all_asset_folders, scan_asset_folder
 
 from .keymap_bindings import KeymapBindingsSection
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
 from .types import Panel
+from .ui import PanelStateBinding, RuntimeState
 from .panels import panel_class
 from .project_manager_preferences import (
     read_preferences as read_project_manager_preferences,
     reset_preferences as reset_project_manager_preferences,
     set_preference as set_project_manager_preference,
 )
+from .portal_connection_ui import connection_action, connection_state
 
 __lfs_panel_classes__ = ["PreferencesPanel"]
 __lfs_panel_ids__ = ["lfs.preferences"]
@@ -64,6 +70,7 @@ class PreferencesPanel(Panel):
         "language",
         "project_location",
         "project_manager",
+        "project_folders",
         "gallery",
         "appearance",
         "scene_rendering",
@@ -95,10 +102,13 @@ class PreferencesPanel(Panel):
         self._mcp_safe_mode = False
         self._last_mcp_runtime_config = None
         self._project_location = ""
+        self._project_folders_index = None
+        self._project_folders_signature = None
         self._applied_project_location = ""
         self._document = None
         self._file_associations = []
         self._mount_count = 0
+        self._portal_state_binding = PanelStateBinding()
         self._scrub_fields = ScrubFieldController(
             self.SPEED_SCRUB_FIELD_DEFS,
             self._get_scrub_value,
@@ -130,7 +140,21 @@ class PreferencesPanel(Panel):
         model.bind_func("show_file_associations", self._show_file_associations)
         model.bind_func("has_file_associations", self._has_file_associations)
         model.bind_func("show_mcp", lambda: self._section == "mcp")
-        model.bind_func("show_section_reset", lambda: True)
+        model.bind_func("show_portal", lambda: self._section == "portal")
+        for name, getter in (
+            ("portal_connection_status", self._portal_connection_status),
+            ("portal_connection_since", self._portal_connection_since),
+            ("portal_user_code", self._portal_user_code),
+            ("portal_verification_qr", self._portal_verification_qr),
+            ("portal_qr_alt", lambda: lf.ui.tr("portal.preferences.qr_alt")),
+            ("portal_connect_visible", lambda: self._portal_connection_action() == "connect"),
+            ("portal_turn_on_visible", lambda: self._portal_connection_action() == "turn_on"),
+            ("portal_disconnect_visible", lambda: self._portal_connection_state() == "connected"),
+            ("portal_linking", lambda: self._portal_connection_snapshot().linking),
+            ("portal_code_visible", lambda: bool(self._portal_user_code())),
+        ):
+            model.bind_func(name, getter)
+        model.bind_func("show_section_reset", self._show_section_reset)
         model.bind_func("reset_section_label", self._reset_section_label)
         for section in self.EXPANDABLE_SECTIONS:
             model.bind_func(
@@ -186,6 +210,10 @@ class PreferencesPanel(Panel):
         model.bind("mcp_port", lambda: self._mcp_port, self._set_mcp_port)
         model.bind("project_location", lambda: self._project_location, self._set_project_location_draft)
         model.bind_func("project_location_hint", self._project_location_hint)
+        model.bind_record_list("project_folders")
+        model.bind_event("add_project_folder", self._on_add_project_folder)
+        model.bind_event("rescan_project_folders", self._on_rescan_project_folders)
+        model.bind_event("remove_project_folder", self._on_remove_project_folder)
         model.bind(
             "project_manager_default_view",
             lambda: read_project_manager_preferences()["defaultView"],
@@ -210,6 +238,7 @@ class PreferencesPanel(Panel):
         model.bind_func("mcp_safe_mode", lambda: self._mcp_safe_mode)
         model.bind_func("mcp_status", self._mcp_status_text)
         model.bind("mcp_endpoint_value", self._mcp_endpoint_text, lambda _value: None)
+        model.bind("mcp_token_value", self._mcp_token_text, lambda _value: None)
         model.bind_func("mcp_error", self._mcp_error_text)
         model.bind_func("mcp_has_error", lambda: bool(self._mcp_error_text()))
         model.bind_func("mcp_log_file", self._mcp_log_file_text)
@@ -223,6 +252,13 @@ class PreferencesPanel(Panel):
         model.bind_event("show_interface", lambda *_: self._set_section("interface"))
         model.bind_event("show_file_associations", lambda *_: self._set_section("file_associations"))
         model.bind_event("show_mcp", lambda *_: self._set_section("mcp"))
+        model.bind_event("show_portal", lambda *_: self._set_section("portal"))
+        model.bind_event("portal_connect", lambda *_: self._portal_account().start_device_flow())
+        model.bind_event("portal_turn_on", lambda *_: self._portal_account().start_device_flow())
+        model.bind_event("portal_disconnect", lambda *_: self._portal_account().disconnect_async())
+        model.bind_event("portal_cancel", lambda *_: self._portal_account().cancel_device_flow())
+        model.bind_event("portal_copy_code", self._copy_portal_code)
+        model.bind_event("portal_open", self._open_portal_verification)
         model.bind_event("set_file_association", self._on_set_file_association)
         model.bind_event("toggle_mcp_enabled", self._on_toggle_mcp_enabled)
         model.bind_event("mcp_port_change", self._on_mcp_port_change)
@@ -232,6 +268,7 @@ class PreferencesPanel(Panel):
         model.bind_event("browse_project_location", self._on_browse_project_location)
         model.bind_event("use_default_project_location", self._on_use_default_project_location)
         model.bind_event("open_mcp_log_folder", self._on_open_mcp_log_folder)
+        model.bind_event("copy_mcp_token", self._on_copy_mcp_token)
         model.bind_event("toggle_section", self._on_toggle_section)
         model.bind_event("set_theme_variant", self._set_theme_variant)
         model.bind_record_list("theme_families")
@@ -246,6 +283,7 @@ class PreferencesPanel(Panel):
         model.bind_record_list("navigation_modes")
         model.bind_record_list("file_associations")
         self._handle = model.get_handle()
+        self._portal_state_binding.set_handle(self._handle)
         self._keymap.bind(model)
         self._reload_file_associations()
 
@@ -259,10 +297,26 @@ class PreferencesPanel(Panel):
                 "click", lambda _ev: self._on_close(None, None, None)
             )
         self._document = doc
+        self._portal_state_binding.close()
+        self._portal_state_binding.watch(
+            RuntimeState.account_state,
+            dirty=(
+                "portal_connection_status",
+                "portal_connection_since",
+                "portal_user_code",
+                "portal_verification_qr",
+                "portal_connect_visible",
+                "portal_turn_on_visible",
+                "portal_disconnect_visible",
+                "portal_linking",
+                "portal_code_visible",
+            ),
+        )
         self._mount_count += 1
         self._expanded_sections = set(self.EXPANDABLE_SECTIONS)
         self._dirty_expanded_sections()
         self._rebuild_records()
+        self._refresh_project_folders()
         self._load_mcp_preferences()
         self._consume_section_request()
         self._last_state = self._state()
@@ -275,6 +329,7 @@ class PreferencesPanel(Panel):
             self._scrub_fields.mount(doc)
 
     def on_unmount(self, doc):
+        self._portal_state_binding.close()
         self._scrub_fields.unmount()
         self._keymap.on_unmount()
         self._document = None
@@ -282,6 +337,7 @@ class PreferencesPanel(Panel):
         doc.remove_data_model("preferences")
 
     def on_update(self, doc):
+        self._refresh_project_folders()
         self._consume_section_request()
         self._sync_mcp_runtime()
         self._ensure_keymap_rows_if_visible()
@@ -766,7 +822,119 @@ class PreferencesPanel(Panel):
         stored = lf.ui.get_project_location_preference()
         self._applied_project_location = stored or lf.ui.get_default_project_location()
         self._project_location = self._applied_project_location
+        if self._project_folders_index is not None:
+            self._project_folders_index.set_default_folder_path(self._applied_project_location)
+            self._project_folders_signature = None
         self._dirty_project_location()
+
+    def _project_folders_backend(self):
+        get_panel = getattr(lf.ui, "get_panel_object", None)
+        panel = get_panel("lfs.asset_manager") if callable(get_panel) else None
+        if panel is not None and getattr(panel, "_asset_index", None) is not None:
+            return panel, panel._asset_index_folders()
+        if self._project_folders_index is None:
+            path = resolve_asset_manager_storage_path()
+            path.mkdir(parents=True, exist_ok=True)
+            self._project_folders_index = AssetIndex(
+                library_path=path / "library.json",
+                default_folder_path=resolve_default_asset_directory(),
+            )
+            self._project_folders_index.load()
+        return self._project_folders_index, self._project_folders_index.folders
+
+    def _refresh_project_folders(self):
+        if not self._handle:
+            return
+        backend, folders = self._project_folders_backend()
+        signature = tuple(sorted((key, str(value.get("name")), str(value.get("path")))
+                                 for key, value in folders.items()))
+        if signature == self._project_folders_signature:
+            return
+        self._project_folders_signature = signature
+        rows = [
+            {
+                "id": key,
+                "name": str(value.get("name") or value.get("path") or key),
+                "label": str(value.get("name") or value.get("path") or key) + (
+                    f" ({lf.ui.tr('preferences.project_folders_default')})" if key == "default" else ""
+                ),
+                "path": str(value.get("path") or ""),
+                "is_default": key == "default",
+                "can_remove": key != "default",
+            }
+            for key, value in folders.items()
+        ]
+        rows.sort(key=lambda row: (row["id"] != "default", row["name"].casefold()))
+        self._handle.update_record_list("project_folders", rows)
+        self._handle.dirty("project_folders")
+
+    def _on_add_project_folder(self, _handle=None, _event=None, _args=None):
+        directory = lf.ui.open_folder_dialog(
+            lf.ui.tr("projects.dialog.select_folder"), str(resolve_default_asset_directory()))
+        if not directory:
+            return
+        folder_only = lf.ui.tr("projects.action.folder_only")
+        include_subfolders = lf.ui.tr("projects.action.include_subfolders")
+
+        def choose(button):
+            if button not in (folder_only, include_subfolders):
+                return
+            recursive = button == include_subfolders
+            backend, _folders = self._project_folders_backend()
+            if hasattr(backend, "_add_folder_from_path"):
+                backend._add_folder_from_path(str(directory), recursive=recursive)
+            else:
+                folder = backend.add_folder(str(directory), recursive=recursive)
+                if folder is not None:
+                    threading.Thread(
+                        target=scan_asset_folder,
+                        args=(backend, folder.id, str(directory)),
+                        kwargs={"recursive": recursive}, daemon=True,
+                    ).start()
+            self._refresh_project_folders()
+
+        lf.ui.confirm_dialog(
+            lf.ui.tr("projects.dialog.scan_depth"),
+            lf.ui.tr("projects.dialog.scan_depth_message"),
+            [folder_only, include_subfolders, lf.ui.tr("common.cancel")], choose,
+        )
+
+    def _on_remove_project_folder(self, _handle=None, _event=None, args=None):
+        folder_id = str((args or [""])[0])
+        backend, folders = self._project_folders_backend()
+        folder = folders.get(folder_id)
+        if folder_id == "default" or folder is None:
+            return
+        if hasattr(backend, "on_delete_folder"):
+            backend.on_delete_folder(None, None, [folder_id])
+            self._project_folders_signature = None
+            return
+        label = lf.ui.tr("projects.action.remove_folder")
+        count = sum(
+            project.get("folder_id") == folder_id
+            for project in backend.assets.values()
+        )
+
+        def confirmed(button):
+            if button == label:
+                backend.delete_folder(folder_id)
+                self._refresh_project_folders()
+        lf.ui.confirm_dialog(
+            lf.ui.tr("projects.dialog.remove_folder"),
+            lf.ui.tr("projects.dialog.remove_folder_message").format(
+                name=str(folder.get("name") or ""), count=count,
+            ),
+            [lf.ui.tr("common.cancel"), label], confirmed,
+        )
+
+    def _on_rescan_project_folders(self, _handle=None, _event=None, _args=None):
+        backend, _folders = self._project_folders_backend()
+        if hasattr(backend, "refresh_catalog"):
+            backend.refresh_catalog(scan_folders=True)
+        else:
+            threading.Thread(
+                target=scan_all_asset_folders, args=(backend,), daemon=True,
+            ).start()
 
     def _set_project_location_draft(self, value):
         self._project_location = str(value).strip()
@@ -1048,6 +1216,15 @@ class PreferencesPanel(Panel):
     def _on_open_mcp_log_folder(self, _handle, _event, _args):
         lf.ui.open_url(lf.ui.get_mcp_log_directory())
 
+    def _on_copy_mcp_token(self, _handle, _event, _args):
+        token = self._mcp_token_text()
+        if token:
+            lf.ui.set_clipboard_text(token)
+
+    def _mcp_token_text(self):
+        getter = getattr(lf.ui, "get_mcp_access_token", None)
+        return getter() if getter else ""
+
     @staticmethod
     def _coerce_bool(value):
         if isinstance(value, str):
@@ -1131,6 +1308,7 @@ class PreferencesPanel(Panel):
             "mcp_safe_mode",
             "mcp_status",
             "mcp_endpoint_value",
+            "mcp_token_value",
             "mcp_error",
             "mcp_has_error",
             "mcp_log_file",
@@ -1186,10 +1364,82 @@ class PreferencesPanel(Panel):
                 "show_file_associations",
                 "has_file_associations",
                 "show_mcp",
+                "show_portal",
                 "show_section_reset",
                 "reset_section_label",
             ):
                 self._handle.dirty(name)
+
+    @staticmethod
+    def _portal_account():
+        from .portal_account import get_portal_account_service
+        return get_portal_account_service()
+
+    def _portal_connection_snapshot(self):
+        return self._portal_account().snapshot()
+
+    def _portal_connection_state(self):
+        return connection_state(self._portal_connection_snapshot())
+
+    def _portal_connection_action(self):
+        return connection_action(self._portal_connection_state())[0]
+
+    def _show_section_reset(self):
+        return self._section != "portal"
+
+    def _portal_connection_status(self):
+        account = self._portal_connection_snapshot()
+        status = connection_state(account)
+        _action, label_key = connection_action(status)
+        if status == "connected" and account.display_name:
+            label = lf.ui.tr(label_key)
+            return label.replace("{name}", account.display_name)
+        if status == "busy":
+            return lf.ui.tr(label_key)
+        if status == "connected":
+            return lf.ui.tr("portal.status.connected")
+        return lf.ui.tr({
+            "switched_off": "portal.status.switched_off",
+            "not_connected": "portal.status.disconnected",
+        }.get(status, label_key))
+
+    def _portal_connection_since(self):
+        account = self._portal_account().snapshot()
+        if not account.signed_in or not account.connected_since:
+            return ""
+        return account.connected_since[:10]
+
+    def _portal_user_code(self):
+        return self._portal_account().snapshot().user_code
+
+    def _portal_verification_qr(self):
+        account = self._portal_account()
+        url = account.snapshot().verification_uri_complete
+        from .portal_connection_ui import qr_image_path
+        path = account.credentials_path.parent / "portal-approval-qr.png"
+        if not url:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return ""
+        from .portal_security import checked_portal_url
+        try:
+            return qr_image_path(checked_portal_url(account, url), path.parent)
+        except ValueError:
+            return ""
+
+    def _copy_portal_code(self, *_args):
+        code = self._portal_user_code()
+        if code:
+            lf.ui.set_clipboard_text(code)
+
+    def _open_portal_verification(self, *_args):
+        account = self._portal_account()
+        url = account.snapshot().verification_uri_complete
+        if url:
+            from .portal_security import checked_portal_url
+            lf.ui.open_url(checked_portal_url(account, url))
 
     def _on_toggle_section(self, _handle, _event, args):
         if not args:
@@ -1215,6 +1465,8 @@ class PreferencesPanel(Panel):
         return lf.ui.tr("preferences.reset_current_section")
 
     def _on_reset_current_section(self, _handle, _event, _args):
+        if self._section == "portal":
+            return
         reset_label = self._reset_section_label()
         section_name = lf.ui.tr(f"preferences.{self._section}")
 
@@ -1272,6 +1524,8 @@ class PreferencesPanel(Panel):
 
     def _reset_section(self, section=None):
         section = section or self._section
+        if section == "portal":
+            return None
         if section == "general":
             from .gallery_preferences import DEFAULTS, set_preference
             for key, value in DEFAULTS.items():

@@ -1994,7 +1994,19 @@ namespace lfs::vis::gui {
                         releaseSlotLocked(it->second);
                         it = entries_.erase(it);
                     }
-                    while (!pages_.empty() && pages_.back().live_slots == 0) {
+                    for (size_t page_index = 0; page_index < pages_.size();) {
+                        if (pages_[page_index].live_slots != 0) {
+                            ++page_index;
+                            continue;
+                        }
+                        const size_t last_index = pages_.size() - 1;
+                        if (page_index != last_index) {
+                            pages_[page_index] = std::move(pages_.back());
+                            for (auto& [_, entry] : entries_) {
+                                if (entry.page_index == static_cast<int>(last_index))
+                                    entry.page_index = static_cast<int>(page_index);
+                            }
+                        }
                         pages_.pop_back();
                         changed = true;
                     }
@@ -2419,43 +2431,6 @@ namespace lfs::vis::gui {
             return alpha;
         }
 
-        [[nodiscard]] glm::vec4 cameraFrustumColor(const lfs::core::Camera& camera,
-                                                   const size_t camera_index,
-                                                   const RenderSettings& settings,
-                                                   const std::span<const glm::vec3> per_camera_colors,
-                                                   const float alpha,
-                                                   const bool focused,
-                                                   const bool disabled,
-                                                   const bool emphasized) {
-            const bool has_override = camera_index < per_camera_colors.size();
-            const bool is_validation = camera.image_name().find("test") != std::string::npos;
-            glm::vec3 color = is_validation ? settings.eval_camera_color : settings.train_camera_color;
-            if (has_override) {
-                const glm::vec3 override_color = per_camera_colors[camera_index];
-                if (std::isfinite(override_color.x) &&
-                    std::isfinite(override_color.y) &&
-                    std::isfinite(override_color.z)) {
-                    color = override_color;
-                }
-            }
-
-            float final_alpha = alpha;
-            if (emphasized) {
-                color = glm::vec3(1.0f, 0.55f, 0.0f);
-                final_alpha = std::min(1.0f, final_alpha + 0.4f);
-            }
-            if (focused) {
-                color = is_validation ? glm::vec3(0.9f, 0.75f, 0.0f)
-                                      : glm::vec3(1.0f, 0.55f, 0.0f);
-                final_alpha = std::min(1.0f, final_alpha + 0.3f);
-            }
-            if (disabled) {
-                color = glm::mix(color, glm::vec3(0.5f), 0.5f);
-                final_alpha *= 0.5f;
-            }
-            return glm::vec4(color, std::clamp(final_alpha, 0.0f, 1.0f));
-        }
-
         [[nodiscard]] std::optional<glm::mat4> cameraFrustumModelMatrix(
             const lfs::core::Camera& camera,
             const glm::mat4& visualizer_camera_to_world,
@@ -2611,9 +2586,9 @@ namespace lfs::vis::gui {
             std::uint64_t hash = 0;
             const glm::mat3 rotation = viewport.getRotationMatrix();
             const glm::vec3 translation = viewport.getTranslation();
-            for (size_t i = 0; i < 9; ++i)
+            for (int i = 0; i < 9; ++i)
                 hashCombine(hash, hashQuantizedFloat(rotation[i / 3][i % 3], 1.0e-6f));
-            for (size_t i = 0; i < 3; ++i)
+            for (int i = 0; i < 3; ++i)
                 hashCombine(hash, hashQuantizedFloat(translation[i], 1.0e-6f));
             return hash;
         }
@@ -2626,7 +2601,7 @@ namespace lfs::vis::gui {
             hashCombine(hash, settings.orthographic);
             hashCombine(hash, settings.equirectangular);
             hashCombine(hash, hashFloat(settings.ortho_scale));
-            for (size_t i = 0; i < 3; ++i) {
+            for (int i = 0; i < 3; ++i) {
                 hashCombine(hash, hashFloat(settings.train_camera_color[i]));
                 hashCombine(hash, hashFloat(settings.eval_camera_color[i]));
             }
@@ -2800,39 +2775,19 @@ namespace lfs::vis::gui {
                 thumbnail_cache.pruneTo(scene_camera_uids);
             }
 
-            const bool priority_changed =
-                camera_data_changed || !cache.valid ||
-                cache.key.selected_set_generation != selection_generation;
+            const bool priority_changed = camera_data_changed || !cache.valid ||
+                                          cache.key.selected_set_generation != selection_generation;
+            std::unordered_set<int> selected_uids;
+            for (const auto& name : scene_manager.getSelectedNodeNames()) {
+                const auto* node = scene.getNode(name);
+                if (node && node->type == lfs::core::NodeType::CAMERA && node->camera_uid >= 0)
+                    selected_uids.insert(node->camera_uid);
+            }
             if (priority_changed) {
-                const auto visible_uids = services().guiOrNull()
-                                              ? services().guiOrNull()->visibleCameraUids()
-                                              : std::unordered_set<int>{};
-                std::unordered_set<int> selected_uids;
-                for (const auto& name : scene_manager.getSelectedNodeNames()) {
-                    const auto* node = scene.getNode(name);
-                    if (node && node->type == lfs::core::NodeType::CAMERA && node->camera_uid >= 0)
-                        selected_uids.insert(node->camera_uid);
-                }
                 if (cache.emphasized_cameras.size() != cache.uids.size())
                     cache.emphasized_cameras.resize(cache.uids.size(), 0);
                 for (size_t i = 0; i < cache.uids.size(); ++i)
                     cache.emphasized_cameras[i] = selected_uids.contains(cache.uids[i]);
-                const std::vector<int> visible_uid_list(visible_uids.begin(), visible_uids.end());
-                const std::vector<int> selected_uid_list(selected_uids.begin(), selected_uids.end());
-                const auto thumbnail_order = cameraThumbnailRequestOrder(
-                    cache.all_uid_list, visible_uid_list, selected_uid_list);
-                std::unordered_map<int, std::shared_ptr<const lfs::core::Camera>> cameras_by_uid;
-                cameras_by_uid.reserve(cache.cameras.size());
-                for (const auto& camera : cache.cameras) {
-                    if (camera && camera->uid() >= 0)
-                        cameras_by_uid.emplace(camera->uid(), camera);
-                }
-                for (const int uid : thumbnail_order) {
-                    const auto camera_it = cameras_by_uid.find(uid);
-                    if (camera_it != cameras_by_uid.end() && camera_it->second->has_image())
-                        thumbnail_cache.request(*camera_it->second);
-                }
-                thumbnail_cache.reprioritize(thumbnail_order);
             }
             thumbnail_cache.processReadyUploads();
             if (thumbnail_cache.hasReadyUploads()) {
@@ -3180,6 +3135,37 @@ namespace lfs::vis::gui {
 
             if (geometry_changed || loss_changed || atlas_changed)
                 ++cache.data->generation;
+            if (geometry_changed || priority_changed) {
+                std::unordered_set<int> needed_uids = selected_uids;
+                std::vector<int> drawable_uids;
+                drawable_uids.reserve(cache.uids.size());
+                for (size_t projected_index = 0; projected_index < cache.projected_visible.size(); ++projected_index) {
+                    if (cache.projected_visible[projected_index]) {
+                        const int uid = cache.uids[projected_index % cache.uids.size()];
+                        if (uid >= 0) {
+                            needed_uids.insert(uid);
+                            drawable_uids.push_back(uid);
+                        }
+                    }
+                }
+                thumbnail_cache.pruneTo(needed_uids);
+                const std::vector<int> selected_uid_list(selected_uids.begin(), selected_uids.end());
+                const std::vector<int> needed_uid_list(needed_uids.begin(), needed_uids.end());
+                const auto thumbnail_order = cameraThumbnailRequestOrder(
+                    needed_uid_list, drawable_uids, selected_uid_list);
+                std::unordered_map<int, std::shared_ptr<const lfs::core::Camera>> cameras_by_uid;
+                cameras_by_uid.reserve(cache.cameras.size());
+                for (const auto& camera : cache.cameras) {
+                    if (camera && camera->uid() >= 0)
+                        cameras_by_uid.emplace(camera->uid(), camera);
+                }
+                for (const int uid : thumbnail_order) {
+                    const auto camera_it = cameras_by_uid.find(uid);
+                    if (camera_it != cameras_by_uid.end() && camera_it->second->has_image())
+                        thumbnail_cache.request(*camera_it->second);
+                }
+                thumbnail_cache.reprioritize(thumbnail_order);
+            }
             cache.key = key;
             cache.valid = true;
             params.frustum_overlay_data = cache.data;
@@ -4555,10 +4541,6 @@ namespace lfs::vis::gui {
         lfs::python::set_rml_manager(&rmlui_manager_);
         initDevResourceHotReload();
 
-        startup_overlay_.setUserDismissCallback([] {
-            if (UserPreferences::instance().openProjectManagerAtStartup())
-                PanelRegistry::instance().set_panel_enabled("lfs.asset_manager", true);
-        });
         startup_overlay_.init(&rmlui_manager_);
         const bool startup_overlay_enabled = viewer_->options_.show_startup_overlay;
         if (!startup_overlay_enabled) {
@@ -4579,20 +4561,14 @@ namespace lfs::vis::gui {
             if (focus_panel_name_ == id)
                 focus_panel_name_.clear();
         };
-        rml_right_panel_.on_splitter_delta = [this](float delta_y) {
+        rml_right_panel_.on_splitter_height = [this](float height, float panel_height) {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
-            int ww = 0;
-            int wh = 0;
-            SDL_GetWindowSize(viewer_->getWindow(), &ww, &wh);
-            ScreenState ss;
-            ss.work_pos = {0.0f, 0.0f};
-            ss.work_size = {static_cast<float>(ww), static_cast<float>(wh)};
-            panel_layout_.adjustScenePanelRatio(delta_y, ss);
+            panel_layout_.setScenePanelHeight(height, panel_height);
         };
         rml_right_panel_.on_splitter_end = [this]() {
             viewer_->getRenderingManager()->setViewportResizeActive(false);
         };
-        rml_right_panel_.on_resize_delta = [this](float dx) {
+        rml_right_panel_.on_resize_width = [this](float width) {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
             int ww = 0;
             int wh = 0;
@@ -4600,7 +4576,7 @@ namespace lfs::vis::gui {
             ScreenState ss;
             ss.work_pos = {0.0f, 0.0f};
             ss.work_size = {static_cast<float>(ww), static_cast<float>(wh)};
-            panel_layout_.applyResizeDelta(dx, ss);
+            panel_layout_.setRightPanelWidth(width, ss);
         };
         rml_right_panel_.on_resize_end = [this]() {
             viewer_->getRenderingManager()->setViewportResizeActive(false);
@@ -5239,10 +5215,6 @@ namespace lfs::vis::gui {
         reg_panel("native.pie_menu", "Pie Menu",
                   make_panel(PieMenuPanel(&gizmo_manager_)),
                   PanelSpace::ViewportOverlay, 950);
-
-        reg_panel("native.startup_overlay", "Startup Overlay",
-                  make_panel(StartupOverlayPanel(&startup_overlay_, &drag_drop_hovering_)),
-                  PanelSpace::ViewportOverlay, 0);
     }
 
     VulkanViewportPassParams GuiManager::buildVulkanViewportParams(const VkExtent2D extent,
@@ -5945,18 +5917,36 @@ namespace lfs::vis::gui {
         bool modal_overlay_pending = false;
         bool context_menu_open = false;
         bool startup_overlay_blocking = startup_overlay_.blocksUnderlayInput();
+        bool startup_overlay_blocks_pointer = false;
         bool block_underlay_input = startup_overlay_blocking;
         {
             LOG_TIMER_THRESHOLD("gui_render.panel_setup.frame_state", 0.25);
+            rmlui_manager_.serviceEmojiFont();
             rmlui_manager_.beginFrameCursorTracking();
             modal_overlay_open = rml_modal_overlay_->isOpen();
             modal_overlay_pending = rml_modal_overlay_->hasPendingRequest();
             context_menu_open = global_context_menu_ && global_context_menu_->isOpen();
+            if ((modal_overlay_open || modal_overlay_pending) && startup_overlay_.isVisible()) {
+                startup_overlay_.dismiss();
+                startup_overlay_blocking = false;
+            }
+            startup_overlay_blocks_pointer =
+                startup_overlay_.blocksPointerInput(sdl_input.mouse_x, sdl_input.mouse_y);
+            if (startup_overlay_blocks_pointer &&
+                (hasMouseButtonClicked(sdl_input) || hasMouseButtonDown(sdl_input))) {
+                startup_overlay_pointer_capture_active_ = true;
+            }
+            startup_overlay_blocks_pointer =
+                startup_overlay_blocks_pointer || startup_overlay_pointer_capture_active_;
+            if (startup_overlay_pointer_capture_active_ && !hasMouseButtonDown(sdl_input))
+                startup_overlay_pointer_capture_active_ = false;
             block_underlay_input = block_underlay_input || modal_overlay_open || modal_overlay_pending || context_menu_open;
             if (block_underlay_input) {
                 auto& focus = guiFocusState();
                 focus.want_capture_mouse = true;
                 focus.want_capture_keyboard = true;
+            } else if (startup_overlay_blocks_pointer) {
+                guiFocusState().want_capture_mouse = true;
             }
 
             const bool escape_pressed =
@@ -6021,8 +6011,8 @@ namespace lfs::vis::gui {
             localized_rml_language_generation_ = language_generation;
             ui_layout_settle_frames_ = std::max<uint8_t>(ui_layout_settle_frames_, 3);
             if (rmlui_manager_.refreshLocalizedDocuments()) {
-                if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
-                    rendering->markDirty(DirtyFlag::OVERLAY);
+                if (auto* const overlay_rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
+                    overlay_rendering->markDirty(DirtyFlag::OVERLAY);
             }
         }
 
@@ -6076,6 +6066,8 @@ namespace lfs::vis::gui {
             menu_input.screen_h = sdl_input.window_h;
             if (block_underlay_input)
                 menu_input = maskInputForBlockedUi(std::move(menu_input));
+            else if (startup_overlay_blocks_pointer)
+                menu_input = maskPointerInputForUnderlay(std::move(menu_input));
 
             if (block_underlay_input && rml_menu_bar_.isOpen())
                 rml_menu_bar_.closeDropdown();
@@ -6120,7 +6112,7 @@ namespace lfs::vis::gui {
                 startup_overlay_input = maskInputForBlockedUi(std::move(startup_overlay_input));
             if (startup_overlay_blocking)
                 frame_input = maskInputForBlockedUi(std::move(frame_input));
-            else if (menu_blocks_underlay_pointer)
+            else if (startup_overlay_blocks_pointer || menu_blocks_underlay_pointer)
                 frame_input = maskPointerInputForUnderlay(std::move(frame_input));
             updateInputOverrides(frame_input, mouse_in_viewport);
             if (auto* const wm = viewer_->getWindowManager()) {
@@ -6365,8 +6357,7 @@ namespace lfs::vis::gui {
             const float splitter_h = PanelLayoutManager::SPLITTER_H * current_ui_scale_;
             const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * current_ui_scale_;
             const float avail_h = ph - 16.0f;
-            const float scene_h = std::max(80.0f * current_ui_scale_,
-                                           avail_h * panel_layout_.getScenePanelRatio() - splitter_h * 0.5f);
+            const float scene_h = panel_layout_.scenePanelHeight(avail_h, current_ui_scale_);
 
             RightPanelLayout rp_layout;
             rp_layout.pos = glm::vec2(screen.work_pos.x + screen.work_size.x - rpw, screen.work_pos.y);
@@ -6381,7 +6372,7 @@ namespace lfs::vis::gui {
                             rp_layout.pos, rp_layout.size);
             const bool pointer_over_right_panel_edge =
                 panel_input.mouse_x >= rp_layout.pos.x - right_panel_edge_grab_w &&
-                panel_input.mouse_x <= rp_layout.pos.x + right_panel_edge_grab_w &&
+                panel_input.mouse_x < rp_layout.pos.x + right_panel_edge_grab_w &&
                 panel_input.mouse_y >= rp_layout.pos.y &&
                 panel_input.mouse_y < rp_layout.pos.y + rp_layout.size.y;
             const bool float_blocks_rp = has_floating_panels &&
@@ -6390,7 +6381,8 @@ namespace lfs::vis::gui {
             // the resize edge, rather than starting panel hover or resize UI.
             const bool viewport_pointer_captured =
                 hasMouseButtonDown(sdl_input) && window_manager &&
-                window_manager->inputRouter().state().pointer_capture == input::InputTarget::Viewport;
+                window_manager->inputRouter().state().pointer_capture == input::InputTarget::Viewport &&
+                !(panel_input.mouse_clicked[0] && pointer_over_right_panel_edge);
             right_panel_resize_edge_was_hovered_ = !float_blocks_rp && !viewport_pointer_captured &&
                                                    pointer_over_right_panel_edge;
             constexpr float RIGHT_PANEL_PAD = 8.0f;
@@ -6410,7 +6402,8 @@ namespace lfs::vis::gui {
                             glm::vec2{content_x, tab_content_y},
                             glm::vec2{content_w, tab_content_h});
 
-            if (float_blocks_rp || viewport_pointer_captured) {
+            if ((float_blocks_rp || viewport_pointer_captured) &&
+                !rml_right_panel_.isResizeInteractionActive()) {
                 PanelInputState masked_input = panel_input;
                 masked_input.mouse_x = -1.0e9f;
                 masked_input.mouse_y = -1.0e9f;
@@ -6532,9 +6525,6 @@ namespace lfs::vis::gui {
         const float bottom_dock_w = bottom_dock_layout.width;
         const float bottom_dock_y =
             screen.work_pos.y + screen.work_size.y - bottom_dock_h;
-        const float bottom_dock_edge_grab_h =
-            std::max(PanelLayoutManager::SPLITTER_H * current_ui_scale_,
-                     8.0f * current_ui_scale_);
         const float bottom_dock_grip_h = PanelLayoutManager::DOCK_GRIP_H * current_ui_scale_;
         const bool pointer_over_bottom_dock =
             panel_layout_.isBottomDockVisible() &&
@@ -6545,8 +6535,8 @@ namespace lfs::vis::gui {
             panel_layout_.isBottomDockVisible() &&
             panel_input.mouse_x >= bottom_dock_x &&
             panel_input.mouse_x < bottom_dock_x + bottom_dock_w &&
-            panel_input.mouse_y >= bottom_dock_y - bottom_dock_edge_grab_h &&
-            panel_input.mouse_y <= bottom_dock_y + bottom_dock_grip_h + 4.0f * current_ui_scale_;
+            bottomDockResizeHitZone(bottom_dock_y, current_ui_scale_, bottom_dock_grip_h)
+                .contains(panel_input.mouse_y);
         const bool pointer_targets_bottom_dock =
             pointer_over_bottom_dock || pointer_over_bottom_dock_edge;
         if (pointer_targets_bottom_dock &&
@@ -7261,6 +7251,14 @@ namespace lfs::vis::gui {
                 rml_menu_bar_.setViewportRightEdge(menu_toolbar_right_edge_ - panel_input.screen_x);
                 rml_menu_bar_.draw(panel_input.screen_w, panel_input.screen_h);
             }
+            if (startup_overlay_.isVisible()) {
+                LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render.startup_overlay", 0.25);
+                startup_overlay_.render(panel_input.screen_x,
+                                        panel_input.screen_y,
+                                        static_cast<float>(panel_input.screen_w),
+                                        static_cast<float>(panel_input.screen_h),
+                                        drag_drop_hovering_);
+            }
             if (global_context_menu_->hasPendingRenderWork()) {
                 LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render.context_menu", 0.25);
                 global_context_menu_->render(panel_input.screen_w, panel_input.screen_h,
@@ -7442,8 +7440,8 @@ namespace lfs::vis::gui {
             updateInteractiveTransitionGuard();
             if (!first_render_completed_) {
                 first_render_completed_ = true;
-                if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
-                    rendering->markDirty(DirtyFlag::OVERLAY);
+                if (auto* const overlay_rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
+                    overlay_rendering->markDirty(DirtyFlag::OVERLAY);
             }
             return presented;
         }
@@ -7934,7 +7932,7 @@ namespace lfs::vis::gui {
                               panel_layout_.getRightPanelWidth();
         const float strip_half_w =
             PanelLayoutManager::RIGHT_PANEL_RESIZE_EDGE_HALF_WIDTH * current_ui_scale_;
-        return x >= panel_x - strip_half_w && x <= panel_x + strip_half_w &&
+        return x >= panel_x - strip_half_w && x < panel_x + strip_half_w &&
                y >= last_ui_layout_work_pos_.y &&
                y < last_ui_layout_work_pos_.y + last_ui_layout_work_size_.y;
     }
@@ -8406,9 +8404,7 @@ namespace lfs::vis::gui {
         const float splitter_h = PanelLayoutManager::SPLITTER_H * dpi;
         const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * dpi;
         const float avail_h = panel_h - 2.0f * kPanelPad;
-        const float scene_h =
-            std::max(80.0f * dpi,
-                     avail_h * panel_layout_.getScenePanelRatio() - splitter_h * 0.5f);
+        const float scene_h = panel_layout_.scenePanelHeight(avail_h, dpi);
         const float content_top = kPanelPad;
         const float tab_content_y = content_top + scene_h + splitter_h + tab_bar_h;
         const float tab_content_h =

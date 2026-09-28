@@ -16,10 +16,12 @@
 #include "rendering/cuda_vulkan_interop.hpp"
 #include "rendering/rasterizer/vulkan/src/gs_renderer.h"
 #include "rendering/rendering.hpp"
+#include "vksplat_shared_scratch_install.hpp"
 #include "window/vulkan_context.hpp"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -146,7 +148,8 @@ namespace lfs::vis {
             const lfs::rendering::ViewportRenderRequest& request,
             bool force_input_upload,
             OutputSlot output_slot = OutputSlot::Main,
-            bool synchronize_input_upload = false);
+            bool synchronize_input_upload = false,
+            bool deterministic_export = false);
         [[nodiscard]] std::expected<RenderResult, std::string> rerenderSelectionOverlay(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -187,6 +190,15 @@ namespace lfs::vis {
         // training indefinitely.
         void requestArenaHandoff();
         void cancelArenaHandoff();
+        // Keeps a pending reservation alive and reports whether the next render
+        // could claim the arena without waiting.
+        [[nodiscard]] bool pollArenaHandoff();
+        // Reserves the arena and waits, holding no lock, until the next render can
+        // claim it or the timeout passes.
+        [[nodiscard]] bool waitForArenaHandoff(std::chrono::milliseconds timeout);
+        // While the camera moves during training, the viewer and training take
+        // turns on the shared scratch (see kTrainingFramesPerNavigationRender).
+        void setCameraNavigating(bool navigating);
 
         // Invoked with the completion value immediately after each live-model
         // submit, BEFORE the shared arena frame is released — the trainer's
@@ -389,7 +401,7 @@ namespace lfs::vis {
         static constexpr std::size_t kOverlayRegionCount = 7;
         static constexpr std::size_t kSelectionQueryRegionCount = 7;
         static constexpr std::size_t kRegionAlignment = 256; // VK minStorageBufferOffsetAlignment upper bound on common HW
-        struct CudaOpacityCopySlot {
+        struct CudaDeletedMaskSlot {
             std::shared_ptr<lfs::core::ExportableBlock> block;
             VulkanContext::ExternalBuffer buffer{};
             std::size_t bytes = 0;
@@ -452,7 +464,7 @@ namespace lfs::vis {
         };
 
         void detachManagedBuffers();
-        void releaseOpacityCopySlot(VulkanContext& context, std::size_t ring_slot);
+        void releaseDeletedMaskSlot(VulkanContext& context, std::size_t ring_slot);
         void logVramBreakdownIfChanged(std::string_view reason);
         [[nodiscard]] std::expected<void, std::string> ensureSharedScratchArena(
             VulkanContext& context,
@@ -692,7 +704,7 @@ namespace lfs::vis {
         bool macro_chain_warmup_pending_ = true;
 
         static constexpr std::size_t kInputRingSize = kFrameRingSize;
-        std::array<CudaOpacityCopySlot, kInputRingSize> cuda_opacity_copies_{};
+        std::array<CudaDeletedMaskSlot, kInputRingSize> cuda_deleted_mask_copies_{};
         std::array<CudaOverlaySlot, kInputRingSize> cuda_overlays_{};
         CudaSelectionQuerySlot cuda_selection_query_{};
         std::array<ModelInputSnapshot, kInputRingSize> ring_uploaded_{};
@@ -747,6 +759,7 @@ namespace lfs::vis {
 
         cudaStream_t render_stream_ = nullptr;
         std::uint64_t arena_handoff_token_ = 0;
+        bool camera_navigating_ = false;
 
         std::function<void(std::uint64_t)> live_submit_callback_;
 

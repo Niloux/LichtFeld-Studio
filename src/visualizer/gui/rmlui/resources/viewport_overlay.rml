@@ -7,6 +7,12 @@
     <div id="left-dock-resize-indicator" class="left-dock-resize-indicator hidden"></div>
     <div id="viewport-content">
     <div id="split-divider-overlay" class="viewport-split-divider hidden"></div>
+    <div id="empty-state-hint" class="empty-state-hint" data-if="show_empty_state">
+        <img class="empty-state-icon" src="../icon/archive.png" />
+        <div class="empty-state-title">{{empty_state_title}}</div>
+        <div class="empty-state-subtitle">{{empty_state_subtitle}}</div>
+        <div class="empty-state-import">{{empty_state_import_hint}}</div>
+    </div>
     <div id="project-drop-overlay" class="project-drop-overlay hidden">
         <div class="project-drop-card">
             <div id="project-drop-title" class="project-drop-title">@tr:projects.drag.open_project</div>
@@ -29,7 +35,6 @@
                          data-class-selected="button.selected"
                          data-attr-id="button.button_id"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -41,7 +46,6 @@
                          data-class-selected="button.selected"
                          data-attr-id="button.button_id"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -53,7 +57,6 @@
                          data-class-selected="button.selected"
                          data-attr-id="button.button_id"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -65,7 +68,6 @@
                          data-class-selected="button.selected"
                          data-attr-id="button.button_id"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -77,7 +79,6 @@
                          data-attr-id="button.button_id"
                          data-class-selected="button.selected"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -137,7 +138,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -152,7 +152,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -168,7 +167,6 @@
                      data-class-selected="button.selected"
                      data-class-has-label="button.label != ''"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -184,7 +182,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -196,7 +193,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -211,7 +207,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -226,7 +221,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -240,7 +234,7 @@
                      data-class-hidden="!show_crop_edit_controls"
                      data-attr-id="button.button_id"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
+                     data-keymap-mode="crop_box"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -301,7 +295,6 @@
                          data-attr-id="button.button_id"
                          data-class-selected="button.selected"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -313,7 +306,6 @@
                          data-attr-id="button.button_id"
                          data-class-selected="button.selected"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -325,7 +317,6 @@
                          data-attr-id="button.button_id"
                          data-class-selected="button.selected"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -337,7 +328,6 @@
                          data-attr-id="button.button_id"
                          data-class-selected="button.selected"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -349,7 +339,6 @@
                          data-attr-id="button.button_id"
                          data-class-selected="button.selected"
                          data-attr-data-action="button.action_id"
-                         data-attr-data-shortcut="button.shortcut_text"
                          data-attr-title="button.tooltip_text"
                          data-attrif-disabled="!button.enabled"
                          data-class-disabled="!button.enabled"
@@ -409,7 +398,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -424,7 +412,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -440,7 +427,6 @@
                      data-class-selected="button.selected"
                      data-class-has-label="button.label != ''"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -456,7 +442,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -468,7 +453,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -483,7 +467,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -498,7 +481,6 @@
                      data-attr-id="button.button_id"
                      data-class-selected="button.selected"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -512,7 +494,7 @@
                      data-class-hidden="!show_crop_edit_controls"
                      data-attr-id="button.button_id"
                      data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
+                     data-keymap-mode="crop_box"
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
@@ -630,7 +612,6 @@
                             data-attr-id="button.button_id"
                             data-class-selected="button.selected"
                             data-attr-data-action="button.action_id"
-                            data-attr-data-shortcut="button.shortcut_text"
                             data-attr-title="button.tooltip_text"
                             data-attrif-disabled="!button.enabled"
                             data-class-disabled="!button.enabled"
@@ -648,7 +629,6 @@
                             data-attr-id="button.button_id"
                             data-class-selected="button.selected"
                             data-attr-data-action="button.action_id"
-                            data-attr-data-shortcut="button.shortcut_text"
                             data-attr-title="button.tooltip_text"
                             data-attrif-disabled="!button.enabled"
                             data-class-disabled="!button.enabled"
@@ -661,6 +641,7 @@
                     <button class="icon-btn viewport-transform-action"
                             data-tooltip="tooltip.selection_depth_mode"
                             data-action="toggle_selection_depth_filter"
+                            data-keymap-mode="selection"
                             data-attr-title="selection_depth_toggle_label"
                             data-class-selected="selection_depth_mode_active"
                             data-attrif-disabled="!selection_has_scene"
@@ -670,6 +651,7 @@
                     <button class="icon-btn viewport-transform-action"
                             data-tooltip="tooltip.selection_delete"
                             data-action="delete_selected"
+                            data-keymap-mode="selection"
                             data-attr-title="selection_delete_label"
                             data-attrif-disabled="!selection_can_delete"
                             data-event-click="selection_action('delete')">
@@ -932,7 +914,6 @@
                             data-attr-id="button.button_id"
                             data-class-selected="button.selected"
                             data-attr-data-action="button.action_id"
-                            data-attr-data-shortcut="button.shortcut_text"
                             data-attr-title="button.tooltip_text"
                             data-attrif-disabled="!button.enabled"
                             data-class-disabled="!button.enabled"
@@ -949,7 +930,6 @@
                                 data-attr-id="button.button_id"
                                 data-class-selected="button.selected"
                                 data-attr-data-action="button.action_id"
-                                data-attr-data-shortcut="button.shortcut_text"
                                 data-attr-title="button.tooltip_text"
                                 data-attrif-disabled="!button.enabled"
                                 data-class-disabled="!button.enabled"
@@ -964,7 +944,6 @@
                                 data-attr-id="button.button_id"
                                 data-class-selected="button.selected"
                                 data-attr-data-action="button.action_id"
-                                data-attr-data-shortcut="button.shortcut_text"
                                 data-attr-title="button.tooltip_text"
                                 data-attrif-disabled="!button.enabled"
                                 data-class-disabled="!button.enabled"
@@ -1082,6 +1061,7 @@
             <div class="perf-hud-strip-header" data-perf-toggle-expanded="true">
                 <span class="perf-hud-strip-title">@tr:ui.perf_hud_title</span>
                 <span id="perf-hud-strip-rate" class="perf-hud-strip-rate"></span>
+                <span id="vram-hud-strip-health" class="vram-hud-health"></span>
                 <span class="perf-hud-strip-chevron" title="@tr:ui.perf_expand">⌄</span>
             </div>
             <div class="perf-hud-strip-meter" data-perf-tab="ledger" title="@tr:ui.perf_this_process">
@@ -1094,6 +1074,7 @@
                 <span id="perf-hud-vram-value" class="perf-hud-strip-value"></span>
                 <span id="perf-hud-vram-badge" class="perf-hud-strip-badge"></span>
             </div>
+            <vram-timeline id="vram-hud-mini-timeline" class="vram-hud-mini-timeline" />
             <div class="perf-hud-strip-meter" title="@tr:ui.perf_this_process">
                 <span class="perf-hud-strip-label">RAM</span>
                 <div class="perf-hud-meter-track">
@@ -1119,6 +1100,7 @@
             <div id="vram-hud-header" class="vram-hud-header">
                 <span class="vram-hud-title">@tr:ui.perf_hud_title</span>
                 <span class="vram-hud-header-meta">
+                    <span id="vram-hud-health" class="vram-hud-health"></span>
                     <span id="vram-hud-throughput" class="vram-hud-throughput hidden"></span>
                     <span id="vram-hud-iteration" class="vram-hud-iteration"></span>
                     <span class="perf-hud-card-chevron" data-perf-toggle-expanded="true" title="@tr:ui.perf_collapse">⌃</span>
@@ -1136,6 +1118,33 @@
                 <button class="perf-hud-enable-tracking" data-perf-enable-tracking="true">@tr:ui.perf_enable_tracking</button>
             </div>
             <div id="vram-hud-panel-overview" class="vram-hud-panel">
+                <div class="vram-hud-timeline-toolbar">
+                    <button data-vram-window="60">@tr:ui.vram_window_1m</button>
+                    <button data-vram-window="300">@tr:ui.vram_window_5m</button>
+                    <button data-vram-window="1800">@tr:ui.vram_window_30m</button>
+                    <button data-vram-window="0">@tr:ui.vram_window_all</button>
+                    <button data-vram-axis="true">@tr:ui.vram_axis_toggle</button>
+                    <button id="vram-hud-scale-toggle" data-vram-scale="true">@tr:ui.vram_scale_fit</button>
+                    <button data-vram-baseline="true">@tr:ui.vram_set_baseline</button>
+                    <button data-vram-export="true">@tr:ui.vram_export_csv</button>
+                    <button data-vram-opacity="true">@tr:ui.vram_opacity</button>
+                </div>
+                <div id="vram-hud-timeline-frame" class="vram-hud-timeline-frame">
+                    <vram-timeline id="vram-hud-timeline" class="vram-hud-timeline" />
+                    <div id="vram-hud-timeline-axis" class="vram-hud-timeline-axis"></div>
+                    <span id="vram-hud-timeline-capacity" class="vram-hud-timeline-capacity"></span>
+                    <div id="vram-hud-timeline-markers" class="vram-hud-timeline-markers"></div>
+                    <span id="vram-hud-crosshair" class="vram-hud-crosshair"></span>
+                </div>
+                <div id="vram-hud-timeline-x-axis" class="vram-hud-timeline-x-axis"></div>
+                <div id="vram-hud-timeline-tooltip" class="vram-hud-timeline-tooltip"></div>
+                <div id="vram-hud-timeline-legend" class="vram-hud-timeline-legend"></div>
+                <div class="vram-hud-section-title" data-vram-section="peak">@tr:ui.vram_peak_breakdown</div>
+                <div id="vram-hud-peak" class="vram-hud-peak"></div>
+                <div class="vram-hud-section-title" data-vram-section="movers">@tr:ui.vram_top_movers</div>
+                <input id="vram-hud-mover-filter" class="vram-hud-filter-input" type="text" placeholder="@tr:ui.vram_filter_movers" />
+                <div id="vram-hud-movers" class="vram-hud-movers"></div>
+                <div id="vram-hud-export-path" class="vram-hud-export-path"></div>
                 <div id="vram-hud-summary" class="vram-hud-summary"></div>
                 <div class="perf-hud-overview-meters">
                     <div class="perf-hud-sparkline-row">
@@ -1251,7 +1260,6 @@
             </div>
         </div>
         <div class="viewport-transfer-footer" data-class-hidden="!gallery_transfer_expanded">
-            <button class="btn btn--secondary" data-event-click="gallery_transfer_action('details')">{{gallery_transfer_details_label}}</button>
             <button class="btn btn--secondary" data-event-click="gallery_transfer_action('clear_finished')">{{gallery_transfer_clear_finished_label}}</button>
         </div>
         <span class="viewport-transfer-detail" data-class-status-error="gallery_transfer_message_error" data-if="gallery_transfer_message != ''">{{gallery_transfer_message}}</span>

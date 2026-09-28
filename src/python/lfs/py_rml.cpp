@@ -4,6 +4,7 @@
 
 #include "py_rml.hpp"
 #include "core/logger.hpp"
+#include "core/number_format.hpp"
 #include "python/gil.hpp"
 #include "python/python_runtime.hpp"
 
@@ -238,12 +239,15 @@ namespace lfs::python {
                    resolve_document(element) != nullptr;
         }
 
+        thread_local Rml::ElementDocument* tl_updating_document = nullptr;
+
         void mark_document_dirty(Rml::Element* element) {
             if (!element)
                 return;
             if (auto* doc = resolve_document(element)) {
                 s_dirty_documents.insert(doc);
-                request_redraw();
+                if (doc != tl_updating_document)
+                    request_redraw();
             }
         }
 
@@ -269,9 +273,11 @@ namespace lfs::python {
         }
 
         void mark_model_document_dirty(const std::string& model_name) {
-            if (auto* doc = resolve_model_document(model_name))
+            auto* const doc = resolve_model_document(model_name);
+            if (doc)
                 s_dirty_documents.insert(doc);
-            request_redraw();
+            if (!doc || doc != tl_updating_document)
+                request_redraw();
         }
 
         void request_model_document_update(const std::string& model_name) {
@@ -281,6 +287,13 @@ namespace lfs::python {
         }
 
     } // namespace
+
+    DocumentUpdateScope::DocumentUpdateScope(Rml::ElementDocument* doc)
+        : previous_(tl_updating_document) {
+        tl_updating_document = doc;
+    }
+
+    DocumentUpdateScope::~DocumentUpdateScope() { tl_updating_document = previous_; }
 
     Rml::ElementPtr extractHeldElement(Rml::ElementDocument* doc, Rml::Element* raw) {
         auto it = s_held_elements.find(doc);
@@ -1073,7 +1086,7 @@ namespace lfs::python {
                                        if (args.empty())
                                            return {};
                                        return Rml::Variant(
-                                           Rml::String(std::to_string(args[0].Get<int>())));
+                                           Rml::String(lfs::core::format_count(args[0].Get<std::int64_t>())));
                                    });
 
         ctor.RegisterTransformFunc("format_percent",

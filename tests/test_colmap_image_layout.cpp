@@ -3,11 +3,14 @@
 
 #include "core/cuda/lanczos_resize/lanczos_resize.hpp"
 #include "core/image_io.hpp"
+#include "core/image_loader.hpp"
+#include "io/cache_image_loader.hpp"
 #include "io/filesystem_utils.hpp"
 #include "io/formats/colmap.hpp"
 #include "io/loaders/blender_loader.hpp"
 #include "io/loaders/colmap_loader.hpp"
 #include "io/pipelined_image_loader.hpp"
+#include <algorithm>
 #include <cmath>
 
 #include <atomic>
@@ -172,6 +175,23 @@ namespace {
     bool has_cuda_device() {
         int device_count = 0;
         return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+    }
+
+    void install_camera_image_loader() {
+        static const bool installed = [] {
+            lfs::io::CacheLoader::getInstance(false);
+            lfs::core::set_image_loader([](const lfs::core::ImageLoadParams& p) {
+                return lfs::io::CacheLoader::getInstance().load_cached_image(
+                    p.path,
+                    {.resize_factor = p.resize_factor,
+                     .max_width = p.max_width,
+                     .cuda_stream = p.stream,
+                     .output_uint8 = p.output_uint8,
+                     .skip_blob_cache = p.skip_blob_cache});
+            });
+            return true;
+        }();
+        (void)installed;
     }
 
     struct BicyclePixels {
@@ -513,6 +533,7 @@ TEST(SidecarDimensionsContract, OriginalSizePassesForSmallerTrainingImage) {
 TEST_F(ColmapImageLayoutTest, HalfResolutionDepthAndNormalReachTrainingSize) {
     if (!has_cuda_device())
         GTEST_SKIP() << "CUDA device required";
+    install_camera_image_loader();
     const auto source = read_bicycle_pixels();
     for (const bool blender : {false, true}) {
         for (const int bits : {8, 16}) {
@@ -806,6 +827,31 @@ TEST_F(ColmapImageLayoutTest, ValidationFailsWhenDuplicateBasenameWasCollapsedIn
     EXPECT_NE(result.error().message.find("basename only"), std::string::npos);
     EXPECT_NE(result.error().message.find("Metadata contains 1 record"), std::string::npos);
     EXPECT_NE(result.error().message.find("flattened or dropped"), std::string::npos);
+}
+
+TEST_F(ColmapImageLayoutTest, RecursiveFileCacheObserverVisitsOnlyRegularFiles) {
+    const fs::path images_dir = temp_dir_ / "images";
+    const fs::path image = images_dir / "nested" / "frame_0001.png";
+    const fs::path duplicate_image = images_dir / "other" / "frame_0001.png";
+    const fs::path text_file = images_dir / "nested" / "notes.txt";
+    write_png(image);
+    write_png(duplicate_image);
+    write_text_file(text_file, "not an image");
+    fs::create_directories(images_dir / "other" / "directory.png");
+
+    std::vector<fs::path> visited;
+    lfs::io::RecursiveFileCache cache(images_dir, nullptr, [&](const fs::path& path) {
+        visited.push_back(path);
+    });
+
+    ASSERT_EQ(visited.size(), 3u);
+    EXPECT_NE(std::find(visited.begin(), visited.end(), image.lexically_relative(images_dir)),
+              visited.end());
+    EXPECT_NE(std::find(visited.begin(), visited.end(), duplicate_image.lexically_relative(images_dir)),
+              visited.end());
+    EXPECT_NE(std::find(visited.begin(), visited.end(), text_file.lexically_relative(images_dir)),
+              visited.end());
+    EXPECT_TRUE(cache.lookup("frame_0001.png").ambiguous());
 }
 
 TEST_F(ColmapImageLayoutTest, ValidationFailsWhenMasksDoNotMirrorRelativeImageLayout) {
@@ -1280,4 +1326,52 @@ TEST(SidecarResampling, InvalidDepthAndNormalVectorsStayZero) {
     EXPECT_FLOAT_EQ(resized[0], 1.0f);
     EXPECT_FLOAT_EQ(resized[1], 0.0f);
     EXPECT_FLOAT_EQ(resized[2], -1.0f);
+}
+
+namespace {
+    class ScopedCurrentPath {
+    public:
+        explicit ScopedCurrentPath(const fs::path& path) : previous_(fs::current_path()) { fs::current_path(path); }
+        ~ScopedCurrentPath() {
+            std::error_code ec;
+            fs::current_path(previous_, ec);
+        }
+        ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+        ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+    private:
+        fs::path previous_;
+    };
+} // namespace
+
+TEST_F(ColmapImageLayoutTest, ResolvesImagesFolderNextToDatasetFromWorkingDirectory) {
+    // The parent directory name carries an "_2" that must not be read as an images_N scale.
+    const fs::path shot_dir = temp_dir_ / "take_2";
+    write_text_file(shot_dir / "colmap" / "sparse" / "0" / "cameras.txt", "1 PINHOLE 2 2 2 2 1 1\n");
+    write_text_file(shot_dir / "colmap" / "sparse" / "0" / "images.txt", "1 1 0 0 0 0 0 0 1 sub/frame_0001.png\n");
+    const fs::path image_path = shot_dir / "im01" / "sub" / "frame_0001.png";
+    fs::create_directories(image_path.parent_path());
+    const std::vector<unsigned char> pixels(2 * 2 * 3, 128);
+    ASSERT_TRUE(lfs::core::save_png(image_path, pixels.data(), 2, 2, 3, 8, 6));
+
+    const ScopedCurrentPath cwd(shot_dir);
+    lfs::io::ColmapLoader loader;
+    auto result = loader.load("colmap", {.images_folder = "im01"});
+    ASSERT_TRUE(result.has_value()) << result.error().format();
+
+    const auto& cameras = std::get<lfs::io::LoadedScene>(result->data).cameras;
+    ASSERT_EQ(cameras.size(), 1u);
+    EXPECT_TRUE(fs::equivalent(cameras[0]->image_path(), image_path));
+    EXPECT_FLOAT_EQ(cameras[0]->focal_x(), 2.0f);
+}
+
+TEST_F(ColmapImageLayoutTest, MissingImagesFolderNamesBothSearchedLocations) {
+    write_minimal_colmap_text_dataset(temp_dir_ / "colmap" / "sparse" / "0", "frame_0001.png");
+
+    const ScopedCurrentPath cwd(temp_dir_);
+    lfs::io::ColmapLoader loader;
+    auto result = loader.load("colmap", {.images_folder = "im01"});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code, lfs::io::ErrorCode::MISSING_REQUIRED_FILES);
+    EXPECT_NE(result.error().message.find("dataset or the working directory"), std::string::npos);
 }

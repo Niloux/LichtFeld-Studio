@@ -5,6 +5,7 @@
 
 #include "core/checked_arithmetic.hpp"
 #include "core/cuda_allocation.hpp"
+#include "core/tensor.hpp"
 #include "diagnostics/vram_profiler.hpp"
 
 #include <cstdint>
@@ -56,42 +57,36 @@ namespace lfs::training::cuda_scratch {
     // Reused by the q16 mutation codec. Mutation calls are serialized by the
     // live-model mutation guard, so one process-local workspace is sufficient.
     struct Q16BlockRunWorkspace {
-        // This process-local cache outlives the streams used by individual
-        // trainers. Its allocations must not retain a stream for deallocation.
-        struct AllocationHooks : VramProfilerAllocationHooks {
-            void after_allocate(void* ptr, size_t bytes, std::string_view label) const noexcept {
-                try {
-                    diagnostics::VramProfiler::instance().recordAllocation(
-                        ptr, bytes, diagnostics::VramAllocationMethod::Direct, label);
-                } catch (...) {
-                }
-            }
-        };
-        using PersistentBuffer = lfs::core::UniqueCudaAllocation<
-            lfs::core::DirectCudaAllocator, AllocationHooks>;
-        PersistentBuffer flags;
-        PersistentBuffer compact;
-        PersistentBuffer scan;
+        lfs::core::Tensor flags;
+        lfs::core::Tensor compact;
+        lfs::core::Tensor scan;
         size_t n_capacity = 0;
         size_t scan_bytes = 0;
 
         void ensure(const size_t n,
                     const size_t required_scan_bytes,
                     const cudaStream_t stream) {
+            LFS_ASSERT(n > 0 && required_scan_bytes > 0);
             if (n > n_capacity) {
-                flags = PersistentBuffer(
-                    checked_bytes(n, sizeof(std::int32_t), "q16 block-run flags"),
-                    stream, "training.q16.block_runs.flags");
-                compact = PersistentBuffer(
-                    checked_bytes(n, sizeof(std::int32_t), "q16 block-run compact"),
-                    stream, "training.q16.block_runs.compact");
+                flags = lfs::core::Tensor::empty(
+                    {n}, lfs::core::Device::CUDA, lfs::core::DataType::Int32);
+                compact = lfs::core::Tensor::empty(
+                    {n}, lfs::core::Device::CUDA, lfs::core::DataType::Int32);
+                flags.set_name("training.q16.block_runs.flags");
+                compact.set_name("training.q16.block_runs.compact");
                 n_capacity = n;
             }
             if (required_scan_bytes > scan_bytes) {
-                scan = PersistentBuffer(
-                    required_scan_bytes,
-                    stream, "training.q16.block_runs.scan");
+                scan = lfs::core::Tensor::empty(
+                    {required_scan_bytes}, lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
+                scan.set_name("training.q16.block_runs.scan");
                 scan_bytes = required_scan_bytes;
+            }
+            // The driver may hand a new stream the handle of a released one, so
+            // set_stream alone can see "no change" while the pool home moved on.
+            for (auto* tensor : {&flags, &compact, &scan}) {
+                tensor->set_stream(stream);
+                tensor->record_stream(stream);
             }
         }
     };

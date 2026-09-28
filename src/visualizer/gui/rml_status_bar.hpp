@@ -129,12 +129,13 @@ namespace lfs::vis::gui {
         void removeSaveStep(size_t step);
         void clearSaveStepHover();
         void attachElementListeners();
-        void bindReactiveStore();
+        LFS_VIS_API void bindReactiveStore();
         void markModelDirty();
 
         RmlUIManager* rml_manager_ = nullptr;
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
+        bool document_registered_ = false;
         Rml::DataModelHandle model_handle_;
         Rml::EventListener* git_commit_listener_ = nullptr;
         Rml::EventListener* gpu_icon_listener_ = nullptr;
@@ -250,6 +251,8 @@ namespace lfs::vis::gui {
             std::string fps_value;
             std::string fps_color;
             std::string fps_label;
+            bool preview_reduced = false;
+            std::string preview_reduced_text;
             std::string git_commit;
             bool mcp_details_expanded = false;
             std::string mcp_summary;

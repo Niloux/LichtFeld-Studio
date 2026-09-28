@@ -13,8 +13,10 @@ import lichtfeld as lf
 from .gallery_messages import tr, localize_message
 
 from .gallery_controller import asset_sync_state, get_gallery_controller
+from .gallery_sync_facts import needs_attention
 from .gallery_actions import gallery_actions, gallery_quota
-from .asset_index import display_name, last_known_gallery_label, previous_scene_for
+from .asset_index import display_name, last_known_gallery_label, previous_scene_for, resolve_default_asset_directory
+from .portal_connection_ui import connection_action, connection_state
 
 SCOPE_PUBLISHED = "__gallery__"
 SCOPE_ATTENTION = "__gallery_attention__"
@@ -42,12 +44,14 @@ class GalleryAssetMixin:
         self._gallery_controller = None
         self._gallery_unsubscribe = None
         self._gallery_state = {"scenes": [], "links": {}, "jobs": [], "signed_in": False}
+        self._gallery_rows_generation = 0
         self._gallery_upload_format = "sog"
         self._gallery_pull_folder = ""
         self._gallery_pull_name = ""
         self._gallery_batch = []
         self._gallery_batch_waiting = False
         self._gallery_batch_asset = None
+        self._gallery_connection_resume = None
         self._gallery_notice = ""
         self._gallery_undo = None
         self._gallery_undo_kind = ""
@@ -59,6 +63,14 @@ class GalleryAssetMixin:
         self._gallery_completion_id = None
         self._gallery_toast = None
         self._gallery_toast_timer = None
+
+    def _portal_account_snapshot(self):
+        controller = self._controller()
+        account = getattr(getattr(controller, "service", None), "account", None)
+        return account.snapshot() if account is not None else None
+
+    def _portal_connection_state(self):
+        return connection_state(self._portal_account_snapshot())
 
     def _controller(self):
         if self._gallery_controller is None:
@@ -78,6 +90,7 @@ class GalleryAssetMixin:
         if snapshot.get("message") in ("Gallery checked.", tr("info.checked")):
             snapshot = {**snapshot, "message": ""}
         self._gallery_state = snapshot
+        self._gallery_rows_generation += 1
         if previous_identity != snapshot.get("identity"):
             self._gallery_undo = None
             self._gallery_batch = []
@@ -104,7 +117,8 @@ class GalleryAssetMixin:
             )
             if loaded:
                 self._gallery_pulled_job = pulled["jobId"]
-                self._select_folder_id(SCOPE_PUBLISHED)
+                self._select_folder_id("__all__")
+                self._set_filter("published")
                 self._select_asset_id(pulled["id"])
                 self._refresh_records(assets=True, folders=True)
                 self._gallery_notice = tr("info.pulled")
@@ -141,6 +155,13 @@ class GalleryAssetMixin:
                 identifier, action = self._gallery_batch.pop(0)
                 self._select_asset_id(identifier)
                 self._begin_gallery_publish(self._get_selected_asset(), action)
+        if self._gallery_connection_resume:
+            if self._portal_connection_state() != "connected":
+                self._gallery_connection_resume = None
+            elif self._gallery_connection_ready():
+                identifier, action = self._gallery_connection_resume
+                self._gallery_connection_resume = None
+                self._resume_gallery_action(identifier, action)
         if self._handle:
             self._handle.dirty_all()
         self._request_model_update()
@@ -158,6 +179,8 @@ class GalleryAssetMixin:
 
     def _gallery_scene(self, asset):
         project_id = self._gallery_project_id(asset)
+        if project_id in self._gallery_state.get("unlinkedProjects", ()):
+            return None
         scene_id = asset.get("scene_id") or self._gallery_state.get("links", {}).get(project_id, {}).get("sceneId")
         scene = next((s for s in self._gallery_state.get("scenes", []) if s.get("id") == scene_id), None)
         if scene is not None:
@@ -185,16 +208,20 @@ class GalleryAssetMixin:
         if failure and (not failure.get("commitUuid") or failure["commitUuid"] == asset.get("commit_uuid")):
             jobs.append(failure)
         gallery_asset = ({**asset, "project_uuid": project_id}
-                         if project_id != asset.get("id") else asset)
+                         if project_id != asset.get("id") or asset.get("copy_of") else asset)
+        explicitly_unlinked = project_id in self._gallery_state.get("unlinkedProjects", ())
         facts = asset_sync_state(None if remote else gallery_asset, link, self._gallery_scene(asset),
             jobs, checked=bool(self._gallery_state.get("checkedAt")),
             storage_issue=self._gallery_state.get("storage_issue", False), phase=phase,
-            cached_projection=asset.get("gallery") if "identity" not in self._gallery_state else None,
+            cached_projection=asset.get("gallery") if "identity" not in self._gallery_state and not explicitly_unlinked else None,
             established=self._gallery_state.get("established", self._gallery_state.get("connected", "identity" not in self._gallery_state)))
         for key in ("signed_in", "busy", "relink_required", "unsupported", "source_formats", "quotaBytes", "usedBytes", "reservedBytes", "hdrBackgrounds"):
             if key in self._gallery_state:
                 facts[key] = self._gallery_state[key]
-        previous = previous_scene_for(asset, self._gallery_state)
+        facts["attention"] = needs_attention(facts)
+        account_snapshot = self._portal_account_snapshot()
+        facts["connection_state"] = connection_state(account_snapshot)
+        previous = None if explicitly_unlinked else previous_scene_for(asset, self._gallery_state)
         acknowledged = self._gallery_state.get("replacementAcknowledgments", {}).get(asset.get("id"), {})
         if previous and not link and (acknowledged.get("oldProject") != asset.get("previous_project_uuid")
                 or acknowledged.get("sceneId") != previous.get("sceneId")):
@@ -313,14 +340,15 @@ class GalleryAssetMixin:
 
     def focus_gallery(self, path=None):
         self._gallery_focus_path = path
-        self._select_folder_id(SCOPE_PUBLISHED)
+        self._select_folder_id("__all__")
+        self._set_filter("published")
         if path:
             target = Path(path).resolve()
             asset = next((a for a in self._asset_index_assets().values() if Path(a["path"]).resolve() == target), None)
             if asset:
                 self._gallery_focus_path = None
                 if asset["id"] not in self._gallery_state.get("links", {}):
-                    self._select_folder_id("__all__")
+                    self._set_filter("all")
                 self._select_asset_id(asset["id"])
         self._request_model_update()
 
@@ -342,18 +370,45 @@ class GalleryAssetMixin:
                 "missing": sum(not self._project_available(a) for a in selected)}
 
     def _gallery_checked_label(self):
-        if not self._gallery_state.get("signed_in") or self._gallery_state.get("relink_required"):
+        if self._portal_connection_state() != "connected" or self._gallery_state.get("relink_required"):
             return tr("sidebar.not_checked")
         if self._gallery_state.get("offline"):
             return tr("sidebar.offline")
         checked = self._gallery_state.get("checkedAt", 0)
         return tr("sidebar.checked_relative", time=relative_time(checked)) if checked else tr("sidebar.not_checked")
 
+    def _gallery_check_label(self):
+        state = self._portal_connection_state()
+        if state != "connected":
+            _action, label_key = connection_action(state)
+            return lf.ui.tr(label_key)
+        return lf.ui.tr("projects.action.check_gallery")
+
+    def _resume_gallery_action(self, identifier, action):
+        if self._portal_connection_state() != "connected":
+            self._gallery_connection_resume = None
+            return
+        if not self._gallery_connection_ready():
+            self._gallery_connection_resume = (identifier, action)
+            self._controller()._schedule_poll()
+            return
+        asset = self._asset_dict(identifier)
+        if asset:
+            self._select_asset_id(identifier)
+            self._gallery_command(action)
+
+    def _gallery_connection_ready(self):
+        controller = self._controller()
+        return (self._gallery_state.get("signed_in") and self._gallery_state.get("checkedAt")
+                and not controller._panel_busy()
+                and not getattr(controller, "_refresh_pending", False)
+                and not getattr(controller, "_refresh_requested", False))
+
     def _gallery_notice_text(self):
         from .gallery_messages import localize_message
         if self._gallery_notice:
             return localize_message(self._gallery_notice)
-        if not self._gallery_state.get("signed_in") or self._gallery_state.get("relink_required"):
+        if self._portal_connection_state() != "connected" or self._gallery_state.get("relink_required"):
             return ""
         return localize_message(self._gallery_state.get("message", ""))
 
@@ -368,18 +423,21 @@ class GalleryAssetMixin:
             model.bind_func("selected_" + name, lambda name=name: self._selected_gallery_badge_value(name))
         values = {
             "gallery_supported": lambda: not self._gallery_state.get("unsupported", False),
-            "gallery_signed_in": lambda: self._gallery_state.get("signed_in", False) and not self._gallery_state.get("relink_required", False),
+            "gallery_signed_in": lambda: self._portal_connection_state() == "connected" and not self._gallery_state.get("relink_required", False),
             "gallery_checked": self._gallery_checked_label,
+            "gallery_needs_connection": lambda: connection_action(self._portal_connection_state())[0] is not None,
+            "gallery_connection_action_label": lambda: lf.ui.tr(
+                connection_action(self._portal_connection_state())[1]),
             "gallery_quota": self._gallery_quota,
             "gallery_has_toast": lambda: bool(self._gallery_toast),
             "gallery_toast": lambda: (self._gallery_toast or {}).get("text", ""),
             "gallery_toast_portal": lambda: bool((self._gallery_toast or {}).get("scene")),
             "gallery_toast_open": lambda: bool((self._gallery_toast or {}).get("path")),
-            "gallery_update_all_visible": lambda: self._selected_folder_id in GALLERY_SCOPES and bool(self._gallery_update_candidates()),
+            "gallery_update_all_visible": lambda: bool(self._gallery_update_candidates()),
             "gallery_update_all_label": lambda: tr("action.update_all", count=len(self._gallery_update_candidates())),
             "gallery_update_all_enabled": lambda: bool(self._gallery_update_candidates()) and not self._gallery_state.get("busy") and self._gallery_state.get("phase", "idle") == "idle",
             "gallery_empty": lambda: not self._backend_load_active and self._selected_folder_id == SCOPE_PUBLISHED and self._gallery_state.get("connected", False) and not self._gallery_state.get("scenes"),
-            "gallery_local_empty": lambda: not self._backend_load_active and self._selected_folder_id not in GALLERY_SCOPES and not self._asset_index_assets(),
+            "gallery_local_empty": lambda: not self._backend_load_active and self._selected_folder_id not in GALLERY_SCOPES and not (self._all_display_assets() if self._selected_folder_id == "__all__" else self._asset_index_assets()),
             "gallery_empty_pull": lambda: bool(self._gallery_state.get("scenes")) and not self._asset_index_assets(),
             "gallery_published_count": lambda: len(self._gallery_rows()),
             "gallery_attention_count": lambda: len(self._gallery_rows(True)),
@@ -486,7 +544,14 @@ class GalleryAssetMixin:
                 self._controller().update_all(self._gallery_update_candidates())
                 return
             if action == "refresh":
-                self._controller().refresh(force=True)
+                account = getattr(getattr(self._controller(), "service", None), "account", None)
+                if account is None:
+                    self._controller().refresh(force=True)
+                    return
+                if self._portal_connection_state() != "connected":
+                    account.run_after_connection(lambda: self._controller().refresh(force=True))
+                else:
+                    self._controller().refresh(force=True)
                 return
             if action == "open_recovery":
                 self._controller().command("show_recovery_folder")
@@ -514,6 +579,14 @@ class GalleryAssetMixin:
                 action = self._selected_gallery_action()
             aliases = {"pause_transfer": "pause", "cancel_transfer": "cancel"}
             action = aliases.get(action, action)
+            account = getattr(getattr(self._controller(), "service", None), "account", None)
+            connection = connection_state(self._portal_account_snapshot())
+            if account and action in ("check", "publish", "update", "publish_new", "publish_again") \
+                    and connection != "connected":
+                identifier = asset["id"]
+                if account.run_after_connection(lambda: self._resume_gallery_action(identifier, action)):
+                    self._gallery_notice = lf.ui.tr("projects.portal.connection_pending")
+                return
             offered = next((item for item in facts["actions"] if item["id"] == action), None)
             self._gallery_notice = ""
             if offered and not offered["enabled"]:
@@ -618,7 +691,8 @@ class GalleryAssetMixin:
             asset = self._gallery_remote_assets().get("remote:" + scene_id)
             if not asset:
                 return False
-            self._select_folder_id(SCOPE_PUBLISHED)
+            self._select_folder_id("__all__")
+            self._set_filter("gallery")
             self._select_asset_id(asset["id"])
             self._gallery_command("pull_open")
             return True
@@ -629,32 +703,15 @@ class GalleryAssetMixin:
         if identity != self._gallery_state.get("identity") or not self._gallery_state.get("connected"):
             return
         asset = self._asset_dict(identifier)
-        if not asset:
+        if not asset or not asset.get("remote_only"):
             return
         self._select_asset_id(identifier)
-        if asset.get("remote_only"):
-            if folder == SCOPE_PUBLISHED:
-                self._show_gallery_toast(tr("drop.already_published"))
-                if self._handle:
-                    self._handle.dirty_all()
-                self._request_model_update()
-                return
-            target = self._asset_index_folders().get(folder)
-            if not target:
-                return
-            self._gallery_last_folder = folder
-            # The shared pull review and controller validate existence/overwrite.
-            self._gallery_command("pull")
-        elif folder == SCOPE_PUBLISHED:
-            facts = self._gallery_facts(asset)
-            if not self._project_available(asset):
-                self._show_gallery_toast(tr("drop.review_first"))
-            elif facts["state"] == "equal":
-                self._show_gallery_toast(tr("drop.up_to_date"))
-            elif facts["action"] in ("publish", "update"):
-                self._gallery_command(facts["action"])
-            else:
-                self._show_gallery_toast(tr("drop.review_first"))
+        target = self._asset_index_folders().get(folder)
+        if not target:
+            return
+        self._gallery_last_folder = folder
+        # The shared pull review and controller validate existence/overwrite.
+        self._gallery_command("pull")
         if self._handle:
             self._handle.dirty_all()
         self._request_model_update()
@@ -742,7 +799,8 @@ class GalleryAssetMixin:
         asset = asset if asset is not None else self._get_selected_asset() or {}
         scene = self._gallery_scene(asset) or {}
         link = self._gallery_state.get("links", {}).get(asset.get("id"), {})
-        fields = link.get("localFields") or link.get("sharedFields") or scene
+        draft = asset.get("gallery_details_draft")
+        fields = link.get("localFields") or link.get("sharedFields") or scene or (draft if isinstance(draft, dict) else {})
         return {"title": fields.get("title", display_name(asset)),
                 "description": fields.get("description", "")}
 
@@ -772,7 +830,7 @@ class GalleryAssetMixin:
     def _gallery_review_includes(self, *, publish_new=False):
         text = tr("review.includes", saved=self.get_selected_asset_modified())
         if self._gallery_scene(self._get_selected_asset() or {}) and not publish_new:
-            text += " " + tr("review.cover_kept")
+            text += " " + tr("review.cover_on_update")
         return text
 
     def _gallery_published_summary(self):
@@ -834,6 +892,14 @@ class GalleryAssetMixin:
 
         fields = dict(self._gallery_details(asset), upload_format=self._gallery_upload_format,
                       pull_folder=self._gallery_pull_folder, pull_name=self._gallery_pull_name)
+        pull_folders = []
+        if action == "pull":
+            default_path = str(resolve_default_asset_directory())
+            pull_folders.append({"name": tr("review.default_folder", name=Path(default_path).name or default_path), "path": default_path})
+            for folder in self._asset_index_folders().values():
+                path = str(folder.get("path") or "")
+                if path and not any(Path(row["path"]) == Path(path) for row in pull_folders):
+                    pull_folders.append({"name": str(folder.get("name") or Path(path).name), "path": path})
         asset = dict(asset)
         from .project_inspector import value
         details = getattr(self, "_inspection_by_asset", {}).get(asset["id"], {}).get("details")
@@ -849,13 +915,13 @@ class GalleryAssetMixin:
             fields=fields,
             includes=self._gallery_review_includes(publish_new=publish_new), quota=self._gallery_quota(),
             warning=self._gallery_quota_warning() if action != "pull" else "",
-            publish_new=publish_new, open_after=open_after, on_done=done)
+            publish_new=publish_new, open_after=open_after, on_done=done,
+            pull_folders=pull_folders)
 
     def _pull_gallery_asset(self, asset, *, open_after=False):
         scene = self._gallery_scene(asset)
         if not scene:
             return
-        folder = self._asset_index_folders().get(self._gallery_last_folder) or self._asset_index_folders().get(self._default_folder_id(), {})
-        self._gallery_pull_folder = folder.get("path", "")
+        self._gallery_pull_folder = str(resolve_default_asset_directory())
         self._gallery_pull_name = self._controller().safe_filename(scene.get("title", ""))
         self._open_gallery_review(dict(asset, remote_only=True), "pull", open_after=open_after)

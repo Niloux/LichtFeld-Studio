@@ -8,6 +8,7 @@
     "libpng",
     "libwebp",
     "nlohmann-json",
+    "openssl",
     "spdlog",
     "tbb",
     "tiff",

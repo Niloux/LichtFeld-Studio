@@ -99,6 +99,11 @@ lfs_validate_vcpkg_profile()
 
 project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CUDA CXX C)
 
+if(WIN32)
+    enable_language(RC)
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsVersionResource.cmake")
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SelectFastLinker.cmake")
 
 # On Linux, hide symbols pulled in from third-party image / compression static
@@ -333,6 +338,17 @@ else()
     message(STATUS "Compiler cache: disabled")
 endif()
 
+if(MSVC)
+    foreach(_lfs_language IN ITEMS C CXX CUDA)
+        set(CMAKE_${_lfs_language}_COMPILER_LAUNCHER
+            "${CMAKE_COMMAND}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/NormalizeMsvcFlags.cmake"
+            --
+            ${CMAKE_${_lfs_language}_COMPILER_LAUNCHER})
+    endforeach()
+    unset(_lfs_language)
+endif()
+
 # Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
 
@@ -385,7 +401,7 @@ else()
     if(LFS_TRAIN_ONLY AND BUILD_CUDA_PTX_ONLY)
         message(STATUS "Train PTX build: GPU probing is not required")
     else()
-        message(WARNING "nvidia-smi not found! We are likely in CI, default to 8.6.")
+        message(STATUS "nvidia-smi not found; using CUDA architecture 8.6 for this build")
     endif()
     set(DETECTED_COMPUTE_CAP 8.6)
     set(LichtFeld-Studio_CUDA_ARCH "86")
@@ -570,6 +586,10 @@ endif()
 
 if(LFS_ENABLE_CUDA_DEVICE_DEBUG)
     add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G>)
+else()
+    # Device debug already includes line information; passing both flags makes
+    # nvcc and ptxas warn about the redundant, overridden -lineinfo option.
+    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-lineinfo>)
 endif()
 
 add_compile_definitions(
@@ -626,6 +646,18 @@ add_dependencies(${PROJECT_NAME} lfs_core_abi_stamp)
 target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
     "${LFS_CORE_ABI_INCLUDE_DIR}"
 )
+
+# Give every first-party Windows binary a consistent product identity. This
+# also covers lfs_core.dll, which Defender has flagged in local source builds.
+lfs_add_windows_version_resource(${PROJECT_NAME} "LichtFeld Studio")
+lfs_add_windows_version_resource(lfs_core "LichtFeld Studio core and tensor runtime")
+lfs_add_windows_version_resource(lfs_diagnostics "LichtFeld Studio diagnostics")
+lfs_add_windows_version_resource(lfs_logger "LichtFeld Studio logging")
+lfs_add_windows_version_resource(lfs_event_bridge "LichtFeld Studio event bridge")
+lfs_add_windows_version_resource(lfs_visualizer "LichtFeld Studio visualizer")
+lfs_add_windows_version_resource(lfs_mcp "LichtFeld Studio MCP server")
+lfs_add_windows_version_resource(lfs_python_runtime "LichtFeld Studio Python runtime")
+lfs_add_windows_version_resource(lfs_py "LichtFeld Studio Python module")
 
 # The binary only carries code for these architectures; the app refuses to start on anything
 # lower instead of dying inside the first kernel launch (#1540).
@@ -1325,6 +1357,9 @@ if(TARGET nvimgcodec)
     install(TARGETS nvimgcodec
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        # Keep SDK headers out of the application's default runtime install.
+        PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            COMPONENT Development EXCLUDE_FROM_ALL
     )
     if(TARGET nvjpeg_ext)
         install(TARGETS nvjpeg_ext

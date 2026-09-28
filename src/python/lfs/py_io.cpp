@@ -36,6 +36,7 @@
 
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -122,15 +123,22 @@ namespace lfs::python {
             }));
         }
 
+        // Native operations copy these callbacks while the GIL is released.
+        // Share the Python handle so those copies only change C++ reference counts.
         struct PyProgressCallback {
-            nb::object callback;
+            std::shared_ptr<nb::object> callback;
+            bool present;
+
+            explicit PyProgressCallback(nb::object value)
+                : callback(std::make_shared<nb::object>(std::move(value))),
+                  present(*callback && !callback->is_none()) {}
 
             void operator()(float progress, const std::string& message) const {
                 nb::gil_scoped_acquire gil;
-                if (!callback || callback.is_none())
+                if (!present)
                     return;
                 try {
-                    callback(progress, message);
+                    (*callback)(progress, message);
                 } catch (const std::exception& e) {
                     LOG_ERROR("Python progress callback error: {}", e.what());
                 }
@@ -138,14 +146,19 @@ namespace lfs::python {
         };
 
         struct PyCancelCallback {
-            nb::object callback;
+            std::shared_ptr<nb::object> callback;
+            bool present;
+
+            explicit PyCancelCallback(nb::object value)
+                : callback(std::make_shared<nb::object>(std::move(value))),
+                  present(*callback && !callback->is_none()) {}
 
             bool operator()() const {
                 nb::gil_scoped_acquire gil;
-                if (!callback || callback.is_none())
+                if (!present)
                     return false;
                 try {
-                    return nb::cast<bool>(callback());
+                    return nb::cast<bool>((*callback)());
                 } catch (const std::exception& e) {
                     LOG_ERROR("Python cancellation callback error: {}", e.what());
                     return true;
@@ -154,14 +167,19 @@ namespace lfs::python {
         };
 
         struct PyExportProgressCallback {
-            nb::object callback;
+            std::shared_ptr<nb::object> callback;
+            bool present;
+
+            explicit PyExportProgressCallback(nb::object value)
+                : callback(std::make_shared<nb::object>(std::move(value))),
+                  present(static_cast<bool>(*callback)) {}
 
             bool operator()(float progress, const std::string& stage) const {
                 nb::gil_scoped_acquire gil;
-                if (!callback)
+                if (!present)
                     return true;
                 try {
-                    nb::object result = callback(progress, stage);
+                    nb::object result = (*callback)(progress, stage);
                     if (nb::isinstance<nb::bool_>(result))
                         return nb::cast<bool>(result);
                     return true;
@@ -216,6 +234,8 @@ namespace lfs::python {
             io::project::ContainerRole role = io::project::ContainerRole::Master;
             io::project::OpenState open_state = io::project::OpenState::HardFail;
             bool has_preview = false;
+            bool has_checkpoint = false;
+            bool has_dataset = false;
             std::uint32_t preview_width = 0;
             std::uint32_t preview_height = 0;
             std::string fallback_preview_path;
@@ -500,6 +520,8 @@ namespace lfs::python {
             .def_ro("role", &PyProjectInspection::role)
             .def_ro("open_state", &PyProjectInspection::open_state)
             .def_ro("has_preview", &PyProjectInspection::has_preview)
+            .def_ro("has_checkpoint", &PyProjectInspection::has_checkpoint)
+            .def_ro("has_dataset", &PyProjectInspection::has_dataset)
             .def_ro("preview_width", &PyProjectInspection::preview_width)
             .def_ro("preview_height", &PyProjectInspection::preview_height)
             .def_ro("fallback_preview_path", &PyProjectInspection::fallback_preview_path);
@@ -777,6 +799,10 @@ namespace lfs::python {
             }
             return unwrap(std::move(*result)); }, nb::arg("path"));
 
+        m.def("project_content_stamp", [](const std::filesystem::path& path) {
+            nb::gil_scoped_release release;
+            return project::project_content_stamp(path); }, nb::arg("path"));
+
         m.def("inspect_project_details", [](const std::filesystem::path& path, const std::uint64_t checkpoint_byte_budget) {
             std::optional<lfs::Result<project::ProjectInspectorDetails>> result;
             {
@@ -819,10 +845,10 @@ namespace lfs::python {
                 nb::gil_scoped_release release;
                 result = project::compact_project_file(
                     path,
-                    progress_callback.callback && !progress_callback.callback.is_none()
+                    progress_callback.present
                         ? project::ProjectOperationProgress(progress_callback)
                         : project::ProjectOperationProgress{},
-                    cancel_callback.callback && !cancel_callback.callback.is_none()
+                    cancel_callback.present
                         ? project::ProjectOperationCancel(cancel_callback)
                         : project::ProjectOperationCancel{});
             }
@@ -834,8 +860,8 @@ namespace lfs::python {
             PyCancelCallback cancel_callback{std::move(cancel)};
             nb::gil_scoped_release release;
             return unwrap(project::clean_project_file(path, destination, expected,
-                progress_callback.callback && !progress_callback.callback.is_none() ? project::ProjectOperationProgress(progress_callback) : project::ProjectOperationProgress{},
-                cancel_callback.callback && !cancel_callback.callback.is_none() ? project::ProjectOperationCancel(cancel_callback) : project::ProjectOperationCancel{})); }, nb::arg("path"), nb::arg("destination") = "", nb::arg("expected_commit") = "", nb::arg("progress") = nb::none(), nb::arg("cancel") = nb::none());
+                progress_callback.present ? project::ProjectOperationProgress(progress_callback) : project::ProjectOperationProgress{},
+                cancel_callback.present ? project::ProjectOperationCancel(cancel_callback) : project::ProjectOperationCancel{})); }, nb::arg("path"), nb::arg("destination") = "", nb::arg("expected_commit") = "", nb::arg("progress") = nb::none(), nb::arg("cancel") = nb::none());
 
         m.def("plan_reduce_size", [](const std::filesystem::path& path) {
             std::optional<lfs::Result<project::ProjectReducePlan>> result;
@@ -872,10 +898,10 @@ namespace lfs::python {
                 nb::gil_scoped_release release;
                 result = project::reduce_size(
                     path, drop_unbound_checkpoints, drop_embedded_dataset,
-                    progress_callback.callback && !progress_callback.callback.is_none()
+                    progress_callback.present
                         ? project::ProjectOperationProgress(progress_callback)
                         : project::ProjectOperationProgress{},
-                    cancel_callback.callback && !cancel_callback.callback.is_none()
+                    cancel_callback.present
                         ? project::ProjectOperationCancel(cancel_callback)
                         : project::ProjectOperationCancel{}, selection);
             }
@@ -889,10 +915,10 @@ namespace lfs::python {
                 nb::gil_scoped_release release;
                 result = project::embed_dataset_file(
                     path,
-                    progress_callback.callback && !progress_callback.callback.is_none()
+                    progress_callback.present
                         ? project::ProjectOperationProgress(progress_callback)
                         : project::ProjectOperationProgress{},
-                    cancel_callback.callback && !cancel_callback.callback.is_none()
+                    cancel_callback.present
                         ? project::ProjectOperationCancel(cancel_callback)
                         : project::ProjectOperationCancel{});
             }
@@ -920,10 +946,10 @@ namespace lfs::python {
                 nb::gil_scoped_release release;
                 result = project::export_project_as(
                     path, export_format, destination,
-                    progress_callback.callback && !progress_callback.callback.is_none()
+                    progress_callback.present
                         ? project::ProjectOperationProgress(progress_callback)
                         : project::ProjectOperationProgress{},
-                    cancel_callback.callback && !cancel_callback.callback.is_none()
+                    cancel_callback.present
                         ? project::ProjectOperationCancel(cancel_callback)
                         : project::ProjectOperationCancel{});
             }
@@ -946,10 +972,10 @@ namespace lfs::python {
                 nb::gil_scoped_release release;
                 result = project::verify_project_file(
                     path,
-                    progress_callback.callback && !progress_callback.callback.is_none()
+                    progress_callback.present
                         ? project::ProjectOperationProgress(progress_callback)
                         : project::ProjectOperationProgress{},
-                    cancel_callback.callback && !cancel_callback.callback.is_none()
+                    cancel_callback.present
                         ? project::ProjectOperationCancel(cancel_callback)
                         : project::ProjectOperationCancel{});
             }
@@ -1058,9 +1084,12 @@ namespace lfs::python {
                 std::string fallback_preview_path;
                 std::uint32_t preview_width = 0;
                 std::uint32_t preview_height = 0;
+                project::ProjectFilterFacts facts;
                 {
                     nb::gil_scoped_release release;
                     opened = project::ProjectReader::open(path, options);
+                    if (opened && opened->has_value())
+                        facts = project::inspect_project_filter_facts(**opened);
                     if (resolve_preview_fallback && opened && opened->has_value() &&
                         !(**opened).preview().has_value()) {
                         const auto& reader = **opened;
@@ -1133,6 +1162,8 @@ namespace lfs::python {
                     .role = reader.superblock().role,
                     .open_state = reader.open_state(),
                     .has_preview = reader.preview().has_value(),
+                    .has_checkpoint = facts.has_checkpoint,
+                    .has_dataset = facts.has_dataset,
                     .preview_width = preview_width,
                     .preview_height = preview_height,
                     .fallback_preview_path = std::move(fallback_preview_path),
@@ -1140,7 +1171,7 @@ namespace lfs::python {
             },
             nb::arg("path"),
             nb::arg("resolve_preview_fallback") = true,
-            "Inspect validated .licht container metadata without reading project payloads.");
+            "Inspect validated .licht metadata and lightweight project contents.");
 
         nb::class_<PyLoadResult>(m, "LoadResult")
             .def_prop_ro("splat_data", &PyLoadResult::get_splat_data, "Loaded splat data, or None")

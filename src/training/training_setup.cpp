@@ -819,8 +819,9 @@ namespace lfs::training {
                 }
 
                 const auto& cameras = data.cameras;
-                const bool enable_eval = params.optimization.enable_eval && params.dataset.use_test_split;
-                const auto eval_mask = enable_eval
+                const bool hold_out = params.optimization.holds_out_eval_images() &&
+                                      params.dataset.use_test_split;
+                const auto eval_mask = hold_out
                                            ? evaluation_camera_mask(cameras, params.dataset.test_every)
                                            : std::vector<bool>(cameras.size(), false);
 
@@ -853,7 +854,7 @@ namespace lfs::training {
                     }
                 }
 
-                if (enable_eval && val_count > 0) {
+                if (hold_out && val_count > 0) {
                     const auto val_cameras_id = scene.addCameraGroup(
                         "Validation",
                         cameras_group_id,
@@ -868,7 +869,7 @@ namespace lfs::training {
 
                 LOG_INFO("Loaded dataset '{}' into scene: {} train{} cameras{}",
                          dataset_name, train_count,
-                         enable_eval ? std::format(" + {} val", val_count) : "",
+                         hold_out ? std::format(" + {} val", val_count) : "",
                          mask_count > 0 ? std::format(" ({} with masks)", mask_count) : "");
                 return {};
 
@@ -1176,8 +1177,9 @@ namespace lfs::training {
                 }
 
                 const auto& cameras = data.cameras;
-                const bool enable_eval = params.optimization.enable_eval && params.dataset.use_test_split;
-                const auto eval_mask = enable_eval
+                const bool hold_out = params.optimization.holds_out_eval_images() &&
+                                      params.dataset.use_test_split;
+                const auto eval_mask = hold_out
                                            ? evaluation_camera_mask(cameras, params.dataset.test_every)
                                            : std::vector<bool>(cameras.size(), false);
 
@@ -1200,7 +1202,7 @@ namespace lfs::training {
                     }
                 }
 
-                if (enable_eval && val_count > 0) {
+                if (hold_out && val_count > 0) {
                     const auto val_cameras_id = scene.addCameraGroup(
                         "Validation", cameras_group_id, val_count);
                     for (size_t i = 0; i < cameras.size(); ++i) {
@@ -1212,7 +1214,7 @@ namespace lfs::training {
 
                 LOG_INFO("Dataset '{}': {} train{} cameras{}",
                          dataset_name, train_count,
-                         enable_eval ? std::format(" + {} val", val_count) : "",
+                         hold_out ? std::format(" + {} val", val_count) : "",
                          mask_count > 0 ? std::format(" ({} masked)", mask_count) : "");
                 return {};
 
@@ -1356,6 +1358,7 @@ namespace lfs::training {
             case OutputFormat::SOG: return ".sog";
             case OutputFormat::SSOG: return ".ssog";
             case OutputFormat::SPZ: return ".spz";
+            case OutputFormat::GLB: return ".glb";
             case OutputFormat::HTML: return ".html";
             case OutputFormat::USD: return ".usd";
             case OutputFormat::USDA: return ".usda";
@@ -1388,6 +1391,8 @@ namespace lfs::training {
                 return lfs::io::save_sog(splat, {.output_path = output, .kmeans_iterations = 10, .provenance = provenance});
             case OutputFormat::SPZ:
                 return lfs::io::save_spz(splat, {.output_path = output, .version = 4, .provenance = provenance});
+            case OutputFormat::GLB:
+                return lfs::io::save_spz(splat, {.output_path = output, .provenance = provenance, .glb = true});
             case OutputFormat::HTML:
                 return lfs::io::export_html(splat, {.output_path = output, .kmeans_iterations = 10, .provenance = provenance});
             case OutputFormat::USD:

@@ -4,11 +4,30 @@
 
 from enum import IntEnum
 from importlib import import_module
+import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
 
 import pytest
+
+
+def test_project_folder_remove_label_uses_sentence_case_in_all_locales():
+    expected = {
+        "de": "Ordner entfernen",
+        "en": "Remove folder",
+        "es": "Quitar carpeta",
+        "fr": "Retirer le dossier",
+        "it": "Rimuovi cartella",
+        "ja": "フォルダーを外す",
+        "ko": "폴더 제거",
+        "nl": "Map verwijderen",
+        "pl": "Usuń folder",
+        "zh": "移除文件夹",
+    }
+    locales = Path(__file__).resolve().parents[2] / "src/visualizer/gui/resources/locales"
+    assert {path.stem: json.loads(path.read_text())["projects"]["action.remove_folder"]
+            for path in locales.glob("*.json")} == expected
 
 
 @pytest.fixture
@@ -50,6 +69,7 @@ def preferences_panel_module(monkeypatch):
             "safe_mode": False,
         },
         set_mcp_calls=[],
+        clipboard_text="",
         file_associations=[],
         file_association_set_calls=[],
         panel_enabled_calls=[],
@@ -131,6 +151,8 @@ def preferences_panel_module(monkeypatch):
         get_ui_scale_preference=lambda: 0.0,
         set_ui_scale=lambda *_a, **_k: None,
         get_mcp_preferences=lambda: dict(state.mcp_preferences),
+        get_mcp_access_token=lambda: "test-token",
+        set_clipboard_text=lambda text: setattr(state, "clipboard_text", text),
         set_mcp_preferences=set_mcp_preferences,
         get_mcp_status=lambda: dict(state.mcp_status),
         get_project_location=lambda: state.project_location or "/home/tester/.lichtfeld/projects",
@@ -405,6 +427,78 @@ def test_project_manager_preferences_round_trip_and_reset(preferences_panel_modu
     }
 
 
+def test_project_folders_preferences_add_remove_and_protect_default(preferences_panel_module, monkeypatch):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    records = {}
+    panel._handle = SimpleNamespace(
+        update_record_list=lambda name, rows: records.__setitem__(name, rows),
+        dirty=lambda _name: None,
+    )
+    folders = {"default": {"name": "Projects", "path": "/tmp/projects"}}
+    calls = []
+    backend = SimpleNamespace(
+        _asset_index=object(),
+        _asset_index_folders=lambda: folders,
+        _add_folder_from_path=lambda path, recursive: calls.append((path, recursive)) or folders.__setitem__("extra", {"name": "Extra", "path": path}),
+        on_delete_folder=lambda _h, _e, args: calls.append(("remove", args[0])),
+        refresh_catalog=lambda **kwargs: calls.append(("rescan", kwargs)),
+    )
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _id: backend, raising=False)
+    monkeypatch.setattr(module.lf.ui, "open_folder_dialog", lambda *_: "/tmp/extra")
+    monkeypatch.setattr(module.lf.ui, "confirm_dialog", lambda _title, _message, buttons, callback: callback(buttons[1]), raising=False)
+
+    panel._refresh_project_folders()
+    assert records["project_folders"][0]["id"] == "default"
+    assert records["project_folders"][0]["can_remove"] is False
+    panel._on_add_project_folder()
+    assert calls == [("/tmp/extra", True)]
+    panel._on_remove_project_folder(args=["default"])
+    assert len(calls) == 1
+    panel._on_remove_project_folder(args=["extra"])
+    panel._on_rescan_project_folders()
+    assert calls[-2:] == [("remove", "extra"), ("rescan", {"scan_folders": True})]
+
+
+def test_portal_section_does_not_offer_settings_reset(preferences_panel_module, monkeypatch):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._section = "portal"
+    dialogs = []
+    monkeypatch.setattr(module.lf.ui, "confirm_dialog", lambda *args: dialogs.append(args), raising=False)
+    panel._on_reset_current_section(None, None, None)
+
+    assert dialogs == []
+    assert panel._show_section_reset() is False
+
+
+def test_preferences_portal_status_uses_shared_connection_state(preferences_panel_module, monkeypatch):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    translations = {
+        "portal.status.connect": "Connect to Portal",
+        "portal.status.turn_on": "Turn on Portal",
+        "portal.status.busy": "Portal: Working…",
+        "portal.status.switched_off": "Portal connected, switched off",
+        "portal.status.disconnected": "Portal: Not connected",
+        "portal.status.connected_as": "Portal connected as {name}",
+    }
+    monkeypatch.setattr(module.lf.ui, "tr", lambda key: translations.get(key, key), raising=False)
+    snapshots = (
+        (SimpleNamespace(signed_in=False, authorized=False, linking=False, disconnecting=False,
+                         display_name=""), "Portal: Not connected"),
+        (SimpleNamespace(signed_in=False, authorized=True, linking=False, disconnecting=False,
+                         display_name=""), "Portal connected, switched off"),
+        (SimpleNamespace(signed_in=False, authorized=False, linking=True, disconnecting=False,
+                         display_name=""), "Portal: Working…"),
+        (SimpleNamespace(signed_in=True, authorized=True, linking=False, disconnecting=False,
+                         display_name="A Long Display Name"), "Portal connected as A Long Display Name"),
+    )
+    for snapshot, expected in snapshots:
+        monkeypatch.setattr(panel, "_portal_connection_snapshot", lambda snapshot=snapshot: snapshot)
+        assert panel._portal_connection_status() == expected
+
+
 def test_viewport_chrome_selection_uses_global_style_preference(preferences_panel_module):
     module, state = preferences_panel_module
     panel = module.PreferencesPanel()
@@ -596,6 +690,16 @@ def test_mcp_port_is_drafted_until_explicit_confirmation(preferences_panel_modul
             "request_logging": False,
         }
     ]
+
+
+def test_mcp_access_token_copy_uses_displayed_value(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+
+    assert panel._mcp_token_text() == "test-token"
+    panel._on_copy_mcp_token(None, None, None)
+
+    assert state.clipboard_text == "test-token"
 
 
 def test_invalid_mcp_port_blocks_application(preferences_panel_module):

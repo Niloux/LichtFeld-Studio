@@ -61,6 +61,7 @@
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "core/session_breadcrumb.hpp"
+#include "diagnostics/vram_owner_model.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gui/rmlui/elements/loss_graph_element.hpp"
 #include "gui/utils/file_association.hpp"
@@ -1580,6 +1581,48 @@ NB_MODULE(lichtfeld, m) {
         },
         "Return whether the active project has a bound .licht path");
     m.def(
+        "project_path", []() -> std::optional<std::string> {
+            auto* const viewer =
+                lfs::python::get_visualizer();
+            if (!viewer) {
+                return std::nullopt;
+            }
+            auto info = viewer->projectGetInfo();
+            if (!info) {
+                throw std::runtime_error(
+                    std::format(
+                        "project_path failed: {}",
+                        lfs::format_for_developer(
+                            info.error())));
+            }
+            if (!info->path) {
+                return std::nullopt;
+            }
+            return lfs::core::path_to_utf8(*info->path);
+        },
+        "Return the active project's bound .licht path, or None");
+    m.def(
+        "project_uuid", []() -> std::optional<std::string> {
+            auto* const viewer =
+                lfs::python::get_visualizer();
+            if (!viewer) {
+                return std::nullopt;
+            }
+            auto info = viewer->projectGetInfo();
+            if (!info) {
+                throw std::runtime_error(
+                    std::format(
+                        "project_uuid failed: {}",
+                        lfs::format_for_developer(
+                            info.error())));
+            }
+            if (info->project_uuid.empty()) {
+                return std::nullopt;
+            }
+            return info->project_uuid;
+        },
+        "Return the active project UUID (kept across saves), or None");
+    m.def(
         "project_can_embed_dataset", []() {
             auto* const viewer = lfs::python::get_visualizer();
             if (!viewer) {
@@ -2075,7 +2118,7 @@ NB_MODULE(lichtfeld, m) {
         nb::arg("chunk_extent") = 16.0f,
         nb::arg("chunk_min_k") = 8,
         nb::arg("kmeans_iterations") = 10,
-        "Export scene nodes to file or directory. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP, 8=SSOG. "
+        "Export scene nodes to file or directory. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP, 8=SSOG, 13=GLB. "
         "For SSOG, path names a .ssog bundle or directory; lod_levels, lod_ratio, chunk_count_k, chunk_extent, chunk_min_k and kmeans_iterations control its LODs and chunks. "
         "spz_version is 3 (legacy gzip) or 4 (zstd, default) and is only used for SPZ. "
         "include_provenance (default true) writes a full provenance stamp into the format metadata slot; when false, a minimal build stamp is still embedded. "
@@ -2233,6 +2276,33 @@ NB_MODULE(lichtfeld, m) {
             return lfs::diagnostics::VramProfiler::instance().enabled();
         },
         "Return whether the live VRAM diagnostics profiler is enabled");
+
+    m.def(
+        "vram_owner_breakdown", []() {
+            const auto snapshot = lfs::diagnostics::VramProfiler::instance().snapshot();
+            const auto owners = lfs::diagnostics::buildVramOwnerBreakdown(
+                snapshot, snapshot.process.shared_scratch_bytes > 0);
+            nb::dict categories;
+            for (std::size_t i = 0; i < lfs::diagnostics::kVramOwnerCount; ++i)
+                categories[lfs::diagnostics::vramOwnerName(
+                    static_cast<lfs::diagnostics::VramOwner>(i))] = owners.bytes[i];
+            nb::dict result;
+            result["iteration"] = snapshot.iteration;
+            result["splats"] = snapshot.training_state.live_splats;
+            result["process_bytes"] = owners.process_bytes;
+            result["process_valid"] = owners.process_valid;
+            result["signed_residual_bytes"] = owners.signed_residual_bytes;
+            result["context_inferred_bytes"] = owners.context_inferred_bytes;
+            result["categories"] = categories;
+            nb::dict unexplained;
+            constexpr std::array<std::string_view, 5> names{
+                "cuda_slab", "hooked_direct", "tensor_direct", "vulkan_vma", "process_balance"};
+            for (std::size_t i = 0; i < names.size(); ++i)
+                unexplained[names[i].data()] = owners.unattributed_roots[i];
+            result["unattributed_roots"] = unexplained;
+            return result;
+        },
+        "Return a sampled process VRAM breakdown by owner category");
 
     // Scene manipulation
     m.def(
@@ -2828,6 +2898,9 @@ NB_MODULE(lichtfeld, m) {
     m.def(
         "toggle_vram_hud", []() { lfs::core::events::ui::ToggleVramHud{}.emit(); },
         "Toggle the VRAM diagnostics HUD overlay (requires vram profiler enabled)");
+    m.def(
+        "toggle_perf_hud_expanded", []() { lfs::core::events::ui::TogglePerfHudExpanded{}.emit(); },
+        "Toggle the performance HUD between its full and compact views");
     m.def(
         "is_perf_hud_visible",
         []() -> bool { return lfs::vis::app_store().perf_hud.get().visible; },

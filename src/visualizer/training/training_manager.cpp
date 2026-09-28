@@ -79,7 +79,7 @@ namespace lfs::vis {
 
         void refreshCameraEvaluationSplit(
             lfs::core::Scene& scene,
-            const bool enable_eval,
+            const bool hold_out,
             const int test_every) {
             auto cameras = scene.getActiveCameras();
             std::erase_if(cameras, [](const auto& camera) {
@@ -94,7 +94,7 @@ namespace lfs::vis {
             const auto split_interval = static_cast<size_t>(std::max(1, test_every));
             size_t eval_count = 0;
             for (size_t i = 0; i < cameras.size(); ++i) {
-                const bool is_eval = enable_eval && (i % split_interval) == 0;
+                const bool is_eval = hold_out && (i % split_interval) == 0;
                 cameras[i]->set_split(
                     is_eval ? lfs::core::CameraSplit::Eval
                             : lfs::core::CameraSplit::Train);
@@ -2487,15 +2487,6 @@ namespace lfs::vis {
         });
     }
 
-    std::shared_ptr<const lfs::core::Camera> TrainerManager::getCamById(int camId) const {
-        // Get camera from Scene (Scene owns all training data)
-        if (scene_) {
-            return scene_->getCameraByUid(camId);
-        }
-        LOG_ERROR("getCamById called but scene is not set");
-        return nullptr;
-    }
-
     std::vector<std::shared_ptr<lfs::core::Camera>> TrainerManager::getAllCamList() const {
         if (scene_) {
             return scene_->getAllCameras();
@@ -2554,12 +2545,12 @@ namespace lfs::vis {
         }
 
         const bool evaluation_split_changed =
-            previous_params.optimization.enable_eval != params.optimization.enable_eval ||
+            previous_params.optimization.holds_out_eval_images() != params.optimization.holds_out_eval_images() ||
             previous_params.dataset.test_every != params.dataset.test_every;
         if (!trainer_->isInitialized() && scene_ && evaluation_split_changed) {
             refreshCameraEvaluationSplit(
                 *scene_,
-                params.optimization.enable_eval,
+                params.optimization.holds_out_eval_images(),
                 params.dataset.test_every);
         }
         trainer_->setParams(params);

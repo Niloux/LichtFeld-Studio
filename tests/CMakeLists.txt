@@ -50,6 +50,7 @@ if(BUILD_VISUALIZER_TESTS)
         test_menu_bar_title.cpp
         test_panel_layout_render_demand.cpp
         test_preferences_migration.cpp
+        test_startup_overlay_geometry.cpp
     )
     add_executable(lichtfeld_visualizer_tests EXCLUDE_FROM_ALL
         ${LICHTFELD_VISUALIZER_TEST_SOURCES}
@@ -374,6 +375,8 @@ set(TEST_FILES
     test_densify_events_4x.cpp
     test_training_state_ledger.cpp
     test_vram_ledger_model.cpp
+    test_vram_owner_timeline.cpp
+    test_gpu_memory_query.cpp
     test_host_metrics.cpp
     test_joint_adam_codec.cpp
     test_sh_value_codec.cpp
@@ -490,6 +493,7 @@ set(TEST_FILES
     test_panel_registry_animation_demand.cpp
     test_panel_registry_default_closed.cpp
     test_panel_layout_render_demand.cpp
+    test_number_format.cpp
     test_reactive_store.cpp
     test_video_color_convert.cpp
     test_python_integration.cpp
@@ -564,6 +568,7 @@ set(TEST_FILES
     test_operator_return_value.cpp
     test_sdl_rml_key_mapping.cpp
     test_rml_path_utils.cpp
+    test_rml_system_interface.cpp
     test_rml_drag_payload.cpp
     test_context_menu_placement.cpp
     test_rml_static_style_boundaries.cpp
@@ -611,6 +616,8 @@ set(TEST_FILES
     test_rml_im_mode_layout.cpp
     test_rml_python_listener_lifetime.cpp
     test_status_bar_fit.cpp
+    test_training_progress_publisher.cpp
+    test_startup_overlay_geometry.cpp
     test_menu_bar_title.cpp
     test_status_bar_mining.cpp
     test_rotated_sh_correctness.cpp

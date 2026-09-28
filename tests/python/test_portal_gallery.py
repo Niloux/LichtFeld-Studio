@@ -509,8 +509,9 @@ def test_pinned_download_storage_redirect_never_forwards_account_token(tmp_path,
         client.download(identifier, tmp_path / "unsafe.licht")
 
 
-@pytest.mark.parametrize('method,attempts', [('GET', 4), ('HEAD', 1), ('POST', 1)])
-def test_only_get_requests_retry_transient_failures(monkeypatch, method, attempts):
+@pytest.mark.parametrize('method,key,attempts', [('GET', False, 4), ('HEAD', False, 1),
+    ('POST', False, 1), ('POST', True, 4)])
+def test_account_requests_retry_only_when_idempotent(monkeypatch, method, key, attempts):
     from lfs_plugins import portal_account, portal_retry
     service = object.__new__(portal_account.PortalAccountService)
     service._current_credentials = lambda: None
@@ -521,7 +522,7 @@ def test_only_get_requests_retry_transient_failures(monkeypatch, method, attempt
     service._request_json_once = fail
     monkeypatch.setattr(portal_retry.time, 'sleep', lambda _delay: None)
     with pytest.raises(PortalHTTPError):
-        service._request_json(method, '/uploads/id/complete', {'idempotencyKey': 'key'}, timeout=7)
+        service._request_json(method, '/uploads/id/complete', {'idempotencyKey': 'key'} if key else None, timeout=7)
     assert len(calls) == attempts
     assert all(kwargs['timeout'] == 7 for _args, kwargs in calls)
 
@@ -668,3 +669,65 @@ def test_project_preparation_stops_at_its_deadline(tmp_path, monkeypatch):
     assert client.processing_deadline == 1002.0
     assert all(state == {"stage": "preparing_download", "completed": 0, "total": 0} for state in states)
     assert not list(tmp_path.iterdir())
+
+
+def _camera_path(count):
+    frames = [{"time": index + 0.1234567890123456,
+               "position": [-1.2345678901234567e-120, -1.2345678901234567e-120, -1.2345678901234567e-120],
+               "rotation": [-1.2345678901234567e-120, -1.2345678901234567e-120,
+                            -1.2345678901234567e-120, -0.4567890123456789],
+               "focal_length_mm": 35.123456789012345, "easing": 3}
+              for index in range(count)]
+    return {"version": 1, "duration": float(count) + 0.123456789012, "keyframes": frames,
+            "loopMode": "ping_pong", "playbackSpeed": 1.2345678901234567}
+
+
+def test_update_refuses_a_camera_path_past_the_gallery_keyframe_limit():
+    import json
+    calls = []
+
+    def request(method, path, body=None, **_kwargs):
+        calls.append((method, path, body))
+        if path.endswith("/me"):
+            return {"id": "11111111-1111-1111-1111-111111111111", "gallerySyncVersion": 1,
+                    "revisionDomains": 1, "sourceFormats": ["licht"], "maxFileBytes": 1024}
+        frames = ((body or {}).get("viewerSettings") or {}).get("cameraPath", {}).get("keyframes") or []
+        if len(frames) > 4096:
+            raise AssertionError("oversized camera path was sent")
+        return {}
+
+    client = portal_gallery.PortalGalleryClient(SimpleNamespace(request_json_authenticated=request))
+    scene = "11111111-1111-1111-1111-111111111111"
+    view = {"cameraPath": _camera_path(4097), "verticalFov": True}
+    with pytest.raises(ValueError, match="camera_path"):
+        client.update(scene, {"contentRevision": "content", "metadataRevision": "metadata"},
+                      title="T" * 120, description="D" * 5000, viewerSettings=view)
+    assert not any(method == "PATCH" for method, _path, _body in calls)
+    calls.clear()
+    client.update(scene, {"contentRevision": "content", "metadataRevision": "metadata"},
+                  viewerSettings={"cameraPath": _camera_path(4096), "verticalFov": True})
+    patched = [body for method, _path, body in calls if method == "PATCH"]
+    assert len(patched) == 1
+    raw = json.dumps(dict(patched[0]), separators=(",", ":")).encode("utf-8")
+    assert len(raw) > 1024 * 1024
+    assert len(raw) <= 2 * 1024 * 1024
+
+
+def test_upload_refuses_a_camera_path_past_the_gallery_keyframe_limit(tmp_path):
+    path = tmp_path / "scene.licht"
+    path.write_bytes(b"prepared")
+    calls = []
+
+    def request(method, url, body=None, **_kwargs):
+        calls.append(url)
+        if url.endswith("/me"):
+            return {"id": "11111111-1111-1111-1111-111111111111", "gallerySyncVersion": 1, "revisionDomains": 1,
+                    "sourceFormats": ["licht"], "maxFileBytes": 1024, "hdrBackgrounds": False}
+        raise AssertionError("oversized camera path was sent")
+
+    account = SimpleNamespace(base_url="http://127.0.0.1:9", request_json_authenticated=request,
+                              _client_version="test")
+    client = portal_gallery.PortalGalleryClient(account)
+    with pytest.raises(ValueError, match="camera_path"):
+        client.upload(path, {"title": "Scene", "viewerSettings": {"cameraPath": _camera_path(4097)}})
+    assert not any(url.endswith("/splats/uploads") for url in calls)

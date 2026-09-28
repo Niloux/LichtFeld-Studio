@@ -87,6 +87,8 @@ def _validate_journal(data):
     for bucket in data["accounts"].values():
         require(isinstance(bucket, dict) and isinstance(bucket.get("links"), dict)
             and isinstance(bucket.get("jobs"), list))
+        require(isinstance(bucket.get("unlinkedProjects", []), list)
+            and all(isinstance(project_id, str) and project_id for project_id in bucket.get("unlinkedProjects", [])))
         intents = bucket.get("handoffIntents", {})
         require(isinstance(intents, dict) and (not intents or data["version"] == 3))
         for identifier, handoff in intents.items():
@@ -116,7 +118,7 @@ def _validate_journal(data):
             for key in ('createdAt', 'finishedAt', 'processingDeadline'):
                 require(key not in job or (type(job[key]) in (int, float) and math.isfinite(job[key]) and job[key] >= 0))
             require('attempts' not in job or (type(job['attempts']) is int and job['attempts'] >= 0))
-            for key in ("serverProcessing", "packaged", "needsAttention", "retryable", "requiresPreparation", "preparedRemoved"):
+            for key in ("serverProcessing", "packaged", "needsAttention", "retryable", "requiresPreparation", "preparedRemoved", "unlinked", "liveSnapshot"):
                 require(key not in job or type(job[key]) is bool)
             if "preparation" in job:
                 require(isinstance(job["preparation"], str) and job.get("kind", "upload") == "upload"
@@ -125,7 +127,9 @@ def _validate_journal(data):
             require(isinstance(job.get("metadata"), dict) and isinstance(job["metadata"].get("title"), str))
             optional_text(job["metadata"], ("description", "visibility", "replaceSceneId"))
             optional_text(job, ("failureReason", "previewPng", "destinationPath", "downloadProject"))
-            require(len(job.get("previewPng", "")) <= 3 * 1024**2)
+            # Older writers saved full viewport PNGs here. The whole journal is
+            # already byte-bounded; one oversized cover must not hide every link
+            # and upload key. Validate/resize its image when preparing that job.
             if "handoff" in job:
                 handoff = job["handoff"]
                 require(data["version"] == 3 and isinstance(handoff, dict))
@@ -153,6 +157,9 @@ def _validate_journal(data):
                 require(all(isinstance(job.get(key), str) for key in ("sceneId",)))
                 require(job["status"] != "completed" or "result" in job)
     return data
+
+
+COVER_WARNING = "projects.gallery.warning.cover_failed"
 
 
 def friendly_error(exc):
@@ -281,6 +288,14 @@ class GallerySync:
             self._disk_digest = digest
             self._journal_problem = self._stale = False
         if recover_interrupted:
+            interrupted_updates = [job for bucket in self._data["accounts"].values() for job in bucket["jobs"]
+                if job.get("stagedImport", {}).get("updateOnly") and not job.get("retired")]
+            for job in interrupted_updates:
+                job["stagedImport"]["cleanupPending"] = True
+            if interrupted_updates:
+                self._save()
+                for job in interrupted_updates:
+                    self._retire_update_download(job)
             pending_cleanup = [job for bucket in self._data["accounts"].values() for job in bucket["jobs"]
                                if job["status"] in ("error", "completed", "canceled") and job.get("ownedExport")
                                and (not job.get("preparedRemoved") or job.get("cleanupPending"))]
@@ -297,6 +312,7 @@ class GallerySync:
             with self._lock:
                 self._check_journal_ready()
                 self._prune_jobs()
+                _validate_journal(self._data)
                 encoded = json.dumps(self._data, allow_nan=False)
                 if len(encoded.encode()) > MAX_JOURNAL_BYTES:
                     raise ValueError("Gallery transfer history is too large to save. Keep the recovery folder for help.")
@@ -310,10 +326,13 @@ class GallerySync:
                 previous = self._journal_bytes()
                 if previous is not None:
                     FileBackend(self._journal.with_suffix(".json.bak")).write(previous)
-                for path_identity, project_id in project_checks:
+                for check in project_checks:
+                    path_identity, project_id = check[:2]
                     path_identity.validate()
                     _require_project(path_identity.path, project_id)
                     path_identity.validate()
+                    if len(check) > 2 and file_stamp(path_identity.path) != check[2]:
+                        raise ValueError("The local project changed. Review it before updating.")
                 os.replace(temporary, self._journal)
                 self._journal_seen = True
                 self._disk_digest = hashlib.sha256(encoded.encode()).hexdigest()
@@ -619,8 +638,9 @@ class GallerySync:
                 self._checked_at = time.time()
                 if scenes is not None:
                     self.scenes = scenes
-                recovered = self._origin_publication_links(self.scenes, self._bucket()["links"])
-                for link in self._bucket()["links"].values():
+                bucket = self._bucket()
+                recovered = self._origin_publication_links(self.scenes, bucket["links"], bucket.get("unlinkedProjects", ()))
+                for link in bucket["links"].values():
                     link["checkedAt"] = self._checked_at
                 if recovered:
                     self._save()
@@ -719,7 +739,7 @@ class GallerySync:
                         Path(entry["path"]).unlink(missing_ok=True)
 
     @staticmethod
-    def _origin_publication_links(scenes, links):
+    def _origin_publication_links(scenes, links, unlinked_projects=()):
         """Recover unambiguous local-project links from an owner listing."""
         candidates = {}
         for scene in scenes:
@@ -730,7 +750,7 @@ class GallerySync:
 
         recovered = {}
         for project_id, matches in candidates.items():
-            if project_id in links or len(matches) != 1:
+            if project_id in links or project_id in unlinked_projects or len(matches) != 1:
                 continue
             scene = matches[0]
             if not all(isinstance(scene.get(key), str) and scene[key]
@@ -783,12 +803,16 @@ class GallerySync:
                       size=job["total"], format=Path(export_path).suffix.lower().lstrip("."),
                       account_origin=safe_url(self.account.base_url))
             job["commitUuid"] = job["metadata"].pop("_commitUuid", "")
+            job["unlinked"] = bool(job["metadata"].pop("_unlinked", False))
+            job["liveSnapshot"] = bool(job["metadata"].pop("_liveSnapshot", False))
             job["uploadFormat"] = job["metadata"].pop("_uploadFormat", "studio")
             job["contentStamp"] = job["metadata"].pop("_contentStamp", "")
             job["publishAsNew"] = job["metadata"].pop("_publishAsNew", False)
             preview = job["metadata"].pop("_previewPng", None)
             if preview is not None:
-                job["previewPng"] = preview
+                import base64
+                job["previewPng"] = base64.b64encode(gallery_preparation.publication_preview(
+                    base64.b64decode(preview, validate=True))).decode("ascii")
             handoff = job["metadata"].pop("_handoff", None)
             target = job["metadata"].get("replaceSceneId")
             if target and not handoff and (linked or {}).get("sceneId") != target and any(key != project_id and value["sceneId"] == target
@@ -798,7 +822,8 @@ class GallerySync:
                 job["handoff"] = copy.deepcopy(handoff)
                 job["metadata"]["originFileUuid"] = handoff["fileUuid"]
                 self._check_handoff(job)
-            job["metadata"].setdefault("originProjectUuid", project_id)
+            if not job["unlinked"]:
+                job["metadata"].setdefault("originProjectUuid", project_id)
             if job["commitUuid"]:
                 job["metadata"].setdefault("originCommitUuid", job["commitUuid"])
             job["metadata"].setdefault("clientMutationId", job["id"])
@@ -936,6 +961,7 @@ class GallerySync:
             if job.get("retryable") is False:
                 raise ValueError(job["message"])
             bucket = self._bucket()
+            identity = self.identity()
             extend_processing = keep_waiting or job.get("needsAttention", False)
 
         def action():
@@ -973,26 +999,35 @@ class GallerySync:
             def complete_upload(result):
                 self._client()
                 scene = result["scene"]
+                cover_preview = (job.get("previewPng") if job["metadata"].get("useEmbeddedPreview")
+                    and job["metadata"].get("replaceSceneId") and not job.get("handoff") else None)
+                linked = bucket["links"].get(job["project"])
                 with self._lock:
                     self._check_handoff(job)
                     if job.get("handoff") and scene["id"] != job["handoff"]["sceneId"]:
                         raise ValueError("The Gallery returned a different replacement scene. The previous link was kept.")
                     previous_links = copy.deepcopy(bucket["links"])
+                    previous_unlinked = list(bucket.get("unlinkedProjects", ()))
                     previous_job = copy.deepcopy(job)
                     previous_scenes = copy.deepcopy(self.scenes)
                     previous_intents = copy.deepcopy(bucket.get("handoffIntents", {}))
                     previous_undo = []
                     self._completion = {"id": str(uuid.uuid4()), "kind": "publish", "scene": copy.deepcopy(scene)}
-                    bucket["links"][job["project"]] = exchange_link(scene, job.get("commitUuid", ""))
-                    bucket["links"][job["project"]]["uploadFormat"] = job.get("uploadFormat", "studio")
-                    bucket["links"][job["project"]]["contentStamp"] = job.get("contentStamp", "")
-                    for history in bucket["jobs"]:
-                        update = history.get("localUpdate", {})
-                        if (history.get("project") == job["project"] and update.get("state") == "applied"
-                                and not update.get("undoRestored") and update.get("appliedCommit") == job.get("commitUuid")
-                                and tuple(update.get("appliedIdentity", ())) == self.identity()):
-                            previous_undo.append((update, copy.deepcopy(update.get("appliedLink"))))
-                            update["appliedLink"] = copy.deepcopy(bucket["links"][job["project"]])
+                    if not job.get("unlinked"):
+                        bucket["links"][job["project"]] = exchange_link(scene, job.get("commitUuid", ""))
+                        bucket["unlinkedProjects"] = [project_id for project_id in previous_unlinked
+                                                       if project_id != job["project"]]
+                        bucket["links"][job["project"]]["uploadFormat"] = job.get("uploadFormat", "studio")
+                        bucket["links"][job["project"]]["contentStamp"] = job.get("contentStamp", "")
+                        if job.get("liveSnapshot"):
+                            bucket["links"][job["project"]]["liveSnapshot"] = True
+                        for history in bucket["jobs"]:
+                            update = history.get("localUpdate", {})
+                            if (history.get("project") == job["project"] and update.get("state") == "applied"
+                                    and not update.get("undoRestored") and update.get("appliedCommit") == job.get("commitUuid")
+                                    and tuple(update.get("appliedIdentity", ())) == self.identity()):
+                                previous_undo.append((update, copy.deepcopy(update.get("appliedLink"))))
+                                update["appliedLink"] = copy.deepcopy(bucket["links"][job["project"]])
                     job.update(status="completed", completed=job["total"], serverProcessing=False, message="Uploaded", result=scene)
                     job.pop("previewPng", None)
                     if job.get("handoff"):
@@ -1006,6 +1041,7 @@ class GallerySync:
                 except Exception:
                     with self._lock:
                         bucket["links"] = previous_links
+                        bucket["unlinkedProjects"] = previous_unlinked
                         self.scenes = previous_scenes
                         bucket["handoffIntents"] = previous_intents
                         for update, applied_link in previous_undo:
@@ -1015,10 +1051,33 @@ class GallerySync:
                         self._completion = None
                     raise
                 self._retire_export(job)
-                log_stage("link_saved", scene_id=scene["id"],
-                          content_revision=scene.get("contentRevision", ""),
-                          metadata_revision=scene.get("metadataRevision", ""),
-                          project_id=job["project"])
+                if not job.get("unlinked"):
+                    log_stage("link_saved", scene_id=scene["id"],
+                              content_revision=scene.get("contentRevision", ""),
+                              metadata_revision=scene.get("metadataRevision", ""),
+                              project_id=job["project"])
+                if cover_preview:
+                    try:
+                        if not linked or linked["sceneId"] != scene["id"]:
+                            raise ValueError("The Gallery link changed. Check gallery before setting its cover.")
+                        import base64
+                        client.set_cover(scene["id"], scene, base64.b64decode(cover_preview, validate=True))
+                        updated = client.scene(scene["id"])
+                        with self._lock:
+                            self.scenes = [updated if item["id"] == scene["id"] else item for item in self.scenes]
+                            link = bucket["links"][job["project"]]
+                            link["metadata"] = copy.deepcopy(updated)
+                            link["acknowledgedPresentationRevision"] = updated.get("presentationRevision", "")
+                            job["result"] = updated
+                            self._completion["scene"] = copy.deepcopy(updated)
+                            if self._action_failure and self._action_failure["message"] == COVER_WARNING:
+                                self._action_failure = None
+                        self._save()
+                    except Exception as exc:
+                        log_failure("cover_after_upload", exc, project_id=job["project"])
+                        with self._lock:
+                            self.message = COVER_WARNING
+                            self._action_failure = dict(id=str(uuid.uuid4()), identity=identity, message=self.message)
 
             try:
                 self._check_handoff(job)
@@ -1196,12 +1255,15 @@ class GallerySync:
         path_identity = ProjectPathIdentity.capture(project_path)
         def action():
             previous, previous_project = copy.deepcopy(bucket["links"].get(project_id)), job["project"]
+            previous_unlinked = list(bucket.get("unlinkedProjects", ()))
             previous_update = copy.deepcopy(job.get("localUpdate"))
             try:
                 self._client()
                 with self._lock:
                     scene = job["result"]
                     bucket["links"][project_id] = exchange_link(scene, commit_uuid)
+                    bucket["unlinkedProjects"] = [identifier for identifier in previous_unlinked
+                                                   if identifier != project_id]
                     if local_fields is not None:
                         bucket["links"][project_id]["localFields"] = local_fields
                     if job.get("localUpdate", {}).get("backupPath"):
@@ -1221,6 +1283,7 @@ class GallerySync:
                         bucket["links"].pop(project_id, None)
                     else:
                         bucket["links"][project_id] = previous
+                    bucket["unlinkedProjects"] = previous_unlinked
                     job["project"] = previous_project
                     if previous_update is not None:
                         job["localUpdate"] = previous_update
@@ -1300,7 +1363,7 @@ class GallerySync:
         self._launch(action)
         return update_id
 
-    def stage_download(self, job_id):
+    def stage_download(self, job_id, *, for_update=False):
         """Give a native import a unique name so it cannot be confused with local nodes."""
         self._client()
         job = self._job(job_id)
@@ -1308,12 +1371,20 @@ class GallerySync:
             raise ValueError("Finish downloading this scene first.")
         identifier = str(uuid.uuid4())
         record = {"id": identifier, "state": "preparing"}
+        if for_update:
+            record.update(updateOnly=True, path=str(self.root / "imports" / (identifier + ".scene")))
         source_identity = ProjectPathIdentity.capture(job["path"])
         source_project = job.get("downloadProject") or _project_uuid(job["path"])
-        from .asset_index import resolve_default_asset_directory
-        project_path = (Path(job["destination"]) if job.get("destination") else
-                        resolve_default_asset_directory() / ("Gallery-" + identifier + ".licht"))
-        destination_identity = ProjectPathIdentity.capture(project_path)
+        if not for_update:
+            from .asset_index import resolve_default_asset_directory
+            project_path = (Path(job["destination"]) if job.get("destination") else
+                            resolve_default_asset_directory() / ("Gallery-" + identifier + ".licht"))
+            destination_identity = ProjectPathIdentity.capture(project_path)
+        else:
+            project_path = None
+            with self._lock:
+                job["stagedImport"] = record
+            self._save()
 
         def action():
             target = self.root / "imports" / (identifier + ".scene")
@@ -1321,9 +1392,10 @@ class GallerySync:
             # Repeated updates must not orphan a directory on every attempt.
             try:
                 self._client()
-                previous_paths = self._cleanup_paths(job, {})
-                for path in previous_paths[1:]:  # The first path is the kept download.
-                    self._unlink_temporary(path)
+                if not for_update:
+                    previous_paths = self._cleanup_paths(job, {})
+                    for path in previous_paths[1:]:  # The first path is the kept download.
+                        self._unlink_temporary(path)
             except Exception as exc:
                 log_failure("download_staging_cleanup", exc, job_id=job["id"])
                 with self._lock:
@@ -1336,8 +1408,10 @@ class GallerySync:
             retained_asset = None
             retained_project = None
             try:
-                disk_preflight([(target, Path(job['path']).stat().st_size),
-                                (self._download_destination(job), Path(job['path']).stat().st_size)])
+                preflight = [(target, Path(job['path']).stat().st_size)]
+                if not for_update:
+                    preflight.append((self._download_destination(job), Path(job['path']).stat().st_size))
+                disk_preflight(preflight)
                 target.parent.mkdir(mode=0o700, exist_ok=True)
                 with self._lock:
                     record["path"] = str(target)
@@ -1351,28 +1425,29 @@ class GallerySync:
                         self.message = f"Checking downloaded scene… {int(100 * done / max(1, total))}%"
                         self.version += 1
                 gallery_preparation.unpack_project(target.parent, job["path"], target, progress=progress)
-                from .asset_index import resolve_default_asset_directory
-                assets = resolve_default_asset_directory()
-                assets.mkdir(parents=True, exist_ok=True)
-                if project_path.exists():
-                    raise ValueError("The destination already exists. Choose another file name.")
-                import lichtfeld as lf
-                self._client()
-                # A download is a new project each time, even when the same
-                # representation is downloaded twice on this machine.
-                source_identity.validate()
-                _require_project(job["path"], source_project)
-                destination_identity.validate()
-                planned_destination = Path(job.get("destinationPath", str(project_path.resolve())))
-                if ((job.get("destination") and planned_destination != project_path.resolve()) or
-                        planned_destination.parent != project_path.resolve().parent):
-                    raise ValueError("The download destination path changed. Choose it again.")
-                restored = lf.io.restore_save(job["path"], 1, project_path)
-                retained_project = ProjectPathIdentity.capture(project_path)
-                with self._lock:
-                    record["projectPath"] = str(project_path)
-                    record["projectId"] = str(restored.project_uuid)
-                    record["projectStamp"] = file_stamp(project_path)
+                if not for_update:
+                    from .asset_index import resolve_default_asset_directory
+                    assets = resolve_default_asset_directory()
+                    assets.mkdir(parents=True, exist_ok=True)
+                    if project_path.exists():
+                        raise ValueError("The destination already exists. Choose another file name.")
+                    import lichtfeld as lf
+                    self._client()
+                    # A download is a new project each time, even when the same
+                    # representation is downloaded twice on this machine.
+                    source_identity.validate()
+                    _require_project(job["path"], source_project)
+                    destination_identity.validate()
+                    planned_destination = Path(job.get("destinationPath", str(project_path.resolve())))
+                    if ((job.get("destination") and planned_destination != project_path.resolve()) or
+                            planned_destination.parent != project_path.resolve().parent):
+                        raise ValueError("The download destination path changed. Choose it again.")
+                    restored = lf.io.restore_save(job["path"], 1, project_path)
+                    retained_project = ProjectPathIdentity.capture(project_path)
+                    with self._lock:
+                        record["projectPath"] = str(project_path)
+                        record["projectId"] = str(restored.project_uuid)
+                        record["projectStamp"] = file_stamp(project_path)
                 background = target / "environment.lfsenv"
                 if background.exists():
                     # Keep a private asset independently of disposable import
@@ -1413,8 +1488,35 @@ class GallerySync:
                 with self._lock:
                     record.update(state="failed", message="Preparation canceled. Your download was kept." if isinstance(exc, GalleryTransferCanceled) else friendly_error(exc))
             self._save()
+            if for_update and record.get("cleanupPending"):
+                self._retire_update_download(job)
         self._launch(action)
         return identifier
+
+    def finish_update_download(self, job_id, stage_id):
+        job = self._job(job_id)
+        stage = job.get("stagedImport", {})
+        if stage.get("id") != stage_id or not stage.get("updateOnly"):
+            return
+        stage["cleanupPending"] = True
+        self._save()
+        if not self.busy:
+            self._retire_update_download(job)
+
+    def _retire_update_download(self, job):
+        stage = job.get("stagedImport", {})
+        if not stage.get("updateOnly") or not stage.get("cleanupPending"):
+            return
+        try:
+            paths = self._cleanup_paths(job, self._cleanup_references())
+            for path in paths:
+                self._unlink_temporary(path)
+            with self._lock:
+                job.update(retired=True, path="", completed=0, total=0)
+                job.pop("stagedImport", None)
+            self._save()
+        except (OSError, ValueError) as exc:
+            log_failure("update_download_cleanup", exc, job_id=job["id"])
 
     def environment_path(self, job):
         if not job.get("result", {}).get("viewerSettings", {}).get("environment"):
@@ -1620,11 +1722,11 @@ class GallerySync:
 
     def clear_finished(self, job_ids):
         """Clear reviewed account-local history and owned files, retaining recovery."""
-        self._client()
-        bucket = self._bucket()
         identifiers = tuple(dict.fromkeys(job_ids))
 
         def action():
+            # Resolved here: a refresh this waits for may reload the journal.
+            bucket = self._bucket()
             guard = _locked_sidecar(self.root / "local-use.lock", blocking=False)
             try:
                 guard.__enter__()
@@ -1674,7 +1776,7 @@ class GallerySync:
                     self.message = "Finished transfers cleared. Project links and recovery copies kept."
             finally:
                 guard.__exit__(None, None, None)
-        self._launch(action)
+        self._launch_metadata(action)
 
     def _retire_export(self, job):
         # Never remove a user-supplied file; only snapshots created inside our spool.
@@ -1685,6 +1787,7 @@ class GallerySync:
                 self._unlink_temporary(path)
             job.pop("cleanupPending", None)
             job["preparedRemoved"] = True
+            job.pop("previewPng", None)
             self._save()
             log_stage("export_cleanup", job_id=job["id"], path=job["path"], status=job["status"])
         except (ValueError, OSError) as exc:
@@ -1725,17 +1828,48 @@ class GallerySync:
                 bucket = self._bucket()
                 check_pending()
                 bucket["links"].pop(project_id, None)
+                unlinked = bucket.setdefault("unlinkedProjects", [])
+                if project_id not in unlinked:
+                    unlinked.append(project_id)
                 bucket["handoffIntents"] = {key: value for key, value in bucket.get("handoffIntents", {}).items()
                                            if project_id not in (value["oldProject"], value["newProject"])}
             self._save()
         self._launch_metadata(action)
 
-    def edit(self, scene_id, baseline, metadata, *, commit_uuid=None, content_stamp=None, project_id=None):
+    def set_local_details(self, project_id, title, description):
+        with self._lock:
+            self._check_journal_ready()
+            bucket = self._bucket()
+            if any(job["project"] == project_id and job["status"] not in ("completed", "canceled")
+                   for job in bucket["jobs"]):
+                raise ValueError("Finish or discard this project's pending transfer before updating it.")
+            link = bucket["links"].get(project_id)
+            if link is None:
+                raise ValueError("The Gallery link changed. Review it again.")
+            previous = copy.deepcopy(link.get("localFields"))
+            had_local = "localFields" in link
+            fields = copy.deepcopy(link.get("localFields") or link.get("sharedFields") or shared_fields(link.get("metadata", {})))
+            fields.update(title=str(title), description=str(description))
+            link["localFields"] = fields
+            try:
+                self._save()
+            except Exception:
+                if had_local:
+                    link["localFields"] = previous
+                else:
+                    link.pop("localFields", None)
+                raise
+
+    def edit(self, scene_id, baseline, metadata, *, commit_uuid=None, content_stamp=None, project_id=None, cover_png=None):
         baseline = copy.deepcopy(baseline)
         metadata = copy.deepcopy(metadata)
         def action():
             client = self._client()
             bucket = self._bucket()
+            if cover_png is not None:
+                link = bucket["links"].get(project_id)
+                if not link or link["sceneId"] != scene_id:
+                    raise ValueError("The Gallery link changed. Check gallery before setting its cover.")
             scene = client.update(scene_id, domain_tokens(baseline), **metadata)
             with self._lock:
                 self.scenes = [scene if s["id"] == scene_id else s for s in self.scenes]
@@ -1757,6 +1891,23 @@ class GallerySync:
                         if content_stamp:
                             link["contentStamp"] = content_stamp
             self._save()
+            if cover_png is not None:
+                try:
+                    client.set_cover(scene_id, scene, cover_png)
+                    updated = client.scene(scene_id)
+                    with self._lock:
+                        self.scenes = [updated if item["id"] == scene_id else item for item in self.scenes]
+                        bucket["links"][project_id]["metadata"] = copy.deepcopy(updated)
+                        bucket["links"][project_id]["acknowledgedPresentationRevision"] = updated.get("presentationRevision", "")
+                        self._completion["scene"] = copy.deepcopy(updated)
+                        if self._action_failure and self._action_failure["message"] == COVER_WARNING:
+                            self._action_failure = None
+                    self._save()
+                except Exception as exc:
+                    log_failure("cover_after_update", exc, project_id=project_id or "")
+                    with self._lock:
+                        self.message = COVER_WARNING
+                        self._action_failure = dict(id=str(uuid.uuid4()), identity=self.identity(), message=self.message)
         self._launch_metadata(action)
 
 
@@ -1856,6 +2007,56 @@ class GallerySync:
                 update.clear()
                 update.update(before_update)
                 raise
+        self._launch_metadata(action)
+
+
+    def acknowledge_gallery_text(self, scene, project_id, path, stamp, reviewed_link):
+        scene = copy.deepcopy(scene)
+        reviewed_link = copy.deepcopy(reviewed_link)
+        identity = self.identity()
+        def action():
+            bucket = self._bucket()
+            link = bucket["links"].get(project_id)
+            if (not link or any(link.get(key) != reviewed_link.get(key) for key in
+                    ("sceneId", "contentRevision", "metadataRevision", "commitUuid", "sharedFields", "localFields"))
+                    or link["sceneId"] != scene["id"]):
+                raise ValueError("The previous gallery link changed. Review it again.")
+            if any(not job.get("retired") and (job.get("status") not in ("completed", "canceled")
+                    or job.get("localUpdate", {}).get("state") in ("preparing", "ready", "failed")
+                    or job.get("localUpdate", {}).get("interrupted"))
+                    and (job.get("project") == project_id or job.get("sceneId") == scene["id"])
+                    for job in bucket["jobs"]):
+                raise ValueError("This project already has a transfer. Resume or discard it first.")
+            if any(project_id in (intent["oldProject"], intent["newProject"])
+                    for intent in bucket.get("handoffIntents", {}).values()):
+                raise ValueError("This project already has a transfer. Resume or discard it first.")
+            if file_stamp(path) != stamp:
+                raise ValueError("The local project changed. Review it before updating.")
+            path_identity = ProjectPathIdentity.capture(path)
+            _require_project(path, project_id)
+            remote = self._client().scene(scene["id"])
+            if self.identity() != identity:
+                raise ValueError("The account changed. Refresh the gallery before continuing.")
+            if domain_tokens(remote) != domain_tokens(scene):
+                raise ValueError("The previous gallery link changed. Review it again.")
+            if file_stamp(path) != stamp:
+                raise ValueError("The local project changed. Review it before updating.")
+            before_link = copy.deepcopy(link)
+            local_fields = {key: value for key, value in link.get("localFields", {}).items()
+                            if key not in ("title", "description") and value != link.get("sharedFields", {}).get(key)}
+            link.update(metadataRevision=scene["metadataRevision"], sharedFields=shared_fields(remote),
+                        metadata=copy.deepcopy(remote), exchangedAt=time.time(), checkedAt=time.time())
+            if local_fields:
+                link["localFields"] = local_fields
+            else:
+                link.pop("localFields", None)
+            try:
+                self._save(project_checks=((path_identity, project_id, stamp),))
+            except Exception:
+                link.clear()
+                link.update(before_link)
+                raise
+            self.message = "projects.gallery.info.applied"
         self._launch_metadata(action)
 
 
@@ -1986,7 +2187,10 @@ class GallerySync:
             self.scenes = [item for item in self.scenes if item["id"] != scene["id"]] + [updated]
             link["acknowledgedPresentationRevision"] = updated.get("presentationRevision", "")
             self._save()
-            self.message = "projects.gallery.info.cover"
+            with self._lock:
+                self.message = "projects.gallery.info.cover"
+                if self._action_failure and self._action_failure["message"] == COVER_WARNING:
+                    self._action_failure = None
         self._launch_metadata(action)
 
 
@@ -1997,7 +2201,7 @@ class GallerySync:
             scenes = [scene for scene in scenes if scene.get("originProjectUuid") == project_id
                       and scene.get("status") == "ready"]
             bucket = self._bucket()
-            recovered = self._origin_publication_links(scenes, bucket["links"])
+            recovered = self._origin_publication_links(scenes, bucket["links"], bucket.get("unlinkedProjects", ()))
             if recovered:
                 scene = next(iter(recovered.values()))["metadata"]
                 self.scenes = [item for item in self.scenes if item["id"] != scene["id"]] + [scene]

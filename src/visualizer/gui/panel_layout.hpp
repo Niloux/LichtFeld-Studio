@@ -7,6 +7,7 @@
 #include "core/export.hpp"
 #include "gui/layout_state.hpp"
 #include "gui/panel_registry.hpp"
+#include "gui/resize_geometry.hpp"
 #include "gui/ui_context.hpp"
 #include "input/frame_input_buffer.hpp"
 #include <cstdint>
@@ -151,13 +152,14 @@ namespace lfs::vis::gui {
 
         CursorRequest getCursorRequest() const { return cursor_request_; }
 
-        void applyResizeDelta(float dx, const ScreenState& screen);
+        void setRightPanelWidth(float width, const ScreenState& screen);
         void enforceWidthConstraints(bool show_main_panel, bool ui_hidden,
                                      const ScreenState& screen);
 
         float getRightPanelWidth() const { return right_panel_width_; }
         float getScenePanelRatio() const { return scene_panel_ratio_; }
-        void adjustScenePanelRatio(float delta_y, const ScreenState& screen);
+        [[nodiscard]] float scenePanelHeight(float avail_h, float dpi) const;
+        void setScenePanelHeight(float height, float panel_height);
         float getPythonConsoleWidth() const { return python_console_width_; }
         float getBottomDockHeight() const { return bottom_dock_height_; }
         bool isBottomDockVisible() const { return bottom_dock_visible_; }
@@ -170,6 +172,7 @@ namespace lfs::vis::gui {
         bool bottomDockActiveTabChanged() const { return bottom_dock_active_tab_changed_; }
         PanelDrawBounds bottomDockTabBarRect() const { return bottom_dock_tab_bar_rect_; }
         float getLeftDockWidth() const { return left_dock_width_; }
+        float getLeftDockPreferredWidth() const { return left_dock_preferred_width_; }
         void setLeftDockWidth(float width);
         bool isLeftDockVisible() const { return left_dock_visible_; }
         bool isShowSequencer() const { return show_sequencer_; }
@@ -181,6 +184,9 @@ namespace lfs::vis::gui {
                            std::string& focus_panel_name);
 
         static constexpr float SPLITTER_H = 6.0f;
+        // Scene tabs, filter chips, search and footer take about 130 dp; this keeps
+        // three tree rows visible under them.
+        static constexpr float SCENE_PANEL_MIN_HEIGHT = 200.0f;
         static constexpr float DOCK_GRIP_H = 8.0f;
         static constexpr float TAB_BAR_H = 28.0f;
         static constexpr float STATUS_BAR_HEIGHT = 22.0f;
@@ -206,21 +212,28 @@ namespace lfs::vis::gui {
         [[nodiscard]] float maxRightPanelWidth(bool show_main_panel, bool ui_hidden,
                                                const ScreenState& screen) const;
 
+        // Effective widths are clamped to the window every frame; preferred widths
+        // hold the user's choice so the panels grow back when the window does.
         float right_panel_width_ = 360.0f;
+        float right_panel_preferred_width_ = 360.0f;
         float scene_panel_ratio_ = 0.4f;
 
         float python_console_width_ = -1.0f;
         bool python_console_resizing_ = false;
         bool python_console_hovering_edge_ = false;
+        ResizeDrag python_console_drag_{};
         float bottom_dock_height_ = 320.0f;
         bool bottom_dock_resizing_ = false;
         bool bottom_dock_hovering_edge_ = false;
+        ResizeDrag bottom_dock_drag_{};
         bool bottom_dock_visible_ = false;
         float bottom_dock_top_y_ = -1.0f;
 
         float left_dock_width_ = 320.0f;
+        float left_dock_preferred_width_ = 320.0f;
         bool left_dock_resizing_ = false;
         bool left_dock_hovering_edge_ = false;
+        ResizeDrag left_dock_drag_{};
         bool left_dock_visible_ = false;
 
         bool show_sequencer_ = false;
@@ -236,8 +249,6 @@ namespace lfs::vis::gui {
         float tab_content_total_h_ = 0.0f;
 
         CursorRequest cursor_request_ = CursorRequest::None;
-        float prev_mouse_x_ = 0;
-        float prev_mouse_y_ = 0;
 
         static constexpr float RIGHT_PANEL_MIN_RATIO = 0.01f;
         static constexpr float RIGHT_PANEL_MAX_RATIO = 0.99f;

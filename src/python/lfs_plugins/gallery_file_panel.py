@@ -56,6 +56,8 @@ class GalleryFilePanel(Panel):
         self._handle = None
         self._unsubscribe = None
         self._submitting = False
+        self._description_focused = False
+        self._pull_folders = []
 
     def poll(self, _context):
         return self._review is not None
@@ -69,9 +71,9 @@ class GalleryFilePanel(Panel):
     def show(self, *, controller, asset, scene, action, fields, includes="", quota="",
              warning="", publish_new=False, open_after=False, on_done=None,
              mode="publish", groups=(), on_submit=None, apply_only=False,
-             expected_project_path=None):
+             expected_project_path=None, unlinked=False, pull_folders=()):
         identity = controller.service.identity()
-        key = (identity, asset["id"], action, publish_new, open_after, expected_project_path, mode, apply_only)
+        key = (identity, asset["id"], action, publish_new, open_after, expected_project_path, mode, apply_only, unlinked)
         if self._review and self._review["key"] == key:
             lf.ui.set_panel_enabled(self.id, True)
             self._dirty()
@@ -82,9 +84,15 @@ class GalleryFilePanel(Panel):
                             quota=quota, warning=warning, publish_new=publish_new,
                             open_after=open_after, on_done=on_done, mode=mode,
                             groups=deepcopy(list(groups)), on_submit=on_submit, apply_only=apply_only,
-                            expected_project_path=expected_project_path)
+                            expected_project_path=expected_project_path, unlinked=unlinked)
+        current_path = lf.project_poll_write().get("path") if mode == "publish" and action in ("publish", "update") else None
+        open_project = bool(current_path and Path(current_path).resolve() == Path(asset["path"]).resolve())
+        self._review["open_project"] = bool(open_project)
         self._fields = dict(fields)
+        self._pull_folders = deepcopy(list(pull_folders)) if action == "pull" else []
         self._fields.setdefault("use_cover", False)
+        if open_project:
+            self._fields.setdefault("save_project", bool(lf.project_is_dirty()))
         self._error = ""
         if self._unsubscribe:
             self._unsubscribe()
@@ -114,11 +122,12 @@ class GalleryFilePanel(Panel):
     def _dirty(self):
         if self._handle:
             self._handle.update_record_list("choices", (self._review or {}).get("groups", []))
+            self._handle.update_record_list("pull_folders", self._pull_folders)
             self._handle.dirty_all()
         lf.ui.request_redraw()
 
     def _set(self, name, value):
-        if name == "use_cover":
+        if name in ("use_cover", "save_project"):
             self._fields[name] = value is True or str(value).lower() in ("true", "1")
             self._dirty()
             return
@@ -131,6 +140,17 @@ class GalleryFilePanel(Panel):
 
     def _is_pull(self):
         return bool(self._review and self._review["action"] == "pull")
+
+    def _browse_pull_folder(self):
+        if not self._is_pull():
+            return
+        directory = lf.ui.open_folder_dialog(
+            tr("review.choose_folder"), self._fields.get("pull_folder", ""))
+        if directory:
+            path = str(directory)
+            if not any(row["path"] == path for row in self._pull_folders):
+                self._pull_folders.append({"name": Path(path).name or path, "path": path})
+            self._set("pull_folder", path)
 
     def _can_submit(self):
         if not self._review or self._submitting or self._state.get("busy"):
@@ -193,8 +213,10 @@ class GalleryFilePanel(Panel):
         model = ctx.create_data_model("gallery_file")
         if model is None:
             return
-        for name in ("title", "description", "upload_format", "pull_folder", "pull_name", "use_cover"):
-            model.bind(name, lambda n=name: self._fields.get(n, False if n == "use_cover" else ""), lambda v, n=name: self._set(n, v))
+        for name in ("title", "description", "upload_format", "pull_name", "use_cover", "save_project"):
+            model.bind(name, lambda n=name: self._fields.get(n, False if n in ("use_cover", "save_project") else ""), lambda v, n=name: self._set(n, v))
+        # Rebuilding options can write back the old selection. Accept only the change event.
+        model.bind("pull_folder", lambda: self._fields.get("pull_folder", ""), lambda _value: None)
         values = {
             "panel_label": self._panel_label,
             "file_name": lambda: (self._review or {}).get("asset", {}).get("name", ""),
@@ -211,6 +233,12 @@ class GalleryFilePanel(Panel):
             "replacement_warning": lambda: tr("replacement.warning", path=(self._review or {}).get("asset", {}).get("path", ""), title=((self._review or {}).get("scene") or {}).get("title", "")),
             "can_submit": self._can_submit,
             "can_cover": lambda: bool((self._review or {}).get("asset", {}).get("has_preview")),
+            "show_save_project": lambda: bool((self._review or {}).get("open_project")),
+            "show_unsaved_hint": lambda: bool((self._review or {}).get("open_project") and not self._fields.get("save_project") and lf.project_is_dirty()),
+            "show_prepared_copy": lambda: not bool((self._review or {}).get("unlinked")),
+            "show_cover": lambda: not bool((self._review or {}).get("unlinked")),
+            "show_unlinked_hint": lambda: bool((self._review or {}).get("unlinked")),
+            "unlinked_copy": lambda: tr("review.unlinked_copy"),
             "submit_label": self._submit_label,
             "format_hint": lambda: tr("format." + self._fields.get("upload_format", "sog") + "_hint"),
             "includes": lambda: (self._review or {}).get("includes", ""),
@@ -223,8 +251,11 @@ class GalleryFilePanel(Panel):
         for name, getter in values.items():
             model.bind_func(name, getter)
         model.bind_record_list("choices")
+        model.bind_record_list("pull_folders")
         model.bind_event("choose", lambda _h, _e, args: self._choose(args))
         model.bind_event("replacement", lambda _h, _e, args: self._replacement(args))
+        model.bind_event("choose_pull_folder", lambda _h, _e, args: self._set("pull_folder", args[0]) if args else None)
+        model.bind_event("browse_pull_folder", lambda _h, _e, _args: self._browse_pull_folder())
         model.bind_func("cancel_label", lambda: tr("replacement.later") if (self._review or {}).get("mode") == "replacement" else tr("action.cancel"))
         for key in ("review.title", "review.description", "review.upload_as",
                     "format.studio", "format.sog", "format.ssog", "format.spz", "info.folder", "info.filename", "action.cancel"):
@@ -273,11 +304,19 @@ class GalleryFilePanel(Panel):
                 else:
                     review["on_submit"](decisions)
             else:
-                details = {k: self._fields[k].strip() for k in ("title", "description")}
+                details = {
+                    "title": self._fields["title"].strip(),
+                    "description": self._fields["description"],
+                }
                 details["useEmbeddedPreview"] = bool(self._fields.get("use_cover", False))
+                if review["open_project"]:
+                    details["saveProject"] = bool(self._fields["save_project"])
                 controller.upload_format = self._fields["upload_format"]
-                controller.publish_asset(review["asset"], details, self._fields["upload_format"],
-                                         update=review["action"] == "update", publish_as_new=review["publish_new"])
+                if review.get("unlinked"):
+                    controller.publish_unlinked_scene(review["asset"], details, self._fields["upload_format"])
+                else:
+                    controller.publish_asset(review["asset"], details, self._fields["upload_format"],
+                                             update=review["action"] == "update", publish_as_new=review["publish_new"])
             # Publishing an update can hand off to conflict resolution, which
             # replaces this panel's review synchronously. Only close the review
             # that submitted; closing whatever is current would dismiss the
@@ -337,11 +376,12 @@ class GalleryFilePanel(Panel):
 
         def keydown(event):
             key = int(event.get_parameter("key_identifier", "0"))
+            target = event.target()
             if key == KI_ESCAPE:
                 self._close(False)
                 event.stop_propagation()
-            elif key == KI_RETURN and event.target().tag_name != "textarea":
-                action = event.target().get_attribute("data-event-click", "")
+            elif key == KI_RETURN and not self._description_focused:
+                action = target.get_attribute("data-event-click", "")
                 if action == "apply_local":
                     self._submit(local_only=True)
                 elif action == "cancel":
@@ -351,6 +391,15 @@ class GalleryFilePanel(Panel):
                 event.stop_propagation()
 
         doc.add_event_listener("keydown", keydown)
+        description = doc.get_element_by_id("gallery-file-description")
+        self._description_focused = False
+        if description:
+            description.add_event_listener(
+                "focus", lambda _event: setattr(self, "_description_focused", True)
+            )
+            description.add_event_listener(
+                "blur", lambda _event: setattr(self, "_description_focused", False)
+            )
         title = doc.get_element_by_id("gallery-file-title")
         if title and not self._is_pull():
             rml_widgets.bind_select_all_on_focus(title)

@@ -247,6 +247,8 @@ namespace lfs::vis::project {
         license();
         [[nodiscard]] lfs::Result<void>
         setLicense(const lfs::io::project::ProjectLicense& license);
+        [[nodiscard]] lfs::Result<void> adoptImportLicense(
+            const std::optional<std::vector<uint8_t>>& license_bytes);
         [[nodiscard]] lfs::Result<void> clearLicense();
         [[nodiscard]] lfs::Result<void>
         setPreview(std::span<const std::byte> png_bytes,
@@ -667,7 +669,8 @@ namespace lfs::vis::project {
             lfs::io::project::ProjectDocument& document,
             const lfs::io::project::ProjectDocumentHydrationReport&
                 report);
-        void captureStoredTrainingSession(
+        // Returns whether a dataset-only session can build its trainer now.
+        bool captureStoredTrainingSession(
             const lfs::io::project::ProjectDocumentHydrationReport&
                 report);
         void clearStoredTrainingSession();

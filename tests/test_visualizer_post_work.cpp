@@ -12991,6 +12991,52 @@ namespace lfs::vis {
     }
 
     TEST_F(VisualizerImplResetTest,
+           DatasetProjectWithoutCheckpointOpensReady) {
+        if (!cuda_device_available()) {
+            GTEST_SKIP() << "CUDA device unavailable";
+        }
+        const auto project_path =
+            temporary_.path / "never-trained.licht";
+        const auto dataset_path =
+            temporary_.path / "never-trained-source";
+        write_minimal_transforms_dataset(dataset_path);
+        write_dataset_project_without_checkpoint(
+            project_path, dataset_path);
+
+        auto options = projectOptions();
+        VisualizerImpl viewer(options);
+        ASSERT_TRUE(viewer.getParameterManager()
+                        ->ensureLoaded());
+        ASSERT_TRUE(viewer.getWindowManager()->init());
+        auto opened = viewer.projectOpen(
+            project_path,
+            ProjectSwitchDisposition::DiscardChanges);
+        ASSERT_TRUE(opened)
+            << lfs::format_for_developer(
+                   opened.error());
+        viewer.noteGuiSessionRestoreOwnerReady(1);
+        // Nothing asks for a restore: a project that never trained opens
+        // with its trainer built, ready to start.
+        ASSERT_TRUE(pumpUntil(
+            viewer.work_queue_mutex_,
+            viewer.work_queue_, [&] {
+                viewer.getGuiManager()
+                    ->asyncTasks()
+                    .pollImportCompletion();
+                const auto session =
+                    viewer.projectTrainingSessionState();
+                return session.hydrated && !session.restoring;
+            }));
+
+        ASSERT_NE(viewer.getTrainer(), nullptr);
+        EXPECT_EQ(viewer.getTrainerManager()->getState(),
+                  lfs::vis::TrainingState::Ready);
+        EXPECT_EQ(
+            viewer.getTrainer()->getParams().optimization.iterations,
+            1234);
+    }
+
+    TEST_F(VisualizerImplResetTest,
            HydratedDatasetReopenMarksDeletedImageMissing) {
         if (!cuda_device_available()) {
             GTEST_SKIP() << "CUDA device unavailable";
@@ -15490,6 +15536,89 @@ namespace lfs::vis {
         ASSERT_TRUE(info);
         EXPECT_TRUE(info->dataset_external_available);
         EXPECT_FALSE(info->embedded_dataset_complete);
+    }
+
+    TEST_F(VisualizerImplResetTest,
+           FinishedTrainingStartReportsOverwriteConflict) {
+        auto options = projectOptions();
+        {
+            VisualizerImpl paused(options);
+            ASSERT_TRUE(paused.getParameterManager()
+                            ->ensureLoaded());
+            auto& scene = paused.getScene();
+            const auto cameras = scene.addGroup("Train cameras");
+            scene.addCamera(
+                "camera.png", cameras,
+                make_project_request_test_camera());
+            paused.getTrainerManager()->setTrainer(
+                std::make_unique<lfs::training::Trainer>(scene));
+            auto* const trainer = paused.getTrainer();
+            ASSERT_NE(trainer, nullptr);
+            trainer->current_iteration_.store(40);
+            auto& state_machine =
+                const_cast<TrainingStateMachine&>(
+                    paused.getTrainerManager()->getStateMachine());
+            if (state_machine.getState() == TrainingState::Idle) {
+                ASSERT_TRUE(state_machine.transitionTo(
+                    TrainingState::Ready));
+            }
+            ASSERT_TRUE(state_machine.transitionTo(
+                TrainingState::Starting));
+            ASSERT_TRUE(state_machine.transitionTo(
+                TrainingState::Running));
+            ASSERT_TRUE(state_machine.transitionTo(
+                TrainingState::Paused));
+            EXPECT_FALSE(
+                paused.trainingStartOverwriteConflict()
+                    .has_value());
+        }
+        {
+            VisualizerImpl viewer(options);
+            ASSERT_TRUE(viewer.getParameterManager()
+                            ->ensureLoaded());
+            auto& scene = viewer.getScene();
+            const auto cameras = scene.addGroup("Train cameras");
+            scene.addCamera(
+                "camera.png", cameras,
+                make_project_request_test_camera());
+            viewer.getTrainerManager()->setTrainer(
+                std::make_unique<lfs::training::Trainer>(scene));
+            auto* const trainer = viewer.getTrainer();
+            ASSERT_NE(trainer, nullptr);
+            trainer->current_iteration_.store(40);
+            auto& state_machine =
+                const_cast<TrainingStateMachine&>(
+                    viewer.getTrainerManager()->getStateMachine());
+            if (state_machine.getState() == TrainingState::Idle) {
+                ASSERT_TRUE(state_machine.transitionTo(
+                    TrainingState::Ready));
+            }
+            ASSERT_TRUE(state_machine.transitionTo(
+                TrainingState::Starting));
+            ASSERT_TRUE(state_machine.transitionToFinished(
+                FinishReason::Completed));
+            ASSERT_TRUE(viewer.getTrainerManager()->isFinished());
+
+            const auto conflict =
+                viewer.trainingStartOverwriteConflict();
+            ASSERT_TRUE(conflict.has_value());
+            EXPECT_EQ(*conflict, 40);
+
+            CapturingErrorConsumer consumer;
+            auto subscription =
+                lfs::ErrorBus::instance().subscribe(consumer);
+            const auto rejected = viewer.startTraining();
+            ASSERT_FALSE(rejected);
+            EXPECT_NE(
+                rejected.error().find("overwrite consent"),
+                std::string::npos);
+            ASSERT_FALSE(consumer.user_messages.empty());
+            EXPECT_NE(
+                consumer.user_messages.back().find(
+                    "overwrite consent"),
+                std::string::npos);
+            (void)subscription;
+        }
     }
 
 } // namespace lfs::vis
