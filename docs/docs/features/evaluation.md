@@ -35,13 +35,14 @@ Everything is written to the output directory:
 ├── metrics_report.txt       best and final scores in plain text
 ├── per_image_metrics.json   every image at every evaluated iteration
 └── eval_step_30000
-    ├── IMG_0001.png               reference | render, unscored pixels black; with a mask three rows:
-    │                              as rendered, mask applied, inverted mask applied
+    ├── IMG_0001.png               reference | render, one row with unscored pixels black
     ├── IMG_0001_flip.png          FLIP error map, with --eval-flip
     └── ...
 ```
 
 Images are named after their input image. When two input images share a name, the later ones get their evaluation index appended.
+
+RGB comparisons use a single row, with the evaluation mask applied to both the reference and render. Set `LFS_EVAL_SAVE_MASK_DIAGNOSTICS=1` to save masked views using the three-row diagnostic layout instead: as rendered, with the mask applied, and with the inverted mask applied inside the valid view. This only changes the saved image layout; scoring uses the same evaluation mask.
 
 `metrics.csv` has the columns `iteration, psnr, ssim, lpips, time_per_image, num_gaussians, normal_angle_deg, depth_absrel, bias_r, bias_g, bias_b, bias_corr_r, bias_corr_g, bias_corr_b, flip`. Columns without a value are left empty.
 

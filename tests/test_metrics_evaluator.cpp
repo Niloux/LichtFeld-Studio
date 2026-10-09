@@ -495,16 +495,15 @@ TEST(MetricsEvaluator, FlipIsReportedAndSavedOnlyWhenEnabled) {
     std::filesystem::remove_all(tmp);
 }
 
-// Fails when a masked evaluation does not save one 3x2 image per view (as rendered, mask applied, inverted mask
-// applied) and nothing else, or names its files by evaluation index instead of the camera; an evaluation without a
-// mask keeps the 1x2 pair.
-TEST(MetricsEvaluator, MaskedEvaluationSavesGridNamedAfterTheCamera) {
+// Both masked and plain evaluations save one reference/render pair per view, named after the camera.
+// A masked pair keeps evaluated pixels unchanged and blanks the excluded pixels in both halves.
+TEST(MetricsEvaluator, MaskedEvaluationSavesPairNamedAfterTheCamera) {
     if (!torch::cuda::is_available()) {
         GTEST_SKIP() << "CUDA not available";
     }
     ensure_image_loader();
 
-    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_mask_grid";
+    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_mask_pair";
     std::filesystem::remove_all(tmp);
     const auto image_path = std::filesystem::path(TEST_DATA_DIR) / "bicycle" / "images_8" / "_DSC8679.JPG";
     const auto [width, height, channels] = lfs::core::get_image_info(image_path);
@@ -531,7 +530,7 @@ TEST(MetricsEvaluator, MaskedEvaluationSavesGridNamedAfterTheCamera) {
         return rgb;
     };
 
-    for (const bool masked : {true, false}) {
+    for (const bool masked : {false, true}) {
         auto params = make_eval_params(tmp / (masked ? "masked" : "plain"));
         params.optimization.enable_save_eval_images = true;
         std::filesystem::create_directories(params.dataset.output_path);
@@ -549,25 +548,29 @@ TEST(MetricsEvaluator, MaskedEvaluationSavesGridNamedAfterTheCamera) {
         EXPECT_FALSE(std::filesystem::exists(dir / "_DSC8679_metric_mask.png"));
         const auto saved = read_rgb(dir / "_DSC8679.png");
         ASSERT_EQ(saved.width, 2 * width + 4);
-        ASSERT_EQ(saved.height, masked ? 3 * height + 8 : height);
+        ASSERT_EQ(saved.height, height);
         if (!masked)
             continue;
 
-        // Every pixel shows in exactly one of the two lower rows, unchanged, and the box splits the view.
+        const auto plain = read_rgb(tmp / "plain" / "eval_step_1" / "_DSC8679.png");
+        ASSERT_EQ(plain.width, saved.width);
+        ASSERT_EQ(plain.height, saved.height);
+        // The box splits the view; excluded pixels are black in both halves, and retained pixels match the plain pair.
         size_t inside = 0, outside = 0, mismatches = 0;
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
+                const uint8_t* gt = saved.at(x, y);
+                const uint8_t* render = saved.at(width + 4 + x, y);
+                const bool excluded = !(gt[0] | gt[1] | gt[2] | render[0] | render[1] | render[2]);
+                inside += !excluded;
+                outside += excluded;
+                if (excluded)
+                    continue;
                 for (const int half : {0, width + 4}) {
-                    const uint8_t* rendered = saved.at(half + x, y);
-                    const uint8_t* applied = saved.at(half + x, y + height + 4);
-                    const uint8_t* inverted = saved.at(half + x, y + 2 * (height + 4));
-                    const bool in_applied = applied[0] | applied[1] | applied[2];
-                    const bool in_inverted = inverted[0] | inverted[1] | inverted[2];
-                    inside += in_applied;
-                    outside += in_inverted;
-                    mismatches += in_applied && in_inverted;
+                    const uint8_t* applied = saved.at(half + x, y);
+                    const uint8_t* unmasked = plain.at(half + x, y);
                     for (int c = 0; c < 3; ++c)
-                        mismatches += applied[c] + inverted[c] != rendered[c];
+                        mismatches += applied[c] != unmasked[c];
                 }
             }
         }

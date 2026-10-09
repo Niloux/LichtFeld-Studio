@@ -1835,7 +1835,8 @@ namespace lfs::training {
                 const auto metadata = lfs::core::provenance_to_json(stamp);
                 auto gt_vis = image_as_float01(gt_image);
                 auto render_vis = r_output.image;
-                if (user_mask_applied) {
+                const auto* mask_diagnostics = std::getenv("LFS_EVAL_SAVE_MASK_DIAGNOSTICS");
+                if (user_mask_applied && mask_diagnostics && std::string_view(mask_diagnostics) == "1") {
                     // Rows: as rendered, with the mask applied, with the inverted mask applied inside the valid view.
                     assert(mask.is_valid() && mask.ndim() == 2);
                     const auto scored = mask_as_float01(mask);
