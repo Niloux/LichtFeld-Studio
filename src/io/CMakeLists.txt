@@ -161,6 +161,7 @@ target_include_directories(lfs_video SYSTEM PRIVATE
 
 target_link_libraries(lfs_video
         PRIVATE
+        lfs_core
         PkgConfig::FFMPEG
         spdlog::spdlog
         CUDA::cudart
@@ -334,6 +335,7 @@ set(LFS_IO_SOURCES
         project/project_chapters.cpp
         project/session_chapters.cpp
         project/project_document.cpp
+        project/sfm_observation_chapter.cpp
         project/project_preview.cpp
         project/project_recovery.cpp
         project/project_inspector.cpp
@@ -432,7 +434,7 @@ if(NOT LFS_TRAIN_ONLY)
         ${WEBP_DECODE_LIB}     # WebP for SOG decompression
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
-        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
+        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ, deflated SSOG members
         $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         lfs_io_rad_quant_cuda  # RAD encode quantization (bit-exact, no fast math)
         assimp::assimp         # Multi-format mesh import

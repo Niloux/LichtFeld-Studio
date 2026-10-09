@@ -20,6 +20,7 @@
 #include "gui/utils/native_file_dialog.hpp"
 #include "io/loader.hpp"
 #include "io/video/video_export_options.hpp"
+#include "operation/undo_history.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
@@ -50,6 +51,156 @@
 namespace lfs::vis::gui {
 
     namespace {
+        [[nodiscard]] bool sameKeyframe(const sequencer::Keyframe& lhs, const sequencer::Keyframe& rhs) {
+            return lhs.id == rhs.id && lhs.time == rhs.time && lhs.position == rhs.position &&
+                   lhs.rotation == rhs.rotation && lhs.focal_length_mm == rhs.focal_length_mm &&
+                   lhs.easing == rhs.easing && lhs.is_loop_point == rhs.is_loop_point;
+        }
+
+        class KeyframeChangeUndoEntry final : public op::UndoEntry {
+        public:
+            KeyframeChangeUndoEntry(SequencerController& controller, std::weak_ptr<void> lifetime,
+                                    std::optional<sequencer::Keyframe> before,
+                                    std::optional<sequencer::Keyframe> after,
+                                    const float duration_before, const std::string_view action_name)
+                : controller_(controller), lifetime_(std::move(lifetime)), before_(std::move(before)), after_(std::move(after)), id_(before_ ? before_->id : after_->id), duration_before_(duration_before), duration_after_(controller.clipDuration()), action_name_(action_name) {}
+
+            void undo() override { apply(after_, before_, duration_after_, duration_before_); }
+            void redo() override { apply(before_, after_, duration_before_, duration_after_); }
+            [[nodiscard]] std::string name() const override { return std::string(action_name_); }
+            [[nodiscard]] size_t estimatedBytes() const override { return sizeof(*this); }
+
+        private:
+            void apply(const std::optional<sequencer::Keyframe>& expected,
+                       const std::optional<sequencer::Keyframe>& desired,
+                       const float expected_duration, const float desired_duration) {
+                if (lifetime_.expired())
+                    throw op::HistoryStaleEntryError("Sequencer is no longer available");
+                const auto* current = controller_.timeline().getKeyframeById(id_);
+                if ((expected && (!current || !sameKeyframe(*current, *expected))) || (!expected && current))
+                    throw op::HistoryStaleEntryError("Keyframe changed since the recorded change");
+
+                const bool restore_duration = controller_.clipDuration() == expected_duration;
+                if (desired) {
+                    if (!current)
+                        controller_.addKeyframe(*desired);
+                    *controller_.timeline().getKeyframeById(id_) = *desired;
+                    controller_.commitKeyframeTimeById(id_);
+                } else {
+                    controller_.removeKeyframeById(id_);
+                }
+                if (restore_duration && desired_duration != expected_duration)
+                    controller_.setClipDuration(desired_duration);
+                lfs::core::events::state::KeyframeListChanged{
+                    .count = controller_.timeline().realKeyframeCount()}
+                    .emit();
+            }
+
+            SequencerController& controller_;
+            std::weak_ptr<void> lifetime_;
+            std::optional<sequencer::Keyframe> before_;
+            std::optional<sequencer::Keyframe> after_;
+            sequencer::KeyframeId id_;
+            float duration_before_;
+            float duration_after_;
+            std::string_view action_name_;
+        };
+
+        class KeyframeTimeUndoEntry final : public op::UndoEntry {
+        public:
+            KeyframeTimeUndoEntry(SequencerController& controller, std::weak_ptr<void> lifetime,
+                                  const sequencer::KeyframeId id, const float before, const float after)
+                : controller_(controller), lifetime_(std::move(lifetime)), generation_(controller.timelineGeneration()), id_(id), before_(before), after_(after) {}
+
+            void undo() override { apply(after_, before_); }
+            void redo() override { apply(before_, after_); }
+            [[nodiscard]] std::string name() const override { return "Edit Keyframe Time"; }
+            [[nodiscard]] size_t estimatedBytes() const override { return sizeof(*this); }
+
+        private:
+            void apply(const float expected, const float desired) {
+                if (lifetime_.expired() || controller_.timelineGeneration() != generation_)
+                    throw op::HistoryStaleEntryError("Sequencer timeline is no longer available");
+                const auto* keyframe = controller_.timeline().getKeyframeById(id_);
+                if (!keyframe || keyframe->is_loop_point || keyframe->time != expected)
+                    throw op::HistoryStaleEntryError("Keyframe time changed since the recorded edit");
+                controller_.setKeyframeTimeById(id_, desired);
+                lfs::core::events::state::KeyframeListChanged{
+                    .count = controller_.timeline().realKeyframeCount()}
+                    .emit();
+            }
+
+            SequencerController& controller_;
+            std::weak_ptr<void> lifetime_;
+            uint64_t generation_;
+            sequencer::KeyframeId id_;
+            float before_;
+            float after_;
+        };
+
+        class KeyframeEasingUndoEntry final : public op::UndoEntry {
+        public:
+            KeyframeEasingUndoEntry(SequencerController& controller, std::weak_ptr<void> lifetime,
+                                    sequencer::Keyframe before, const sequencer::EasingType after)
+                : controller_(controller), lifetime_(std::move(lifetime)), before_(std::move(before)), after_(after) {}
+
+            void undo() override { apply(after_, before_.easing); }
+            void redo() override { apply(before_.easing, after_); }
+            [[nodiscard]] std::string name() const override { return "Set Keyframe Easing"; }
+            [[nodiscard]] size_t estimatedBytes() const override { return sizeof(*this); }
+
+        private:
+            void apply(const sequencer::EasingType expected, const sequencer::EasingType desired) {
+                if (lifetime_.expired())
+                    throw op::HistoryStaleEntryError("Sequencer is no longer available");
+                const auto* current = controller_.timeline().getKeyframeById(before_.id);
+                auto expected_key = before_;
+                expected_key.easing = expected;
+                if (!current || !sameKeyframe(*current, expected_key))
+                    throw op::HistoryStaleEntryError("Keyframe changed since the recorded easing edit");
+                if (!controller_.setKeyframeEasingById(before_.id, desired))
+                    throw op::HistoryStaleEntryError("Could not restore keyframe easing");
+                lfs::core::events::state::KeyframeListChanged{
+                    .count = controller_.timeline().realKeyframeCount()}
+                    .emit();
+            }
+
+            SequencerController& controller_;
+            std::weak_ptr<void> lifetime_;
+            sequencer::Keyframe before_;
+            sequencer::EasingType after_;
+        };
+
+        class ClipDurationUndoEntry final : public op::UndoEntry {
+        public:
+            ClipDurationUndoEntry(SequencerController& controller, std::weak_ptr<void> lifetime,
+                                  const float before, const float after)
+                : controller_(controller), lifetime_(std::move(lifetime)), generation_(controller.timelineGeneration()), before_(before), after_(after) {}
+
+            void undo() override { apply(after_, before_); }
+            void redo() override { apply(before_, after_); }
+            [[nodiscard]] std::string name() const override { return "Edit Clip Duration"; }
+            [[nodiscard]] size_t estimatedBytes() const override { return sizeof(*this); }
+
+        private:
+            void apply(const float expected, const float desired) {
+                if (lifetime_.expired() || controller_.timelineGeneration() != generation_)
+                    throw op::HistoryStaleEntryError("Sequencer timeline is no longer available");
+                if (controller_.clipDuration() != expected || desired < controller_.timeline().realEndTime())
+                    throw op::HistoryStaleEntryError("Timeline changed since the recorded duration edit");
+                controller_.setClipDuration(desired);
+                lfs::core::events::state::KeyframeListChanged{
+                    .count = controller_.timeline().realKeyframeCount()}
+                    .emit();
+            }
+
+            SequencerController& controller_;
+            std::weak_ptr<void> lifetime_;
+            uint64_t generation_;
+            float before_;
+            float after_;
+        };
+
         constexpr size_t MIN_PATH_RENDER_SAMPLES = 128;
         constexpr size_t MAX_PATH_RENDER_SAMPLES = 4096;
         constexpr float PATH_SAMPLES_PER_VIEWPORT_PIXEL = 2.0f;
@@ -278,9 +429,37 @@ namespace lfs::vis::gui {
           ui_state_(ui_state),
           panel_(std::make_unique<RmlSequencerPanel>(controller_, ui_state_, rml_manager)),
           overlay_(std::make_unique<RmlSequencerOverlay>(controller_, rml_manager)),
-          scene_sync_(std::make_unique<KeyframeSceneSync>(controller_, viewer)) {}
+          scene_sync_(std::make_unique<KeyframeSceneSync>(controller_, viewer)) {
+        controller_.setKeyframeRemovedCallback([this](const sequencer::Keyframe& keyframe, const float duration_before) {
+            auto& history = op::undoHistory();
+            if (!history.isPlaybackActive())
+                history.push(std::make_unique<KeyframeChangeUndoEntry>(controller_, history_lifetime_, keyframe,
+                                                                       std::nullopt, duration_before, "Delete Keyframe"));
+        });
+        controller_.setKeyframeTimeCommitCallback([this](const sequencer::KeyframeId id,
+                                                         const float before, const float after) {
+            if (!op::undoHistory().isPlaybackActive())
+                op::undoHistory().push(std::make_unique<KeyframeTimeUndoEntry>(
+                    controller_, history_lifetime_, id, before, after));
+        });
+        controller_.setKeyframeEasingChangedCallback([this](const sequencer::Keyframe& before, const sequencer::EasingType after) {
+            auto& history = op::undoHistory();
+            if (!history.isPlaybackActive())
+                history.push(std::make_unique<KeyframeEasingUndoEntry>(controller_, history_lifetime_, before, after));
+        });
+        controller_.setClipDurationCommitCallback([this](const float before, const float after) {
+            if (!op::undoHistory().isPlaybackActive())
+                op::undoHistory().push(std::make_unique<ClipDurationUndoEntry>(
+                    controller_, history_lifetime_, before, after));
+        });
+    }
 
     SequencerUIManager::~SequencerUIManager() {
+        controller_.setKeyframeRemovedCallback({});
+        controller_.setKeyframeTimeCommitCallback({});
+        controller_.setKeyframeEasingChangedCallback({});
+        controller_.setClipDurationCommitCallback({});
+
         stopPlySequenceStreaming();
     }
 
@@ -400,12 +579,20 @@ namespace lfs::vis::gui {
             // keyframe overwrites that keyframe with the current pose instead of stacking.
             constexpr float REPLACE_EPSILON_S = 0.01f;
             const auto& keyframes = controller_.timeline().keyframes();
-            const auto existing = std::find_if(keyframes.begin(), keyframes.end(),
-                                               [time](const lfs::sequencer::Keyframe& kf) {
-                                                   return !kf.is_loop_point &&
-                                                          std::abs(kf.time - time) < REPLACE_EPSILON_S;
-                                               });
+            // Adding beyond the clip extends it even within the replacement tolerance.
+            const auto existing = time > controller_.timeline().clipDuration()
+                                      ? keyframes.end()
+                                      : std::find_if(keyframes.begin(), keyframes.end(),
+                                                     [time](const lfs::sequencer::Keyframe& kf) {
+                                                         return !kf.is_loop_point &&
+                                                                std::abs(kf.time - time) < REPLACE_EPSILON_S;
+                                                     });
+            const float duration_before = controller_.clipDuration();
+            std::optional<sequencer::Keyframe> before;
+            sequencer::KeyframeId edited_id;
             if (existing != keyframes.end()) {
+                before = *existing;
+                edited_id = existing->id;
                 LOG_INFO("Replaced keyframe {} at t={:.3f}s instead of adding a new one", existing->id, time);
                 controller_.updateKeyframeById(existing->id, position, rotation, focal_mm);
             } else {
@@ -414,8 +601,9 @@ namespace lfs::vis::gui {
                 kf.position = position;
                 kf.rotation = rotation;
                 kf.focal_length_mm = focal_mm;
-                controller_.addKeyframeAtTime(kf, time);
+                edited_id = controller_.addKeyframeAtTime(kf, time);
             }
+            recordKeyframeAddition(std::move(before), edited_id, duration_before);
             state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
         });
 
@@ -425,10 +613,10 @@ namespace lfs::vis::gui {
             const auto& cam = viewer_->getViewport().camera;
             auto* const rm = viewer_->getRenderingManager();
             const float focal_mm = rm ? rm->getFocalLengthMm() : lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
-            controller_.updateSelectedKeyframe(
-                cam.t,
-                glm::quat_cast(cam.R),
-                focal_mm);
+            updateKeyframeFromView(*controller_.selectedKeyframeId(),
+                                   {.position = cam.t,
+                                    .rotation = glm::quat_cast(cam.R),
+                                    .focal_length_mm = focal_mm});
             if (viewport_keyframe_edit_snapshot_.has_value() &&
                 controller_.selectedKeyframeId().has_value() &&
                 *controller_.selectedKeyframeId() ==
@@ -452,9 +640,7 @@ namespace lfs::vis::gui {
         });
 
         cmd::SequencerLoadPlySequence::when([this](const auto& event) {
-            if (event.fps > 0.0f)
-                ui_state_.sequence_fps = std::clamp(event.fps, MIN_SEQUENCE_FPS, MAX_SEQUENCE_FPS);
-            loadPlySequenceFromDirectory(lfs::core::utf8_to_path(event.directory));
+            (void)loadPlySequenceFromDirectory(lfs::core::utf8_to_path(event.directory), event.fps);
         });
 
         state::KeyframeListChanged::when([this](const auto&) {
@@ -532,16 +718,9 @@ namespace lfs::vis::gui {
         overlay_input.key_shift = (sdl_buf.key_mods & SDL_KMOD_SHIFT) != 0;
         overlay_input.key_alt = (sdl_buf.key_mods & SDL_KMOD_ALT) != 0;
         overlay_input.key_super = (sdl_buf.key_mods & SDL_KMOD_GUI) != 0;
+        overlay_input.input_events = sdl_buf.input_events;
         for (auto sc : sdl_buf.keys_pressed)
             overlay_input.keys_pressed.push_back(static_cast<int>(sc));
-        for (auto sc : sdl_buf.keys_released)
-            overlay_input.keys_released.push_back(static_cast<int>(sc));
-        overlay_input.text_codepoints = sdl_buf.text_codepoints;
-        overlay_input.text_inputs = sdl_buf.text_inputs;
-        overlay_input.text_editing = sdl_buf.text_editing;
-        overlay_input.text_editing_start = sdl_buf.text_editing_start;
-        overlay_input.text_editing_length = sdl_buf.text_editing_length;
-        overlay_input.has_text_editing = sdl_buf.has_text_editing;
 
         renderKeyframeEditOverlay(viewport);
         overlay_->processInput(overlay_input);
@@ -579,11 +758,18 @@ namespace lfs::vis::gui {
         return overlay_ && (overlay_->isContextMenuOpen() || overlay_->isPopupOpen());
     }
 
-    bool SequencerUIManager::needsAnimationFrame() const {
+    bool SequencerUIManager::needsAnimationFrame(const bool ui_visible) const {
+        if (controller_.isPlaying() || controller_.state() == PlaybackState::SCRUBBING ||
+            plySequenceStreamHasWork()) {
+            return true;
+        }
+
+        // Hidden panels cannot consume localization, preview, or overlay updates.
+        const auto* const gui = viewer_ ? viewer_->getGuiManager() : nullptr;
+        if (!ui_visible || !gui || !gui->panelLayout().isShowSequencer())
+            return false;
+
         return (panel_ && panel_->needsLocalizationFrame()) ||
-               controller_.isPlaying() ||
-               controller_.state() == PlaybackState::SCRUBBING ||
-               plySequenceStreamHasWork() ||
                keyframe_gizmo_active_ ||
                viewport_keyframe_edit_snapshot_.has_value() ||
                (ui_state_.show_pip_preview &&
@@ -1045,7 +1231,7 @@ namespace lfs::vis::gui {
         if (current_frame_loaded)
             last_ply_sequence_frame_ = std::nullopt;
         if (auto* const rm = viewer_->getRenderingManager())
-            rm->markDirty(DirtyFlag::SPLATS);
+            rm->markDirty(DirtyFlag::SPLATS, lfs::vis::FrameReason::SceneChange);
         if (current_frame.has_value())
             evictPlySequenceFrames(*current_frame);
     }
@@ -1347,7 +1533,7 @@ namespace lfs::vis::gui {
         if (panel_->consumeLoadSequenceRequest()) {
             const auto path = gui::PickFolderDialog();
             if (!path.empty())
-                loadPlySequenceFromDirectory(path);
+                (void)loadPlySequenceFromDirectory(path);
         }
 
         if (panel_->consumeDockToggleRequest()) {
@@ -1376,10 +1562,7 @@ namespace lfs::vis::gui {
         if (panel_->consumeClearRequest() &&
             (controller_.timeline().realKeyframeCount() > 0 || controller_.timeline().hasAnimationClip() ||
              controller_.hasPlySequence())) {
-            stopPlySequenceStreaming();
-            controller_.clear();
-            last_ply_sequence_frame_ = std::nullopt;
-            loaded_ply_sequence_frames_.clear();
+            controller_.clearKeyframes();
             lfs::core::events::state::KeyframeListChanged{.count = 0}.emit();
             LOG_INFO("Sequencer cleared");
         }
@@ -1476,10 +1659,7 @@ namespace lfs::vis::gui {
                                    if (action == "clear_confirm" &&
                                        (controller_.timeline().realKeyframeCount() > 0 || controller_.timeline().hasAnimationClip() ||
                                         controller_.hasPlySequence())) {
-                                       stopPlySequenceStreaming();
-                                       controller_.clear();
-                                       last_ply_sequence_frame_ = std::nullopt;
-                                       loaded_ply_sequence_frames_.clear();
+                                       controller_.clearKeyframes();
                                        lfs::core::events::state::KeyframeListChanged{.count = 0}.emit();
                                        LOG_INFO("Sequencer cleared");
                                    }
@@ -1628,7 +1808,7 @@ namespace lfs::vis::gui {
                 pos,
                 settings.focal_length_mm,
                 settings.orthographic,
-                settings.ortho_scale);
+                panel.viewport->ortho_scale_override.value_or(settings.ortho_scale));
             if (!projected)
                 return {-10000.0f, -10000.0f};
             const float scale_x =
@@ -1650,7 +1830,7 @@ namespace lfs::vis::gui {
                 pos,
                 settings.focal_length_mm,
                 settings.orthographic,
-                settings.ortho_scale);
+                panel.viewport->ortho_scale_override.value_or(settings.ortho_scale));
             if (!projected)
                 return false;
             const float margin_x =
@@ -1669,7 +1849,7 @@ namespace lfs::vis::gui {
 
         const auto& t = theme();
         const auto* const wm = viewer_->getWindowManager();
-        const glm::ivec2 screen_size = wm ? wm->getWindowSize() : glm::ivec2{};
+        const glm::ivec2 screen_size = wm ? wm->getFramebufferSize() : glm::ivec2{};
         const glm::ivec2 framebuffer_size = wm ? wm->getFramebufferSize() : glm::ivec2{};
         const int screen_w = screen_size.x;
         const int screen_h = screen_size.y;
@@ -1949,7 +2129,7 @@ namespace lfs::vis::gui {
             render_size,
             settings.focal_length_mm,
             settings.orthographic,
-            settings.ortho_scale);
+            gizmo_viewport->ortho_scale_override.value_or(settings.ortho_scale));
 
         const glm::mat3 rot_mat = glm::mat3_cast(kf->rotation);
         glm::mat4 gizmo_matrix(rot_mat);
@@ -2034,7 +2214,7 @@ namespace lfs::vis::gui {
                     new_pos,
                     new_rot,
                     kf->focal_length_mm)) {
-                rendering_manager->markDirty(DirtyFlag::OVERLAY);
+                rendering_manager->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
             }
         }
 
@@ -2048,15 +2228,25 @@ namespace lfs::vis::gui {
         draw_list.PopClipRect();
     }
 
-    void SequencerUIManager::loadPlySequenceFromDirectory(const std::filesystem::path& directory) {
+    lfs::Result<void> SequencerUIManager::loadPlySequenceFromDirectory(
+        const std::filesystem::path& directory, const float fps) {
+        const auto fail = [](const lfs::ErrorCode code, std::string message) {
+            return lfs::Result<void>::failure(lfs::make_error(lfs::ErrorInit{
+                .code = code,
+                .domain = lfs::ErrorDomain::Sequencer,
+                .user_message = std::move(message),
+                .detection = LFS_SOURCE_SITE_CURRENT()}));
+        };
+        if (fps > 0.0f)
+            ui_state_.sequence_fps = std::clamp(fps, MIN_SEQUENCE_FPS, MAX_SEQUENCE_FPS);
         auto* const scene_manager = viewer_->getSceneManager();
         if (!scene_manager)
-            return;
+            return fail(lfs::ErrorCode::Unavailable, "Scene manager unavailable");
 
         std::error_code ec;
         if (!std::filesystem::is_directory(directory, ec)) {
             LOG_ERROR("PLY sequence path is not a directory: {}", lfs::core::path_to_utf8(directory));
-            return;
+            return fail(lfs::ErrorCode::InvalidArgument, std::format("PLY sequence path is not a directory: {}", lfs::core::path_to_utf8(directory)));
         }
         last_ply_sequence_frame_ = std::nullopt;
         loaded_ply_sequence_frames_.clear();
@@ -2067,14 +2257,14 @@ namespace lfs::vis::gui {
             LOG_ERROR("Failed to read PLY sequence directory {}: {}",
                       lfs::core::path_to_utf8(directory),
                       ec.message());
-            return;
+            return fail(lfs::ErrorCode::Unavailable, std::format("Failed to read PLY sequence directory: {}", ec.message()));
         }
         for (const auto& entry : entries) {
             if (ec) {
                 LOG_ERROR("Failed to read PLY sequence directory {}: {}",
                           lfs::core::path_to_utf8(directory),
                           ec.message());
-                return;
+                return fail(lfs::ErrorCode::Unavailable, std::format("Failed to read PLY sequence directory: {}", ec.message()));
             }
             if (!entry.is_regular_file(ec))
                 continue;
@@ -2088,14 +2278,14 @@ namespace lfs::vis::gui {
         std::sort(paths.begin(), paths.end());
         if (paths.empty()) {
             LOG_WARN("No PLY files found in sequence directory: {}", lfs::core::path_to_utf8(directory));
-            return;
+            return fail(lfs::ErrorCode::InvalidArgument, std::format("No PLY files found in sequence directory: {}", lfs::core::path_to_utf8(directory)));
         }
 
         // A PLY sequence replaces the scene. Each file gets a real scene-graph
         // child immediately; the heavy SplatData is streamed into those nodes.
         if (scene_manager->getContentType() != SceneManager::ContentType::Empty) {
             if (!scene_manager->clear())
-                return;
+                return fail(lfs::ErrorCode::Internal, "Failed to clear scene for PLY sequence");
         }
 
         const std::string sequence_prefix = lfs::core::path_to_utf8(directory.filename().empty()
@@ -2106,7 +2296,7 @@ namespace lfs::vis::gui {
         if (sequence_node.empty()) {
             LOG_ERROR("Failed to create PLY sequence node for {}",
                       lfs::core::path_to_utf8(directory));
-            return;
+            return fail(lfs::ErrorCode::Internal, "Failed to create PLY sequence node");
         }
 
         std::vector<std::filesystem::path> loaded_paths;
@@ -2121,7 +2311,7 @@ namespace lfs::vis::gui {
         const auto* sequence_scene_node = scene.getNode(sequence_node);
         if (!sequence_scene_node) {
             LOG_ERROR("Failed to resolve PLY sequence node '{}'", sequence_node);
-            return;
+            return fail(lfs::ErrorCode::Internal, "Failed to resolve PLY sequence node");
         }
         const core::NodeId sequence_id = sequence_scene_node->id;
         const core::Uuid sequence_uuid = sequence_scene_node->uuid;
@@ -2138,7 +2328,7 @@ namespace lfs::vis::gui {
                 LOG_ERROR("Failed to create PLY sequence frame placeholder '{}'", node_name);
                 if (!scene_manager->clear())
                     LOG_WARN("Failed to clear partial PLY sequence after placeholder failure");
-                return;
+                return fail(lfs::ErrorCode::Internal, "Failed to create PLY sequence frame placeholder");
             }
             const auto* frame_node = scene.getNodeById(frame_id);
             assert(frame_node);
@@ -2167,7 +2357,7 @@ namespace lfs::vis::gui {
             const auto resolved_node = resolvePlySequenceNode(scene, sequence->node_uuid, sequence->node_name);
             if (!resolved_node) {
                 LOG_ERROR("Cannot select PLY sequence container: {}", resolved_node.error().message);
-                return;
+                return fail(lfs::ErrorCode::Internal, std::format("Cannot select PLY sequence container: {}", resolved_node.error().message));
             }
             scene_manager->selectNode(*resolved_node);
             LOG_INFO("Registered PLY sequence '{}' with {} frames at {} fps",
@@ -2179,6 +2369,7 @@ namespace lfs::vis::gui {
         lfs::core::events::state::KeyframeListChanged{
             .count = controller_.timeline().realKeyframeCount()}
             .emit();
+        return {};
     }
 
     void SequencerUIManager::applyPlySequenceFrame() {
@@ -2236,7 +2427,34 @@ namespace lfs::vis::gui {
         }
         last_ply_sequence_frame_ = display_frame;
         if (auto* const rm = viewer_->getRenderingManager())
-            rm->markDirty(DirtyFlag::SPLATS);
+            rm->markDirty(DirtyFlag::SPLATS, lfs::vis::FrameReason::SceneChange);
+    }
+
+    void SequencerUIManager::recordKeyframeAddition(std::optional<sequencer::Keyframe> before,
+                                                    const sequencer::KeyframeId id, const float duration_before) {
+        const auto* after = controller_.timeline().getKeyframeById(id);
+        if (!after || (before && sameKeyframe(*before, *after)))
+            return;
+        const auto action_name = before ? "Replace Keyframe" : "Add Keyframe";
+        op::undoHistory().push(std::make_unique<KeyframeChangeUndoEntry>(
+            controller_, history_lifetime_, std::move(before), *after, duration_before, action_name));
+    }
+
+    bool SequencerUIManager::updateKeyframeFromView(const sequencer::KeyframeId id,
+                                                    const sequencer::CameraState& view_state) {
+        const auto* keyframe = controller_.timeline().getKeyframeById(id);
+        if (!keyframe || keyframe->is_loop_point)
+            return false;
+        const auto before = *keyframe;
+        const float duration_before = controller_.clipDuration();
+        if (!controller_.updateKeyframeById(id, view_state.position, view_state.rotation, view_state.focal_length_mm))
+            return false;
+        const auto* after = controller_.timeline().getKeyframeById(id);
+        if (after && !sameKeyframe(before, *after)) {
+            op::undoHistory().push(std::make_unique<KeyframeChangeUndoEntry>(
+                controller_, history_lifetime_, before, *after, duration_before, "Update Keyframe"));
+        }
+        return true;
     }
 
     void SequencerUIManager::handleOverlayActions() {
@@ -2255,7 +2473,9 @@ namespace lfs::vis::gui {
                 kf.position = cam.t;
                 kf.rotation = glm::quat_cast(cam.R);
                 kf.focal_length_mm = focal_mm;
-                controller_.addKeyframeAtTime(kf, time);
+                const float duration_before = controller_.clipDuration();
+                const auto id = controller_.addKeyframeAtTime(kf, time);
+                recordKeyframeAddition(std::nullopt, id, duration_before);
                 controller_.seek(time);
                 state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
             } break;
@@ -2287,7 +2507,7 @@ namespace lfs::vis::gui {
                                           ? SequencerViewportEditMode::None
                                           : SequencerViewportEditMode::Translate;
                 if (auto* const rm = viewer_->getRenderingManager())
-                    rm->markDirty(DirtyFlag::OVERLAY);
+                    rm->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
                 break;
             case Action::SET_ROTATE:
                 keyframe_gizmo_active_ = false;
@@ -2297,7 +2517,7 @@ namespace lfs::vis::gui {
                                           ? SequencerViewportEditMode::None
                                           : SequencerViewportEditMode::Rotate;
                 if (auto* const rm = viewer_->getRenderingManager())
-                    rm->markDirty(DirtyFlag::OVERLAY);
+                    rm->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
                 break;
             case Action::SET_EASING: {
                 const auto easing = static_cast<sequencer::EasingType>(action->easing_value);
@@ -2321,11 +2541,7 @@ namespace lfs::vis::gui {
             case Action::APPLY_EDIT:
                 if (viewport_keyframe_edit_snapshot_.has_value()) {
                     const auto view_state = currentViewportCameraState();
-                    if (controller_.updateKeyframeById(
-                            viewport_keyframe_edit_snapshot_->id,
-                            view_state.position,
-                            view_state.rotation,
-                            view_state.focal_length_mm)) {
+                    if (updateKeyframeFromView(viewport_keyframe_edit_snapshot_->id, view_state)) {
                         state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
                     }
                     if (const auto* const keyframe =
