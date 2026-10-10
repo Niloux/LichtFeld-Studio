@@ -235,6 +235,7 @@ endif()
 # unreferenced function sections before resolution. Keep the dependency-heavy
 # chapter coverage in the non-Windows composition.
 set(LICHT_FORMAT_WINDOWS_FILES
+    test_project_save_as_paths.cpp
     test_json_chapter_dom.cpp
     test_project_chapters.cpp
     test_project_container.cpp
@@ -548,6 +549,7 @@ set(TEST_FILES
     test_roi_weight_map.cpp
     test_mesh_mask_kernels.cpp
     test_flip.cpp
+    test_compare_images.cpp
     test_roi_weighted_losses.cpp
     test_checkpoint_resume.cpp
     test_component_config_serialization.cpp
@@ -660,6 +662,7 @@ set(TEST_FILES
     test_fastgs_analytical_gradients.cpp
     test_normal_prior_decode.cpp
     test_normal_auto_generate.cpp
+    test_lens_priors.cpp
     test_metrics_evaluator.cpp
     test_metrics_eval_mask.cpp
     test_background_image.cpp
@@ -840,6 +843,7 @@ target_include_directories(lichtfeld_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/tests
     ${CMAKE_SOURCE_DIR}/src/training   # For training headers
     ${CMAKE_SOURCE_DIR}/src            # For module headers
+    ${CMAKE_SOURCE_DIR}/src/preprocessing/include
     ${CMAKE_SOURCE_DIR}/src/app/include
     ${CMAKE_SOURCE_DIR}/src/visualizer # For visualizer-relative headers (e.g. gui/ui_widgets.hpp)
     ${CMAKE_SOURCE_DIR}/external/spz   # SPZ library headers

@@ -330,10 +330,9 @@ namespace lfs::vis {
                     phase += period;
                 if (phase <= end) {
                     playhead_ = phase;
-                    reverse_direction_ = false;
                 } else {
                     playhead_ = period - phase;
-                    reverse_direction_ = true;
+                    reverse_direction_ = !reverse_direction_;
                 }
             }
             break;
@@ -519,10 +518,10 @@ namespace lfs::vis {
     void SequencerController::clear() {
         ++timeline_generation_;
         pending_keyframe_time_edit_.reset();
-        stop();
         deselectKeyframe();
         ply_sequence_.reset();
         timeline_.clear();
+        stop();
         markTimelineChanged();
     }
 

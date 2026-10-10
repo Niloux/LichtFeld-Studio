@@ -414,6 +414,46 @@ TEST_F(McpSequencerToolsTest, PlySequenceLoadPreservesValidAndDefaultFps) {
     EXPECT_TRUE(backend_.visible);
 }
 
+TEST_F(McpSequencerToolsTest, CameraCommandsRejectDegenerateExplicitUpWithoutSideEffects) {
+    const auto id = backend_.add_manual_keyframe(0.0f, {3.0f, 2.0f, 1.0f});
+    const auto before = lfs::mcp::ToolRegistry::instance().call_tool("sequencer.get", json::object());
+    const auto camera_before = backend_.camera;
+    for (const auto* tool : {"sequencer.add_keyframe", "sequencer.update_keyframe"}) {
+        for (const auto& up : {json::array({0.0, 0.0, 0.0}), json::array({0.0, 0.0, 1.0}),
+                               json::array({0.0, 0.0, -1.0}), json::array({0.0, 1.0e-8, 1.0})}) {
+            SCOPED_TRACE(std::string(tool) + up.dump());
+            const auto result = lfs::mcp::ToolRegistry::instance().call_tool(
+                tool, json{{"keyframe_id", id}, {"eye", json::array({0, 0, 5})}, {"target", json::array({0, 0, 0})}, {"up", up}, {"fov_degrees", 30.0}});
+            EXPECT_EQ(result.value("error", json::object()).value("code", ""), "InvalidArgument");
+            EXPECT_NE(result.value("error_message", "").find("up"), std::string::npos);
+            EXPECT_EQ(lfs::mcp::ToolRegistry::instance().call_tool("sequencer.get", json::object()), before);
+            EXPECT_EQ(backend_.camera.eye, camera_before.eye);
+            EXPECT_EQ(backend_.camera.target, camera_before.target);
+            EXPECT_EQ(backend_.camera.up, camera_before.up);
+            EXPECT_FLOAT_EQ(backend_.camera.fov_degrees, camera_before.fov_degrees);
+        }
+    }
+}
+
+TEST_F(McpSequencerToolsTest, CameraCommandsPreserveValidExplicitAndDefaultUp) {
+    const auto id = backend_.add_manual_keyframe(0.0f, {0.0f, 0.0f, 0.0f});
+    for (const auto* tool : {"sequencer.add_keyframe", "sequencer.update_keyframe"}) {
+        backend_.visible = false;
+        for (const auto& up : {json::array({0.0, 1.0, 0.0}), json::array({1.0, 1.0, 0.0}),
+                               json::array({0.0, 2.0, 0.0}), json::array({0.0, 1.0, 1.0})}) {
+            const auto result = lfs::mcp::ToolRegistry::instance().call_tool(
+                tool, json{{"keyframe_id", id}, {"eye", json::array({0, 0, 5})}, {"target", json::array({0, 0, 0})}, {"up", up}, {"show_sequencer", false}});
+            ASSERT_TRUE(result.value("success", false)) << result.dump();
+            EXPECT_EQ(backend_.camera.up, glm::vec3(up[0].get<float>(), up[1].get<float>(), up[2].get<float>()));
+            EXPECT_FALSE(backend_.visible);
+        }
+        const auto result = lfs::mcp::ToolRegistry::instance().call_tool(
+            tool, json{{"keyframe_id", id}, {"eye", json::array({0, 5, 0})}, {"target", json::array({0, 0, 0})}});
+        ASSERT_TRUE(result.value("success", false)) << result.dump();
+        EXPECT_EQ(backend_.camera.up, glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+}
+
 TEST_F(McpSequencerToolsTest, AddKeyframeRejectsCoincidentCameraView) {
     const auto result = lfs::mcp::ToolRegistry::instance().call_tool(
         "sequencer.add_keyframe",
@@ -488,11 +528,59 @@ TEST_F(McpSequencerToolsTest, SetEasingRejectsOutOfRangeNumbersWithoutChangingKe
     }
 }
 
+TEST_F(McpSequencerToolsTest, FractionalKeyframeIdCannotMutateAnyCommand) {
+    auto& registry = lfs::mcp::ToolRegistry::instance();
+    for (const auto* command : {"sequencer.delete_keyframe", "sequencer.update_keyframe",
+                                "sequencer.select_keyframe", "sequencer.go_to_keyframe", "sequencer.set_easing"}) {
+        SCOPED_TRACE(command);
+        backend_.controller.clear();
+        backend_.add_manual_keyframe(0.0f, {0.0f, 0.0f, 0.0f});
+        backend_.add_manual_keyframe(1.0f, {1.0f, 0.0f, 0.0f});
+        backend_.add_manual_keyframe(2.0f, {2.0f, 0.0f, 0.0f});
+        const auto before = registry.call_tool("sequencer.get", json::object());
+        const auto result = registry.call_tool(command, json{{"keyframe_id", 2.5}, {"easing", "ease_out"}});
+        EXPECT_EQ(result.value("error", json::object()).value("code", ""), "InvalidArgument");
+        EXPECT_EQ(registry.call_tool("sequencer.get", json::object()), before);
+    }
+}
+
+TEST_F(McpSequencerToolsTest, FractionalPlyFrameCannotMovePlayhead) {
+    backend_.controller.setPlySequence("sequence", "sequence", {"0.ply", "1.ply", "2.ply", "3.ply"},
+                                       {"0", "1", "2", "3"}, 24.0f);
+    backend_.controller.seek(3.0f / 24.0f);
+    auto& registry = lfs::mcp::ToolRegistry::instance();
+    const auto before = registry.call_tool("sequencer.get", json::object());
+    const auto result = registry.call_tool("sequencer.scrub", json{{"frame", 1.5}});
+    EXPECT_EQ(result.value("error", json::object()).value("code", ""), "InvalidArgument");
+    EXPECT_FLOAT_EQ(backend_.controller.playhead(), 3.0f / 24.0f);
+    EXPECT_EQ(registry.call_tool("sequencer.get", json::object()), before);
+    for (const auto& frame : {json(2), json(2.0), json("2")}) {
+        const auto valid = registry.call_tool("sequencer.scrub", json{{"frame", frame}});
+        ASSERT_TRUE(valid.value("success", false));
+        EXPECT_FLOAT_EQ(backend_.controller.playhead(), 2.0f / 24.0f);
+    }
+}
+
+TEST_F(McpSequencerToolsTest, SetEasingRejectsFractionalModesWithoutChangingState) {
+    const auto id = backend_.add_manual_keyframe(0.0f, {0.0f, 0.0f, 0.0f});
+    backend_.add_manual_keyframe(1.0f, {1.0f, 0.0f, 0.0f});
+    for (const double easing : {0.5, 1.5, 2.7, 2.9999999999999996}) {
+        SCOPED_TRACE(easing);
+        backend_.controller.setKeyframeEasingById(id, lfs::sequencer::EasingType::EASE_IN_OUT);
+        const auto before = lfs::mcp::ToolRegistry::instance().call_tool("sequencer.get", json::object());
+        const auto result = lfs::mcp::ToolRegistry::instance().call_tool(
+            "sequencer.set_easing", json{{"keyframe_id", id}, {"easing", easing}});
+        EXPECT_EQ(result.value("error", json::object()).value("code", ""), "InvalidArgument");
+        EXPECT_NE(result.value("error_message", "").find("easing"), std::string::npos);
+        EXPECT_EQ(lfs::mcp::ToolRegistry::instance().call_tool("sequencer.get", json::object()), before);
+    }
+}
+
 TEST_F(McpSequencerToolsTest, SetEasingPreservesAllNumericAndNamedModes) {
     const auto id = backend_.add_manual_keyframe(0.0f, {0.0f, 0.0f, 0.0f});
     const std::array<const char*, 4> names = {"linear", "ease_in", "ease_out", "ease_in_out"};
     for (size_t mode = 0; mode < names.size(); ++mode) {
-        for (const auto& easing : {json(mode), json(names[mode])}) {
+        for (const auto& easing : {json(mode), json(static_cast<double>(mode)), json(names[mode])}) {
             SCOPED_TRACE(easing.dump());
             backend_.controller.setKeyframeEasingById(
                 id, static_cast<lfs::sequencer::EasingType>((mode + 1) % names.size()));
@@ -505,6 +593,44 @@ TEST_F(McpSequencerToolsTest, SetEasingPreservesAllNumericAndNamedModes) {
                       static_cast<lfs::sequencer::EasingType>(mode));
         }
     }
+}
+
+TEST_F(McpSequencerToolsTest, DeleteRejectsProtectedFirstKeyframeWithoutChangingState) {
+    const auto reject_deletion = [this](const lfs::sequencer::KeyframeId id) {
+        const auto before = lfs::mcp::ToolRegistry::instance().call_tool("sequencer.get", json::object());
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const auto result = lfs::mcp::ToolRegistry::instance().call_tool(
+                "sequencer.delete_keyframe", json{{"keyframe_id", id}});
+            EXPECT_EQ(result.value("error", json::object()).value("code", ""), "InvalidArgument");
+            EXPECT_NE(result.value("error_message", "").find("first keyframe cannot be deleted"), std::string::npos);
+            EXPECT_EQ(lfs::mcp::ToolRegistry::instance().call_tool("sequencer.get", json::object()), before);
+        }
+    };
+    const auto first = backend_.add_manual_keyframe(0.0f, {0.0f, 0.0f, 0.0f});
+    reject_deletion(first);
+    const auto second = backend_.add_manual_keyframe(1.0f, {1.0f, 0.0f, 0.0f});
+    reject_deletion(first);
+    backend_.controller.setKeyframeTimeById(second, -1.0f);
+    reject_deletion(second);
+}
+
+TEST_F(McpSequencerToolsTest, SetEasingCommandLatency) {
+    const auto id = backend_.add_manual_keyframe(0.0f, {0.0f, 0.0f, 0.0f});
+    auto& registry = lfs::mcp::ToolRegistry::instance();
+    std::vector<double> timings;
+    json args{{"keyframe_id", id}, {"easing", 0}};
+    for (int batch = 0; batch < 7; ++batch) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 1000; ++i) {
+            args["easing"] = i % 4;
+            const auto result = registry.call_tool("sequencer.set_easing", args);
+            ASSERT_TRUE(result.value("success", false));
+            ASSERT_EQ(result["keyframes"][0]["easing"], i % 4);
+        }
+        timings.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 1000);
+    }
+    std::sort(timings.begin(), timings.end());
+    RecordProperty("median_easing_us", std::to_string(timings[3]));
 }
 
 TEST_F(McpSequencerToolsTest, SetEasingAndDeleteResolveByIdAfterReorder) {
@@ -731,6 +857,49 @@ TEST_F(McpSequencerToolsTest, ScrubDoesNotInventCameraWithoutCameraKeyframes) {
     EXPECT_EQ(backend_.camera.eye, camera_before.eye);
     EXPECT_EQ(backend_.camera.target, camera_before.target);
     EXPECT_FLOAT_EQ(backend_.camera.fov_degrees, camera_before.fov_degrees);
+}
+
+TEST_F(McpSequencerToolsTest, ScrubReportsPendingFailedAndDisplayedFrames) {
+    backend_.controller.setPlySequence("sequence", "sequence",
+                                       {"frame_0.ply", "frame_1.ply"}, {"frame_0", "frame_1"}, 1.0f);
+    json status = {{"requested_frame", 1}, {"displayed_frame", 0}, {"on_target", false}, {"requested_frame_failed", false}, {"failed", 0}};
+    auto backend = backend_.tool_backend();
+    backend.ply_sequence_status = [&] { return status.dump(); };
+    unregister_tools();
+    lfs::app::register_gui_sequencer_tools(lfs::mcp::ToolRegistry::instance(), &viewer_, backend);
+    const auto scrub = [&] {
+        return lfs::mcp::ToolRegistry::instance().call_tool("sequencer.scrub", json{{"frame", 1}});
+    };
+
+    auto result = scrub();
+    EXPECT_FALSE(result.value("success", true));
+    EXPECT_TRUE(result.value("pending", false));
+    EXPECT_FALSE(result.contains("error"));
+    EXPECT_EQ(result["ply_player"]["displayed_frame"], 0);
+    EXPECT_FLOAT_EQ(backend_.controller.playhead(), 1.0f);
+
+    // A failed prefetch of another frame must not fail this request.
+    status["failed"] = 7;
+    result = scrub();
+    EXPECT_TRUE(result.value("pending", false));
+    EXPECT_FALSE(result.contains("error"));
+
+    status["requested_frame_failed"] = true;
+    result = scrub();
+    EXPECT_FALSE(result.value("success", true));
+    EXPECT_FALSE(result.value("pending", true));
+    ASSERT_TRUE(result.contains("error"));
+    EXPECT_NE(result["error"]["message"].get<std::string>().find("frame 1"), std::string::npos);
+    EXPECT_EQ(result["ply_player"]["displayed_frame"], 0);
+
+    // A successful retry restores the normal response despite old failure counts.
+    status["requested_frame_failed"] = false;
+    status["displayed_frame"] = 1;
+    status["on_target"] = true;
+    result = scrub();
+    EXPECT_TRUE(result.value("success", false));
+    EXPECT_FALSE(result.value("pending", true));
+    EXPECT_FALSE(result.contains("error"));
 }
 
 TEST_F(McpSequencerToolsTest, PlaybackAndPersistenceToolsRoundTripState) {

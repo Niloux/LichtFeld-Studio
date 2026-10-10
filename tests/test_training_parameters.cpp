@@ -484,6 +484,20 @@ namespace {
         EXPECT_TRUE(defaults.normal_auto_generate);
     }
 
+    TEST_F(TrainingParametersTest, DepthAutoGenerateRoundTripAndDefault) {
+        auto params = OptimizationParameters::mrnf_defaults();
+        EXPECT_TRUE(params.depth_auto_generate);
+
+        params.depth_auto_generate = false;
+        const auto json = params.to_json();
+        EXPECT_FALSE(json.at("depth_auto_generate").get<bool>());
+        EXPECT_FALSE(OptimizationParameters::from_json(json).depth_auto_generate);
+
+        auto missing = json;
+        missing.erase("depth_auto_generate");
+        EXPECT_TRUE(OptimizationParameters::from_json(missing).depth_auto_generate);
+    }
+
     TEST_F(TrainingParametersTest, NormalSupervisionScheduleRoundTripAndValidation) {
         auto params = OptimizationParameters::mrnf_defaults();
         EXPECT_FLOAT_EQ(params.normal_start_fraction, 0.08f);
@@ -525,18 +539,6 @@ namespace {
         params.normal_start_fraction = 0.2f;
         params.normal_end_fraction = -0.1f;
         EXPECT_NE(params.validate().find("normal_end_fraction"), std::string::npos);
-    }
-
-    // Catches depth maps loaded and anchors fitted for a GUT run, whose rasterizer renders no depth.
-    TEST_F(TrainingParametersTest, GutHasNoDepthSupervision) {
-        OptimizationParameters params;
-        params.use_depth_loss = true;
-        EXPECT_TRUE(params.depth_supervision_enabled());
-        params.gut = true;
-        EXPECT_FALSE(params.depth_supervision_enabled());
-        params.gut = false;
-        params.depth_loss_weight = 0.0f;
-        EXPECT_FALSE(params.depth_supervision_enabled());
     }
 
     TEST_F(TrainingParametersTest, NormalSupervisionActiveRespectsStartEndAndStepsScaler) {

@@ -19,22 +19,28 @@
 
 namespace lfs::training {
 
-    struct NormalAutoGenerateJob {
+    // An empty output path means the camera already has that map.
+    struct PriorMapJob {
         std::filesystem::path image_path;
-        std::filesystem::path output_path;
+        std::filesystem::path depth_output_path;
+        std::filesystem::path normal_output_path;
     };
 
-    using NormalGenerateProgress = std::function<void(
+    using PriorMapProgress = std::function<void(
         std::size_t done, std::size_t total, std::string_view filename)>;
 
-    using NormalEstimator = std::function<std::expected<void, lfs::Error>(
-        std::span<const NormalAutoGenerateJob> jobs,
-        const NormalGenerateProgress& progress)>;
+    using PriorMapEstimator = std::function<std::expected<void, lfs::Error>(
+        std::span<const PriorMapJob> jobs,
+        const PriorMapProgress& progress)>;
 
-    // Prior loading and generation require a backend with a normal channel.
+    [[nodiscard]] inline bool training_depth_priors_enabled(
+        const lfs::core::param::OptimizationParameters& opt) {
+        return opt.use_depth_loss && opt.depth_loss_weight > 0.0f;
+    }
+
     [[nodiscard]] inline bool training_normal_priors_enabled(
         const lfs::core::param::OptimizationParameters& opt) {
-        return !opt.gut && opt.use_normal_loss && opt.normal_loss_weight > 0.0f;
+        return opt.use_normal_loss && opt.normal_loss_weight > 0.0f;
     }
 
     [[nodiscard]] bool normal_auto_generate_needed(
@@ -43,20 +49,27 @@ namespace lfs::training {
         float normal_loss_weight,
         std::span<const std::shared_ptr<lfs::core::Camera>> cameras);
 
-    struct NormalAutoGenerateOutcome {
+    struct PriorMapCounts {
+        std::size_t existing = 0;
+        std::size_t missing = 0;
+    };
+
+    struct PriorAutoGenerateOutcome {
         bool attempted = false;
         bool generated = false;
         bool failed = false;
-        std::size_t existing_count = 0;
-        std::size_t missing_count = 0;
+        PriorMapCounts depth;
+        PriorMapCounts normal;
         std::string warning;
     };
 
-    // Never fails training. On estimator/download/ONNX errors, logs one warning
-    // and leaves cameras without maps so the prior stays inactive.
-    NormalAutoGenerateOutcome ensure_training_normal_maps(
+    // Generates the missing maps of every enabled prior whose auto-generate flag
+    // is on, with one MoGe-2 pass per image. Never fails training: on
+    // estimator/download/ONNX errors, logs one warning and leaves cameras
+    // without maps so the prior stays inactive.
+    PriorAutoGenerateOutcome ensure_training_prior_maps(
         const lfs::core::param::TrainingParameters& params,
         std::span<const std::shared_ptr<lfs::core::Camera>> cameras,
-        const NormalEstimator& estimator = {});
+        const PriorMapEstimator& estimator = {});
 
 } // namespace lfs::training

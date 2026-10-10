@@ -9,15 +9,22 @@
 #include "core/cuda/memory_arena.hpp"
 #include "core/cuda/vmm_device_buffer.hpp"
 #include "core/environment.hpp"
+#include "core/image_io.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "training/components/ppisp.hpp"
+#include "training/depth_anchor/depth_anchor_cache.hpp"
 #include "training/kernels/densification_kernels.hpp"
+#include "training/kernels/depth_loss.hpp"
+#include "training/kernels/normal_consistency_loss.hpp"
 #include "training/rasterization/fast_rasterizer.hpp"
 #include "training/rasterization/gsplat/Common.h"
+#include "training/rasterization/gsplat/GeometryFeatures.h"
 #include "training/rasterization/gsplat/IntersectionCount.h"
 #include "training/rasterization/gsplat/Ops.h"
 #include "training/rasterization/gsplat_rasterizer.hpp"
@@ -1754,4 +1761,272 @@ TEST(GutScreenShareStrategy, RendererSwitchStartsANewMeasurementWindow) {
     params.max_screen_share = 0.f;
     strategy.set_optimization_params(params);
     EXPECT_FALSE(strategy.get_optimizer().collect_projected_screen_share());
+}
+
+TEST_F(GsplatRasterizerTest, GeometryChannelsAndGradientsMatchEveryCameraModel) {
+    struct ForwardStream {
+        cudaStream_t stream = nullptr;
+        ForwardStream() {
+            if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+                throw std::runtime_error("failed to create test stream");
+        }
+        ~ForwardStream() {
+            release_gsplat_rasterizer_thread_local_caches();
+            gsplat_lfs::release_intersect_thread_local_cache();
+            CudaMemoryPool::instance().release_stream(stream);
+            cudaStreamDestroy(stream);
+        }
+    } forward_stream;
+    for (const auto model : {lfs::core::CameraModelType::PINHOLE,
+                             lfs::core::CameraModelType::FISHEYE,
+                             lfs::core::CameraModelType::EQUIRECTANGULAR,
+                             lfs::core::CameraModelType::THIN_PRISM_FISHEYE}) {
+        SCOPED_TRACE(static_cast<int>(model));
+        const size_t w = 64, h = 48;
+        auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);
+        auto T = Tensor::zeros({3}, Device::CUDA);
+        const bool pinhole = model == lfs::core::CameraModelType::PINHOLE;
+        Camera camera(R, T, 28.f, 28.f, w / 2.f, h / 2.f,
+                      Tensor::zeros({pinhole ? 3UL : 4UL}, Device::CPU),
+                      Tensor::zeros({pinhole ? 2UL : 4UL}, Device::CPU),
+                      model, "geometry", "", {}, w, h, 0);
+        auto means = Tensor::from_vector({.4f, .2f, 3.f}, {1, 3}, Device::CUDA);
+        auto rotation = Tensor::from_vector({1.f, .1f, .2f, .05f}, {1, 4}, Device::CUDA);
+        auto scales = Tensor::from_vector({-.3f, -.5f, -1.5f}, {1, 3}, Device::CUDA);
+        SplatData splat(0, means, Tensor::full({1, 1, 3}, .5f, Device::CUDA),
+                        Tensor::zeros({1, 0, 3}, Device::CUDA), scales, rotation,
+                        Tensor::full({1}, 2.f, Device::CUDA), 1.f);
+        auto bg = Tensor::full({3}, .25f, Device::CUDA);
+        auto rgb = gsplat_rasterize(camera, splat, bg, 1.f, false, GsplatRenderMode::RGB, true).image.cpu();
+        auto plain_depth = gsplat_rasterize(camera, splat, bg, 1.f, false, GsplatRenderMode::RGB_D, true);
+        auto depth_cpu = plain_depth.depth.cpu();
+        auto alpha_cpu = plain_depth.alpha.cpu();
+        auto image_cpu = plain_depth.image.cpu();
+        const float expected = model == lfs::core::CameraModelType::PINHOLE ? 3.f : std::sqrt(9.2f);
+        int covered = 0;
+        for (size_t i = 0; i < w * h; ++i) {
+            if (alpha_cpu.ptr<float>()[i] > .1f) {
+                ++covered;
+                EXPECT_NEAR(depth_cpu.ptr<float>()[i] / alpha_cpu.ptr<float>()[i], expected, 2e-5f);
+            }
+            for (int c = 0; c < 3; ++c)
+                EXPECT_NEAR(image_cpu.ptr<float>()[c * w * h + i], rgb.ptr<float>()[c * w * h + i], 2e-5f);
+        }
+        EXPECT_GT(covered, 10);
+        AdamConfig cfg;
+        cfg.initial_capacity = 1;
+        AdamOptimizer opt(splat, cfg);
+        opt.allocate_gradients(1);
+        auto r = [&] {
+            CUDAStreamGuard guard(forward_stream.stream);
+            return gsplat_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB_D_N, true);
+        }();
+        ASSERT_TRUE(r.has_value());
+        std::vector<float> depth_weights(w * h);
+        for (size_t i = 0; i < w * h; ++i)
+            depth_weights[i] = alpha_cpu.ptr<float>()[i] > .2f ? .3f / (w * h) : 0.f;
+        auto gd = Tensor::from_vector(depth_weights, {h, w}, Device::CUDA);
+        std::vector<float> normal_weights(3 * w * h);
+        for (size_t i = 0; i < w * h; ++i) {
+            normal_weights[i] = depth_weights[i] * (2.f / 3.f);
+            normal_weights[w * h + i] = depth_weights[i] * (-4.f / 3.f);
+            normal_weights[2 * w * h + i] = depth_weights[i] / 3.f;
+        }
+        auto gn = Tensor::from_vector(normal_weights, {3, h, w}, Device::CUDA);
+        gsplat_rasterize_backward(r->second, Tensor::zeros_like(r->first.image),
+                                  Tensor::zeros_like(r->first.alpha), splat, opt, {}, {}, {}, gd, gn);
+        auto gm = opt.get_grad(ParamType::Means).cpu();
+        auto gq = opt.get_grad(ParamType::Rotation).cpu();
+        auto objective = [&]() {
+            auto out = gsplat_rasterize(camera, splat, bg, 1.f, false, GsplatRenderMode::RGB_D_N, true);
+            auto d = out.depth.cpu(), n = out.normal.cpu();
+            double sum = 0;
+            for (size_t i = 0; i < w * h; ++i)
+                sum += depth_weights[i] * d.ptr<float>()[i] + normal_weights[i] * n.ptr<float>()[i] + normal_weights[w * h + i] * n.ptr<float>()[w * h + i] + normal_weights[2 * w * h + i] * n.ptr<float>()[2 * w * h + i];
+            return sum;
+        };
+        auto check = [&](Tensor& param, const Tensor& grad) {
+            auto host = param.cpu();
+            for (size_t j = 0; j < param.numel(); ++j) {
+                const float original = host.ptr<float>()[j], eps = 1e-3f;
+                float v = original + eps;
+                ASSERT_EQ(cudaMemcpy(param.ptr<float>() + j, &v, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+                const double plus = objective();
+                v = original - eps;
+                ASSERT_EQ(cudaMemcpy(param.ptr<float>() + j, &v, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+                const double minus = objective();
+                ASSERT_EQ(cudaMemcpy(param.ptr<float>() + j, &original, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+                const double numeric = (plus - minus) / (2 * eps);
+                EXPECT_NEAR(grad.ptr<float>()[j], numeric, 2e-4 + .03 * std::abs(numeric)) << "component " << j;
+            }
+        };
+        check(means, gm);
+        check(rotation, gq);
+    }
+}
+
+TEST_F(GsplatRasterizerTest, GeometryAnchorsAndDepthNormalsFollowCameraRays) {
+    constexpr size_t w = 64, h = 48, pixels = w * h;
+    auto view = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f}, {16}, Device::CUDA);
+    for (const auto model : {::CameraModelType::PINHOLE, ::CameraModelType::FISHEYE,
+                             ::CameraModelType::EQUIRECTANGULAR, ::CameraModelType::THIN_PRISM_FISHEYE}) {
+        SCOPED_TRACE(static_cast<int>(model));
+        const bool equi = model == ::CameraModelType::EQUIRECTANGULAR;
+        auto K = Tensor::from_vector({equi ? float(w) : 28.f, 0.f, equi ? 0.f : w / 2.f,
+                                      0.f, equi ? float(h) : 28.f, equi ? 0.f : h / 2.f, 0.f, 0.f, 1.f},
+                                     {9}, Device::CUDA);
+        auto radial = Tensor::from_vector({.02f, -.003f, 0.f, 0.f, 0.f, 0.f}, {6}, Device::CUDA);
+        auto rays = Tensor::empty({h, w, 3}, Device::CUDA);
+        gsplat_lfs::geometry_camera_rays(rays.ptr<float>(), w, h, K.ptr<float>(), model, radial.ptr<float>(), nullptr, nullptr, nullptr);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        const auto host = rays.cpu();
+        std::vector<float> points(3 * pixels), prior(pixels), normals(3 * pixels), depths(pixels, 2.f);
+        size_t valid = 0;
+        for (size_t i = 0; i < pixels; ++i) {
+            const float d = 2.f + .001f * i;
+            prior[i] = 2.f * d + 1.f;
+            if (std::isfinite(host.ptr<float>()[3 * i]))
+                ++valid;
+            for (int c = 0; c < 3; ++c) {
+                points[3 * i + c] = d * host.ptr<float>()[3 * i + c];
+                normals[c * pixels + i] = model == ::CameraModelType::PINHOLE ? (c == 2 ? -1.f : 0.f) : -host.ptr<float>()[3 * i + c];
+            }
+        }
+        auto pts = Tensor::from_vector(points, {pixels, 3}, Device::CUDA);
+        auto pr = Tensor::from_vector(prior, {h, w}, Device::CUDA);
+        kernels::DepthCameraProjection projection;
+        projection.model = static_cast<int>(model);
+        projection.radial[0] = .02f;
+        projection.radial[1] = -.003f;
+        const float lo[3] = {-100, -100, -100}, hi[3] = {100, 100, 100};
+        auto pairs = kernels::collect_depth_anchor_samples(pts.ptr<float>(), pixels, view.ptr<float>(), 28, 28, w / 2.f, h / 2.f,
+                                                           pr.ptr<float>(), w, h, .01f, lo, hi, nullptr, projection);
+        EXPECT_EQ(pairs.size(), valid);
+        EXPECT_GT(pairs.size(), pixels / 2);
+        for (auto pair : pairs)
+            EXPECT_NEAR(pair.y, (pair.x - 1.f) / 2.f, 2e-5f);
+        const auto fit = kernels::fit_depth_anchor_from_samples(pairs);
+        ASSERT_TRUE(fit.depth.valid);
+        EXPECT_NEAR(fit.depth.scale, .5f, 2e-4f);
+        EXPECT_NEAR(fit.depth.shift, -.5f, 2e-4f);
+        auto normal = Tensor::from_vector(normals, {3, h, w}, Device::CUDA);
+        auto depth = Tensor::from_vector(depths, {h, w}, Device::CUDA);
+        auto alpha = Tensor::ones({h, w}, Device::CUDA);
+        auto gn = Tensor::zeros_like(normal), gd = Tensor::zeros_like(depth), ga = Tensor::zeros_like(depth);
+        auto loss = Tensor::zeros({1}, Device::CUDA);
+        auto partials = Tensor::empty({kernels::normal_consistency_partial_count(pixels)}, Device::CUDA);
+        kernels::launch_normal_consistency_loss(normal.ptr<float>(), depth.ptr<float>(), alpha.ptr<float>(),
+                                                gn.ptr<float>(), gd.ptr<float>(), ga.ptr<float>(), loss.ptr<float>(), partials.ptr<float>(),
+                                                w, h, 28, 28, w / 2.f, h / 2.f, 1.f, nullptr, nullptr, rays.ptr<float>(), equi);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_NEAR(loss.cpu().ptr<float>()[0], 0.f, 2e-4f);
+        const auto stats = partials.cpu();
+        EXPECT_EQ(stats.ptr<float>()[kernels::normal_consistency_slots::kValid], 1.f);
+        if (equi)
+            EXPECT_EQ(stats.ptr<float>()[kernels::normal_consistency_slots::kCount], float(w * (h - 2)));
+    }
+}
+
+// The anchor must come from the surface the camera sees. The sparse cloud also holds points behind that surface on
+// the same rays; fitting the prior against them made every target too far. Here the hidden points are the
+// majority, so an anchor fitted against the whole cloud lands on them (shift near 3) instead of the surface.
+TEST(DepthAnchorFit, UsesOnlyThePointsTheCameraObserved) {
+    constexpr int width = 64;
+    constexpr int height = 48;
+    constexpr float focal = 50.0f;
+    const auto surface_depth = [](const float u) { return 2.0f + 2.0f * u / width; };
+
+    const auto directory = std::filesystem::temp_directory_path() / "lfs_depth_anchor_visible";
+    std::filesystem::create_directories(directory);
+    const auto depth_path = directory / "view.png";
+    std::vector<std::uint16_t> prior(static_cast<size_t>(width) * height);
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+            prior[static_cast<size_t>(y) * width + x] =
+                static_cast<std::uint16_t>(std::lround(surface_depth(x + 0.5f) / 10.0f * 65535.0f));
+    ASSERT_TRUE(lfs::core::save_png(depth_path, prior.data(), width, height, 1, 16, 1));
+
+    auto R = Tensor::from_vector(std::vector<float>{1, 0, 0, 0, 1, 0, 0, 0, 1}, {3, 3}, Device::CPU);
+    auto T = Tensor::zeros({3}, Device::CPU);
+    auto camera = std::make_shared<lfs::core::Camera>(
+        R, T, focal, focal, width / 2.0f, height / 2.0f, Tensor(), Tensor(), lfs::core::CameraModelType::PINHOLE,
+        "view.png", std::filesystem::path{}, std::filesystem::path{}, width, height, 0, 0, depth_path);
+    camera->set_image_dimensions(width, height);
+
+    std::vector<lfs::core::Camera::SfmObservation> observations;
+    std::vector<float> cloud;
+    for (int y = 1; y < height; y += 2) {
+        for (int x = 1; x < width; x += 2) {
+            const float u = x + 0.5f;
+            const float v = y + 0.5f;
+            const float rx = (u - width / 2.0f) / focal;
+            const float ry = (v - height / 2.0f) / focal;
+            const float z = surface_depth(u);
+            observations.push_back({u, v, rx * z, ry * z, z});
+            cloud.insert(cloud.end(), {rx * z, ry * z, z});
+            for (int k = 0; k < 3; ++k) {
+                const float hidden = z + 3.0f + 0.01f * k;
+                cloud.insert(cloud.end(), {rx * hidden, ry * hidden, hidden});
+            }
+        }
+    }
+    camera->set_sfm_observations(std::move(observations));
+    const auto means = Tensor::from_vector(cloud, {cloud.size() / 3, size_t{3}}, Device::CUDA);
+
+    const auto anchors = lfs::training::computeRawDepthAnchors(means, {camera}, -1, 0);
+    std::filesystem::remove_all(directory);
+    ASSERT_TRUE(anchors.contains("view.png"));
+    const auto& depth = anchors.at("view.png").depth;
+    ASSERT_TRUE(depth.valid);
+    EXPECT_NEAR(depth.scale, 10.0f, 0.1f);
+    EXPECT_NEAR(depth.shift, 0.0f, 0.05f);
+}
+
+TEST_F(GsplatRasterizerTest, ExpectedRadialDepthBehindCameraHasCorrectGradients) {
+    for (const auto model : {lfs::core::CameraModelType::EQUIRECTANGULAR, lfs::core::CameraModelType::FISHEYE, lfs::core::CameraModelType::THIN_PRISM_FISHEYE}) {
+        SCOPED_TRACE(static_cast<int>(model));
+        auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);
+        Camera camera(R, Tensor::zeros({3}, Device::CUDA), 16, 16, 32, 24, {}, {},
+                      model, "rear", "", {}, 64, 48, 0);
+        auto splat = make_visible_splat(1);
+        const float pos[3] = {3.f, .2f, -.4f};
+        ASSERT_EQ(cudaMemcpy(splat->means().ptr<float>(), pos, sizeof(pos), cudaMemcpyHostToDevice), cudaSuccess);
+        const float scales[3] = {-.3f, -.5f, -1.5f};
+        ASSERT_EQ(cudaMemcpy(splat->scaling_raw().ptr<float>(), scales, sizeof(scales), cudaMemcpyHostToDevice), cudaSuccess);
+        auto bg = Tensor::full({3}, .7f, Device::CUDA);
+        for (const auto mode : {GsplatRenderMode::ED, GsplatRenderMode::RGB_ED}) {
+            AdamConfig cfg;
+            cfg.initial_capacity = 1;
+            AdamOptimizer opt(*splat, cfg);
+            opt.allocate_gradients(1);
+            auto r = gsplat_rasterize_forward(camera, *splat, bg, 0, 0, 0, 0, 1.f, false, mode, true);
+            ASSERT_TRUE(r.has_value());
+            auto alpha = r->first.alpha.cpu(), depth = r->first.depth.cpu();
+            std::vector<float> weights(64 * 48, 0.f);
+            int count = 0;
+            for (size_t i = 0; i < weights.size(); ++i)
+                if (alpha.ptr<float>()[i] > .2f) {
+                    weights[i] = 1.f;
+                    ++count;
+                    EXPECT_NEAR(depth.ptr<float>()[i], std::sqrt(9.2f), 2e-5f);
+                }
+            if (count <= 10) {
+                release_ctx_arena(r->second);
+                FAIL() << "Insufficient rear-hemisphere coverage: " << count;
+            }
+            for (auto& weight : weights)
+                weight /= count;
+            auto gd = Tensor::from_vector(weights, {48, 64}, Device::CUDA);
+            gsplat_rasterize_backward(r->second, {}, {}, *splat, opt, {}, {}, {}, gd, {}, .6f);
+            auto gm = opt.get_grad(ParamType::Means).cpu();
+            for (int c = 0; c < 3; ++c)
+                EXPECT_NEAR(gm.ptr<float>()[c], pos[c] / std::sqrt(9.2f), 2e-4f);
+            auto go = opt.get_grad(ParamType::Opacity).cpu();
+            EXPECT_NEAR(go.ptr<float>()[0], 0.f, 1e-5f);
+            auto gs = opt.get_grad(ParamType::Scaling).cpu();
+            EXPECT_NEAR(gs.ptr<float>()[0], 0.f, 1e-5f);
+            EXPECT_NEAR(gs.ptr<float>()[1], 0.f, 1e-5f);
+            EXPECT_NEAR(gs.ptr<float>()[2], .6f * std::exp(-1.5f), 1e-5f);
+        }
+    }
 }

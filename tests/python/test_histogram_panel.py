@@ -1300,7 +1300,41 @@ def test_histogram_ctrl_drag_subtracts_with_modifier_bitmask(histogram_panel_mod
     assert panel._histogram_overlay_bounds == (2, 2)
 
 
-def test_histogram_shift_drag_selection_uses_modifier_seen_on_mouseup(histogram_panel_module, lf, numpy, monkeypatch):
+def test_histogram_modifier_pressed_after_mousedown_does_not_change_mode(histogram_panel_module, lf, numpy, monkeypatch):
+    panel = histogram_panel_module.HistogramPanel()
+    panel._show_chart = True
+    panel._metric_id = "opacity"
+    panel._chart_el = SimpleNamespace(absolute_left=0.0, absolute_width=160.0)
+
+    values = lf.Tensor.from_numpy(numpy.array([0.05, 0.15, 0.35], dtype=numpy.float32))
+    finite_mask = values.isfinite()
+    panel._primary_values = values
+    panel._primary_finite_mask = finite_mask
+    panel._primary_valid_values = values[finite_mask]
+    panel._primary_histogram_min = 0.0
+    panel._primary_histogram_max = 1.0
+    panel._histogram_bin_count = 16
+    panel._rebuild_histogram_from_cache()
+
+    scene = _SceneSelectionStub()
+    monkeypatch.setattr(lf, "get_scene", lambda: scene)
+
+    panel._marked_bin_start = 0
+    panel._marked_bin_end = 0
+    panel._sync_marked_range(apply_scene=True)
+
+    # Like the viewport selection tools, the modifiers at press time decide the mode.
+    x = 5 * 10.0 + 1.0
+    panel._on_chart_mousedown(_MouseEventStub(mouse_x=x))
+    panel._on_document_mousemove(_MouseEventStub(mouse_x=x + 1.0, shift=True))
+    panel._on_document_mouseup(_MouseEventStub(mouse_x=x, shift=True))
+
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([False, False, True], dtype=bool))
+    assert panel._selected_histogram_bins == {5}
+    assert panel._histogram_overlay_bounds == (5, 5)
+
+
+def test_histogram_shift_click_adds_a_bin_like_selection_tools(histogram_panel_module, lf, numpy, monkeypatch):
     panel = histogram_panel_module.HistogramPanel()
     panel._show_chart = True
     panel._metric_id = "opacity"
@@ -1324,8 +1358,8 @@ def test_histogram_shift_drag_selection_uses_modifier_seen_on_mouseup(histogram_
     panel._sync_marked_range(apply_scene=True)
 
     x = 5 * 10.0 + 1.0
-    panel._on_chart_mousedown(_MouseEventStub(mouse_x=x))
-    panel._on_document_mouseup(_MouseEventStub(mouse_x=x, shift=True))
+    panel._on_chart_mousedown(_MouseEventStub(mouse_x=x, shift=True))
+    panel._on_document_mouseup(_MouseEventStub(mouse_x=x))
 
     numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, False, True], dtype=bool))
     assert panel._selected_histogram_bins == {0, 5}
@@ -1333,7 +1367,118 @@ def test_histogram_shift_drag_selection_uses_modifier_seen_on_mouseup(histogram_
     assert panel._histogram_overlay_bounds == (5, 5)
 
 
-def test_histogram_ctrl_drag_subtracts_when_modifier_is_seen_on_mouseup(histogram_panel_module, lf, numpy, monkeypatch):
+def _three_bin_panel(histogram_panel_module, lf, numpy, monkeypatch):
+    panel = histogram_panel_module.HistogramPanel()
+    panel._show_chart = True
+    panel._metric_id = "opacity"
+    panel._chart_el = SimpleNamespace(absolute_left=0.0, absolute_width=160.0)
+
+    values = lf.Tensor.from_numpy(numpy.array([0.05, 0.15, 0.35], dtype=numpy.float32))
+    finite_mask = values.isfinite()
+    panel._primary_values = values
+    panel._primary_finite_mask = finite_mask
+    panel._primary_valid_values = values[finite_mask]
+    panel._primary_histogram_min = 0.0
+    panel._primary_histogram_max = 1.0
+    panel._histogram_bin_count = 16
+    panel._rebuild_histogram_from_cache()
+
+    scene = _SceneSelectionStub()
+    monkeypatch.setattr(lf, "get_scene", lambda: scene)
+    return panel, scene
+
+
+def _click_bin(panel, bin_index, **modifiers):
+    x = bin_index * 10.0 + 1.0
+    panel._on_chart_mousedown(_MouseEventStub(mouse_x=x, **modifiers))
+    panel._on_document_mouseup(_MouseEventStub(mouse_x=x))
+
+
+def test_histogram_consecutive_shift_clicks_keep_every_added_bin(histogram_panel_module, lf, numpy, monkeypatch):
+    panel, scene = _three_bin_panel(histogram_panel_module, lf, numpy, monkeypatch)
+
+    _click_bin(panel, 0)
+    _click_bin(panel, 2, shift=True)
+    _click_bin(panel, 5, shift=True)
+
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, True, True], dtype=bool))
+    assert panel._selected_histogram_bins == {0, 2, 5}
+
+
+def test_histogram_consecutive_ctrl_clicks_keep_every_removed_bin(histogram_panel_module, lf, numpy, monkeypatch):
+    panel, scene = _three_bin_panel(histogram_panel_module, lf, numpy, monkeypatch)
+
+    panel._marked_bin_start = 0
+    panel._marked_bin_end = 5
+    panel._sync_marked_range(apply_scene=True)
+    _click_bin(panel, 0, ctrl=True)
+    _click_bin(panel, 2, ctrl=True)
+
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([False, False, True], dtype=bool))
+    assert panel._selected_histogram_bins == {5}
+
+
+def _settle_on_update(panel, module, lf, monkeypatch, selection_generation):
+    panel._scene_generation = 0
+    panel._scene_data_generation = 0
+    panel._history_generation = 0
+    panel._selection_generation = selection_generation - 1
+    panel._last_lang = "en"
+    panel._trainer_state = module.RuntimeState.trainer_state.value
+    panel._selected_nodes_signature = ()
+    monkeypatch.setattr(lf, "get_scene_generation", lambda: 0)
+    monkeypatch.setattr(panel, "_scene_data_generation_value", lambda: 0)
+    monkeypatch.setattr(panel, "_history_generation_value", lambda: 0)
+    monkeypatch.setattr(panel, "_selection_generation_value", lambda: selection_generation)
+    monkeypatch.setattr(panel, "_scene_node_selection_signature", lambda: ())
+    monkeypatch.setattr(panel, "_sync_panel_space_state", lambda: False)
+    monkeypatch.setattr(lf.ui, "get_current_language", lambda: "en")
+    panel.on_update(None)
+
+
+def test_histogram_ctrl_click_unhighlights_the_removed_bin_at_once(histogram_panel_module, lf, numpy, monkeypatch):
+    panel, scene = _three_bin_panel(histogram_panel_module, lf, numpy, monkeypatch)
+    panel._handle = _UpdateHandleStub()
+
+    _click_bin(panel, 0)
+    _click_bin(panel, 5, shift=True)
+    _click_bin(panel, 0, ctrl=True)
+
+    # The bars the panel last pushed, not a fresh rebuild.
+    highlighted = {index for index, record in enumerate(panel._handle.records["bins"]) if record["selected"]}
+    assert panel._selected_histogram_bins == {5}
+    assert highlighted == {5}
+
+
+def test_histogram_follows_selection_changes_made_outside_the_panel(histogram_panel_module, lf, numpy, monkeypatch):
+    panel, scene = _three_bin_panel(histogram_panel_module, lf, numpy, monkeypatch)
+    _click_bin(panel, 0)
+    assert panel._selected_histogram_bins == {0}
+
+    # A viewport tool selects the second Gaussian instead.
+    scene.selection_mask = lf.Tensor.from_numpy(numpy.array([False, True, False], dtype=bool))
+    _settle_on_update(panel, histogram_panel_module, lf, monkeypatch, selection_generation=5)
+    assert panel._selected_histogram_bins == {2}
+
+    # Clearing the selection elsewhere clears the chart too.
+    scene.clear_selection()
+    _settle_on_update(panel, histogram_panel_module, lf, monkeypatch, selection_generation=6)
+    assert panel._selected_histogram_bins == set()
+
+
+def test_histogram_shift_click_adds_to_a_selection_made_outside_the_panel(histogram_panel_module, lf, numpy, monkeypatch):
+    panel, scene = _three_bin_panel(histogram_panel_module, lf, numpy, monkeypatch)
+    _click_bin(panel, 0)
+
+    scene.selection_mask = lf.Tensor.from_numpy(numpy.array([False, True, False], dtype=bool))
+    _settle_on_update(panel, histogram_panel_module, lf, monkeypatch, selection_generation=5)
+    _click_bin(panel, 5, shift=True)
+
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([False, True, True], dtype=bool))
+    assert panel._selected_histogram_bins == {2, 5}
+
+
+def test_histogram_ctrl_click_removes_a_bin_like_selection_tools(histogram_panel_module, lf, numpy, monkeypatch):
     panel = histogram_panel_module.HistogramPanel()
     panel._show_chart = True
     panel._metric_id = "opacity"
@@ -1355,8 +1500,8 @@ def test_histogram_ctrl_drag_subtracts_when_modifier_is_seen_on_mouseup(histogra
     panel._on_keydown(_KeyEventStub(KI_A, ctrl=True))
 
     x = 2 * 10.0 + 1.0
-    panel._on_chart_mousedown(_MouseEventStub(mouse_x=x))
-    panel._on_document_mouseup(_MouseEventStub(mouse_x=x, ctrl=True))
+    panel._on_chart_mousedown(_MouseEventStub(mouse_x=x, ctrl=True))
+    panel._on_document_mouseup(_MouseEventStub(mouse_x=x))
 
     numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, False, True], dtype=bool))
     assert panel._selected_histogram_bins == {0, 5}
@@ -1364,7 +1509,7 @@ def test_histogram_ctrl_drag_subtracts_when_modifier_is_seen_on_mouseup(histogra
     assert panel._histogram_overlay_bounds == (2, 2)
 
 
-def test_histogram_click_selected_bar_deselects_only_that_bar(histogram_panel_module, lf, numpy, monkeypatch):
+def test_histogram_plain_click_on_selected_bar_replaces_the_selection(histogram_panel_module, lf, numpy, monkeypatch):
     panel = histogram_panel_module.HistogramPanel()
     panel._show_chart = True
     panel._metric_id = "opacity"
@@ -1392,12 +1537,15 @@ def test_histogram_click_selected_bar_deselects_only_that_bar(histogram_panel_mo
     panel._on_document_mousemove(_MouseEventStub(mouse_x=x, shift=True))
     panel._on_document_mouseup(_MouseEventStub(mouse_x=x, shift=True))
 
+    assert panel._selected_histogram_bins == {0, 5}
+
+    # A plain click never toggles: it replaces the selection with the clicked bin.
     panel._on_chart_mousedown(_MouseEventStub(mouse_x=x))
     panel._on_document_mouseup(_MouseEventStub(mouse_x=x))
 
-    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, False, False], dtype=bool))
-    assert panel._selected_histogram_bins == {0}
-    assert panel._histogram_overlay_bounds == (0, 0)
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([False, False, True], dtype=bool))
+    assert panel._selected_histogram_bins == {5}
+    assert panel._histogram_overlay_bounds == (5, 5)
 
 
 def test_histogram_owned_modifier_selection_survives_two_follow_up_updates(histogram_panel_module, lf, numpy, monkeypatch):
@@ -1422,7 +1570,7 @@ def test_histogram_owned_modifier_selection_survives_two_follow_up_updates(histo
     panel._histogram_bin_count = 16
     panel._rebuild_histogram_from_cache()
 
-    scene = _SceneSelectionStub(lf.Tensor.from_numpy(numpy.array([True, False, False], dtype=bool)))
+    scene = _SceneSelectionStub(lf.Tensor.from_numpy(numpy.array([True, False, True], dtype=bool)))
     monkeypatch.setattr(lf, "get_scene", lambda: scene)
 
     panel._commit_histogram_mask_selection(
@@ -1431,7 +1579,6 @@ def test_histogram_owned_modifier_selection_survives_two_follow_up_updates(histo
         overlay_bounds=(5, 5),
     )
     panel._selection_owned = True
-    panel._pending_selection_commit = 2
 
     scene_generations = iter([1, 1])
     history_generations = iter([0, 1])
@@ -1589,7 +1736,7 @@ def test_chart_mousedown_allows_native_doubleclick(histogram_panel_module, monke
         assert panel._dragging_mark
         assert panel._marked_bin_start == panel._marked_bin_end == 2
         assert panel._drag_selection_mode == mode
-        assert panel._drag_selection_base_mask is mask
+        assert panel._drag_selection_base_mask is (None if mode == "replace" else mask)
 
     # RmlUi Context::ProcessMouseButtonDown only detects dblclick when the
     # mousedown dispatch propagates. Stopping it prevents the callback entirely.
@@ -1968,3 +2115,83 @@ def test_outdated_metric_result_cannot_replace_current_range(pending_range_panel
     assert not panel._computing
     assert getattr(panel, f"{prefix}_min_str") == "-10"
     assert getattr(panel, f"{prefix}_max_str") == "20"
+
+
+def test_bin_count_change_rebins_loaded_snapshot_without_the_worker(histogram_panel_module, lf, numpy, monkeypatch):
+    panel = histogram_panel_module.HistogramPanel()
+    panel._handle = _UpdateHandleStub()
+    panel._show_chart = True
+    panel._metric_id = "opacity"
+    values = lf.Tensor.from_numpy(numpy.array([0.05, 0.15, 0.35, 0.65, 0.95], dtype=numpy.float32))
+    finite_mask = values.isfinite()
+    panel._primary_values = values
+    panel._primary_finite_mask = finite_mask
+    panel._primary_valid_values = values[finite_mask]
+    panel._primary_histogram_min = 0.0
+    panel._primary_histogram_max = 1.0
+    panel._histogram_bin_count = 16
+    panel._rebuild_histogram_from_cache()
+    # A bin-count change keeps the extracted values; re-running the worker re-reads and
+    # re-sorts every sample, which took ~0.5 s per change on a 3M-Gaussian scene.
+    monkeypatch.setattr(panel, "_queue_histogram_compute", lambda *a, **k: pytest.fail("worker must not run"))
+    monkeypatch.setattr(panel, "_extract_metric_values", lambda *a, **k: pytest.fail("values must not be re-extracted"))
+
+    panel._set_histogram_bin_count(32)
+
+    expected = [0] * 32
+    for index in (1, 4, 11, 20, 30):
+        expected[index] = 1
+    assert panel._hist_counts == expected
+    assert panel._handle.dirty_all_count >= 1
+
+
+def test_zoom_snapping_uses_sorted_values_without_a_full_scan(histogram_panel_module, lf, numpy, monkeypatch):
+    panel = histogram_panel_module.HistogramPanel()
+    data = numpy.array([0.1, 0.25, 0.4, 0.55, 0.9], dtype=numpy.float32)
+    panel._primary_valid_values = lf.Tensor.from_numpy(data)
+    panel._primary_sorted_values = lf.Tensor.from_numpy(data)
+    monkeypatch.setattr(
+        histogram_panel_module.HistogramPanel, "_snap_bounds_to_data",
+        staticmethod(lambda *a, **k: pytest.fail("zoom must not scan every sample")),
+    )
+
+    assert panel._snap_histogram_zoom_bounds_to_data(0.2, 0.6) == pytest.approx((0.25, 0.55))
+    assert panel._snap_histogram_zoom_bounds_to_data(0.95, 1.0) == pytest.approx((0.95, 1.0))
+    assert panel._snap_histogram_zoom_bounds_to_data(0.0, 1.0) == pytest.approx((0.1, 0.9))
+
+
+@pytest.mark.parametrize("bounds", [(0.0, 1.0), (0.2, 0.6), (0.4, 0.4), (0.41, 0.54), (0.9, 2.0), (-1.0, 0.1)])
+def test_sorted_snapping_matches_the_full_scan(histogram_panel_module, lf, numpy, bounds):
+    data = numpy.array([0.1, 0.25, 0.25, 0.4, 0.55, 0.9], dtype=numpy.float32)
+    tensor = lf.Tensor.from_numpy(data)
+    panel_type = histogram_panel_module.HistogramPanel
+    assert panel_type._snap_sorted_bounds_to_data(tensor, *bounds) == panel_type._snap_bounds_to_data(tensor, *bounds)
+
+
+def test_bin_counts_match_the_compacted_reference(histogram_panel_module, lf, numpy):
+    rng = numpy.random.default_rng(7)
+    data = rng.normal(0.5, 0.3, 2000).astype(numpy.float32)
+    data[::97] = numpy.nan
+    values = lf.Tensor.from_numpy(data)
+    finite = values.isfinite()
+    panel_type = histogram_panel_module.HistogramPanel
+    bins = panel_type._bin_indices_for_values(values, 0.1, 0.9, 32, finite)
+    counts = panel_type._bin_counts(bins, 32)
+    valid = data[numpy.isfinite(data)]
+    valid = valid[(valid >= 0.1) & (valid <= 0.9)]
+    expected = numpy.clip(numpy.floor(((valid - numpy.float32(0.1)) / numpy.float32(0.8)) * 32), 0, 31).astype(int)
+    assert counts == numpy.bincount(expected, minlength=32).tolist()
+    assert bins.cpu().numpy()[~numpy.isfinite(data)].tolist() == [-1] * int((~numpy.isfinite(data)).sum())
+
+
+@pytest.mark.parametrize("bounds", [(0.0, 1.0), (0.1, 0.2), (0.33, 0.34), (0.5, 0.7), (0.95, 1.5), (-1.0, 0.004)])
+def test_sampled_sorted_snapping_matches_the_full_scan_on_many_values(histogram_panel_module, lf, numpy, bounds, monkeypatch):
+    monkeypatch.setattr(histogram_panel_module, "SORTED_SAMPLE_POINTS", 64)
+    data = numpy.sort(numpy.random.default_rng(3).random(10_000).astype(numpy.float32))
+    data[5000:5100] = data[5000]
+    tensor = lf.Tensor.from_numpy(data)
+    panel_type = histogram_panel_module.HistogramPanel
+    sample = panel_type._sorted_sample(tensor)
+    assert sample[0] > 1
+    expected = panel_type._snap_bounds_to_data(tensor, *bounds)
+    assert panel_type._snap_sorted_bounds_to_data(tensor, *bounds, sample=sample) == expected

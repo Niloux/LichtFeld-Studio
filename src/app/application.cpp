@@ -76,6 +76,31 @@
 
 namespace lfs::app {
 
+    std::optional<std::filesystem::path> prepare_lpips_weights(const bool allow_download) {
+        if (const auto path = core::environment::value("LFS_LPIPS_WEIGHTS"))
+            return core::utf8_to_path(*path);
+        auto result = lfs::preprocessing::ensure_lpips_weights(allow_download);
+        if (result)
+            return std::move(*result);
+        LOG_WARN("LPIPS unavailable: {}", result.error().detail());
+        return std::nullopt;
+    }
+
+    void install_image_loader(const bool use_cpu_memory) {
+        // On Windows lfs_io is linked into both the exe and lfs_visualizer.dll, each with its own CacheLoader
+        // singleton; the callback runs in the exe, so the exe's copy must exist before it is invoked.
+        lfs::io::CacheLoader::getInstance(use_cpu_memory);
+        lfs::core::set_image_loader([](const lfs::core::ImageLoadParams& p) {
+            return lfs::io::CacheLoader::getInstance().load_cached_image(
+                p.path,
+                {.resize_factor = p.resize_factor,
+                 .max_width = p.max_width,
+                 .cuda_stream = p.stream,
+                 .output_uint8 = p.output_uint8,
+                 .skip_blob_cache = p.skip_blob_cache});
+        });
+    }
+
     namespace {
 
         struct HeadlessPluginSignalGuard {
@@ -94,14 +119,14 @@ namespace lfs::app {
         };
 
         // Headless runs train into the project they were started from unless
-        // -o redirects the result to a fresh project.licht.
+        // -o redirects the result to a fresh project file in the output folder.
         [[nodiscard]] std::filesystem::path headless_project_save_destination(
             const core::param::TrainingParameters& cli_params,
             const std::filesystem::path& source) {
             if (!cli_params.dataset.output_path_explicit)
                 return source;
 
-            const auto destination = cli_params.dataset.output_path / "project.licht";
+            const auto destination = cli_params.dataset.project_file();
             LOG_INFO("Headless project destination: {}",
                      core::path_to_utf8(destination));
             return destination;
@@ -117,7 +142,7 @@ namespace lfs::app {
         }
 
         // Empty for a plain dataset-folder run, which keeps the default
-        // output_path/project.licht destination.
+        // project file destination in the output folder.
         [[nodiscard]] std::filesystem::path headless_dataset_project_destination(
             const core::param::TrainingParameters& params) {
             if (!params.dataset_project)
@@ -137,16 +162,6 @@ namespace lfs::app {
                 .detail = std::move(detail),
                 .detection = source,
             });
-        }
-
-        std::optional<std::filesystem::path> prepare_lpips_weights(const bool allow_download) {
-            if (const auto path = core::environment::value("LFS_LPIPS_WEIGHTS"))
-                return core::utf8_to_path(*path);
-            auto result = lfs::preprocessing::ensure_lpips_weights(allow_download);
-            if (result)
-                return std::move(*result);
-            LOG_WARN("LPIPS unavailable: {}", result.error().detail());
-            return std::nullopt;
         }
 
         // --data-path may name an untrained .licht. Resolve its dataset, the
@@ -1301,7 +1316,7 @@ namespace lfs::app {
                 return 1;
             }
 
-            const float duration = timeline.duration();
+            const float duration = timeline.clipDuration();
             const int total_frames = static_cast<int>(std::ceil(duration * cfg.fps)) + 1;
             LOG_INFO("Rendering {} frame(s) ({:.2f}s @ {}fps) from {} to {}",
                      total_frames, duration, cfg.fps,
@@ -1764,22 +1779,7 @@ namespace lfs::app {
     } // namespace
 
     int Application::run(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
-        // Pre-initialize CacheLoader for the exe module.
-        // On Windows, lfs_io (static lib) is linked into both the exe and
-        // lfs_visualizer.dll, giving each its own CacheLoader singleton.
-        // The callback below executes in the exe's context, so the exe's
-        // copy must be initialized before it is invoked.
-        lfs::io::CacheLoader::getInstance(params->dataset.loading_params.use_cpu_memory);
-
-        lfs::core::set_image_loader([](const lfs::core::ImageLoadParams& p) {
-            return lfs::io::CacheLoader::getInstance().load_cached_image(
-                p.path,
-                {.resize_factor = p.resize_factor,
-                 .max_width = p.max_width,
-                 .cuda_stream = p.stream,
-                 .output_uint8 = p.output_uint8,
-                 .skip_blob_cache = p.skip_blob_cache});
-        });
+        install_image_loader(params->dataset.loading_params.use_cpu_memory);
 
         if (params->render_path) {
             const int result = runHeadlessRender(std::move(params));

@@ -285,6 +285,11 @@ namespace lfs::core {
             bool use_depth_loss = false;         // Use dataset depth maps when available
             float depth_loss_weight = 2.0f;      // Depth supervision weight (decays over training)
             std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, or ssi-depth
+#ifdef LFS_TRAIN_ONLY
+            bool depth_auto_generate = false;
+#else
+            bool depth_auto_generate = true;     // Generate missing/mismatched maps from images/ with MoGe-2
+#endif
 
             // Normal supervision
             bool use_normal_loss = false;             // Use dataset normal maps when available
@@ -393,10 +398,6 @@ namespace lfs::core {
             void remove_step_scaling();
             [[nodiscard]] int resolved_total_iterations() const;
             [[nodiscard]] bool normal_supervision_active(int iter) const;
-            // The 3DGUT rasterizer renders no depth, so GUT training has no depth supervision.
-            [[nodiscard]] bool depth_supervision_enabled() const {
-                return !gut && use_depth_loss && depth_loss_weight > 0.0f;
-            }
             [[nodiscard]] float scale_reg_at(int iter) const;
             void resolve_mrnf_capacity_defaults();
             // Every test_every-th image is withheld from training for evaluation.
@@ -473,6 +474,11 @@ namespace lfs::core {
             nlohmann::json to_json() const;
             static DatasetConfig from_json(const nlohmann::json& j);
             [[nodiscard]] std::string validate() const;
+
+            // output_name without a splat or project extension, so "scene.ply" names scene.ply, not scene.ply.ply.
+            [[nodiscard]] std::string output_stem() const;
+            // output_path/<output_stem>.licht, or output_path/project.licht without an output name.
+            [[nodiscard]] std::filesystem::path project_file() const;
         };
 
         struct LFS_CORE_API ServerConfig {
@@ -686,6 +692,18 @@ namespace lfs::core {
             bool include_provenance = true; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
         };
 
+        // Parameters for the compare command
+        struct LFS_CORE_API CompareParameters {
+            std::filesystem::path reference_path; // An image, a folder of images or a COLMAP dataset folder
+            std::filesystem::path test_path;      // The same kind as reference_path
+            std::filesystem::path output_path;
+            std::filesystem::path colmap_path; // Cameras of a reference folder that is no COLMAP dataset
+            // The eval_* options and enable_save_eval_images as in training; undistort says that test images
+            // without cameras of their own were rendered with the undistorted reference cameras.
+            OptimizationParameters evaluation{.enable_save_eval_images = false};
+            bool no_download = false;
+        };
+
         enum class PreprocessOutputMode { Depth,
                                           Normals,
                                           Both };
@@ -709,6 +727,7 @@ namespace lfs::core {
             bool no_download = false;
             bool download_only = false;
             std::vector<std::filesystem::path> image_paths; // Empty = scan images_folder
+            std::string depth_folder = "depth";
             std::string normals_folder = "normals";
         };
 

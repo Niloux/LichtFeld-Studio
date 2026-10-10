@@ -752,10 +752,12 @@ namespace lfs::training {
             .min_track_length = effectiveMinTrackLengthForLoad(params),
             .validate_only = false,
             .load_masks = params.optimization.mask_mode != lfs::core::param::MaskMode::None,
-            .load_depths = params.optimization.depth_supervision_enabled(),
+            .load_depths = params.optimization.use_depth_loss &&
+                           params.optimization.depth_loss_weight > 0.0f,
             .load_normals = training_normal_priors_enabled(params.optimization) ||
-                            (!params.optimization.gut && params.optimization.enable_eval),
+                            params.optimization.enable_eval,
             .normal_auto_generate = params.optimization.normal_auto_generate,
+            .depth_auto_generate = params.optimization.depth_auto_generate,
             .centralize = parse_centralize(params.dataset.centralize_dataset),
             .progress = [&data_path](float percentage, const std::string& message) {
                 LOG_DEBUG("[{:5.1f}%] {}", percentage, message);
@@ -1145,9 +1147,11 @@ namespace lfs::training {
             .min_track_length = params.dataset.min_track_length,
             .validate_only = true,
             .load_masks = params.optimization.mask_mode != lfs::core::param::MaskMode::None,
-            .load_depths = params.optimization.depth_supervision_enabled(),
+            .load_depths = params.optimization.use_depth_loss &&
+                           params.optimization.depth_loss_weight > 0.0f,
             .load_normals = training_normal_priors_enabled(params.optimization),
-            .normal_auto_generate = params.optimization.normal_auto_generate};
+            .normal_auto_generate = params.optimization.normal_auto_generate,
+            .depth_auto_generate = params.optimization.depth_auto_generate};
 
         auto result = data_loader->load(params.dataset.data_path, load_options);
         if (!result) {
@@ -1373,7 +1377,7 @@ namespace lfs::training {
         }
         trainer.set_live_project_snapshot(
             destination.empty()
-                ? params.dataset.output_path / "project.licht"
+                ? params.dataset.project_file()
                 : destination,
             {}, std::move(source_path));
         trainer.set_trainer_project_save_policy({
@@ -1482,7 +1486,7 @@ namespace lfs::training {
         const std::filesystem::path out_dir = params.dataset.output_path;
         const std::string stem = params.dataset.output_name.empty()
                                      ? std::format("splat_{}", trainer.get_current_iteration())
-                                     : params.dataset.output_name;
+                                     : params.dataset.output_stem();
 
         lfs::core::ProvenanceStamp stamp = params.include_provenance
                                                ? lfs::core::make_provenance_stamp()

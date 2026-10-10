@@ -2840,6 +2840,8 @@ namespace lfs::training {
                     LOG_WARN("Sparsity: clamping stop_refine from {} to {} to freeze topology before pruning",
                              params_.optimization.stop_refine, stop_refine_limit);
                     params_.optimization.stop_refine = stop_refine_limit;
+                    params_.optimization.start_refine =
+                        std::min(params_.optimization.start_refine, stop_refine_limit);
                 }
             }
 
@@ -3140,76 +3142,38 @@ namespace lfs::training {
             if (!params_.optimization.eval_mask.empty()) {
                 const glm::vec3 origin = scene_ ? scene_->getTrainingDataOrigin() : glm::vec3{0.0f};
                 const bool invert = params_.optimization.eval_mask_invert;
-                if (const auto file = lfs::core::param::eval_mask_splat_file(params_.optimization.eval_mask)) {
-                    auto splat = lfs::training::load_evaluation_splat(lfs::core::utf8_to_path(std::string(*file)),
-                                                                      {origin.x, origin.y, origin.z});
-                    if (!splat)
-                        return std::unexpected(std::format("Failed to load evaluation splat '{}': {}", *file,
-                                                           splat.error().detail()));
-                    LOG_INFO("Evaluation mask: {} splats from {} at opacity {}{}", splat->size(), *file,
-                             params_.optimization.eval_mask_opacity, invert ? " (inverted)" : "");
-                    evaluator_->set_eval_splat(lfs::training::EvaluationSplat{
-                        .model = std::move(*splat),
-                        .opacity = params_.optimization.eval_mask_opacity,
-                        .invert = invert});
-                } else if (const auto file = lfs::core::param::eval_mask_points_file(params_.optimization.eval_mask)) {
-                    auto means = lfs::training::load_evaluation_points(lfs::core::utf8_to_path(std::string(*file)),
-                                                                       {origin.x, origin.y, origin.z});
-                    if (!means)
-                        return std::unexpected(std::format("Failed to load evaluation points '{}': {}", *file,
-                                                           means.error().detail()));
-                    LOG_INFO("Evaluation mask: {} points from {}{}", means->shape()[0], *file, invert ? " (inverted)" : "");
-                    evaluator_->set_eval_points(lfs::training::EvaluationPoints{.means = std::move(*means), .invert = invert});
-                } else if (const auto splat = lfs::core::param::parse_eval_mask_points(params_.optimization.eval_mask)) {
-                    auto cloud = scene_ ? scene_->getInitialPointCloud() : nullptr;
-                    if (!cloud || !cloud->means.is_valid() || cloud->means.numel() == 0) {
-                        auto reloaded = lfs::training::loadInitialPointCloud(params_, origin);
-                        if (!reloaded)
-                            return std::unexpected(std::format("Evaluation mask 'points' needs the points training "
-                                                               "started from: {}",
-                                                               reloaded.error().user_message()));
-                        cloud = std::move(*reloaded);
+                auto installed = evaluator_->install_eval_mask_source({origin.x, origin.y, origin.z});
+                if (!installed)
+                    return std::unexpected(std::string(installed.error().user_message()));
+                if (!*installed) {
+                    if (const auto splat = lfs::core::param::parse_eval_mask_points(params_.optimization.eval_mask)) {
+                        auto cloud = scene_ ? scene_->getInitialPointCloud() : nullptr;
+                        if (!cloud || !cloud->means.is_valid() || cloud->means.numel() == 0) {
+                            auto reloaded = lfs::training::loadInitialPointCloud(params_, origin);
+                            if (!reloaded)
+                                return std::unexpected(std::format("Evaluation mask 'points' needs the points training "
+                                                                   "started from: {}",
+                                                                   reloaded.error().user_message()));
+                            cloud = std::move(*reloaded);
+                        }
+                        evaluator_->set_eval_points(lfs::training::EvaluationPoints{
+                            .means = cloud->means.to(lfs::core::Device::CUDA).to(lfs::core::DataType::Float32).contiguous(),
+                            .radius = (*splat)[0],
+                            .close = (*splat)[1],
+                            .invert = invert});
+                        LOG_INFO("Evaluation mask: {} initial points, radius {} px, closed by {} px{}",
+                                 cloud->means.shape()[0], (*splat)[0], (*splat)[1], invert ? " (inverted)" : "");
+                    } else if (lfs::core::param::is_eval_mask_cropbox(params_.optimization.eval_mask)) {
+                        const auto cropbox = scene_ ? lfs::training::resolve_training_cropbox_geom(*scene_) : std::nullopt;
+                        if (!cropbox)
+                            return std::unexpected("Evaluation mask 'cropbox' needs an enabled crop box on the training model");
+                        const bool cropbox_invert = invert != cropbox->inverse;
+                        evaluator_->set_eval_mesh(lfs::training::make_evaluation_box(
+                            lfs::training::training_cropbox_model_corners(*cropbox), cropbox_invert));
+                        LOG_INFO("Evaluation mask: crop box{}", cropbox_invert ? " (inverted)" : "");
+                    } else {
+                        LOG_INFO("Evaluation mask: {}{}", params_.optimization.eval_mask, invert ? " (inverted)" : "");
                     }
-                    evaluator_->set_eval_points(lfs::training::EvaluationPoints{
-                        .means = cloud->means.to(lfs::core::Device::CUDA).to(lfs::core::DataType::Float32).contiguous(),
-                        .radius = (*splat)[0],
-                        .close = (*splat)[1],
-                        .invert = invert});
-                    LOG_INFO("Evaluation mask: {} initial points, radius {} px, closed by {} px{}",
-                             cloud->means.shape()[0], (*splat)[0], (*splat)[1], invert ? " (inverted)" : "");
-                } else if (lfs::core::param::is_eval_mask_folder(params_.optimization.eval_mask)) {
-                    const auto folder = lfs::core::utf8_to_path(
-                        std::string(lfs::core::param::eval_mask_folder(params_.optimization.eval_mask)));
-                    std::error_code folder_error;
-                    if (!std::filesystem::is_directory(folder, folder_error))
-                        return std::unexpected(std::format("Evaluation mask folder '{}' does not exist",
-                                                           lfs::core::path_to_utf8(folder)));
-                    evaluator_->set_eval_mask_folder(
-                        std::make_shared<const lfs::io::MaskDirCache>(lfs::io::MaskDirCache::for_folder(folder)));
-                    LOG_INFO("Evaluation mask: masks from {}{}", lfs::core::path_to_utf8(folder), invert ? " (inverted)" : "");
-                } else if (lfs::core::param::is_eval_mask_cropbox(params_.optimization.eval_mask)) {
-                    const auto cropbox = scene_ ? lfs::training::resolve_training_cropbox_geom(*scene_) : std::nullopt;
-                    if (!cropbox)
-                        return std::unexpected("Evaluation mask 'cropbox' needs an enabled crop box on the training model");
-                    const bool cropbox_invert = invert != cropbox->inverse;
-                    evaluator_->set_eval_mesh(lfs::training::make_evaluation_box(
-                        lfs::training::training_cropbox_model_corners(*cropbox), cropbox_invert));
-                    LOG_INFO("Evaluation mask: crop box{}", cropbox_invert ? " (inverted)" : "");
-                } else if (lfs::core::param::is_eval_mask_depth(params_.optimization.eval_mask)) {
-                    LOG_INFO("Evaluation mask: {}{}", params_.optimization.eval_mask, invert ? " (inverted)" : "");
-                } else if (const auto box = lfs::core::param::parse_eval_mask_box(params_.optimization.eval_mask)) {
-                    evaluator_->set_eval_mesh(lfs::training::make_evaluation_box(
-                        lfs::training::axis_aligned_box_corners(*box, {origin.x, origin.y, origin.z}), invert));
-                    LOG_INFO("Evaluation mask: {}{}", params_.optimization.eval_mask, invert ? " (inverted)" : "");
-                } else {
-                    auto mesh = lfs::training::load_evaluation_mesh(
-                        lfs::core::utf8_to_path(params_.optimization.eval_mask), {origin.x, origin.y, origin.z}, invert);
-                    if (!mesh)
-                        return std::unexpected(std::format("Failed to load evaluation mesh '{}': {}",
-                                                           params_.optimization.eval_mask, mesh.error().detail()));
-                    LOG_INFO("Evaluation mask: {} triangles from {}{}", mesh->indices.shape()[0],
-                             params_.optimization.eval_mask, invert ? " (inverted)" : "");
-                    evaluator_->set_eval_mesh(std::move(*mesh));
                 }
             }
             if (params_.optimization.ppisp_active() && ppisp_ && ppisp_->isFinalized()) {
@@ -3490,7 +3454,7 @@ namespace lfs::training {
                             render_camera, model, background,
                             1.0f, false,
                             lfs::core::param::is_eval_mask_depth(params.optimization.eval_mask)
-                                ? GsplatRenderMode::RGB_ED
+                                ? GsplatRenderMode::RGB_D
                                 : GsplatRenderMode::RGB,
                             true, sky_bg);
                     } else {
@@ -6672,7 +6636,14 @@ namespace lfs::training {
                                     auto rasterize_result = gsplat_rasterize_forward(
                                         *cam, strategy_->get_model(), bg,
                                         0, 0, 0, 0,
-                                        1.0f, false, GsplatRenderMode::RGB, true, bg_tile);
+                                        1.0f, false,
+                                        (normal_supervision_started && (params_.optimization.normal_loss_weight > 0.f ||
+                                                                        params_.optimization.normal_consistency_weight > 0.f))
+                                            ? GsplatRenderMode::RGB_D_N
+                                        : (params_.optimization.use_depth_loss && params_.optimization.depth_loss_weight > 0.f)
+                                            ? GsplatRenderMode::RGB_D
+                                            : GsplatRenderMode::RGB,
+                                        true, bg_tile);
                                     if (!rasterize_result) {
                                         auto typed = lfs::from_legacy_expected<
                                             std::pair<RenderOutput, GsplatRasterizeContext>>(
@@ -7222,7 +7193,7 @@ namespace lfs::training {
                             }
                         }
 
-                        if (run_fastgs_gaussian_backward &&
+                        if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
                             params_.optimization.use_depth_loss &&
                             params_.optimization.depth_loss_weight > 0.0f &&
                             output.depth.is_valid() &&
@@ -7350,7 +7321,7 @@ namespace lfs::training {
                             }
                         }
 
-                        if (run_fastgs_gaussian_backward &&
+                        if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
                             normal_supervision_started &&
                             params_.optimization.normal_loss_weight > 0.0f &&
                             output.normal.is_valid() &&
@@ -7453,7 +7424,7 @@ namespace lfs::training {
                                     if (output.depth.is_valid() &&
                                         output.depth.numel() > 0 &&
                                         cam->camera_width() > 0 && cam->camera_height() > 0 &&
-                                        cam->focal_x() > 0.0f && cam->focal_y() > 0.0f) {
+                                        (gsplat_ctx || (cam->focal_x() > 0.0f && cam->focal_y() > 0.0f))) {
                                         lfs::core::Tensor rendered_depth = output.depth;
                                         if (rendered_depth.ndim() == 3 && rendered_depth.shape()[0] == 1) {
                                             rendered_depth = rendered_depth.squeeze(0);
@@ -7512,7 +7483,9 @@ namespace lfs::training {
                                                 cy,
                                                 params_.optimization.normal_loss_weight,
                                                 normal_stream,
-                                                normal_pixel_weight);
+                                                normal_pixel_weight,
+                                                gsplat_ctx ? gsplat_ctx->camera_rays.ptr<float>() : nullptr,
+                                                gsplat_ctx && gsplat_ctx->camera_model == ::CameraModelType::EQUIRECTANGULAR);
                                             tile_loss = tile_loss + normal_prior_depth_scalar_;
                                         }
                                     }
@@ -7526,7 +7499,7 @@ namespace lfs::training {
                             }
                         }
 
-                        if (run_fastgs_gaussian_backward &&
+                        if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
                             normal_supervision_started &&
                             params_.optimization.normal_consistency_weight > 0.0f &&
                             output.normal.is_valid() &&
@@ -7569,7 +7542,7 @@ namespace lfs::training {
                                 rendered_alpha.shape()[0] == rendered_normal.shape()[1] &&
                                 rendered_alpha.shape()[1] == rendered_normal.shape()[2] &&
                                 cam->camera_width() > 0 && cam->camera_height() > 0 &&
-                                cam->focal_x() > 0.0f && cam->focal_y() > 0.0f;
+                                (gsplat_ctx || (cam->focal_x() > 0.0f && cam->focal_y() > 0.0f));
 
                             if (consistency_shapes_match) {
                                 const cudaStream_t consistency_stream = rendered_normal.stream();
@@ -7630,7 +7603,9 @@ namespace lfs::training {
                                     cy,
                                     params_.optimization.normal_consistency_weight,
                                     consistency_stream,
-                                    consistency_pixel_weight);
+                                    consistency_pixel_weight,
+                                    gsplat_ctx ? gsplat_ctx->camera_rays.ptr<float>() : nullptr,
+                                    gsplat_ctx && gsplat_ctx->camera_model == ::CameraModelType::EQUIRECTANGULAR);
 
                                 tile_loss = tile_loss + normal_consistency_scalar_;
                             }
@@ -7878,7 +7853,9 @@ namespace lfs::training {
                                                           strategy_->get_model(), strategy_->get_optimizer(),
                                                           use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
                                                           edge_weight_scoring_active_ ? edge_weight_map : lfs::core::Tensor{},
-                                                          edge_weight_scoring_active_ ? edge_score_scratch : lfs::core::Tensor{});
+                                                          edge_weight_scoring_active_ ? edge_score_scratch : lfs::core::Tensor{},
+                                                          tile_grad_depth, tile_grad_normal,
+                                                          normal_supervision_started ? params_.optimization.normal_flatten_weight : 0.f);
                                 if (edge_weight_scoring_active_) {
                                     strategy_->on_edge_score_accumulated(iter);
                                 }
@@ -8736,12 +8713,6 @@ namespace lfs::training {
         }
         apply_pending_params_at_safe_point();
         lfs::diagnostics::VramProfiler::instance().mark("training_start");
-        if (params_.optimization.gut && params_.optimization.use_normal_loss) {
-            LOG_WARN("normal loss requested but the 3DGUT backend has no normal channel; normal terms are inactive");
-        }
-        if (params_.optimization.gut && params_.optimization.use_depth_loss) {
-            LOG_WARN("depth loss requested but the 3DGUT backend has no depth channel; depth terms are inactive");
-        }
         if (PerfBenchCollector::enabled()) {
             PerfBenchCollector::instance().on_training_start(get_total_iterations());
         }
@@ -8827,7 +8798,20 @@ namespace lfs::training {
                          params_.optimization.depth_loss_mode);
                 params_.optimization.use_depth_loss = false;
             }
-            aux_pipeline_config.load_depths = params_.optimization.depth_supervision_enabled();
+            aux_pipeline_config.load_depths = training_depth_priors_enabled(params_.optimization);
+            aux_pipeline_config.load_normals = training_normal_priors_enabled(params_.optimization);
+#ifndef LFS_TRAIN_ONLY
+            {
+                // Val cameras need maps too for the eval depth and normal metrics;
+                // one call keeps generation to a single estimator pass.
+                auto prior_cameras = train_dataset_->get_cameras();
+                if (val_dataset_) {
+                    const auto& val_cameras = val_dataset_->get_cameras();
+                    prior_cameras.insert(prior_cameras.end(), val_cameras.begin(), val_cameras.end());
+                }
+                ensure_training_prior_maps(params_, prior_cameras);
+            }
+#endif
             if (aux_pipeline_config.load_depths) {
                 size_t cameras_with_depth = 0;
                 for (const auto& cam : train_dataset_->get_cameras()) {
@@ -8850,16 +8834,7 @@ namespace lfs::training {
                     fitDepthAnchors(cameras_with_depth);
                 }
             }
-            aux_pipeline_config.load_normals = training_normal_priors_enabled(params_.optimization);
             if (aux_pipeline_config.load_normals) {
-#ifndef LFS_TRAIN_ONLY
-                ensure_training_normal_maps(params_, train_dataset_->get_cameras());
-                if (val_dataset_) {
-                    // Scene-path val cameras are a separate list, so generate
-                    // their missing maps too for the eval normal metric.
-                    ensure_training_normal_maps(params_, val_dataset_->get_cameras());
-                }
-#endif
                 normal_prior_flip_yz_ = false;
                 normal_prior_world_space_ = false;
                 normal_prior_srgb_ = false;
