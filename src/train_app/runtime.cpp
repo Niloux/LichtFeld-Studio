@@ -3,8 +3,10 @@
 #include "app/headless_recovery_document.hpp"
 #include "app/headless_run_coordinator.hpp"
 #include "core/checkpoint_format.hpp"
+#include "core/environment.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/image_loader.hpp"
+#include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data.hpp"
@@ -34,6 +36,23 @@ namespace lfs::app {
                 throw std::invalid_argument("lfs-train supports only --export ply");
     }
     namespace {
+        [[nodiscard]] std::optional<std::filesystem::path> find_lpips_weights() {
+            const auto override_path = core::environment::value("LFS_LPIPS_WEIGHTS");
+            const auto path = override_path
+                                  ? core::utf8_to_path(*override_path)
+                                  : core::lichtfeld_home_directory() / ".lichtfeld" / "onnx" / "lpips-vgg16-v0.1.lfw";
+            std::error_code error;
+            if (!std::filesystem::is_regular_file(path, error)) {
+                LOG_WARN("Eval: LPIPS weights unavailable at '{}'; download lpips-vgg16-v0.1.lfw "
+                         "from the model-lpips-v1 release or set LFS_LPIPS_WEIGHTS. "
+                         "Continuing with PSNR and SSIM.",
+                         core::path_to_utf8(path));
+                return std::nullopt;
+            }
+            LOG_INFO("Eval: LPIPS weights: {}", core::path_to_utf8(path));
+            return path;
+        }
+
         void validate_scene(const core::param::TrainingParameters& p, const core::Scene& scene) {
             if (!scene.hasTrainingData())
                 throw std::invalid_argument("No training cameras were loaded; provide a COLMAP or NeRF-transform dataset");
@@ -578,6 +597,8 @@ namespace lfs::app {
         }
         validate_train_parameters(trainer->getParams());
         validate_scene(trainer->getParams(), scene);
+        if (trainer->getParams().optimization.enable_eval)
+            trainer->set_lpips_weights_path(find_lpips_weights());
         params.dataset.output_path = trainer->get_output_path();
         core::Tensor::trim_memory_pool();
         auto trained = trainer->train(coordinator.stop_token());

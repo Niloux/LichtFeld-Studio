@@ -78,10 +78,10 @@ unless split parameters are overridden. Changing a split requires a fresh traini
 run for comparable held-out metrics; evaluating newly held-out images from an old
 checkpoint may include images that checkpoint already trained on.
 
-From the repository root, the supplied exhibition preset runs with:
+From the repository root, the supplied basketball preset runs with:
 
 ```sh
-./build/train/lfs-train --config configs/展厅.json
+./build/train/lfs-train --config configs/篮球场.json
 ```
 
 Edit that JSON for subsequent runs. `dataset` contains `data_path`,
@@ -95,16 +95,21 @@ full-snapshot reader is unchanged, and missing required optimization fields are
 rejected. Older flat optimization JSON snapshots remain supported with paths
 supplied on the command line.
 
+The preset groups fields by purpose with blank lines and keeps arrays compact.
+See the [configuration quick reference (中文)](../configs/README.md) for common
+edits, the group order and evaluation/save semantics.
+
 Command-line values override matching JSON values (a conflicting `--strategy`
 is rejected). For a shorter run and a separate output directory:
 
 ```sh
-./build/train/lfs-train --config configs/展厅.json \
-  --iter 3000 --eval-steps 3000 -o ./output/展厅_3k
+./build/train/lfs-train --config configs/篮球场.json \
+  --iter 3000 --eval-steps 3000 -o ./output/篮球场_3k
 ```
 
-The exhibition preset disables sky training. Its absolute dataset and LiDAR
-paths refer to the local exhibition dataset; change them on another machine.
+The basketball preset disables Gaussian sky training and uses the
+`segment_and_ignore` mask mode with image alpha. Its absolute dataset and
+initialization paths refer to local inputs; set them to existing paths before running.
 Choose an output directory appropriate for each run. Relative launch paths resolve from the **working directory**,
 just like CLI paths. `images` remains relative to the dataset.
 JSON does not support comments. To disable an option enabled by the preset,
@@ -116,10 +121,11 @@ arbitrary desktop project compatibility is not promised. Pass `-o` when resuming
 to save into a new output directory. Without `-o`, a resumed `.licht` remains the
 save destination. PLY files contain the exported model, not optimizer state.
 
-Automatic normal generation defaults to off. Provide existing mask/depth/normal
+Automatic depth and normal generation default to off. Provide existing mask/depth/normal
 files when enabling the corresponding loss; missing required supervision is an
 error (image alpha can supply a mask when enabled). Older saved configurations
-that enable auto-generation must be overridden with `--no-normal-auto-generate`.
+that enable auto-generation must be overridden with `--no-depth-auto-generate`
+and `--no-normal-auto-generate`, as appropriate.
 
 RGB-only training needs no depth or normal maps: both supervision options default
 to off. For fisheye datasets, use `--gut` to retain the native camera model.
@@ -134,6 +140,37 @@ gradient to the rasterizer.
 The CLI reports training, final export and asynchronous project-writer failures
 through a nonzero exit code. SIGINT/SIGTERM request an orderly stop and return
 128 plus the signal number after shutdown.
+
+### LPIPS evaluation
+
+With `optimization.enable_eval=true`, `lfs-train` calculates PSNR and SSIM,
+and also LPIPS v0.1 (VGG16) when its native `.lfw` weights are available.
+New and resumed runs read `LFS_LPIPS_WEIGHTS` when set, otherwise
+`~/.lichtfeld/onnx/lpips-vgg16-v0.1.lfw`. The model loads at the first evaluation.
+Standalone training uses local weights and does not download them during a run.
+Missing or incompatible weights, or insufficient GPU memory, leave LPIPS
+unavailable with a warning; the other metrics remain available.
+
+Download the native weights from the upstream
+[LPIPS model release](https://github.com/MrNeRF/LichtFeld-Studio/releases/tag/model-lpips-v1)
+and verify its published SHA-256 before putting it in the cache:
+
+```sh
+mkdir -p "$HOME/.lichtfeld/onnx"
+curl -fL --retry 3 \
+  -o "$HOME/.lichtfeld/onnx/lpips-vgg16-v0.1.lfw.part" \
+  https://github.com/MrNeRF/LichtFeld-Studio/releases/download/model-lpips-v1/lpips-vgg16-v0.1.lfw
+printf 'ea2f01796fbcf9950f9454f19b42e45568f166d879ec141ec100b9897a8cc769  %s\n' \
+  "$HOME/.lichtfeld/onnx/lpips-vgg16-v0.1.lfw.part" | sha256sum --check &&
+  mv "$HOME/.lichtfeld/onnx/lpips-vgg16-v0.1.lfw.part" "$HOME/.lichtfeld/onnx/lpips-vgg16-v0.1.lfw"
+```
+
+To use a different location:
+
+```sh
+LFS_LPIPS_WEIGHTS=/path/to/lpips-vgg16-v0.1.lfw \
+  ./build/train/lfs-train --config configs/篮球场.json
+```
 
 ## Verify the build boundary
 
