@@ -345,15 +345,16 @@ namespace lfs::training {
         return grad_rgb;
     }
 
-    void BilateralGrid::backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int image_idx) {
+    void BilateralGrid::backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int image_idx,
+                                         const bool accumulate) {
         LFS_ASSERT(grad.is_contiguous());
-        backward_into(rgb, grad, grad, image_idx);
+        backward_into(rgb, grad, grad, image_idx, accumulate);
     }
 
     void BilateralGrid::backward_into(const lfs::core::Tensor& rgb,
                                       const lfs::core::Tensor& grad_output,
                                       lfs::core::Tensor& grad_rgb,
-                                      int image_idx) {
+                                      int image_idx, const bool accumulate) {
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::backward: image_idx out of range");
         }
@@ -369,8 +370,9 @@ namespace lfs::training {
         float* grad_grid_ptr = slice_grad_.ptr<float>();
         assert(static_cast<int>(grids_.shape()[1]) == channels_);
 
-        LFS_CUDA_CHECK(cudaMemsetAsync(
-            grad_grid_ptr, 0, slice_elements() * sizeof(float), nullptr));
+        if (!accumulate)
+            LFS_CUDA_CHECK(cudaMemsetAsync(
+                grad_grid_ptr, 0, slice_elements() * sizeof(float), nullptr));
 
         if (layout.chw) {
             if (parameterization_ == BilateralGridParameterization::ExposureChroma) {

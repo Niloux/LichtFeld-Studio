@@ -27,10 +27,22 @@ clamped to RGB [1/255, 1]. This matches the SH0 configuration used for the local
 remain independent.
 
 Sky Gaussians never enter the foreground strategy, densification count, scene
-nodes, or PLY export. Their geometry, colors, Adam moments and step are persisted
-in the `.licht` checkpoint. Sky training no longer uses sky masks: there is no
-foreground-opacity penalty, so the foreground is not explicitly discouraged from
-growing into sky pixels.
+nodes, or foreground PLY. With `--export ply`, final export additionally writes
+`sky.ply` in the output directory, using the standard Gaussian PLY fields for
+positions, SH0 colors, opacity, scales, and rotations. The foreground file retains
+its usual name and point count. Sky geometry, colors, Adam moments and step are
+persisted in the `.licht` checkpoint. With mask mode `none`/`ignore`, sky training retains
+the unmasked composition path and has no foreground-opacity penalty.
+
+For joint foreground/sky supervision, use `sky_enabled=true`,
+`mask_mode="segment_and_ignore"`, and `invert_masks=false`. The upstream bands
+remain unchanged: 0–127 ignores the pixel, 128–250 segments it, and 251–255 keeps
+it. Author dynamic objects as 0, sky as 128, and static scene content as 255.
+The segment band's existing `mask_opacity_penalty_weight` penalizes accumulated
+**foreground** alpha; it does not penalize the separate sky Gaussians. The power,
+weight, and image-wide normalization of this penalty retain upstream semantics.
+Without Gaussian sky enabled, `segment_and_ignore` also retains its upstream
+behavior, including no RGB supervision in the segment band.
 
 ## Dataset and command
 
@@ -40,8 +52,8 @@ parameter snapshot, then enable `optimization.sky_enabled`. The current
 See [JSON configuration](train-only.md#json-training-configuration) for overrides
 and path handling.
 
-No sky masks are required. Ordinary validity masks (`--mask-mode`) remain
-independent and unchanged.
+No sky masks are required for `none`/`ignore`. Joint supervision uses the existing
+three-band mask files; loading preserves their labels rather than binarizing 128.
 
 ```bash
 ./build/train/lfs-train \
@@ -73,6 +85,23 @@ composition and its gradients reach both models. Sky color receives the complete
 valid photometric gradient multiplied by foreground transmittance. The foreground
 strategy retains its usual behavior.
 
+In joint mode, keep pixels retain this composite photometric loss and the original
+foreground strategy. Segment pixels additionally supervise the independent sky
+render with masked L1 RGB loss, normalized by the segment/ROI weights. This branch
+uses the same exposure/PPISP/bilateral-grid order as the foreground and sends its
+image gradient only to the sky. It is independent of foreground transmittance, so
+initial foreground occlusion does not starve sky color learning. An image with no
+segment pixels contributes zero sky-only loss.
+
+Foreground RGB gradients are zeroed outside the keep band after appearance
+backward, including any neighboring SSIM-window gradients. Foreground error maps
+continue to use upstream keep-band masking. In gradient-norm densification, the
+segment alpha derivative is excluded from the norm while still updating foreground
+opacity and geometry. GUT replays backward for this norm only when no pixel-error
+map is used; FastGS accumulates the separate norm derivative in its existing pass.
+Sky count and geometry stay fixed in every mode. Sky mislabeled as keep can still
+drive foreground reconstruction.
+
 Sky uses the GUT world-space rasterizer with a far plane of 1e10, including native
 fisheye models. Foreground rendering can use GUT or FastGS. Sky translation is
 finite-distance world-space geometry, unlike the previous direction-only cube.
@@ -99,11 +128,12 @@ Geometry and optimizer state survive resume; changing count, radius or fixed
 opacity on resume is rejected. Cubemap component version 1 cannot be resumed as
 Gaussian sky. Feature-off checkpoints retain version 3 and remain readable.
 
-Supported paths include mask mode `none`/`ignore`, PPISP without controller,
+Supported paths include mask mode `none`/`ignore`/`segment_and_ignore`, PPISP without controller,
 exposure correction and bilateral grids. Orthographic cameras, pre-undistortion,
 other background modes and PPISP controller training are rejected. Use `--gut`
 for native fisheye images. Evaluation and timelapse renders include the sky;
 foreground PLY and generic viewer renders do not carry this training background.
+The separate `sky.ply` can be loaded as a Gaussian model for inspection.
 The dataset must use +Z as up and fit well inside the sky hemisphere radius.
 
 ## Validation
@@ -115,8 +145,10 @@ build/train/lfs-sky-test
 python3 tools/train_sky_smoke.py build/train/lfs-train --output /tmp/lfs-gaussian-sky-smoke
 ```
 
-The component test checks camera models, SH0 finite differences, fixed geometry,
-and Adam continuation. The smoke harness checks both foreground renderers,
+The component test checks the upstream mask bands in byte/normalized-float form,
+sky-only color gradients, foreground alpha penalties, gradient-norm densification
+isolation in both renderers, shared appearance accumulation, camera models, SH0
+finite differences, fixed geometry, and Adam continuation. The smoke harness checks both foreground renderers,
 exposure correction, evaluation, checkpoint resume, foreground-only PLY counts,
 invalid geometry and feature-off compatibility. These verify implementation
 behavior; full-scene quality comparisons are performed separately.
@@ -126,3 +158,18 @@ cases and three CTest checks passed. The actual 252-image fisheye dataset ran
 five steps with 1,488,579 LiDAR foreground points and 100,000 sky Gaussians at
 maximum image width 512. PLY retained 1,488,579 foreground points. Full-resolution
 30,000-step quality validation and a complete Studio build were not run.
+
+Local joint-mask validation (2026-10-10): `lfs-train` and the focused GPU checks
+compiled; `lfs-sky-test` and `lfs-ppisp-test` passed. Four real fisheye views with
+0/128/255 masks completed 32 steps using 100,000 uniformly sampled LiDAR
+initialization points and the fixed 100,000-point sky. PPISP and the bilateral
+grid were active from the first step. The run saved a `.licht` project and
+exported exactly 100,000 foreground points, with no CUDA error in the log.
+This is a reduced-input pipeline check; it does not establish full-scene floater
+removal or a reconstruction-quality improvement.
+
+Local sky PLY export validation (2026-10-10): the incremental `lfs-train` build
+passed. Reloading the 32-step project with the same iteration limit exported
+`sky.ply` with 100,000 Gaussians and all standard Gaussian attributes. Every
+field was finite; positions retained the fixed +Z hemisphere and radius 10000.
+The foreground PLY's binary vertex payload was identical to the original export.

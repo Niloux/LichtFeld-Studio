@@ -197,7 +197,8 @@ namespace lfs::training {
         int iteration = 0,
         const FastGSFusedExtraGradients& fused_extra_gradients = {},
         const lfs::core::Tensor& grad_depth = {},
-        const lfs::core::Tensor& grad_normal = {});
+        const lfs::core::Tensor& grad_normal = {},
+        const lfs::core::Tensor& densification_alpha_exclusion = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_fast_rasterizer_thread_local_caches() noexcept;

@@ -288,6 +288,10 @@ namespace lfs::training {
         // just for viewer to get model
         const IStrategy& get_strategy() const { return *strategy_; }
 
+        const lfs::core::SplatData* get_sky_model() const {
+            return sky_background_ ? &sky_background_->model() : nullptr;
+        }
+
         // Mutable access for controlled callbacks (e.g., Python control layer)
         IStrategy& get_strategy_mutable() { return *strategy_; }
 
@@ -661,6 +665,12 @@ namespace lfs::training {
         void cleanup();
 
         void initialize_sky();
+        SkyColorLoss compute_sky_color_loss(const core::Camera& camera,
+                                            const core::Tensor& sky_image,
+                                            const core::Tensor& target,
+                                            const core::Tensor& mask,
+                                            const core::Tensor& roi_weight,
+                                            int iteration);
         std::expected<void, std::string> initialize_bilateral_grid();
         std::expected<void, std::string> initialize_ppisp();
         std::expected<void, std::string> initialize_ppisp_controller();
@@ -806,7 +816,7 @@ namespace lfs::training {
         lfs::core::Tensor pipelined_depth_;
         lfs::core::Tensor pipelined_normal_;
 
-        // Auxiliary fixed sky model, separate from foreground/exported splats.
+        // Auxiliary fixed sky model, separate from foreground splats.
         std::unique_ptr<SkyBackground> sky_background_;
 
         // Bilateral grid for appearance modeling (optional)

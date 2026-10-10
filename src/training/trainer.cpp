@@ -1194,8 +1194,9 @@ namespace lfs::training {
             throw std::runtime_error("Sky requires a dataset scene");
         if (params_.optimization.ppisp_use_controller ||
             (params_.optimization.mask_mode != core::param::MaskMode::None &&
-             params_.optimization.mask_mode != core::param::MaskMode::Ignore))
-            throw std::runtime_error("Sky currently supports mask-mode none/ignore and PPISP without controller");
+             params_.optimization.mask_mode != core::param::MaskMode::Ignore &&
+             params_.optimization.mask_mode != core::param::MaskMode::SegmentAndIgnore))
+            throw std::runtime_error("Sky supports mask-mode none/ignore/segment_and_ignore and PPISP without controller");
         auto sky = std::make_unique<SkyBackground>(params_.optimization.sky_num_points,
                                                    params_.optimization.sky_radius, params_.optimization.sky_initial_opacity);
         std::vector<core::Camera*> cameras;
@@ -1203,6 +1204,57 @@ namespace lfs::training {
             cameras.push_back(camera.get());
         sky->configure(params_, cameras);
         sky_background_ = std::move(sky);
+    }
+
+    SkyColorLoss Trainer::compute_sky_color_loss(const core::Camera& camera,
+                                                 const core::Tensor& sky_image,
+                                                 const core::Tensor& target,
+                                                 const core::Tensor& mask,
+                                                 const core::Tensor& roi_weight,
+                                                 const int iteration) {
+        const auto& opt = params_.optimization;
+        const bool ppisp_on = ppisp_ && opt.ppisp_active();
+        const bool grid_on = bilateral_grid_ && opt.bilateral_grid_active() &&
+                             (!opt.use_exposure_correction || iteration >= opt.exposure_correction_grid_start_iter);
+        core::Tensor corrected = sky_image;
+        core::Tensor ppisp_input, grid_input;
+        // Match the foreground appearance order, using independent image storage.
+        if (opt.use_exposure_correction) {
+            if (ppisp_on) {
+                ppisp_input = corrected;
+                corrected = ppisp_->apply(ppisp_input, camera.camera_id(), camera.uid());
+            }
+            if (grid_on) {
+                grid_input = corrected;
+                corrected = bilateral_grid_->apply(grid_input, camera.uid());
+            }
+        } else {
+            if (grid_on) {
+                grid_input = corrected;
+                corrected = bilateral_grid_->apply(grid_input, camera.uid());
+            }
+            if (ppisp_on) {
+                ppisp_input = corrected;
+                corrected = ppisp_->apply(ppisp_input, camera.camera_id(), camera.uid());
+            }
+        }
+        if (opt.use_exposure_correction || !ppisp_on)
+            corrected = corrected.clamp(0.f, 1.f);
+        auto result = sky_background_->masked_color_loss(corrected, target, mask, roi_weight);
+        if (opt.use_exposure_correction) {
+            if (grid_on)
+                bilateral_grid_->backward_in_place(grid_input, result.grad_image, camera.uid(), true);
+            if (ppisp_on)
+                ppisp_->backward_in_place(ppisp_input, result.grad_image, camera.camera_id(), camera.uid());
+        } else {
+            if (ppisp_on)
+                ppisp_->backward_in_place(ppisp_input, result.grad_image, camera.camera_id(), camera.uid());
+            if (grid_on)
+                bilateral_grid_->backward_in_place(grid_input, result.grad_image, camera.uid(), true);
+        }
+        if (ppisp_on && is_ppisp_frozen())
+            ppisp_->zero_grad();
+        return result;
     }
 
     std::expected<void, std::string> Trainer::initialize_bilateral_grid() {
@@ -7836,8 +7888,17 @@ namespace lfs::training {
                         // Capture before sky forward reuses the renderer's output/alpha caches.
                         // Photometric gradients already contain validity masks and exposure backward.
                         core::Tensor sky_gradient;
+                        const bool joint_sky_mask = sky_background_ && use_mask &&
+                                                    params_.optimization.mask_mode == core::param::MaskMode::SegmentAndIgnore;
+                        if (joint_sky_mask)
+                            sky_background_->mask_foreground_gradient(raster_grad, mask_tile);
                         if (sky_background_)
                             sky_gradient = raster_grad.slice(0, 0, 3).mul(output.alpha.mul(-1.f).add(1.f)).contiguous();
+                        if (joint_sky_mask) {
+                            const auto sky_loss = compute_sky_color_loss(*cam, bg_tile, gt_tile, mask_tile, roi_weight, iter);
+                            loss_tensor_gpu = loss_tensor_gpu + sky_loss.loss;
+                            sky_gradient.add_(sky_loss.grad_image);
+                        }
                         current_phase = StepPhase::Backward;
                         nvtxRangePush("rasterize_backward");
                         PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::BwdBegin, iter);
@@ -7855,7 +7916,8 @@ namespace lfs::training {
                                                           edge_weight_scoring_active_ ? edge_weight_map : lfs::core::Tensor{},
                                                           edge_weight_scoring_active_ ? edge_score_scratch : lfs::core::Tensor{},
                                                           tile_grad_depth, tile_grad_normal,
-                                                          normal_supervision_started ? params_.optimization.normal_flatten_weight : 0.f);
+                                                          normal_supervision_started ? params_.optimization.normal_flatten_weight : 0.f,
+                                                          joint_sky_mask ? mask_preprocess_workspace_.grad_alpha : core::Tensor{});
                                 if (edge_weight_scoring_active_) {
                                     strategy_->on_edge_score_accumulated(iter);
                                 }
@@ -7884,7 +7946,8 @@ namespace lfs::training {
                                                             iter,
                                                             fused_extra_gradients,
                                                             tile_grad_depth,
-                                                            tile_grad_normal);
+                                                            tile_grad_normal,
+                                                            joint_sky_mask ? mask_preprocess_workspace_.grad_alpha : core::Tensor{});
                                     if (fused_extra_gradients.edge_score_out != nullptr) {
                                         strategy_->on_edge_score_accumulated(iter);
                                     }

@@ -22,6 +22,9 @@ namespace fast_lfs::rasterization {
         const float* bg_color = nullptr;
         const float* bg_image = nullptr;
         const float* grad_alpha_extra = nullptr;
+        // Optional derivative used only by gradient-norm densification.
+        const float* grad_alpha_densification_exclusion = nullptr;
+        float2* densification_mean2d = nullptr;
     };
 } // namespace fast_lfs::rasterization
 

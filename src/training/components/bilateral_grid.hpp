@@ -61,7 +61,9 @@ namespace lfs::training {
                                    const lfs::core::Tensor& grad_output,
                                    int image_idx);
         /// Backward pass that overwrites the contiguous grad with the gradient with respect to rgb.
-        void backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int image_idx);
+        /// Set accumulate to retain parameter gradients from another loss on this image.
+        void backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int image_idx,
+                               bool accumulate = false);
 
         /// Compute TV loss for regularization (returns GPU tensor for async accumulation)
         lfs::core::Tensor tv_loss_gpu();
@@ -122,7 +124,8 @@ namespace lfs::training {
         void backward_into(const lfs::core::Tensor& rgb,
                            const lfs::core::Tensor& grad_output,
                            lfs::core::Tensor& grad_rgb,
-                           int image_idx);
+                           int image_idx,
+                           bool accumulate = false);
         void compute_bias_corrections(float& bc1_rcp, float& bc2_sqrt_rcp) const {
             const double bc1 = 1.0 - std::pow(config_.beta1, step_ + 1);
             const double bc2 = 1.0 - std::pow(config_.beta2, step_ + 1);

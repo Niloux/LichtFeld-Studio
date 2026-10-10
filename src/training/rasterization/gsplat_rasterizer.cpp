@@ -722,7 +722,8 @@ namespace lfs::training {
         const core::Tensor& grad_depth,
         const core::Tensor& grad_normal,
         float flatten_weight,
-        core::Tensor* color_only_gradient) {
+        core::Tensor* color_only_gradient,
+        const core::Tensor& densification_alpha_exclusion = {}) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -893,8 +894,11 @@ namespace lfs::training {
             float* const edge_score_out_ptr =
                 edge_scoring ? edge_score_out.ptr<float>() : nullptr;
 
-            // Call backward with raw pointers
-            gsplat_lfs::rasterize_from_world_with_sh_bwd(
+            // The optional replay below computes the original geometry gradient
+            // norm without the segment alpha penalty, after optimizer accumulation.
+            auto raster_backward = [&](float* alpha_grad, float* densification_out,
+                                       const float* error_out, float* edge_out) {
+                gsplat_lfs::rasterize_from_world_with_sh_bwd(
                 ctx.means.ptr<float>(),
                 ctx.quats.ptr<float>(),
                 ctx.scales.ptr<float>(),
@@ -941,17 +945,19 @@ namespace lfs::training {
                 ctx.depths_ptr,
                 ctx.compensations_ptr,
                 v_render_colors_ptr,
-                v_render_alphas_ptr,
+                alpha_grad,
                 v_means_ptr,
                 v_quats_ptr,
                 v_scales_ptr,
                 v_opacities_ptr,
                 v_sh_coeffs_ptr,
-                densification_info_ptr,
-                pixel_error_map_ptr,
+                densification_out,
+                error_out,
                 edge_weight_map_ptr,
-                edge_score_out_ptr,
+                edge_out,
                 stream, ctx.batches, ctx.tiles_per_gauss_ptr);
+            };
+            raster_backward(v_render_alphas_ptr, densification_info_ptr, pixel_error_map_ptr, edge_score_out_ptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
 
@@ -1019,6 +1025,17 @@ namespace lfs::training {
 
             // Accumulate gradient norms when pixel-error map is not provided
             if (update_densification_info && pixel_error_map_ptr == nullptr) {
+                if (densification_alpha_exclusion.is_valid()) {
+                    densification_alpha_exclusion.sync_to_stream(stream);
+                    auto alpha_grad = core::Tensor::from_blob(
+                        v_render_alphas_ptr, {H, W}, core::Device::CUDA, core::DataType::Float32, stream);
+                    auto photographic_alpha_grad = alpha_grad - densification_alpha_exclusion;
+                    // Parameter gradients were already copied to Adam. Only
+                    // scratch gradients are overwritten; no second optimizer step.
+                    LFS_CUDA_CHECK(cudaMemsetAsync(v_means_ptr, 0,
+                        v_means_size + v_quats_size + v_scales_size + v_opacities_size + v_sh_coeffs_size, stream));
+                    raster_backward(photographic_alpha_grad.ptr<float>(), nullptr, nullptr, nullptr);
+                }
                 gaussian_model._densification_info.set_stream(stream);
                 kernels::launch_grad_norm_accumulate(
                     gaussian_model._densification_info.ptr<float>(),
@@ -1055,10 +1072,11 @@ namespace lfs::training {
                                    const core::Tensor& error_map, const core::Tensor& edge_map,
                                    core::Tensor edge_score,
                                    const core::Tensor& grad_depth, const core::Tensor& grad_normal,
-                                   float flatten_weight) {
+                                   float flatten_weight,
+                                   const core::Tensor& densification_alpha_exclusion) {
         gsplat_rasterize_backward_impl(ctx, grad_image, grad_alpha, model, &optimizer,
                                        error_map, edge_map, edge_score, grad_depth, grad_normal,
-                                       flatten_weight, nullptr);
+                                       flatten_weight, nullptr, densification_alpha_exclusion);
     }
 
     void gsplat_rasterize_backward_sh0(const GsplatRasterizeContext& ctx,

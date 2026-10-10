@@ -12,6 +12,11 @@
 #include <vector>
 
 namespace lfs::training {
+    struct SkyColorLoss {
+        core::Tensor loss;
+        core::Tensor grad_image;
+    };
+
     // Separate, fixed world-space upper-hemisphere Gaussians. Only SH0 colors
     // are optimized. This model is never registered in the foreground scene.
     class SkyBackground {
@@ -20,6 +25,12 @@ namespace lfs::training {
         void configure(const core::param::TrainingParameters& params,
                        const std::vector<core::Camera*>& cameras);
         core::Tensor render(const core::Camera& camera) const;
+        // Segment-band color supervision is independent of foreground visibility.
+        SkyColorLoss masked_color_loss(const core::Tensor& corrected_sky,
+                                      const core::Tensor& target,
+                                      const core::Tensor& mask,
+                                      const core::Tensor& roi_weight = {});
+        void mask_foreground_gradient(core::Tensor& gradient, const core::Tensor& mask) const;
         // Must run AFTER foreground backward: the renderer reuses TLS caches.
         void backward(const core::Camera& camera, const core::Tensor& grad_sky);
         void optimizer_step(float learning_rate);
@@ -41,5 +52,6 @@ namespace lfs::training {
         std::uint64_t step_ = 0;
         std::unique_ptr<core::SplatData> model_;
         core::Tensor gradients_, exp_avg_, exp_avg_sq_;
+        core::Tensor color_grad_image_, color_loss_stats_, color_reduce_temp_;
     };
 } // namespace lfs::training

@@ -204,7 +204,8 @@ void fast_lfs::rasterization::backward(
                 fused_adam,
                 shN_value_bounds,
                 shN_value_n_cells,
-                shN_value_bits);
+                shN_value_bits,
+                background_grad.densification_mean2d);
             LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.backward.preprocess_backward");
         };
         const bool disabled_features = fused_adam.erank_reg_weight <= 0.0f &&

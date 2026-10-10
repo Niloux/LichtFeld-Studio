@@ -1512,6 +1512,24 @@ namespace lfs::training {
                 failed += failed.empty() ? file : ", " + file;
             }
         }
+        if (const auto* sky = trainer.get_sky_model();
+            sky && std::ranges::find(params.export_formats, lfs::core::param::OutputFormat::PLY) != params.export_formats.end()) {
+            const std::filesystem::path path = out_dir / "sky.ply";
+            const std::string file = lfs::core::path_to_utf8(path);
+            try {
+                if (stem == "sky")
+                    throw std::invalid_argument("Cannot export sky.ply: choose a foreground output name other than 'sky'");
+                if (const auto result = save_final_splat(*sky, path, lfs::core::param::OutputFormat::PLY, stamp, params); !result) {
+                    LOG_ERROR("Failed to export Gaussian sky to {}: {}", file, result.error().message);
+                    failed += failed.empty() ? file : ", " + file;
+                } else {
+                    LOG_INFO("Exported Gaussian sky ({} points): {}", sky->size(), file);
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR("Failed to export Gaussian sky to {}: {}", file, e.what());
+                failed += failed.empty() ? file : ", " + file;
+            }
+        }
         if (failed.empty()) {
             return {};
         }

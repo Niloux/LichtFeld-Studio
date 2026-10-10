@@ -83,6 +83,7 @@ namespace lfs::training {
     /// Write `--export` formats next to project.licht after a terminal project
     /// save. No-op when `params.export_formats` is empty. Frozen --add-splat rows
     /// are left out when --exclude-export was given or restored from the checkpoint.
+    /// PLY export also writes an enabled Gaussian sky separately to sky.ply.
     [[nodiscard]] lfs::Status export_final_splats(
         const Trainer& trainer,
         const lfs::core::param::TrainingParameters& params);

@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "sky_background.hpp"
 #include "config_serialization.hpp"
+#include "core/assert.hpp"
 #include "core/logger.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "nanoflann.hpp"
@@ -76,7 +77,7 @@ namespace lfs::training {
             if (cam->camera_model_type() == core::CameraModelType::ORTHO)
                 throw std::invalid_argument("Sky does not support orthographic cameras");
         }
-        LOG_INFO("Gaussian sky: {} fixed points, radius {}, opacity {}, SH0 colors; excluded from PLY", count_, radius_, opacity_);
+        LOG_INFO("Gaussian sky: {} fixed points, radius {}, opacity {}, SH0 colors; separate from foreground", count_, radius_, opacity_);
     }
 
     Tensor SkyBackground::render(const core::Camera& cam) const {
@@ -88,6 +89,54 @@ namespace lfs::training {
         core::GlobalArenaManager::instance().get_arena().end_frame(result->second.frame_id, result->second.stream);
         // Forward output is TLS-owned. A foreground forward must not overwrite it.
         return result->first.image.clone();
+    }
+
+    SkyColorLoss SkyBackground::masked_color_loss(const Tensor& image, const Tensor& target,
+                                                  const Tensor& mask, const Tensor& roi) {
+        const auto mask_2d = mask.ndim() == 3 ? mask.squeeze(0) : mask;
+        LFS_ASSERT_MSG(image.dtype() == DataType::Float32 && image.ndim() == 3 && image.shape()[0] == 3,
+                       "Sky color loss expects Float32 CHW RGB");
+        LFS_ASSERT_MSG(target.shape() == image.shape() && mask_2d.ndim() == 2 &&
+                           mask_2d.shape()[0] == image.shape()[1] && mask_2d.shape()[1] == image.shape()[2],
+                       "Sky color target and mask must match the rendered image");
+        LFS_ASSERT_MSG(target.dtype() == DataType::Float32 || target.dtype() == DataType::UInt8,
+                       "Sky target must be Float32 or UInt8");
+        LFS_ASSERT_MSG(mask_2d.dtype() == DataType::Float32 || mask_2d.dtype() == DataType::UInt8 ||
+                           mask_2d.dtype() == DataType::Bool,
+                       "Sky mask must be Float32 or byte samples");
+        LFS_ASSERT_MSG(!roi.is_valid() || (roi.dtype() == DataType::Float32 && roi.shape() == mask_2d.shape()),
+                       "Sky ROI must match the mask");
+        if (!color_grad_image_.is_valid() || color_grad_image_.shape() != image.shape())
+            color_grad_image_ = Tensor::empty(image.shape(), Device::CUDA);
+        if (!color_loss_stats_.is_valid()) {
+            color_loss_stats_ = Tensor::empty({2}, Device::CUDA);
+            color_reduce_temp_ = Tensor::empty({2048}, Device::CUDA);
+        }
+        const auto stream = core::getCurrentCUDAStream();
+        const auto image_chw = image.contiguous(), target_chw = target.contiguous(), mask_hw = mask_2d.contiguous();
+        const auto roi_hw = roi.is_valid() ? roi.contiguous() : Tensor{};
+        core::prepare_inputs_for_stream({&image_chw, &target_chw, &mask_hw}, stream);
+        if (roi_hw.is_valid())
+            roi_hw.sync_to_stream(stream);
+        color_grad_image_.set_stream(stream);
+        color_loss_stats_.set_stream(stream);
+        color_reduce_temp_.set_stream(stream);
+        kernels::sky_masked_l1(image_chw.ptr<float>(), target_chw.data_ptr(), target.dtype() == DataType::UInt8,
+                              mask_hw.data_ptr(), mask.dtype() != DataType::Float32,
+                              roi_hw.is_valid() ? roi_hw.ptr<float>() : nullptr,
+                              color_grad_image_.ptr<float>(), color_loss_stats_.ptr<float>(),
+                              color_reduce_temp_.ptr<float>(), static_cast<int>(mask_hw.numel()), stream);
+        return {color_loss_stats_.slice(0, 0, 1), color_grad_image_};
+    }
+
+    void SkyBackground::mask_foreground_gradient(Tensor& gradient, const Tensor& mask) const {
+        const auto mask_hw = mask.contiguous();
+        const auto stream = core::getCurrentCUDAStream();
+        core::prepare_inputs_for_stream({&gradient, &mask_hw}, stream);
+        kernels::sky_mask_foreground_gradient(gradient.ptr<float>(), mask_hw.data_ptr(),
+                                             mask.dtype() != DataType::Float32,
+                                             static_cast<int>(mask.numel()), stream);
+        gradient.set_stream(stream);
     }
 
     void SkyBackground::backward(const core::Camera& cam, const Tensor& grad_sky) {

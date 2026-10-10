@@ -142,7 +142,8 @@ namespace lfs::training {
         lfs::core::Tensor edge_score_out = {},
         const lfs::core::Tensor& grad_depth = {},
         const lfs::core::Tensor& grad_normal = {},
-        float flatten_weight = 0.f);
+        float flatten_weight = 0.f,
+        const lfs::core::Tensor& densification_alpha_exclusion = {});
 
     // Fixed SH0-only auxiliary model: compute colors without optimizer state or
     // geometry/densification updates. Consumes the forward arena frame.

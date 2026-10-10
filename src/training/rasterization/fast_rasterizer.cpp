@@ -680,7 +680,8 @@ namespace lfs::training {
         int iteration,
         const FastGSFusedExtraGradients& fused_extra_gradients,
         const core::Tensor& grad_depth,
-        const core::Tensor& grad_normal) {
+        const core::Tensor& grad_normal,
+        const core::Tensor& densification_alpha_exclusion) {
 
         if (grad_image.ndim() != 3 || grad_image.shape()[0] != 3) {
             throw std::runtime_error("FastGS backward expects a [3, H, W] image gradient");
@@ -817,6 +818,19 @@ namespace lfs::training {
             bwd_shN_bits = 16u;
         } else if (ctx.shN.is_valid()) {
             bwd_shN_ptr = ctx.shN.ptr<float>();
+        }
+        // Keep alpha-penalty geometry updates, but exclude them from the original
+        // gradient-norm densification path. Pixel-error strategies already use
+        // the foreground keep-band error map instead of parameter gradients.
+        core::Tensor densification_mean2d;
+        if (update_densification_info && !use_pixel_error_densification &&
+            densification_type == DensificationType::None && densification_alpha_exclusion.is_valid()) {
+            densification_alpha_exclusion.sync_to_stream(stream);
+            densification_mean2d = core::Tensor::zeros(
+                {static_cast<size_t>(ctx.forward_ctx.n_visible), 2}, core::Device::CUDA);
+            densification_mean2d.set_stream(stream);
+            background_grad.grad_alpha_densification_exclusion = densification_alpha_exclusion.ptr<float>();
+            background_grad.densification_mean2d = reinterpret_cast<float2*>(densification_mean2d.ptr<float>());
         }
         auto backward_result = fast_lfs::rasterization::backward_raw(
             update_densification_info ? gaussian_model._densification_info.ptr<float>() : nullptr,

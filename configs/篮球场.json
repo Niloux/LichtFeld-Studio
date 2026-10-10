@@ -1,7 +1,7 @@
 {
   "dataset": {
     "data_path": "/home/wuyou/GeosunPre/work/篮球场/colmap",
-    "output_folder": "./output/1010/篮球场",
+    "output_folder": "./output/1010/篮球场+sky",
     "output_name": "",
 
     "images": "images",
@@ -61,7 +61,7 @@
     "bg_image_path": "",
     "bg_modulation": false,
 
-    "sky_enabled": false,
+    "sky_enabled": true,
     "sky_num_points": 100000,
     "sky_radius": 10000.0,
     "sky_initial_opacity": 0.7,

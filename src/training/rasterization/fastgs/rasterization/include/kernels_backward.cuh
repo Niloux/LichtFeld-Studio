@@ -73,7 +73,8 @@ namespace fast_lfs::rasterization::kernels::backward {
         // path; reading sh_coefficients_rest must always use these.
         const float2* __restrict__ shN_value_bounds,
         const uint shN_value_n_cells,
-        const uint shN_value_bits) {
+        const uint shN_value_bits,
+        const float2* __restrict__ densification_mean2d = nullptr) {
         (void)cx;
         (void)cy;
         auto primitive_idx = cg::this_grid().thread_rank();
@@ -530,8 +531,11 @@ namespace fast_lfs::rasterization::kernels::backward {
             rotation_grads[3] = clamped_rotation.w;
 
             if (densification_info != nullptr) {
+                const float2 densification_grad = densification_mean2d != nullptr
+                                                     ? densification_mean2d[work_idx]
+                                                     : dL_dmean2d;
                 densification_info[primitive_idx] += 1.0f;
-                densification_info[n_primitives + primitive_idx] += length(dL_dmean2d * make_float2(0.5f * w, 0.5f * h));
+                densification_info[n_primitives + primitive_idx] += length(densification_grad * make_float2(0.5f * w, 0.5f * h));
             }
         } // visible geometry
 
@@ -566,6 +570,8 @@ namespace fast_lfs::rasterization::kernels::backward {
     struct BlendBackwardAccum {
         float mean_x;
         float mean_y;
+        float densification_mean_x;
+        float densification_mean_y;
         float conic_x;
         float conic_y;
         float conic_z;
@@ -583,8 +589,7 @@ namespace fast_lfs::rasterization::kernels::backward {
     };
 
     __device__ __forceinline__ BlendBackwardAccum make_zero_blend_backward_accum() {
-        return {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        return {};
     }
 
     // Reverse-order index into [0, T_eff): high contributor first.
@@ -761,6 +766,12 @@ namespace fast_lfs::rasterization::kernels::backward {
         const uint last1 = inside1 ? tile_n_contributions[pixel_idx1] : 0u;
         float T0 = inside0 ? tile_final_transmittance[tile_idx * config::block_size_blend + pixel_rank0] : 1.0f;
         float T1 = inside1 ? tile_final_transmittance[tile_idx * config::block_size_blend + pixel_rank1] : 1.0f;
+        const float excluded_alpha_T0 = inside0 && background_grad.grad_alpha_densification_exclusion
+                                            ? T0 * background_grad.grad_alpha_densification_exclusion[pixel_idx0]
+                                            : 0.f;
+        const float excluded_alpha_T1 = inside1 && background_grad.grad_alpha_densification_exclusion
+                                            ? T1 * background_grad.grad_alpha_densification_exclusion[pixel_idx1]
+                                            : 0.f;
         float3 grad_c0 = inside0
                              ? make_float3(grad_image[pixel_idx0],
                                            grad_image[n_pixels + pixel_idx0],
@@ -1008,7 +1019,8 @@ namespace fast_lfs::rasterization::kernels::backward {
                                                 const float2 pixel, const float pixel_error,
                                                 const float edge_weight,
                                                 float& T, float3& grad_c, float& grad_T,
-                                                const float grad_d, const float3& grad_n) {
+                                                const float grad_d, const float3& grad_n,
+                                                const float excluded_alpha_T) {
                         if (!use || !inside || static_cast<uint>(tile_primitive_idx) >= last)
                             return;
                         const float2 delta = mean2d - pixel;
@@ -1070,6 +1082,12 @@ namespace fast_lfs::rasterization::kernels::backward {
                                                                              conic.y * delta.x + conic.z * delta.y);
                         accum.mean_x += dL_dmean2d.x;
                         accum.mean_y += dL_dmean2d.y;
+                        if (background_grad.densification_mean2d != nullptr) {
+                            const float photographic_helper = gaussian_grad_helper +
+                                (alpha_saturated ? 0.f : alpha * excluded_alpha_T / one_minus_alpha_safe);
+                            accum.densification_mean_x += photographic_helper * (conic.x * delta.x + conic.y * delta.y);
+                            accum.densification_mean_y += photographic_helper * (conic.y * delta.x + conic.z * delta.y);
+                        }
 
                         if constexpr (DENSIFICATION_TYPE == DensificationType::MRNF) {
                             accum.densification_weight += blending_weight;
@@ -1084,9 +1102,9 @@ namespace fast_lfs::rasterization::kernels::backward {
                     };
 
                     accumulate_pixel(use0, inside0, last0, pixel0, pixel_error0, edge_weight0,
-                                     T0, grad_c0, grad_T0, grad_d0, grad_n0);
+                                     T0, grad_c0, grad_T0, grad_d0, grad_n0, excluded_alpha_T0);
                     accumulate_pixel(use1, inside1, last1, pixel1, pixel_error1, edge_weight1,
-                                     T1, grad_c1, grad_T1, grad_d1, grad_n1);
+                                     T1, grad_c1, grad_T1, grad_d1, grad_n1, excluded_alpha_T1);
 
                     // Warp-reduce → one global atomic per splat per warp.
                     const unsigned contrib_mask = __ballot_sync(0xffffffffu, has_contribution);
@@ -1101,6 +1119,10 @@ namespace fast_lfs::rasterization::kernels::backward {
                         };
                         const float mean_x = reduce_field(accum.mean_x);
                         const float mean_y = reduce_field(accum.mean_y);
+                        const float dens_mean_x = background_grad.densification_mean2d != nullptr
+                                                      ? reduce_field(accum.densification_mean_x) : 0.f;
+                        const float dens_mean_y = background_grad.densification_mean2d != nullptr
+                                                      ? reduce_field(accum.densification_mean_y) : 0.f;
                         const float conic_x = reduce_field(accum.conic_x);
                         const float conic_y = reduce_field(accum.conic_y);
                         const float conic_z = reduce_field(accum.conic_z);
@@ -1126,6 +1148,10 @@ namespace fast_lfs::rasterization::kernels::backward {
                         if (lane_id == 0u) {
                             atomicAdd(&grad_mean2d[work_idx].x, clamp_grad(mean_x));
                             atomicAdd(&grad_mean2d[work_idx].y, clamp_grad(mean_y));
+                            if (background_grad.densification_mean2d != nullptr) {
+                                atomicAdd(&background_grad.densification_mean2d[work_idx].x, clamp_grad(dens_mean_x));
+                                atomicAdd(&background_grad.densification_mean2d[work_idx].y, clamp_grad(dens_mean_y));
+                            }
                             atomicAdd(&grad_conic[work_idx].x, clamp_grad(conic_x));
                             atomicAdd(&grad_conic[work_idx].y, clamp_grad(conic_y));
                             atomicAdd(&grad_conic[work_idx].z, clamp_grad(conic_z));
