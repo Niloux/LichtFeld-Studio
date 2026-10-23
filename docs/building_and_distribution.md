@@ -109,6 +109,15 @@ cmake --build --preset trainer
 ./build-trainer/lfs_train -d /path/to/data -o /path/to/output --export ply
 ```
 
+On Windows, `windows-trainer` builds the same target with the Release-only
+dependency profile of `windows-release`, so vcpkg compiles each package once
+instead of in Debug and Release. Its output goes to `build-windows-trainer/`.
+
+```bash
+cmake --preset windows-trainer
+cmake --build --preset windows-trainer
+```
+
 `lfs_train` accepts the training options of `LichtFeld-Studio --headless` and
 writes the same `project.licht` plus the requested `--export` formats. It does
 not support `--resume`, `.licht` projects as `--data-path`, Python scripts,

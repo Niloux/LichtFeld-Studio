@@ -73,6 +73,15 @@
       }
     },
     {
+      "name": "windows-trainer",
+      "displayName": "Windows x64 Trainer only (Release-only dependencies)",
+      "description": "Headless lfs_train only, reusing the windows-release dependency profile without the GUI, Python, video, MCP/TCP or MoGe packages",
+      "inherits": "windows-release",
+      "cacheVariables": {
+        "LFS_TRAINER_ONLY": "ON"
+      }
+    },
+    {
       "name": "linux-release",
       "displayName": "Linux x64 Release (Release-only dependencies)",
       "description": "Native Linux x64 Release build with Release-only target and host dependencies; keeps build/ and build-debug/ intact",
@@ -126,6 +135,16 @@
     {
       "name": "windows-relwithdebinfo",
       "configurePreset": "windows-relwithdebinfo",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "jobs": 6
+    },
+    {
+      "name": "windows-trainer",
+      "configurePreset": "windows-trainer",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
