@@ -58,7 +58,9 @@
 #include "metrics/eval_mask.hpp"
 #include "normal_auto_generate.hpp"
 #include "optimizer/adam_optimizer.hpp"
+#ifndef LFS_TRAINER_ONLY
 #include "python/runner.hpp"
+#endif
 #include "rasterization/fast_rasterizer.hpp"
 #include "rasterization/gsplat/GeometryFeatures.h"
 #include "rasterization/gsplat/Ops.h"
@@ -3372,11 +3374,16 @@ namespace lfs::training {
 
             // Execute configured Python scripts to register iteration callbacks
             if (!python_scripts_.empty()) {
+#ifdef LFS_TRAINER_ONLY
+                return std::unexpected(std::string(
+                    "Python scripts are not supported by the trainer-only build"));
+#else
                 auto py_result = lfs::python::run_scripts(python_scripts_);
                 if (!py_result) {
                     return std::unexpected(std::format("Failed to run Python scripts: {}",
                                                        lfs::format_for_developer(py_result.error())));
                 }
+#endif
             }
 
             if (auto snapshot_service =

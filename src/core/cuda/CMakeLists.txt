@@ -75,8 +75,13 @@ target_link_libraries(lfs_cuda_diagnostics_compile_check
         spdlog::spdlog
         glm::glm
         OpenMP::OpenMP_CXX
-        Vulkan::Vulkan
 )
+if(LFS_TRAINER_ONLY)
+    # The check includes Vulkan rasterizer and visualizer headers.
+    set_target_properties(lfs_cuda_diagnostics_compile_check PROPERTIES EXCLUDE_FROM_ALL TRUE)
+else()
+    target_link_libraries(lfs_cuda_diagnostics_compile_check PRIVATE Vulkan::Vulkan)
+endif()
 
 set_target_properties(lfs_core_cuda PROPERTIES
     CUDA_STANDARD 20

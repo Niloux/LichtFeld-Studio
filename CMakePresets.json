@@ -30,6 +30,16 @@
       }
     },
     {
+      "name": "trainer",
+      "displayName": "Trainer only",
+      "description": "Release build of the headless lfs_train executable only: no GUI, Python, video, MCP/TCP or MoGe, and none of their vcpkg packages",
+      "inherits": "build",
+      "binaryDir": "${sourceDir}/build-trainer",
+      "cacheVariables": {
+        "LFS_TRAINER_ONLY": "ON"
+      }
+    },
+    {
       "name": "release-only-base",
       "hidden": true,
       "inherits": "build",
@@ -96,6 +106,11 @@
     {
       "name": "debug",
       "configurePreset": "debug",
+      "jobs": 6
+    },
+    {
+      "name": "trainer",
+      "configurePreset": "trainer",
       "jobs": 6
     },
     {

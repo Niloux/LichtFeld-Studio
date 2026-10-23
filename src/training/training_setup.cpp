@@ -24,7 +24,9 @@
 #include "io/project_document.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "normal_auto_generate.hpp"
+#ifndef LFS_TRAINER_ONLY
 #include "rendering/mesh2splat.hpp"
+#endif
 #include "strategies/strategy_utils.hpp"
 #include "trainer.hpp"
 #include <algorithm>
@@ -256,6 +258,14 @@ namespace lfs::training {
             const std::filesystem::path& init_file,
             const int resolution,
             const int64_t budget) {
+#ifdef LFS_TRAINER_ONLY
+            static_cast<void>(mesh);
+            static_cast<void>(resolution);
+            static_cast<void>(budget);
+            return initFileError(std::format("Cannot initialize from mesh '{}': Mesh2Splat is not "
+                                             "available in the trainer-only build",
+                                             lfs::core::path_to_utf8(init_file)));
+#else
             lfs::core::Mesh2SplatOptions options;
             options.resolution_target = resolution;
             auto converted = lfs::rendering::mesh_to_splat(mesh, options);
@@ -279,6 +289,7 @@ namespace lfs::training {
                      (*converted)->size(), mesh.face_count(), lfs::core::path_to_utf8(init_file.filename()),
                      options.resolution_target);
             return std::move(*converted);
+#endif
         }
 
         void warnIfMeshResolutionIgnored(const lfs::core::param::OptimizationParameters& opt) {

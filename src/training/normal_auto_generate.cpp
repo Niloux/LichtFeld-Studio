@@ -9,7 +9,9 @@
 #include "core/path_utils.hpp"
 #include "core/source_site.hpp"
 #include "io/filesystem_utils.hpp"
+#ifndef LFS_TRAINER_ONLY
 #include "preprocessing/preprocess.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -165,6 +167,22 @@ namespace lfs::training {
             const std::string& normals_folder,
             std::span<const PriorMapJob> jobs,
             const PriorMapProgress& progress) {
+#ifdef LFS_TRAINER_ONLY
+            static_cast<void>(params);
+            static_cast<void>(images_folder);
+            static_cast<void>(depth_folder);
+            static_cast<void>(normals_folder);
+            static_cast<void>(jobs);
+            static_cast<void>(progress);
+            return std::unexpected(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::FailedPrecondition,
+                .domain = lfs::ErrorDomain::Training,
+                .user_message = "prior map generation is not available in the trainer-only build",
+                .detail = "MoGe-2 is not built; provide depth/normal maps with the dataset "
+                          "or pass --no-depth-auto-generate / --no-normal-auto-generate",
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+#else
             using lfs::core::param::PreprocessOutputMode;
             std::size_t done_before = 0;
             for (const auto mode : {PreprocessOutputMode::Both, PreprocessOutputMode::Depth,
@@ -208,6 +226,7 @@ namespace lfs::training {
                 done_before += batch;
             }
             return {};
+#endif
         }
 
     } // namespace

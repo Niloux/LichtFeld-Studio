@@ -20,6 +20,22 @@ file(GLOB_RECURSE LFS_VCPKG_OVERLAY_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES FAL
     "${CMAKE_CURRENT_SOURCE_DIR}/.github/overlays/*")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERLAY_FILES})
 
+# Trainer-only builds produce just the headless lfs_train executable: no GUI,
+# Python, video, MCP/TCP or MoGe preprocessing, and none of their vcpkg packages.
+option(LFS_TRAINER_ONLY "Build only the headless lfs_train executable without GUI, Python and video dependencies" OFF)
+if(LFS_TRAINER_ONLY)
+    if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_LOCALIZATION_TESTS)
+        message(FATAL_ERROR "LFS_TRAINER_ONLY cannot be combined with the test options; use a regular build directory for tests")
+    endif()
+    if(BUILD_PORTABLE)
+        message(FATAL_ERROR "LFS_TRAINER_ONLY does not support BUILD_PORTABLE")
+    endif()
+    # The GUI dependency set is the manifest's default "gui" feature.
+    set(VCPKG_MANIFEST_NO_DEFAULT_FEATURES ON CACHE BOOL "" FORCE)
+    set(LFS_ENFORCE_LINUX_GUI_BACKENDS OFF CACHE BOOL "" FORCE)
+    set(LFS_ENABLE_VULKAN_VALIDATION OFF CACHE BOOL "" FORCE)
+endif()
+
 # Keep test-only packages out of the application dependency graph. Command-line
 # cache values are visible before project(), when the vcpkg toolchain resolves
 # manifest features.
@@ -488,13 +504,17 @@ message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGE
 # Find packages
 find_package(TBB REQUIRED)
 find_package(Threads REQUIRED)
-find_package(Vulkan REQUIRED)
-find_package(VulkanMemoryAllocator CONFIG REQUIRED)
-find_package(volk CONFIG REQUIRED)
-find_package(SDL3 REQUIRED)
-lfs_validate_linux_sdl_video_backends()
+if(NOT LFS_TRAINER_ONLY)
+    find_package(Vulkan REQUIRED)
+    find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+    find_package(volk CONFIG REQUIRED)
+    find_package(SDL3 REQUIRED)
+    lfs_validate_linux_sdl_video_backends()
+endif()
 find_package(glm REQUIRED)
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupNativeFileDialog.cmake")
+if(NOT LFS_TRAINER_ONLY)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupNativeFileDialog.cmake")
+endif()
 find_package(nlohmann_json REQUIRED)
 find_package(args REQUIRED)
 find_package(fmt CONFIG REQUIRED)
@@ -502,7 +522,9 @@ find_package(JPEG REQUIRED)
 find_package(PNG REQUIRED)
 find_package(TIFF REQUIRED)
 find_package(spdlog REQUIRED)
-find_package(Freetype REQUIRED)
+if(NOT LFS_TRAINER_ONLY)
+    find_package(Freetype REQUIRED)
+endif()
 find_package(WebP REQUIRED)
 find_package(OpenEXR 3.4.15 CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
@@ -512,7 +534,9 @@ find_package(zstd CONFIG REQUIRED)
 find_package(xxHash CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(assimp REQUIRED)
-find_package(RmlUi CONFIG REQUIRED)
+if(NOT LFS_TRAINER_ONLY)
+    find_package(RmlUi CONFIG REQUIRED)
+endif()
 
 # Vulkan-native depth: glm::perspective/ortho/frustum must emit clip-space z in
 # [0, 1], not OpenGL's [-1, 1]. Keeps gl_FragDepth, the grid pass, the depth-
@@ -608,16 +632,20 @@ add_subdirectory(src/diagnostics) # Shared diagnostics/profiling module
 add_subdirectory(src/core)       # Core module (lfs::core namespace)
 add_subdirectory(src/training)   # Training module (lfs::training namespace)
 add_subdirectory(src/io)         # I/O module (lfs::io namespace)
+if(NOT LFS_TRAINER_ONLY)
 add_subdirectory(src/rendering)  # Rendering module (lfs::rendering namespace)
 add_subdirectory(src/sequencer)  # Sequencer module (lfs::sequencer namespace)
 add_subdirectory(src/preprocessing) # CLI preprocessing module (ONNXRuntime)
 add_subdirectory(src/visualizer) # Visualizer module (lfs::vis namespace)
 add_subdirectory(src/tcp)        # TCP event server (ZMQ responder + publisher)
+endif()
 add_subdirectory(src/geometry)   # Geometry utilities
+if(NOT LFS_TRAINER_ONLY)
 add_subdirectory(src/mcp)        # MCP server (AI agent integration)
 add_subdirectory(src/python)
+endif()
 
-if(LFS_HIDDEN_SYMBOLS AND NOT WIN32)
+if(LFS_HIDDEN_SYMBOLS AND NOT WIN32 AND NOT LFS_TRAINER_ONLY)
     # Match the libraries using LFS_*_API DLL exports; leave static libraries alone.
     set_target_properties(lfs_logger lfs_core lfs_visualizer lfs_mcp PROPERTIES
         CXX_VISIBILITY_PRESET hidden
@@ -639,6 +667,10 @@ endif()
 # =============================================================================
 # MAIN EXECUTABLES
 # =============================================================================
+
+if(LFS_TRAINER_ONLY)
+    add_subdirectory(src/train_cli)  # Headless lfs_train executable
+else()
 
 # -----------------------------------------------------------------------------
 # LichtFeld-Studio
@@ -1256,6 +1288,8 @@ if(MSVC)
     set_property(DIRECTORY ${CMAKE_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
 endif()
 
+endif() # NOT LFS_TRAINER_ONLY
+
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
@@ -1295,6 +1329,7 @@ message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
 message(STATUS "  Tests: ${BUILD_TESTS}")
 message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")
 message(STATUS "  Portable Build: ${BUILD_PORTABLE}")
+message(STATUS "  Trainer Only: ${LFS_TRAINER_ONLY}")
 if(BUILD_PORTABLE)
     message(STATUS "  -> PTX-only: ON (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
     message(STATUS "  -> Use: cmake --install build --prefix ./dist")
@@ -1314,6 +1349,9 @@ set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
 include(GNUInstallDirs)
 include(InstallRequiredSystemLibraries)
 
+# lfs_train has its own install rule in src/train_cli; everything below
+# packages the GUI application.
+if(NOT LFS_TRAINER_ONLY)
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS lfs_core
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -1577,6 +1615,7 @@ install(CODE "
     endif()
     file(INSTALL \"\${_lfs_notice_output}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}\")
 " COMPONENT runtime)
+endif() # NOT LFS_TRAINER_ONLY
 
 option(BUILD_SPLAT_TRANSFER_TESTS "Build splat drag export contract tests" ${BUILD_FORMAT_TESTS})
 option(BUILD_SELECTION_OUTLINE_TESTS "Build selection outline request and persistence contracts" ${BUILD_VISUALIZER_TESTS})
