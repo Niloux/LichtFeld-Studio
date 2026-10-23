@@ -340,6 +340,11 @@ namespace lfs::training {
             raw_views.reserve(probe_cams.size());
             for (size_t idx = 0; idx < probe_cams.size(); ++idx) {
                 auto samples = probe_futures[idx].get();
+                // All-zero samples are the "no normal" fill (GeosunPre), as in the training decode;
+                // left in, they decode to (-1,-1,-1) and fail the unit-norm probe.
+                std::erase_if(samples, [](const lfs::core::NormalPriorSample& s) {
+                    return s.r == 0.0f && s.g == 0.0f && s.b == 0.0f;
+                });
                 if (samples.empty()) {
                     continue;
                 }
