@@ -90,6 +90,63 @@ if(TARGET nvjpeg_ext)
     )
 endif()
 
+# JPEG 2000 extension and its runtime: the depth/normal sidecar cache and 16-bit image cache encode JPEG 2000.
+if(TARGET nvjpeg2k_ext)
+    add_dependencies(lfs_train nvjpeg2k_ext)
+    add_custom_command(TARGET lfs_train POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:lfs_train>/extensions"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:nvjpeg2k_ext>" "$<TARGET_FILE_DIR:lfs_train>/extensions/"
+        COMMENT "Copying nvjpeg2k extension for lfs_train"
+    )
+
+    if(WITH_DYNAMIC_NVJPEG2K)
+        if(CUDAToolkit_VERSION_MAJOR)
+            set(_lfs_train_nvjpeg2k_cuda_major "${CUDAToolkit_VERSION_MAJOR}")
+        else()
+            set(_lfs_train_nvjpeg2k_cuda_major "12")
+        endif()
+        set(_lfs_train_nvjpeg2k_runtime_dir
+            "${CMAKE_BINARY_DIR}/_deps/nvjpeg2k_headers-src/lib/${_lfs_train_nvjpeg2k_cuda_major}")
+        if(WIN32)
+            set(_lfs_train_nvjpeg2k_runtime_file "${_lfs_train_nvjpeg2k_runtime_dir}/nvjpeg2k_0.dll")
+            if(NOT EXISTS "${_lfs_train_nvjpeg2k_runtime_file}")
+                unset(_lfs_train_nvjpeg2k_runtime_file)
+            endif()
+        elseif(UNIX)
+            file(GLOB _lfs_train_nvjpeg2k_runtime_candidates
+                "${_lfs_train_nvjpeg2k_runtime_dir}/libnvjpeg2k.so.*.*")
+            list(SORT _lfs_train_nvjpeg2k_runtime_candidates)
+            if(_lfs_train_nvjpeg2k_runtime_candidates)
+                list(GET _lfs_train_nvjpeg2k_runtime_candidates -1 _lfs_train_nvjpeg2k_runtime_file)
+            endif()
+        endif()
+
+        if(DEFINED _lfs_train_nvjpeg2k_runtime_file)
+            get_filename_component(_lfs_train_nvjpeg2k_runtime_name
+                "${_lfs_train_nvjpeg2k_runtime_file}" NAME)
+            add_custom_command(TARGET lfs_train POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_lfs_train_nvjpeg2k_runtime_file}"
+                    "$<TARGET_FILE_DIR:lfs_train>/${_lfs_train_nvjpeg2k_runtime_name}"
+                COMMENT "Copying nvjpeg2k runtime library for lfs_train"
+            )
+            if(UNIX)
+                add_custom_command(TARGET lfs_train POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E create_symlink
+                        "${_lfs_train_nvjpeg2k_runtime_name}" "$<TARGET_FILE_DIR:lfs_train>/libnvjpeg2k.so.0"
+                    COMMAND ${CMAKE_COMMAND} -E create_symlink
+                        "libnvjpeg2k.so.0" "$<TARGET_FILE_DIR:lfs_train>/libnvjpeg2k.so"
+                )
+            endif()
+        else()
+            message(WARNING
+                "WITH_DYNAMIC_NVJPEG2K is ON but no nvjpeg2k runtime was found in "
+                "${_lfs_train_nvjpeg2k_runtime_dir}")
+        endif()
+    endif()
+endif()
+
 # Windows: CUDA runtime and vcpkg DLLs next to the executable.
 if(WIN32)
     file(GLOB _lfs_train_cuda_dlls
@@ -138,6 +195,29 @@ if(TARGET nvjpeg_ext)
         LIBRARY DESTINATION extensions
         RUNTIME DESTINATION extensions
     )
+endif()
+if(TARGET nvjpeg2k_ext)
+    install(TARGETS nvjpeg2k_ext
+        LIBRARY DESTINATION extensions
+        RUNTIME DESTINATION extensions
+    )
+    if(DEFINED _lfs_train_nvjpeg2k_runtime_file)
+        if(WIN32)
+            install(FILES "${_lfs_train_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+        else()
+            install(FILES "${_lfs_train_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
+            install(CODE "
+                execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+                    \"${_lfs_train_nvjpeg2k_runtime_name}\"
+                    \"libnvjpeg2k.so.0\"
+                    WORKING_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
+                execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+                    \"libnvjpeg2k.so.0\"
+                    \"libnvjpeg2k.so\"
+                    WORKING_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
+            ")
+        endif()
+    endif()
 endif()
 
 message(STATUS "Trainer-only build: lfs_train (no GUI, Python, video, MCP/TCP, MoGe)")
