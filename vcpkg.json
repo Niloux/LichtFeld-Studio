@@ -1,8 +1,6 @@
 {
   "builtin-baseline": "c3867e714dd3a51c272826eea77267876517ed99",
   "dependencies": [
-    "cppzmq",
-    "curl",
     "args",
     {
       "name": "assimp",
@@ -10,18 +8,6 @@
         "draco"
       ]
     },
-    {
-      "name": "ffmpeg",
-      "features": [
-        "avcodec",
-        "avfilter",
-        "avformat",
-        "nvcodec",
-        "swscale",
-        "x264"
-      ]
-    },
-    "freetype",
     "fmt",
     "glm",
     {
@@ -36,66 +22,91 @@
     "libdeflate",
     "libjpeg-turbo",
     "libpng",
-    "libplacebo",
     "libwebp",
-    "nanobind",
-    {
-      "name": "nativefiledialog-extended",
-      "platform": "windows | osx"
-    },
     "nlohmann-json",
-    {
-      "name": "python3",
-      "features": [
-        "extensions"
-      ]
-    },
-    {
-      "name": "rmlui",
-      "features": [
-        "svg"
-      ]
-    },
-    {
-      "name": "sdl3",
-      "features": [
-        "vulkan"
-      ]
-    },
+    "openssl",
     "spdlog",
     "tbb",
     "tiff",
     "openexr",
-    "vulkan",
-    {
-      "name": "vulkan-loader",
-      "features": [
-        "wayland",
-        "xcb",
-        "xlib"
-      ],
-      "platform": "linux"
-    },
-    "vulkan-memory-allocator",
-    "volk",
-    {
-      "name": "glslang",
-      "features": [
-        "tools"
-      ]
-    },
-    "shader-slang",
     "xxhash",
     "zstd"
   ],
+  "default-features": [
+    "gui"
+  ],
   "features": {
+    "gui": {
+      "description": "Dependencies of the GUI application (visualizer, Python, video, MCP/TCP, MoGe preprocessing). Trainer-only builds disable this default feature.",
+      "dependencies": [
+        "cppzmq",
+        "curl",
+        {
+          "name": "ffmpeg",
+          "features": [
+            "avcodec",
+            "avfilter",
+            "avformat",
+            "nvcodec",
+            "swscale",
+            "x264"
+          ]
+        },
+        "freetype",
+        "libplacebo",
+        "nanobind",
+        {
+          "name": "nativefiledialog-extended",
+          "platform": "windows | osx"
+        },
+        {
+          "name": "python3",
+          "features": [
+            "extensions"
+          ]
+        },
+        {
+          "name": "rmlui",
+          "features": [
+            "svg"
+          ]
+        },
+        {
+          "name": "sdl3",
+          "features": [
+            "vulkan"
+          ]
+        },
+        "vulkan",
+        {
+          "name": "vulkan-loader",
+          "features": [
+            "wayland",
+            "xcb",
+            "xlib"
+          ],
+          "platform": "linux"
+        },
+        "vulkan-memory-allocator",
+        "volk",
+        {
+          "name": "glslang",
+          "features": [
+            "tools"
+          ]
+        },
+        "shader-slang"
+      ]
+    },
     "tests": {
       "description": "Dependencies used only by the C++ test targets",
       "dependencies": [
         "gtest",
         {
           "name": "openexr",
-          "features": ["cpp"]
+          "features": [
+            "cpp"
+          ]
         }
       ]
     },

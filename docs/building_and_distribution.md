@@ -96,6 +96,26 @@ existing `cmake --build build ...` command, follow the
 including `-B build` and `-DBUILD_TESTS=ON` when building `lichtfeld_tests`.
 The [test prerequisites](#tests) still apply.
 
+#### Trainer-only build (optional)
+
+`LFS_TRAINER_ONLY=ON` (preset `trainer`) builds only the headless `lfs_train`
+executable. The visualizer, Python, video, sequencer, MCP/TCP and MoGe-2
+preprocessing modules are not compiled, and vcpkg skips their packages (the
+manifest's default `gui` feature).
+
+```bash
+cmake --preset trainer
+cmake --build --preset trainer
+./build-trainer/lfs_train -d /path/to/data -o /path/to/output --export ply
+```
+
+`lfs_train` accepts the training options of `LichtFeld-Studio --headless` and
+writes the same `project.licht` plus the requested `--export` formats. It does
+not support `--resume`, `.licht` projects as `--data-path`, Python scripts,
+camera-path rendering, TCP control, mesh initialization or depth/normal
+auto-generation (provide the maps with the dataset). For evaluation with
+LPIPS, point `LFS_LPIPS_WEIGHTS` at the weights file.
+
 ### 2. Portable Build (Distribution)
 
 Creates a self-contained package that works on any machine with an NVIDIA driver.
@@ -227,6 +247,7 @@ dist/
 | `BUILD_CUDA_PTX_ONLY` | OFF | PTX-only build (auto-enabled by PORTABLE) |
 | `BUILD_CUDA_MIN_SM` | 75 | Minimum GPU (75=Turing, 80=Ampere, 89=Ada) |
 | `BUILD_TESTS` | OFF | Build test suite |
+| `LFS_TRAINER_ONLY` | OFF | Build only the headless `lfs_train` executable, without GUI, Python and video dependencies |
 | `BUILD_LOCALIZATION_TESTS` | OFF | Register headless localization contract tests |
 | `LFS_ENFORCE_LINUX_GUI_BACKENDS` | ON | Linux only. Fail configure if SDL3 would be built without both X11 and Wayland |
 | `LFS_CUDA_COMPILER_CACHE` | *(empty)* | Compiler cache for CUDA only. Empty follows the auto-detected launcher; `OFF` disables CUDA caching; or name/path of a launcher such as `ccache`. Needed where nvcc cannot be wrapped by sccache |

@@ -168,10 +168,19 @@ target_link_libraries(lfs_training
         gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
-        lfs_preprocessing       # MoGe-2 normal auto-generate
-        lfs_python_utils
-        lfs_rendering           # Mesh2Splat for mesh initialization
 )
+
+if(LFS_TRAINER_ONLY)
+    # No Python scripts, MoGe-2 prior generation or Mesh2Splat initialization.
+    target_compile_definitions(lfs_training PUBLIC LFS_TRAINER_ONLY)
+else()
+    target_link_libraries(lfs_training
+        PRIVATE
+            lfs_preprocessing       # MoGe-2 normal auto-generate
+            lfs_python_utils
+            lfs_rendering           # Mesh2Splat for mesh initialization
+    )
+endif()
 
 # Set C++ standard
 set_target_properties(lfs_training PROPERTIES

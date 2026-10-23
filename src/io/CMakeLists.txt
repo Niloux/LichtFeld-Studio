@@ -111,6 +111,7 @@ target_compile_features(spz_lib PUBLIC cxx_std_17)
 set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
+if(NOT LFS_TRAINER_ONLY)
 find_package(PkgConfig REQUIRED)
 # Keep pkg-config results separate from FindFFMPEG's cached variables.
 pkg_check_modules(LFS_FFMPEG REQUIRED IMPORTED_TARGET
@@ -194,6 +195,7 @@ target_compile_options(lfs_video PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda>
 )
+endif() # NOT LFS_TRAINER_ONLY
 
 # Main IO library
 add_library(lfs_tinyusdz STATIC
