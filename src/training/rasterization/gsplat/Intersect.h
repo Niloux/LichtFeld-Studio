@@ -31,7 +31,8 @@ namespace gsplat_lfs {
         int32_t* flatten_ids,     // [n_isects] optional (for second pass)
         cudaStream_t stream = nullptr,
         int64_t max_isects = -1, TileRange tiles = {},
-        const int32_t* order = nullptr); // [C * N] optional: element visited by thread k
+        const int32_t* order = nullptr,  // [C * N] optional: element visited by thread k
+        const float* conics = nullptr); // [C, N, 3] optional: cull tiles the ellipse misses
 
     void launch_fill_isect_sentinels_kernel(
         int64_t* isect_ids,

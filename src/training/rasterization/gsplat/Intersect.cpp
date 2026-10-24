@@ -495,7 +495,7 @@ namespace gsplat_lfs {
         bool sort,
         int32_t* tiles_per_gauss_out,
         cudaStream_t stream,
-        int32_t* isect_offsets, TileRange tiles) {
+        int32_t* isect_offsets, TileRange tiles, const float* conics) {
         auto bounds_failure = [](const std::string& message, lfs::ErrorCode code = lfs::ErrorCode::BoundsViolation) {
             throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
                 .code = code,
@@ -579,7 +579,7 @@ namespace gsplat_lfs {
             nullptr,
             tiles_per_gauss_out,
             nullptr, nullptr,
-            stream, -1, tiles, depth_order);
+            stream, -1, tiles, depth_order, conics);
 
         cache.ensure_cum_tiles(n_elements);
         int64_t* d_cum_tiles = cache.cum_tiles.as<int64_t>();
@@ -633,7 +633,7 @@ namespace gsplat_lfs {
                 d_cum_tiles,
                 nullptr,
                 cache.isect_ids(), cache.flatten_ids(),
-                stream, static_cast<int64_t>(sort_n), tiles, depth_order);
+                stream, static_cast<int64_t>(sort_n), tiles, depth_order, conics);
 
             int64_t* keys_out = cache.isect_ids();
             int32_t* vals_out = cache.flatten_ids();

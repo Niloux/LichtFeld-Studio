@@ -17,6 +17,22 @@ namespace gsplat_lfs {
 
     namespace cg = cooperative_groups;
 
+    // Whether q(d) = a dx^2 + 2 b dx dy + c dy^2 <= level anywhere on the rectangle
+    // [x0, x1] x [y0, y1] (offsets from the ellipse centre). Off the centre the
+    // minimum of the convex quadratic lies on an edge.
+    __device__ __forceinline__ bool ellipse_overlaps_rect(
+        const float a, const float b, const float c, const float level,
+        const float x0, const float x1, const float y0, const float y1) {
+        if (x0 <= 0.f && x1 >= 0.f && y0 <= 0.f && y1 >= 0.f) {
+            return true;
+        }
+        auto q = [&](const float x, const float y) { return a * x * x + 2.f * b * x * y + c * y * y; };
+        auto on_column = [&](const float x) { return q(x, fminf(fmaxf(-b * x / c, y0), y1)); };
+        auto on_row = [&](const float y) { return q(fminf(fmaxf(-b * y / a, x0), x1), y); };
+        const float m = fminf(fminf(on_column(x0), on_column(x1)), fminf(on_row(y0), on_row(y1)));
+        return m <= level;
+    }
+
     template <typename scalar_t, bool kBatched>
     __global__ void intersect_tile_kernel(
         const bool packed,
@@ -37,7 +53,8 @@ namespace gsplat_lfs {
         int64_t* __restrict__ isect_ids,
         int32_t* __restrict__ flatten_ids,
         const int64_t max_isects, const TileRange tiles,
-        const int32_t* __restrict__ order) {
+        const int32_t* __restrict__ order,
+        const scalar_t* __restrict__ conics) {
         // Thread k handles element order[k], so the pairs come out in that order;
         // counts and offsets are indexed by k.
         const uint32_t k = cg::this_grid().thread_rank();
@@ -70,11 +87,59 @@ namespace gsplat_lfs {
         tile_max.y = min(max(0, (uint32_t)ceil(tile_y + tile_radius_y)), tile_height);
 
         // Intersection of the original rectangle with a linear tile interval.
-        // Count prefix rectangles in O(1); no new geometric predicate.
         if constexpr (kBatched) {
             tile_min.y = max(tile_min.y, tiles.begin / tile_width);
             tile_max.y = min(tile_max.y, (tiles.end - 1) / tile_width + 1);
         }
+
+        // With conics, tiles of the rectangle that the splat's ellipse misses get no
+        // pair. The level comes from the integer radii, ceil(extend * sqrt(cov)), so
+        // the tested ellipse contains the projection's opacity-aware one.
+        float qa = 0.f, qb = 0.f, qc = 0.f, level = 0.f;
+        bool cull = false;
+        if (conics != nullptr) {
+            qa = conics[idx * 3];
+            qb = conics[idx * 3 + 1];
+            qc = conics[idx * 3 + 2];
+            const float det = qa * qc - qb * qb;
+            cull = qa > 0.f && qc > 0.f && det > 0.f;
+            if (cull) {
+                level = fminf(radius_x * radius_x * det / qc, radius_y * radius_y * det / qa);
+            }
+        }
+        auto tile_hit = [&](const uint32_t tx, const uint32_t ty) {
+            if (!cull) {
+                return true;
+            }
+            const float x0 = static_cast<float>(tx * tile_size) - mean2d.x;
+            const float y0 = static_cast<float>(ty * tile_size) - mean2d.y;
+            return ellipse_overlaps_rect(qa, qb, qc, level, x0, x0 + static_cast<float>(tile_size),
+                                         y0, y0 + static_cast<float>(tile_size));
+        };
+        auto row_span = [&](const uint32_t row, uint32_t& x_begin, uint32_t& x_end) {
+            x_begin = tile_min.x;
+            x_end = tile_max.x;
+            if constexpr (kBatched) {
+                if (row == tiles.begin / tile_width)
+                    x_begin = max(x_begin, tiles.begin % tile_width);
+                if (row == (tiles.end - 1) / tile_width)
+                    x_end = min(x_end, (tiles.end - 1) % tile_width + 1);
+            }
+        };
+
+        if (first_pass && cull) {
+            int32_t count = 0;
+            for (uint32_t i = tile_min.y; i < tile_max.y; ++i) {
+                uint32_t x_begin, x_end;
+                row_span(i, x_begin, x_end);
+                for (uint32_t j = x_begin; j < x_end; ++j) {
+                    count += tile_hit(j, i) ? 1 : 0;
+                }
+            }
+            tiles_per_gauss[k] = count;
+            return;
+        }
+        // Without culling, count prefix rectangles in O(1).
         if (first_pass) {
             if constexpr (!kBatched) {
                 tiles_per_gauss[k] = static_cast<int32_t>(
@@ -109,15 +174,13 @@ namespace gsplat_lfs {
         int64_t depth_id_enc = static_cast<uint32_t>(depth_i32);
 
         int64_t cur_idx = (k == 0) ? 0 : cum_tiles_per_gauss[k - 1];
-        for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
-            uint32_t x_begin = tile_min.x, x_end = tile_max.x;
-            if constexpr (kBatched) {
-                if (i == tiles.begin / tile_width)
-                    x_begin = max(x_begin, tiles.begin % tile_width);
-                if (i == (tiles.end - 1) / tile_width)
-                    x_end = min(x_end, (tiles.end - 1) % tile_width + 1);
-            }
-            for (int32_t j = x_begin; j < x_end; ++j) {
+        for (uint32_t i = tile_min.y; i < tile_max.y; ++i) {
+            uint32_t x_begin, x_end;
+            row_span(i, x_begin, x_end);
+            for (uint32_t j = x_begin; j < x_end; ++j) {
+                if (!tile_hit(j, i)) {
+                    continue;
+                }
                 if (max_isects >= 0 && cur_idx >= max_isects) {
                     return;
                 }
@@ -147,7 +210,7 @@ namespace gsplat_lfs {
         int64_t* isect_ids,
         int32_t* flatten_ids,
         cudaStream_t stream,
-        int64_t max_isects, TileRange tiles, const int32_t* order) {
+        int64_t max_isects, TileRange tiles, const int32_t* order, const float* conics) {
         int64_t n_elements = packed ? nnz : C * N;
 
         uint32_t n_tiles = tile_width * tile_height;
@@ -168,7 +231,7 @@ namespace gsplat_lfs {
                 means2d, radii, depths,
                 cum_tiles_per_gauss,
                 tile_size, tile_width, tile_height, tile_n_bits,
-                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order);
+                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order, conics);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.intersect_tile");
         };
         if (tiles.end == UINT32_MAX)
