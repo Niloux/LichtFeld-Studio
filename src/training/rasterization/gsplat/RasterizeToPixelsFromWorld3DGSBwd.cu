@@ -1271,11 +1271,12 @@ namespace gsplat_lfs {
         }
     }
 
-    // Opt-in while the per-splat backward is measured against the per-pixel one.
+    // The per-splat backward is the default; LFS_GUT_SPLAT_BWD=0 falls back to the
+    // per-pixel kernels.
     bool use_splat_backward() {
         static const bool enabled = [] {
             const char* value = std::getenv("LFS_GUT_SPLAT_BWD");
-            return value != nullptr && value[0] == '1';
+            return value == nullptr || value[0] != '0';
         }();
         return enabled;
     }
