@@ -287,7 +287,8 @@ namespace gsplat_lfs {
         auto intersect = [&](TileRange tiles) {
             return intersect_tile(result.means2d, result.radii, result.depths,
                                   nullptr, nullptr, C, N, tile_size, tile_width, tile_height,
-                                  true, result.tiles_per_gauss, stream, result.tile_offsets, tiles);
+                                  true, result.tiles_per_gauss, stream, result.tile_offsets, tiles,
+                                  result.conics);
         };
         const auto whole = intersect({});
 
@@ -418,7 +419,8 @@ namespace gsplat_lfs {
         cudaStream_t stream,
         const std::vector<TileBatch>& batches, int32_t* tiles_per_gauss,
         const float* reference_viewmats,
-        const FreeSpaceRender& free_space) {
+        const FreeSpaceRender& free_space,
+        const float* conics) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -473,7 +475,8 @@ namespace gsplat_lfs {
                     continue;
                 const auto batch = intersect_tile(means2d, radii, depths, nullptr, nullptr,
                                                   C, N, tile_size, tile_width, tile_height, true,
-                                                  tiles_per_gauss, stream, const_cast<int32_t*>(tile_offsets), saved.tiles);
+                                                  tiles_per_gauss, stream, const_cast<int32_t*>(tile_offsets), saved.tiles,
+                                                  conics);
                 LFS_ASSERT(batch.n_isects == saved.count && batch.n_sort > 0);
                 flatten_ids = batch.flatten_ids;
                 n_isects = static_cast<uint32_t>(batch.n_sort);

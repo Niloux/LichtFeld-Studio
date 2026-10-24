@@ -64,6 +64,8 @@ namespace gsplat_lfs {
             std::optional<lfs::core::VmmDeviceBuffer> isect_values_storage;
             std::optional<lfs::core::VmmDeviceBuffer> sort_ids_storage;
             std::optional<lfs::core::VmmDeviceBuffer> sort_values_storage;
+            // Depth sort of the elements: keys, keys_alt, values, values_alt.
+            std::optional<lfs::core::VmmDeviceBuffer> depth_order_storage;
             size_t cum_tiles_capacity = 0;
             size_t isect_capacity = 0;
             size_t sort_capacity = 0;
@@ -309,6 +311,18 @@ namespace gsplat_lfs {
                 }
             }
 
+            uint32_t* depth_order_buffers(const size_t n_elements) {
+                const size_t bytes = checked_bytes(n_elements, 4 * sizeof(uint32_t), "gsplat depth order");
+                if (!depth_order_storage) {
+                    depth_order_storage = create_vmm_buffer(
+                        pair_reservation_bytes(sizeof(int32_t)), "rasterizer.gsplat.depth_order");
+                }
+                if (depth_order_storage->committed_bytes() < bytes) {
+                    commit_vmm_buffer(*depth_order_storage, bytes);
+                }
+                return depth_order_storage->as<uint32_t>();
+            }
+
             void ensure_isect_buffers(size_t n_isects) {
                 if (n_isects == 0) {
                     return;
@@ -405,6 +419,7 @@ namespace gsplat_lfs {
                 isect_values_storage.reset();
                 sort_ids_storage.reset();
                 sort_values_storage.reset();
+                depth_order_storage.reset();
                 cum_tiles_capacity = 0;
                 isect_capacity = 0;
                 sort_capacity = 0;
@@ -434,7 +449,7 @@ namespace gsplat_lfs {
                 const bool cub_released = release_gsplat_cub_workspace();
                 const bool color_grad_released = release_gsplat_color_grad_workspace();
                 return !cum_tiles && !isect_ids_storage && !isect_values_storage &&
-                       !sort_ids_storage && !sort_values_storage &&
+                       !sort_ids_storage && !sort_values_storage && !depth_order_storage &&
                        sort_reuse_event == nullptr && cub_released &&
                        color_grad_released;
             }
@@ -480,7 +495,7 @@ namespace gsplat_lfs {
         bool sort,
         int32_t* tiles_per_gauss_out,
         cudaStream_t stream,
-        int32_t* isect_offsets, TileRange tiles) {
+        int32_t* isect_offsets, TileRange tiles, const float* conics) {
         auto bounds_failure = [](const std::string& message, lfs::ErrorCode code = lfs::ErrorCode::BoundsViolation) {
             throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
                 .code = code,
@@ -544,6 +559,18 @@ namespace gsplat_lfs {
                                                               ? std::max<size_t>(n_elements, cache.pair_budget)
                                                               : cache.pair_budget);
 
+        // Two-stage sort: order the elements by depth once, emit their pairs in
+        // that order, then sort the pairs by camera and tile only. The radix sort
+        // is stable, so each tile keeps the depth order the full key would give.
+        const int32_t* depth_order = nullptr;
+        if (sort && !packed) {
+            uint32_t* buffers = cache.depth_order_buffers(n_elements);
+            depth_order = sort_by_depth(
+                depths, n_elements, buffers, buffers + n_elements,
+                reinterpret_cast<int32_t*>(buffers + 2 * size_t{n_elements}),
+                reinterpret_cast<int32_t*>(buffers + 3 * size_t{n_elements}), stream);
+        }
+
         launch_intersect_tile_kernel(
             means2d, radii, depths,
             nullptr, nullptr,
@@ -552,7 +579,7 @@ namespace gsplat_lfs {
             nullptr,
             tiles_per_gauss_out,
             nullptr, nullptr,
-            stream, -1, tiles);
+            stream, -1, tiles, depth_order, conics);
 
         cache.ensure_cum_tiles(n_elements);
         int64_t* d_cum_tiles = cache.cum_tiles.as<int64_t>();
@@ -606,7 +633,7 @@ namespace gsplat_lfs {
                 d_cum_tiles,
                 nullptr,
                 cache.isect_ids(), cache.flatten_ids(),
-                stream, static_cast<int64_t>(sort_n), tiles);
+                stream, static_cast<int64_t>(sort_n), tiles, depth_order, conics);
 
             int64_t* keys_out = cache.isect_ids();
             int32_t* vals_out = cache.flatten_ids();
@@ -614,6 +641,7 @@ namespace gsplat_lfs {
                 try {
                     radix_sort_double_buffer(
                         static_cast<int64_t>(sort_n), tile_n_bits, cam_n_bits,
+                        depth_order != nullptr ? 32u : 0u,
                         cache.isect_ids(), cache.flatten_ids(),
                         cache.sorted_isect_ids(), cache.sorted_flatten_ids(),
                         &keys_out, &vals_out,

@@ -77,7 +77,8 @@ namespace gsplat_lfs {
         bool sort,
         int32_t* tiles_per_gauss_out, // [C, N] pre-allocated output
         cudaStream_t stream = nullptr,
-        int32_t* isect_offsets = nullptr, TileRange tiles = {}); // [C * tile_h * tile_w + 1]
+        int32_t* isect_offsets = nullptr, TileRange tiles = {}, // [C * tile_h * tile_w + 1]
+        const float* conics = nullptr);                         // [C, N, 3] optional: cull missed tiles
 
     bool release_intersect_thread_local_cache() noexcept;
 
@@ -406,6 +407,7 @@ namespace gsplat_lfs {
         cudaStream_t stream = nullptr,
         const std::vector<TileBatch>& batches = {}, int32_t* tiles_per_gauss = nullptr,
         const float* reference_viewmats = nullptr, // as in the forward
-        const FreeSpaceRender& free_space = {});
+        const FreeSpaceRender& free_space = {},
+        const float* conics = nullptr); // [C, N, 3] the forward's, so tile batches re-cull alike
 
 } // namespace gsplat_lfs

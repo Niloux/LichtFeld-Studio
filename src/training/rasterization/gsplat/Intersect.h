@@ -30,7 +30,9 @@ namespace gsplat_lfs {
         int64_t* isect_ids,       // [n_isects] optional (for second pass)
         int32_t* flatten_ids,     // [n_isects] optional (for second pass)
         cudaStream_t stream = nullptr,
-        int64_t max_isects = -1, TileRange tiles = {});
+        int64_t max_isects = -1, TileRange tiles = {},
+        const int32_t* order = nullptr,  // [C * N] optional: element visited by thread k
+        const float* conics = nullptr); // [C, N, 3] optional: cull tiles the ellipse misses
 
     void launch_fill_isect_sentinels_kernel(
         int64_t* isect_ids,
@@ -54,6 +56,7 @@ namespace gsplat_lfs {
         int64_t n_isects,
         uint32_t tile_n_bits,
         uint32_t cam_n_bits,
+        uint32_t begin_bit, // 32 sorts camera and tile only, keeping the input depth order
         int64_t* isect_ids,
         int32_t* flatten_ids,
         int64_t* isect_ids_sorted,
@@ -64,6 +67,17 @@ namespace gsplat_lfs {
         int64_t& cub_n,
         uint32_t& cub_end_bit,
         cudaStream_t stream = nullptr);
+
+    // Stable order of the elements by the depth bits the pair keys carry; returns
+    // values or values_alt, whichever holds the sorted indices.
+    const int32_t* sort_by_depth(
+        const float* depths,
+        uint32_t n,
+        uint32_t* keys,
+        uint32_t* keys_alt,
+        int32_t* values,
+        int32_t* values_alt,
+        cudaStream_t stream);
 
     void compute_cumsum_gpu(
         const int32_t* input,

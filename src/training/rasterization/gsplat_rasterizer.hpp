@@ -54,6 +54,7 @@ namespace lfs::training {
         int64_t n_isects = 0;
         std::vector<gsplat_lfs::TileBatch> batches;
         int32_t* tiles_per_gauss_ptr = nullptr;
+        const float* conics_ptr = nullptr; // arena; tile batches re-cull with it in backward
         int32_t n_sort = 0;
 
         // Saved input tensors (references, not copies)

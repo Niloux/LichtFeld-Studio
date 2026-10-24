@@ -1322,6 +1322,90 @@ TEST_F(GsplatRasterizerTest, GutFromWorldThinPrismGradParity) {
     run_gut_from_world_parity(camera, "GUT_THIN_PRISM_GRAD_DUMP", "GUT_THIN_PRISM_GRAD_REF");
 }
 
+// Geometry render modes with image, alpha, depth, normal and free-space gradients all nonzero.
+// GUT_GEOMETRY_GRAD_DUMP=<dir> writes the gradients; GUT_GEOMETRY_GRAD_REF=<dir> compares against them.
+void run_gut_geometry_parity(Camera& camera, const GsplatRenderMode mode, const std::string& tag) {
+    constexpr int kN = 50000;
+    auto splat = make_parity_splat(kN, 0xC0FFEE02u);
+    splat->_max_screen_share = Tensor::zeros({static_cast<size_t>(kN)}, Device::CUDA);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+    bg.fill_(0.25f);
+    const size_t w = static_cast<size_t>(camera.image_width());
+    const size_t h = static_cast<size_t>(camera.image_height());
+
+    // Scan 3 m out (file unit mm) on the left two thirds of the frame.
+    std::vector<float> scan(w * h);
+    for (size_t i = 0; i < w * h; ++i)
+        scan[i] = i % w < (2 * w) / 3 ? 3000.f : 0.f;
+    auto gt = Tensor::from_vector(scan, {h, w}, Device::CUDA);
+    auto t_front = Tensor::empty({h, w}, Device::CUDA);
+    gsplat_lfs::FreeSpaceRender free_space;
+    free_space.gt_depth = gt.ptr<float>();
+    free_space.T_front = t_front.ptr<float>();
+    free_space.gt_w = static_cast<uint32_t>(w);
+    free_space.gt_h = static_cast<uint32_t>(h);
+    free_space.unit = 0.001f;
+    free_space.margin = 0.15f;
+    free_space.margin_rel = 0.02f;
+
+    auto pattern = [](const size_t n, const float freq, const float amp) {
+        std::vector<float> v(n);
+        for (size_t i = 0; i < n; ++i)
+            v[i] = amp * std::sin(freq * static_cast<float>(i) + 0.3f);
+        return v;
+    };
+    const bool normals = mode == GsplatRenderMode::RGB_D_N;
+    auto grad_image = Tensor::from_vector(pattern(3 * w * h, 0.37f, 1e-2f), {3, h, w}, Device::CUDA);
+    auto grad_alpha = Tensor::from_vector(pattern(w * h, 0.11f, 5e-3f), {1, h, w}, Device::CUDA);
+    auto grad_depth = Tensor::from_vector(pattern(w * h, 0.23f, 4e-3f), {h, w}, Device::CUDA);
+    auto grad_normal = normals ? Tensor::from_vector(pattern(3 * w * h, 0.17f, 3e-3f), {3, h, w}, Device::CUDA)
+                               : Tensor{};
+    auto grad_t_front = Tensor::from_vector(pattern(w * h, 0.05f, 2e-3f), {h, w}, Device::CUDA);
+
+    AdamConfig cfg;
+    cfg.lr = 1e-3f;
+    cfg.initial_capacity = static_cast<size_t>(kN);
+    AdamOptimizer opt(*splat, cfg);
+    opt.allocate_gradients(static_cast<size_t>(kN));
+
+    auto r = gsplat_rasterize_forward(camera, *splat, bg, 0, 0, 0, 0, 1.0f, false, mode, true, {}, free_space);
+    ASSERT_TRUE(r.has_value()) << r.error();
+    ASSERT_GT(r->second.n_isects, 0);
+    gsplat_rasterize_backward(r->second, grad_image, grad_alpha, *splat, opt, {}, {}, {},
+                              grad_depth, grad_normal, 0.f, grad_t_front);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    const std::pair<const char*, ParamType> params[] = {
+        {"v_means.bin", ParamType::Means},
+        {"v_scales.bin", ParamType::Scaling},
+        {"v_quats.bin", ParamType::Rotation},
+        {"v_opacities.bin", ParamType::Opacity},
+        {"v_colors.bin", ParamType::Sh0}};
+    if (const char* dump_dir = std::getenv("GUT_GEOMETRY_GRAD_DUMP")) {
+        const auto dir = std::filesystem::path(dump_dir) / tag;
+        std::filesystem::create_directories(dir);
+        for (const auto& [file, type] : params)
+            write_float_bin(dir / file, opt.get_grad(type));
+    }
+    if (const char* ref_dir = std::getenv("GUT_GEOMETRY_GRAD_REF")) {
+        const auto dir = std::filesystem::path(ref_dir) / tag;
+        for (const auto& [file, type] : params) {
+            const float rel = max_rel_diff(opt.get_grad(type), read_float_bin(dir / file));
+            std::cout << tag << " " << file << " max|a-b|/max|a| = " << rel << std::endl;
+            EXPECT_LT(rel, 1e-4f) << tag << " " << file;
+        }
+    }
+}
+
+TEST_F(GsplatRasterizerTest, GutGeometryGradParity) {
+    auto pinhole = make_camera(96, 64);
+    auto fisheye = make_fisheye_camera(96, 64);
+    run_gut_geometry_parity(pinhole, GsplatRenderMode::RGB_D, "pinhole_rgbd");
+    run_gut_geometry_parity(pinhole, GsplatRenderMode::RGB_D_N, "pinhole_rgbdn");
+    run_gut_geometry_parity(fisheye, GsplatRenderMode::RGB_D, "fisheye_rgbd");
+    run_gut_geometry_parity(fisheye, GsplatRenderMode::RGB_D_N, "fisheye_rgbdn");
+}
+
 // Opt-in because this emits 2.4986 billion pairs, bounded by the tile batches.
 TEST_F(GsplatRasterizerTest, AggregateOverflowTrainingStep) {
     if (!std::getenv("GUT_LARGE_FRAME"))

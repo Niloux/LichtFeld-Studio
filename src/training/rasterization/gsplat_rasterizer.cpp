@@ -684,6 +684,7 @@ namespace lfs::training {
             ctx.n_isects = result.n_isects;
             ctx.batches = std::move(result.batches);
             ctx.tiles_per_gauss_ptr = tiles_per_gauss_ptr;
+            ctx.conics_ptr = conics_ptr_out;
             ctx.n_sort = result.n_sort;
 
             // Save input tensors for backward (these are references, not copies)
@@ -1011,7 +1012,8 @@ namespace lfs::training {
                 pixel_error_map_ptr,
                 edge_weight_map_ptr,
                 edge_score_out_ptr,
-                stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr, free_space);
+                stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr, free_space,
+                ctx.conics_ptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
 
