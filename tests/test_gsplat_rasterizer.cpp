@@ -2372,7 +2372,10 @@ TEST_F(GsplatRasterizerTest, FreeSpaceTransmittanceCountsOnlySplatsBeforeTheScan
         }
         // The wall is behind the limit, so T_front only sees the floater.
         EXPECT_GE(t, 1.f - alpha.ptr<float>()[i] - 1e-5f) << i;
-        weights[i] = 1.f;
+        // The rasterizer drops a splat once its alpha falls below 1/255, so T_front
+        // steps there. Leave out pixels near that cutoff: one that crosses it under
+        // the finite-difference nudge adds weight/255 / (2 eps) to the numeric slope.
+        weights[i] = 1.f - t > 2.f / 255.f ? 1.f : 0.f;
         ++scanned;
         hazy += t < .9f;
     }
