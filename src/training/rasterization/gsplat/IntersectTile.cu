@@ -36,18 +36,22 @@ namespace gsplat_lfs {
         int32_t* __restrict__ tiles_per_gauss,
         int64_t* __restrict__ isect_ids,
         int32_t* __restrict__ flatten_ids,
-        const int64_t max_isects, const TileRange tiles) {
-        uint32_t idx = cg::this_grid().thread_rank();
+        const int64_t max_isects, const TileRange tiles,
+        const int32_t* __restrict__ order) {
+        // Thread k handles element order[k], so the pairs come out in that order;
+        // counts and offsets are indexed by k.
+        const uint32_t k = cg::this_grid().thread_rank();
         bool first_pass = cum_tiles_per_gauss == nullptr;
-        if (idx >= (packed ? nnz : C * N)) {
+        if (k >= (packed ? nnz : C * N)) {
             return;
         }
+        const uint32_t idx = order != nullptr ? static_cast<uint32_t>(order[k]) : k;
 
         const float radius_x = radii[idx * 2];
         const float radius_y = radii[idx * 2 + 1];
         if (radius_x <= 0 || radius_y <= 0) {
             if (first_pass) {
-                tiles_per_gauss[idx] = 0;
+                tiles_per_gauss[k] = 0;
             }
             return;
         }
@@ -73,7 +77,7 @@ namespace gsplat_lfs {
         }
         if (first_pass) {
             if constexpr (!kBatched) {
-                tiles_per_gauss[idx] = static_cast<int32_t>(
+                tiles_per_gauss[k] = static_cast<int32_t>(
                     (tile_max.y - tile_min.y) * (tile_max.x - tile_min.x));
                 return;
             }
@@ -89,7 +93,7 @@ namespace gsplat_lfs {
                                                   max((tiles.end - 1) % tile_width + 1, tile_min.x));
                 }
             }
-            tiles_per_gauss[idx] = static_cast<int32_t>(count);
+            tiles_per_gauss[k] = static_cast<int32_t>(count);
             return;
         }
 
@@ -104,7 +108,7 @@ namespace gsplat_lfs {
         int32_t depth_i32 = *(int32_t*)&(depths[idx]);
         int64_t depth_id_enc = static_cast<uint32_t>(depth_i32);
 
-        int64_t cur_idx = (idx == 0) ? 0 : cum_tiles_per_gauss[idx - 1];
+        int64_t cur_idx = (k == 0) ? 0 : cum_tiles_per_gauss[k - 1];
         for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
             uint32_t x_begin = tile_min.x, x_end = tile_max.x;
             if constexpr (kBatched) {
@@ -143,7 +147,7 @@ namespace gsplat_lfs {
         int64_t* isect_ids,
         int32_t* flatten_ids,
         cudaStream_t stream,
-        int64_t max_isects, TileRange tiles) {
+        int64_t max_isects, TileRange tiles, const int32_t* order) {
         int64_t n_elements = packed ? nnz : C * N;
 
         uint32_t n_tiles = tile_width * tile_height;
@@ -164,7 +168,7 @@ namespace gsplat_lfs {
                 means2d, radii, depths,
                 cum_tiles_per_gauss,
                 tile_size, tile_width, tile_height, tile_n_bits,
-                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles);
+                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.intersect_tile");
         };
         if (tiles.end == UINT32_MAX)
@@ -292,6 +296,7 @@ namespace gsplat_lfs {
         int64_t n_isects,
         uint32_t tile_n_bits,
         uint32_t cam_n_bits,
+        uint32_t begin_bit,
         int64_t* isect_ids,
         int32_t* flatten_ids,
         int64_t* isect_ids_sorted,
@@ -313,20 +318,22 @@ namespace gsplat_lfs {
         }
 
         const uint32_t end_bit = 32 + tile_n_bits + cam_n_bits;
-        if (n_isects != cub_n || end_bit != cub_end_bit || cub_ws_bytes == 0) {
+        // The cached workspace is keyed on the bit range as well as the count.
+        const uint32_t bit_range = end_bit | (begin_bit << 8);
+        if (n_isects != cub_n || bit_range != cub_end_bit || cub_ws_bytes == 0) {
             cub::DoubleBuffer<int64_t> query_keys(isect_ids, isect_ids_sorted);
             cub::DoubleBuffer<int32_t> query_vals(flatten_ids, flatten_ids_sorted);
             size_t ws = 0;
             LFS_CUDA_CHECK_MSG(
                 cub::DeviceRadixSort::SortPairs(
                     nullptr, ws, query_keys, query_vals, n_isects,
-                    0, end_bit, stream),
+                    begin_bit, end_bit, stream),
                 "cub::DeviceRadixSort::SortPairs workspace query");
             LFS_ASSERT_MSG(ws > 0,
                            "gsplat CUB radix sort returned an empty workspace");
             cub_ws_bytes = ws;
             cub_n = n_isects;
-            cub_end_bit = end_bit;
+            cub_end_bit = bit_range;
         }
 
         cub::DoubleBuffer<int64_t> d_keys(isect_ids, isect_ids_sorted);
@@ -336,7 +343,7 @@ namespace gsplat_lfs {
         LFS_CUDA_CHECK_MSG(
             cub::DeviceRadixSort::SortPairs(
                 workspace, storage_bytes, d_keys, d_values, n_isects,
-                0, end_bit, stream),
+                begin_bit, end_bit, stream),
             "cub::DeviceRadixSort::SortPairs");
         if (keys_out) {
             *keys_out = d_keys.Current();
@@ -344,6 +351,44 @@ namespace gsplat_lfs {
         if (vals_out) {
             *vals_out = d_values.Current();
         }
+    }
+
+    __global__ void depth_order_keys_kernel(
+        const float* __restrict__ depths,
+        const uint32_t n,
+        uint32_t* __restrict__ keys,
+        int32_t* __restrict__ values) {
+        const uint32_t i = cg::this_grid().thread_rank();
+        if (i >= n) {
+            return;
+        }
+        // Same bit pattern the pair key carries in its low 32 bits.
+        keys[i] = __float_as_uint(depths[i]);
+        values[i] = static_cast<int32_t>(i);
+    }
+
+    const int32_t* sort_by_depth(
+        const float* depths,
+        const uint32_t n,
+        uint32_t* keys,
+        uint32_t* keys_alt,
+        int32_t* values,
+        int32_t* values_alt,
+        cudaStream_t stream) {
+        if (n == 0) {
+            return values;
+        }
+        depth_order_keys_kernel<<<(n + 255) / 256, 256, 0, stream>>>(depths, n, keys, values);
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.depth_order_keys");
+        cub::DoubleBuffer<uint32_t> d_keys(keys, keys_alt);
+        cub::DoubleBuffer<int32_t> d_values(values, values_alt);
+        run_cub_operation(
+            "cub::DeviceRadixSort::SortPairs (depth order)", stream,
+            [&](void* workspace, size_t& workspace_bytes) {
+                return cub::DeviceRadixSort::SortPairs(
+                    workspace, workspace_bytes, d_keys, d_values, n, 0, 32, stream);
+            });
+        return d_values.Current();
     }
 
     void compute_cumsum_gpu(
