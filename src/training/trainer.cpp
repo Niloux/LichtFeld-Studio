@@ -912,6 +912,13 @@ namespace lfs::training {
                 if (!cam) {
                     continue;
                 }
+                // Size slots at the decoded training resolution, as the loader's requests do;
+                // before the first request a camera still reports its source resolution.
+                const int max_width = dataset->get_max_width();
+                if (!cam->image_size_loaded() ||
+                    (max_width > 0 && (cam->image_height() > max_width || cam->image_width() > max_width))) {
+                    cam->load_image_size(dataset->get_resize_factor(), max_width);
+                }
 
                 const size_t width = static_cast<size_t>(std::max(cam->image_width(), 0));
                 const size_t height = static_cast<size_t>(std::max(cam->image_height(), 0));
