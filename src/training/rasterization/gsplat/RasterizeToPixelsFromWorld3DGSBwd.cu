@@ -1009,9 +1009,11 @@ namespace gsplat_lfs {
         const bool do_dens = densification_info != nullptr && densification_error_map != nullptr;
         const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
 
+        // The eighth channel of RGB + depth + normal is padding that is always zero.
+        constexpr uint32_t kUsed = CDIM == 8 ? 7u : CDIM;
         __shared__ float s_T[kSplatBwdPixels];
-        __shared__ float s_buffer[kSplatBwdPixels * CDIM];
-        __shared__ float s_v_c[kSplatBwdPixels * CDIM];
+        __shared__ float s_buffer[kSplatBwdPixels * kUsed];
+        __shared__ float s_v_c[kSplatBwdPixels * kUsed];
         __shared__ float s_v_a[kSplatBwdPixels];
         __shared__ float s_T_final[kSplatBwdPixels];
         __shared__ float s_bg[kSplatBwdPixels];
@@ -1044,10 +1046,10 @@ namespace gsplat_lfs {
             s_v_a[p] = v_render_alphas[pix];
             float bg = 0.f;
 #pragma unroll
-            for (uint32_t k = 0; k < CDIM; ++k) {
+            for (uint32_t k = 0; k < kUsed; ++k) {
                 const float v_c = v_render_colors[chw_pix(k, pix, image_height, image_width)];
-                s_v_c[p * CDIM + k] = v_c;
-                s_buffer[p * CDIM + k] = 0.f;
+                s_v_c[p * kUsed + k] = v_c;
+                s_buffer[p * kUsed + k] = 0.f;
                 // Geometry channels have a zero background; only RGB contributes.
                 if (have_bg && k < 3u) {
                     bg += (bg_images != nullptr ? bg_images[k * pixels + pix] : backgrounds[k]) * v_c;
@@ -1125,10 +1127,9 @@ namespace gsplat_lfs {
                 vec4 quat{1.f, 0.f, 0.f, 0.f};
                 float opac = 0.f;
                 mat3 Mt{1.f};
-                mat3 R{1.f};
-                float rgb[CDIM];
+                float rgb[kUsed];
 #pragma unroll
-                for (uint32_t k = 0; k < CDIM; ++k) {
+                for (uint32_t k = 0; k < kUsed; ++k) {
                     rgb[k] = 0.f;
                 }
                 float splat_depth = 0.f;
@@ -1137,14 +1138,13 @@ namespace gsplat_lfs {
                     opac = activated_opacity(opacities[g]);
                     scale_act = activated_scale(scales[g]);
                     quat = quats[g];
-                    R = quat_to_rotmat(quat);
                     const mat3 S = mat3(
                         1.0f / scale_act[0], 0.f, 0.f,
                         0.f, 1.0f / scale_act[1], 0.f,
                         0.f, 0.f, 1.0f / scale_act[2]);
-                    Mt = glm::transpose(R * S);
+                    Mt = glm::transpose(quat_to_rotmat(quat) * S);
 #pragma unroll
-                    for (uint32_t k = 0; k < CDIM; ++k) {
+                    for (uint32_t k = 0; k < kUsed; ++k) {
                         rgb[k] = colors[g * CDIM + k];
                     }
                     if (depth_channel < CDIM) {
@@ -1152,14 +1152,15 @@ namespace gsplat_lfs {
                     }
                 }
 
-                float v_rgb[CDIM];
+                float v_rgb[kUsed];
 #pragma unroll
-                for (uint32_t k = 0; k < CDIM; ++k) {
+                for (uint32_t k = 0; k < kUsed; ++k) {
                     v_rgb[k] = 0.f;
                 }
-                vec3 v_mean{0.f};
-                vec3 v_scale{0.f};
-                vec4 v_quat{0.f};
+                // The mean and quaternion/scale VJPs are linear in v_gro and v_Mt, so
+                // the pixels' terms are summed here and pushed through them once.
+                vec3 v_gro_sum{0.f};
+                mat3 v_Mt_sum{0.f};
                 float v_opacity = 0.f;
                 float dens_w = 0.f;
                 float dens_e = 0.f;
@@ -1189,12 +1190,12 @@ namespace gsplat_lfs {
                             const float T_final = s_T_final[p];
                             float v_alpha = 0.f;
 #pragma unroll
-                            for (uint32_t k = 0; k < CDIM; ++k) {
-                                const float v_c = s_v_c[p * CDIM + k];
-                                const float buffer = s_buffer[p * CDIM + k];
+                            for (uint32_t k = 0; k < kUsed; ++k) {
+                                const float v_c = s_v_c[p * kUsed + k];
+                                const float buffer = s_buffer[p * kUsed + k];
                                 v_rgb[k] += fac * v_c;
                                 v_alpha += (rgb[k] * T - buffer * ra) * v_c;
-                                s_buffer[p * CDIM + k] = buffer + rgb[k] * fac;
+                                s_buffer[p * kUsed + k] = buffer + rgb[k] * fac;
                             }
                             v_alpha += T_final * ra * s_v_a[p];
                             if (have_bg) {
@@ -1221,11 +1222,9 @@ namespace gsplat_lfs {
                                 const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
                                 const vec3 v_gro = glm::cross(v_gcrod, grd_n);
                                 const vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
-                                const mat3 v_Mt = glm::outerProduct(v_grd, ray_d) +
-                                                  glm::outerProduct(v_gro, o_minus_mu);
-                                v_mean += -(glm::transpose(Mt) * v_gro);
-                                quat_scale_to_preci_half_vjp(
-                                    quat, scale_act, R, glm::transpose(v_Mt), v_quat, v_scale);
+                                v_Mt_sum += glm::outerProduct(v_grd, ray_d) +
+                                            glm::outerProduct(v_gro, o_minus_mu);
+                                v_gro_sum += v_gro;
                                 v_opacity += vis * v_alpha;
                             }
                             s_T[p] = T;
@@ -1235,9 +1234,14 @@ namespace gsplat_lfs {
                 }
 
                 if (touched) {
+                    const vec3 v_mean = -(glm::transpose(Mt) * v_gro_sum);
+                    vec3 v_scale{0.f};
+                    vec4 v_quat{0.f};
+                    quat_scale_to_preci_half_vjp(
+                        quat, scale_act, quat_to_rotmat(quat), glm::transpose(v_Mt_sum), v_quat, v_scale);
                     float* v_rgb_ptr = v_colors + CDIM * g;
 #pragma unroll
-                    for (uint32_t k = 0; k < CDIM; ++k) {
+                    for (uint32_t k = 0; k < kUsed; ++k) {
                         gpuAtomicAdd(v_rgb_ptr + k, v_rgb[k]);
                     }
                     float* v_mean_ptr = reinterpret_cast<float*>(v_means) + 3 * g;
