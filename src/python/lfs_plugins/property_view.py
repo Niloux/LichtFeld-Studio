@@ -359,6 +359,8 @@ REGISTRY_PLACEMENT = {
         "free_space_weight",
         "free_space_margin",
         "free_space_margin_rel",
+        "color_variance_weight",
+        "color_variance_warmup_iters",
         "scale_reg_decay_power",
         "erank_reg",
         "dc_reg",
