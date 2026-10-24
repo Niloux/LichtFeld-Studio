@@ -236,4 +236,34 @@ namespace gsplat_lfs {
         max_set = smem;
     }
 
+    // Whether q(d) = a dx^2 + 2 b dx dy + c dy^2 <= level anywhere on the rectangle
+    // [x0, x1] x [y0, y1] (offsets from the ellipse centre). Off the centre the
+    // minimum of the convex quadratic lies on an edge.
+    __device__ __forceinline__ bool ellipse_overlaps_rect(
+        const float a, const float b, const float c, const float level,
+        const float x0, const float x1, const float y0, const float y1) {
+        if (x0 <= 0.f && x1 >= 0.f && y0 <= 0.f && y1 >= 0.f) {
+            return true;
+        }
+        auto q = [&](const float x, const float y) { return a * x * x + 2.f * b * x * y + c * y * y; };
+        auto on_column = [&](const float x) { return q(x, fminf(fmaxf(-b * x / c, y0), y1)); };
+        auto on_row = [&](const float y) { return q(fminf(fmaxf(-b * y / a, x0), x1), y); };
+        const float m = fminf(fminf(on_column(x0), on_column(x1)), fminf(on_row(y0), on_row(y1)));
+        return m <= level;
+    }
+
+    // Ellipse level of a projected splat for ellipse_overlaps_rect. It comes from the
+    // integer radii, ceil(extend * sqrt(cov)), so the ellipse contains the projection's
+    // opacity-aware one. False when the conic is degenerate and nothing may be culled.
+    __device__ __forceinline__ bool footprint_level(
+        const float a, const float b, const float c,
+        const float radius_x, const float radius_y, float& level) {
+        const float det = a * c - b * b;
+        if (!(a > 0.f && c > 0.f && det > 0.f)) {
+            return false;
+        }
+        level = fminf(radius_x * radius_x * det / c, radius_y * radius_y * det / a);
+        return true;
+    }
+
 } // namespace gsplat_lfs

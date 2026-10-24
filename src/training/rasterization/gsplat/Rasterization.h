@@ -106,7 +106,8 @@ namespace gsplat_lfs {
         const float* edge_weight_map,         // [H, W] or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {});
+        const FreeSpaceRender& free_space = {},
+        const ScreenFootprint& footprint = {}); // lets the per-splat backward cull sub-tiles
 
     /////////////////////////////////////////////////
     // rasterize_to_indices_3dgs

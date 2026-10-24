@@ -143,7 +143,8 @@ namespace gsplat_lfs {
         const float* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space) {
+        const FreeSpaceRender& free_space,
+        const ScreenFootprint& footprint) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -175,7 +176,7 @@ namespace gsplat_lfs {
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
             densification_info, densification_error_map,             \
             edge_weight_map, edge_score_out, stream, tiles,          \
-            free_space);                                             \
+            free_space, footprint);                                  \
         break;
 
         switch (channels) {
@@ -463,7 +464,8 @@ namespace gsplat_lfs {
                 v_means, v_quats, v_scales, v_colors, v_opacities,
                 densification_info, densification_error_map,
                 edge_weight_map, edge_score_out,
-                stream, tiles, free_space);
+                stream, tiles, free_space,
+                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii});
         };
         if (batches.empty()) {
             render_backward({});
