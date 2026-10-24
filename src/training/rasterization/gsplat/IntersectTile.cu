@@ -17,22 +17,6 @@ namespace gsplat_lfs {
 
     namespace cg = cooperative_groups;
 
-    // Whether q(d) = a dx^2 + 2 b dx dy + c dy^2 <= level anywhere on the rectangle
-    // [x0, x1] x [y0, y1] (offsets from the ellipse centre). Off the centre the
-    // minimum of the convex quadratic lies on an edge.
-    __device__ __forceinline__ bool ellipse_overlaps_rect(
-        const float a, const float b, const float c, const float level,
-        const float x0, const float x1, const float y0, const float y1) {
-        if (x0 <= 0.f && x1 >= 0.f && y0 <= 0.f && y1 >= 0.f) {
-            return true;
-        }
-        auto q = [&](const float x, const float y) { return a * x * x + 2.f * b * x * y + c * y * y; };
-        auto on_column = [&](const float x) { return q(x, fminf(fmaxf(-b * x / c, y0), y1)); };
-        auto on_row = [&](const float y) { return q(fminf(fmaxf(-b * y / a, x0), x1), y); };
-        const float m = fminf(fminf(on_column(x0), on_column(x1)), fminf(on_row(y0), on_row(y1)));
-        return m <= level;
-    }
-
     template <typename scalar_t, bool kBatched>
     __global__ void intersect_tile_kernel(
         const bool packed,
@@ -92,20 +76,14 @@ namespace gsplat_lfs {
             tile_max.y = min(tile_max.y, (tiles.end - 1) / tile_width + 1);
         }
 
-        // With conics, tiles of the rectangle that the splat's ellipse misses get no
-        // pair. The level comes from the integer radii, ceil(extend * sqrt(cov)), so
-        // the tested ellipse contains the projection's opacity-aware one.
+        // With conics, tiles of the rectangle that the splat's ellipse misses get no pair.
         float qa = 0.f, qb = 0.f, qc = 0.f, level = 0.f;
         bool cull = false;
         if (conics != nullptr) {
             qa = conics[idx * 3];
             qb = conics[idx * 3 + 1];
             qc = conics[idx * 3 + 2];
-            const float det = qa * qc - qb * qb;
-            cull = qa > 0.f && qc > 0.f && det > 0.f;
-            if (cull) {
-                level = fminf(radius_x * radius_x * det / qc, radius_y * radius_y * det / qa);
-            }
+            cull = footprint_level(qa, qb, qc, radius_x, radius_y, level);
         }
         auto tile_hit = [&](const uint32_t tx, const uint32_t ty) {
             if (!cull) {

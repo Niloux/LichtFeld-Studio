@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include <cooperative_groups.h>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include "Cameras.cuh"
@@ -919,6 +920,362 @@ namespace gsplat_lfs {
         }
     }
 
+    // Per-splat backward. One warp takes an 8x8 sub-tile of a 16x16 tile. Each lane
+    // owns one splat and walks the sub-tile's pixels on a diagonal: at step t lane l
+    // handles pixel t - l, so every pixel meets the splats back to front, one lane
+    // per step. Pixel state lives in shared memory and the splat's gradient in
+    // registers, flushed once per sub-tile instead of reduced across the warp for
+    // every splat. Splats whose ellipse misses the sub-tile are dropped first.
+    constexpr uint32_t kSplatBwdSub = 8;
+    constexpr uint32_t kSplatBwdPixels = kSplatBwdSub * kSplatBwdSub;
+    constexpr int kSplatBwdSurvivors = 8 * 32;
+
+    template <uint32_t CDIM, bool kPerfectPinhole, bool kEdgeScoring, bool kBatched>
+    __global__ void __launch_bounds__(32) rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel(
+        const uint32_t C,
+        const uint32_t N,
+        const vec3* __restrict__ means,
+        const vec4* __restrict__ quats,
+        const vec3* __restrict__ scales,
+        const float* __restrict__ colors,
+        const float* __restrict__ opacities,
+        const float* __restrict__ backgrounds,
+        const float* __restrict__ bg_images,
+        const bool* __restrict__ masks,
+        const uint32_t image_width,
+        const uint32_t image_height,
+        const uint32_t tile_size,
+        const uint32_t tile_width,
+        const uint32_t tile_height,
+        const float* __restrict__ viewmats0,
+        const float* __restrict__ viewmats1,
+        const float* __restrict__ Ks,
+        const CameraModelType camera_model_type,
+        const ShutterType rs_type,
+        const float* __restrict__ radial_coeffs,
+        const float* __restrict__ tangential_coeffs,
+        const float* __restrict__ thin_prism_coeffs,
+        const int32_t* __restrict__ tile_offsets,
+        const int32_t* __restrict__ flatten_ids,
+        const float* __restrict__ render_alphas,
+        const int32_t* __restrict__ last_ids,
+        const float* __restrict__ v_render_colors,
+        const float* __restrict__ v_render_alphas,
+        vec3* __restrict__ v_means,
+        vec4* __restrict__ v_quats,
+        vec3* __restrict__ v_scales,
+        float* __restrict__ v_colors,
+        float* __restrict__ v_opacities,
+        float* __restrict__ densification_info,
+        const float* __restrict__ densification_error_map,
+        const float* __restrict__ edge_weight_map,
+        float* __restrict__ edge_score_out,
+        const TileRange tiles,
+        const FreeSpaceRender free_space,
+        const ScreenFootprint footprint) {
+        const uint32_t cid = blockIdx.x;
+        const uint32_t subs = tile_size / kSplatBwdSub;
+        const uint32_t sub_y = blockIdx.y;
+        const uint32_t sub_x = blockIdx.z;
+        const uint32_t tile_id = (sub_y / subs) * tile_width + sub_x / subs;
+        if constexpr (kBatched) {
+            if (tile_id < tiles.begin || tile_id >= tiles.end)
+                return;
+        }
+        const uint32_t lane = threadIdx.x;
+        const uint32_t pixels = image_width * image_height;
+
+        tile_offsets += cid * tile_height * tile_width;
+        render_alphas += cid * pixels;
+        last_ids += cid * pixels;
+        v_render_colors += cid * pixels * CDIM;
+        v_render_alphas += cid * pixels;
+        if (backgrounds != nullptr) {
+            backgrounds += cid * CDIM;
+        }
+        if (bg_images != nullptr) {
+            bg_images += cid * CDIM * pixels;
+        }
+        if (masks != nullptr) {
+            masks += cid * tile_height * tile_width;
+            if (!masks[tile_id])
+                return;
+        }
+        if constexpr (kEdgeScoring) {
+            edge_weight_map += cid * pixels;
+            edge_score_out += cid * N;
+        }
+        const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
+        const bool do_dens = densification_info != nullptr && densification_error_map != nullptr;
+        const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
+
+        __shared__ float s_T[kSplatBwdPixels];
+        __shared__ float s_buffer[kSplatBwdPixels * CDIM];
+        __shared__ float s_v_c[kSplatBwdPixels * CDIM];
+        __shared__ float s_v_a[kSplatBwdPixels];
+        __shared__ float s_T_final[kSplatBwdPixels];
+        __shared__ float s_bg[kSplatBwdPixels];
+        __shared__ float s_error[kSplatBwdPixels];
+        __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
+        __shared__ float2 s_free[kSplatBwdPixels]; // (limit, v_T_front * T_front)
+        __shared__ float3 s_ray_o[kSplatBwdPixels];
+        __shared__ float3 s_ray_d[kSplatBwdPixels];
+        __shared__ int32_t s_bin[kSplatBwdPixels]; // last contributing pair; -1 inactive
+        __shared__ int32_t s_surv[kSplatBwdSurvivors];
+
+        int32_t bin_max = -1;
+        for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
+            const uint32_t x = sub_x * kSplatBwdSub + p % kSplatBwdSub;
+            const uint32_t y = sub_y * kSplatBwdSub + p / kSplatBwdSub;
+            const bool inside = x < image_width && y < image_height;
+            const uint32_t pix = min(y * image_width + x, pixels - 1);
+            const WorldRay ray = from_world_pixel_ray<kPerfectPinhole>(
+                camera_model_type, rs_type, image_width, image_height,
+                static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
+                viewmats0, viewmats1, Ks, cid, radial_coeffs, tangential_coeffs, thin_prism_coeffs);
+            const bool active = inside && ray.valid_flag;
+            s_bin[p] = active ? last_ids[pix] : -1;
+            bin_max = max(bin_max, s_bin[p]);
+            s_ray_o[p] = make_float3(ray.ray_org.x, ray.ray_org.y, ray.ray_org.z);
+            s_ray_d[p] = make_float3(ray.ray_dir.x, ray.ray_dir.y, ray.ray_dir.z);
+            const float T_final = 1.0f - render_alphas[pix];
+            s_T[p] = T_final;
+            s_T_final[p] = T_final;
+            s_v_a[p] = v_render_alphas[pix];
+            float bg = 0.f;
+#pragma unroll
+            for (uint32_t k = 0; k < CDIM; ++k) {
+                const float v_c = v_render_colors[chw_pix(k, pix, image_height, image_width)];
+                s_v_c[p * CDIM + k] = v_c;
+                s_buffer[p * CDIM + k] = 0.f;
+                // Geometry channels have a zero background; only RGB contributes.
+                if (have_bg && k < 3u) {
+                    bg += (bg_images != nullptr ? bg_images[k * pixels + pix] : backgrounds[k]) * v_c;
+                }
+            }
+            s_bg[p] = bg;
+            s_error[p] = do_dens ? densification_error_map[pix] : 0.f;
+            if constexpr (kEdgeScoring) {
+                s_edge[p] = edge_weight_map[pix];
+            }
+            float2 free = make_float2(0.f, 0.f);
+            if (do_free && active) {
+                const size_t free_pix = static_cast<size_t>(cid) * pixels + pix;
+                free.x = free_space.limit(cid, x, y, image_width, image_height);
+                free.y = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
+            }
+            s_free[p] = free;
+        }
+        for (int offset = 16; offset > 0; offset /= 2) {
+            bin_max = max(bin_max, __shfl_xor_sync(0xffffffffu, bin_max, offset));
+        }
+        __syncwarp();
+
+        const int32_t range_start = tile_offsets[tile_id];
+        const int32_t range_end = tile_offsets[tile_id + 1];
+        const float sub_x0 = static_cast<float>(sub_x * kSplatBwdSub);
+        const float sub_y0 = static_cast<float>(sub_y * kSplatBwdSub);
+        const uint32_t depth_channel = free_space.depth_channel;
+        const bool cull = footprint.means2d != nullptr && footprint.conics != nullptr &&
+                          footprint.radii != nullptr;
+
+        // Nothing past the deepest contributing pair of the sub-tile matters.
+        for (int32_t scan_end = min(range_end - 1, bin_max); scan_end >= range_start;) {
+            // Compact back-to-front survivors; the loop bounds are warp-uniform.
+            int count = 0;
+            int32_t s = scan_end;
+            while (s >= range_start && count <= kSplatBwdSurvivors - 32) {
+                const int32_t gi = s - static_cast<int32_t>(lane);
+                bool keep = false;
+                if (gi >= range_start) {
+                    keep = true;
+                    if (cull) {
+                        const int32_t g = flatten_ids[gi];
+                        const float qa = footprint.conics[g * 3];
+                        const float qb = footprint.conics[g * 3 + 1];
+                        const float qc = footprint.conics[g * 3 + 2];
+                        float level;
+                        if (footprint_level(qa, qb, qc, static_cast<float>(footprint.radii[g * 2]),
+                                            static_cast<float>(footprint.radii[g * 2 + 1]), level)) {
+                            const float x0 = sub_x0 - footprint.means2d[g * 2];
+                            const float y0 = sub_y0 - footprint.means2d[g * 2 + 1];
+                            keep = ellipse_overlaps_rect(qa, qb, qc, level, x0, x0 + kSplatBwdSub,
+                                                         y0, y0 + kSplatBwdSub);
+                        }
+                    }
+                }
+                const uint32_t ballot = __ballot_sync(0xffffffffu, keep);
+                if (keep) {
+                    s_surv[count + __popc(ballot & ((1u << lane) - 1u))] = gi;
+                }
+                count += __popc(ballot);
+                s -= 32;
+            }
+            scan_end = s;
+            __syncwarp();
+
+            for (int base = 0; base < count; base += 32) {
+                const int batch = min(32, count - base);
+                const bool owns = static_cast<int>(lane) < batch;
+                // Lane 0 owns the back-most splat of the batch.
+                const int32_t isect_idx = owns ? s_surv[base + lane] : 0;
+                const int32_t g = owns ? flatten_ids[isect_idx] : 0;
+                vec3 xyz{0.f};
+                vec3 scale_act{1.f};
+                vec4 quat{1.f, 0.f, 0.f, 0.f};
+                float opac = 0.f;
+                mat3 Mt{1.f};
+                mat3 R{1.f};
+                float rgb[CDIM];
+#pragma unroll
+                for (uint32_t k = 0; k < CDIM; ++k) {
+                    rgb[k] = 0.f;
+                }
+                float splat_depth = 0.f;
+                if (owns) {
+                    xyz = means[g];
+                    opac = activated_opacity(opacities[g]);
+                    scale_act = activated_scale(scales[g]);
+                    quat = quats[g];
+                    R = quat_to_rotmat(quat);
+                    const mat3 S = mat3(
+                        1.0f / scale_act[0], 0.f, 0.f,
+                        0.f, 1.0f / scale_act[1], 0.f,
+                        0.f, 0.f, 1.0f / scale_act[2]);
+                    Mt = glm::transpose(R * S);
+#pragma unroll
+                    for (uint32_t k = 0; k < CDIM; ++k) {
+                        rgb[k] = colors[g * CDIM + k];
+                    }
+                    if (depth_channel < CDIM) {
+                        splat_depth = colors[g * CDIM + depth_channel];
+                    }
+                }
+
+                float v_rgb[CDIM];
+#pragma unroll
+                for (uint32_t k = 0; k < CDIM; ++k) {
+                    v_rgb[k] = 0.f;
+                }
+                vec3 v_mean{0.f};
+                vec3 v_scale{0.f};
+                vec4 v_quat{0.f};
+                float v_opacity = 0.f;
+                float dens_w = 0.f;
+                float dens_e = 0.f;
+                float edge_score = 0.f;
+                bool touched = false;
+
+                for (int t = 0; t < batch + static_cast<int>(kSplatBwdPixels) - 1; ++t) {
+                    const int p = t - static_cast<int>(lane);
+                    if (owns && p >= 0 && p < static_cast<int>(kSplatBwdPixels) && isect_idx <= s_bin[p]) {
+                        const float3 o = s_ray_o[p];
+                        const float3 d = s_ray_d[p];
+                        const vec3 ray_o{o.x, o.y, o.z};
+                        const vec3 ray_d{d.x, d.y, d.z};
+                        const vec3 o_minus_mu = ray_o - xyz;
+                        const vec3 gro = Mt * o_minus_mu;
+                        const vec3 grd = Mt * ray_d;
+                        const vec3 grd_n = safe_normalize(grd);
+                        const vec3 gcrod = glm::cross(grd_n, gro);
+                        const float power = -0.5f * glm::dot(gcrod, gcrod);
+                        const float vis = __expf(power);
+                        const float alpha = min(0.999f, opac * vis);
+                        if (power <= 0.f && alpha >= 1.f / 255.f) {
+                            touched = true;
+                            const float ra = 1.0f / (1.0f - alpha);
+                            const float T = s_T[p] * ra;
+                            const float fac = alpha * T;
+                            const float T_final = s_T_final[p];
+                            float v_alpha = 0.f;
+#pragma unroll
+                            for (uint32_t k = 0; k < CDIM; ++k) {
+                                const float v_c = s_v_c[p * CDIM + k];
+                                const float buffer = s_buffer[p * CDIM + k];
+                                v_rgb[k] += fac * v_c;
+                                v_alpha += (rgb[k] * T - buffer * ra) * v_c;
+                                s_buffer[p * CDIM + k] = buffer + rgb[k] * fac;
+                            }
+                            v_alpha += T_final * ra * s_v_a[p];
+                            if (have_bg) {
+                                v_alpha += -T_final * ra * s_bg[p];
+                            }
+                            const float2 free = s_free[p];
+                            if (free.x > 0.f && splat_depth < free.x) {
+                                v_alpha -= free.y * ra;
+                            }
+                            if (do_dens) {
+                                dens_w += fac;
+                                dens_e += fac * s_error[p];
+                            }
+                            if constexpr (kEdgeScoring) {
+                                const float edge_contribution = fac * s_edge[p];
+                                if (s_edge[p] > 0.0f && isfinite(edge_contribution)) {
+                                    edge_score += edge_contribution;
+                                }
+                            }
+                            if (opac * vis <= 0.999f) {
+                                const float v_vis = opac * v_alpha;
+                                const float v_gradDist = -0.5f * vis * v_vis;
+                                const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
+                                const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
+                                const vec3 v_gro = glm::cross(v_gcrod, grd_n);
+                                const vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
+                                const mat3 v_Mt = glm::outerProduct(v_grd, ray_d) +
+                                                  glm::outerProduct(v_gro, o_minus_mu);
+                                v_mean += -(glm::transpose(Mt) * v_gro);
+                                quat_scale_to_preci_half_vjp(
+                                    quat, scale_act, R, glm::transpose(v_Mt), v_quat, v_scale);
+                                v_opacity += vis * v_alpha;
+                            }
+                            s_T[p] = T;
+                        }
+                    }
+                    __syncwarp();
+                }
+
+                if (touched) {
+                    float* v_rgb_ptr = v_colors + CDIM * g;
+#pragma unroll
+                    for (uint32_t k = 0; k < CDIM; ++k) {
+                        gpuAtomicAdd(v_rgb_ptr + k, v_rgb[k]);
+                    }
+                    float* v_mean_ptr = reinterpret_cast<float*>(v_means) + 3 * g;
+                    gpuAtomicAdd(v_mean_ptr, v_mean.x);
+                    gpuAtomicAdd(v_mean_ptr + 1, v_mean.y);
+                    gpuAtomicAdd(v_mean_ptr + 2, v_mean.z);
+                    float* v_scale_ptr = reinterpret_cast<float*>(v_scales) + 3 * g;
+                    gpuAtomicAdd(v_scale_ptr, v_scale.x * scale_act.x);
+                    gpuAtomicAdd(v_scale_ptr + 1, v_scale.y * scale_act.y);
+                    gpuAtomicAdd(v_scale_ptr + 2, v_scale.z * scale_act.z);
+                    float* v_quat_ptr = reinterpret_cast<float*>(v_quats) + 4 * g;
+                    gpuAtomicAdd(v_quat_ptr, v_quat.x);
+                    gpuAtomicAdd(v_quat_ptr + 1, v_quat.y);
+                    gpuAtomicAdd(v_quat_ptr + 2, v_quat.z);
+                    gpuAtomicAdd(v_quat_ptr + 3, v_quat.w);
+                    gpuAtomicAdd(v_opacities + g, v_opacity * opac * (1.0f - opac));
+                    if (do_dens) {
+                        gpuAtomicAdd(densification_info + g, dens_w);
+                        gpuAtomicAdd(densification_info + N + g, dens_e);
+                    }
+                    if constexpr (kEdgeScoring) {
+                        gpuAtomicAdd(edge_score_out + g, edge_score);
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+
+    // Opt-in while the per-splat backward is measured against the per-pixel one.
+    bool use_splat_backward() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LFS_GUT_SPLAT_BWD");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
     ////////////////////////////////////////////////////////////////
     // Launch Function
     ////////////////////////////////////////////////////////////////
@@ -964,7 +1321,8 @@ namespace gsplat_lfs {
         const float* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space_in) {
+        const FreeSpaceRender& free_space_in,
+        const ScreenFootprint& footprint) {
         const bool packed = false; // Only support non-packed for now
         // The free-space test reads the splat depth from a render channel.
         const FreeSpaceRender free_space =
@@ -1030,6 +1388,45 @@ namespace gsplat_lfs {
         };
 
         auto dispatch = [&]<bool kBatched>() {
+            if constexpr (CDIM <= 8) {
+                if (use_splat_backward() && footprint.valid() && tile_size % kSplatBwdSub == 0) {
+                    const uint32_t subs = tile_size / kSplatBwdSub;
+                    const dim3 threads = {32, 1, 1};
+                    const dim3 grid = {C, tile_height * subs, tile_width * subs};
+                    auto launch_splat = [&](auto kernel) {
+                        kernel<<<grid, threads, 0, stream>>>(
+                            C, N,
+                            reinterpret_cast<const vec3*>(means),
+                            reinterpret_cast<const vec4*>(quats),
+                            reinterpret_cast<const vec3*>(scales),
+                            colors, opacities, backgrounds, bg_images, masks,
+                            image_width, image_height, tile_size, tile_width, tile_height,
+                            viewmats0, viewmats1, Ks, camera_model, rs_type,
+                            radial_coeffs, tangential_coeffs, thin_prism_coeffs,
+                            tile_offsets, flatten_ids, render_alphas, last_ids,
+                            v_render_colors, v_render_alphas,
+                            reinterpret_cast<vec3*>(v_means),
+                            reinterpret_cast<vec4*>(v_quats),
+                            reinterpret_cast<vec3*>(v_scales),
+                            v_colors, v_opacities, densification_info, densification_error_map,
+                            edge_weight_map, edge_score_out, tiles, free_space, footprint);
+                        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
+                    };
+                    const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
+                    if (global_shutter && perfect_pinhole) {
+                        if (edges)
+                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched>);
+                        else
+                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched>);
+                    } else {
+                        if (edges)
+                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched>);
+                        else
+                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched>);
+                    }
+                    return;
+                }
+            }
             if constexpr (CDIM == 3) {
                 if (tile_size == 16) {
                     dim3 threads = {8, 16, 1};
@@ -1165,7 +1562,8 @@ namespace gsplat_lfs {
         const float* edge_weight_map,                                          \
         float* edge_score_out,                                                 \
         cudaStream_t stream, TileRange tiles,                                  \
-        const FreeSpaceRender& free_space);
+        const FreeSpaceRender& free_space,                                     \
+        const ScreenFootprint& footprint);
 
     __INS__(1)
     __INS__(2)
