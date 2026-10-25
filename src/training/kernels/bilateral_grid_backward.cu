@@ -6,6 +6,8 @@
 #include "lfs/kernels/bilateral_grid.cuh"
 #include "ppisp_math_bwd.cuh"
 #include <cassert>
+#include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include "kernel_stream.hpp"
@@ -1082,6 +1084,201 @@ namespace lfs::training::kernels {
         flush_smem_to_global(grad_grid, smem, fp, 9, L, H, W, tid, nthreads);
     }
 
+    // Grid gradient by gathering within the tile. A tile's pixels nearly always
+    // share their 2x2 grid cells and differ only in the guidance level, so the
+    // scatter kernel's 72 shared atomics per pixel all land on a few dozen slots.
+    // Here every pixel's parameter gradient and weights go to shared memory once;
+    // then each thread owns one (footprint cell, channel) output, keeps one
+    // register accumulator per guidance level and sweeps the tile's pixels with
+    // no atomics. Threads left over split the pixels into groups that are summed
+    // before the flush. Needs L <= kGatherMaxL and a footprint the tile fits.
+    constexpr int kGatherMaxL = 8;
+    constexpr int kGatherChunk = kBwdThreads * kBwdThreads * kBwdPixX; // pixels staged per pass
+    constexpr int kGatherThreads = kBwdThreads * kBwdThreads;
+
+    template <bool kCHW>
+    __global__ void __launch_bounds__(kGatherThreads) bilateral_grid_slice_exposure_chroma_gridgrad_gather_kernel(
+        const float* __restrict__ grid,
+        const float* __restrict__ rgb,
+        const float* __restrict__ grad_output,
+        float* __restrict__ grad_grid,
+        const int L, const int H, const int W,
+        const int h, const int w,
+        const float* __restrict__ shared_offset) {
+        const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+        const int px0 = blockIdx.x * kBwdTileX;
+        const int py0 = blockIdx.y * kBwdTileY;
+        const int px1 = min(px0 + kBwdTileX, w);
+        const int py1 = min(py0 + kBwdTileY, h);
+
+        __shared__ BwdTileFootprint fp;
+        __shared__ float s_dL[9][kGatherChunk];
+        __shared__ float s_fx[kGatherChunk];
+        __shared__ float s_fy[kGatherChunk];
+        __shared__ float s_fz[kGatherChunk];
+        // Cell offsets inside the footprint and the guidance levels, packed as
+        // x0 | x1 << 2 | y0 << 4 | y1 << 6 | z0 << 8 | z1 << 12; ~0u marks no pixel.
+        __shared__ uint32_t s_cell[kGatherChunk];
+        __shared__ float s_partial[kGatherThreads * kGatherMaxL];
+        if (tid == 0) {
+            compute_bwd_tile_footprint(fp, px0, py0, px1, py1, h, w, H, W);
+        }
+        __syncthreads();
+
+        // Block-uniform roles for the sweep.
+        const int combos = fp.fx * fp.fy * 9;
+        const int groups = kGatherThreads / combos;
+        const int combo = tid % combos;
+        const int group = tid / combos;
+        const bool sweeping = group < groups;
+        const int cell = combo / 9;
+        const int ci = combo % 9;
+        const int lx = cell % fp.fx;
+        const int ly = cell / fp.fx;
+
+        float acc[kGatherMaxL];
+#pragma unroll
+        for (int z = 0; z < kGatherMaxL; ++z)
+            acc[z] = 0.f;
+
+        const int hw = h * w;
+        for (int dy = 0; dy < kBwdPixY; ++dy) {
+#pragma unroll
+            for (int dx = 0; dx < kBwdPixX; ++dx) {
+                const int slot = tid * kBwdPixX + dx;
+                const int wi = px0 + threadIdx.x * kBwdPixX + dx;
+                const int hi = py0 + threadIdx.y * kBwdPixY + dy;
+                if (wi >= w || hi >= h) {
+                    s_cell[slot] = ~0u;
+                    continue;
+                }
+                const int pixel_idx = hi * w + wi;
+                float sr, sg, sb, dr, dg, db;
+                if constexpr (kCHW) {
+                    sr = rgb[0 * hw + pixel_idx];
+                    sg = rgb[1 * hw + pixel_idx];
+                    sb = rgb[2 * hw + pixel_idx];
+                    dr = grad_output[0 * hw + pixel_idx];
+                    dg = grad_output[1 * hw + pixel_idx];
+                    db = grad_output[2 * hw + pixel_idx];
+                } else {
+                    const int rgb_offset = pixel_idx * 3;
+                    const RGB rgb_val = load_rgb_cs(&rgb[rgb_offset]);
+                    sr = rgb_val.r;
+                    sg = rgb_val.g;
+                    sb = rgb_val.b;
+                    const RGB grad = load_rgb_cs(&grad_output[rgb_offset]);
+                    dr = grad.r;
+                    dg = grad.g;
+                    db = grad.b;
+                }
+                sr = isfinite(sr) ? sr : 0.5f;
+                sg = isfinite(sg) ? sg : 0.5f;
+                sb = isfinite(sb) ? sb : 0.5f;
+                dr = isfinite(dr) ? dr : 0.0f;
+                dg = isfinite(dg) ? dg : 0.0f;
+                db = isfinite(db) ? db : 0.0f;
+
+                const float x = w > 1 ? static_cast<float>(wi) / (w - 1) * (W - 1) : 0.0f;
+                const float y = h > 1 ? static_cast<float>(hi) / (h - 1) * (H - 1) : 0.0f;
+                const float guidance = fminf(1.0f, fmaxf(0.0f, kC2G_r * sr + kC2G_g * sg + kC2G_b * sb));
+                const float z = guidance * (L - 1);
+
+                const int x0 = floorf(x), y0 = floorf(y);
+                int z0 = floorf(z);
+                const int x1 = min(x0 + 1, W - 1);
+                const int y1 = min(y0 + 1, H - 1);
+                int z1 = z0 + 1;
+                z0 = min(max(z0, 0), L - 1);
+                z1 = min(max(z1, 0), L - 1);
+
+                const float fx = x - x0, fy = y - y0, fz = z - z0;
+                float sampled[9];
+                sample_exposure_chroma_grid_bwd(
+                    grid, L, H, W, x0, y0, z0, x1, y1, z1, fx, fy, fz, shared_offset, sampled);
+                float dL[9];
+                float3 grad_rgb_in;
+                exposure_chroma_param_vjp(sr, sg, sb, sampled, dr, dg, db, grad_rgb_in, dL);
+
+#pragma unroll
+                for (int c = 0; c < 9; ++c)
+                    s_dL[c][slot] = dL[c];
+                s_fx[slot] = fx;
+                s_fy[slot] = fy;
+                s_fz[slot] = fz;
+                s_cell[slot] = static_cast<uint32_t>(x0 - fp.xmin) |
+                               static_cast<uint32_t>(x1 - fp.xmin) << 2 |
+                               static_cast<uint32_t>(y0 - fp.ymin) << 4 |
+                               static_cast<uint32_t>(y1 - fp.ymin) << 6 |
+                               static_cast<uint32_t>(z0) << 8 |
+                               static_cast<uint32_t>(z1) << 12;
+            }
+            __syncthreads();
+
+            if (sweeping) {
+                for (int p = group; p < kGatherChunk; p += groups) {
+                    const uint32_t code = s_cell[p];
+                    if (code == ~0u)
+                        continue;
+                    const float fx = s_fx[p];
+                    const float fy = s_fy[p];
+                    // A clamped corner coincides with its neighbour; the weights add.
+                    const float wx = (lx == static_cast<int>(code & 3u) ? 1.f - fx : 0.f) +
+                                     (lx == static_cast<int>((code >> 2) & 3u) ? fx : 0.f);
+                    const float wy = (ly == static_cast<int>((code >> 4) & 3u) ? 1.f - fy : 0.f) +
+                                     (ly == static_cast<int>((code >> 6) & 3u) ? fy : 0.f);
+                    const float d = wx * wy * s_dL[ci][p];
+                    if (d == 0.f)
+                        continue;
+                    const float fz = s_fz[p];
+                    const int z0 = static_cast<int>((code >> 8) & 15u);
+                    const int z1 = static_cast<int>((code >> 12) & 15u);
+#pragma unroll
+                    for (int zl = 0; zl < kGatherMaxL; ++zl) {
+                        acc[zl] += (zl == z0 ? d * (1.f - fz) : 0.f) + (zl == z1 ? d * fz : 0.f);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // Sum the pixel groups, then one global atomic per touched slot.
+        if (sweeping) {
+#pragma unroll
+            for (int zl = 0; zl < kGatherMaxL; ++zl)
+                s_partial[(group * combos + combo) * kGatherMaxL + zl] = acc[zl];
+        }
+        __syncthreads();
+        const int HW = H * W;
+        for (int i = tid; i < combos * L; i += kGatherThreads) {
+            const int zl = i % L;
+            const int c = i / L;
+            float sum = 0.f;
+            for (int g = 0; g < groups; ++g)
+                sum += s_partial[(g * combos + c) * kGatherMaxL + zl];
+            if (sum == 0.f)
+                continue;
+            const int cc = c / 9;
+            const int ch = c % 9;
+            const int gx = fp.xmin + cc % fp.fx;
+            const int gy = fp.ymin + cc / fp.fx;
+            atomicAdd(grad_grid + (ch * L + zl) * HW + gy * W + gx, sum);
+        }
+    }
+
+    // The gather kernel needs every tile inside a 3x3-cell footprint, which holds
+    // when a tile spans less than one cell. LFS_BILAGRID_GATHER=0 forces the
+    // scatter kernel.
+    bool use_gridgrad_gather(const int L, const int H, const int W, const int h, const int w) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LFS_BILAGRID_GATHER");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled && L <= kGatherMaxL && H > 1 && W > 1 && h > 1 && w > 1 &&
+               static_cast<int64_t>(kBwdTileX - 1) * (W - 1) < w - 1 &&
+               static_cast<int64_t>(kBwdTileY - 1) * (H - 1) < h - 1;
+    }
+
     inline size_t bwd_hist_smem_bytes(const int channels, const int L) {
         return static_cast<size_t>(channels) * L * kBwdMaxFootprint * kBwdSmemStrideX * sizeof(float);
     }
@@ -1142,9 +1339,15 @@ namespace lfs::training::kernels {
         const dim3 block(kBwdThreads, kBwdThreads);
         const dim3 pix_grid((w + kBwdThreads - 1) / kBwdThreads, (h + kBwdThreads - 1) / kBwdThreads);
         const dim3 tile_grid((w + kBwdTileX - 1) / kBwdTileX, (h + kBwdTileY - 1) / kBwdTileY);
-        bilateral_grid_slice_exposure_chroma_gridgrad_kernel<false>
-            <<<tile_grid, block, bwd_hist_smem_bytes(9, L), stream>>>(
-                grid, rgb, grad_output, grad_grid, L, H, W, h, w, shared_offset);
+        if (use_gridgrad_gather(L, H, W, h, w)) {
+            bilateral_grid_slice_exposure_chroma_gridgrad_gather_kernel<false>
+                <<<tile_grid, block, 0, stream>>>(
+                    grid, rgb, grad_output, grad_grid, L, H, W, h, w, shared_offset);
+        } else {
+            bilateral_grid_slice_exposure_chroma_gridgrad_kernel<false>
+                <<<tile_grid, block, bwd_hist_smem_bytes(9, L), stream>>>(
+                    grid, rgb, grad_output, grad_grid, L, H, W, h, w, shared_offset);
+        }
         LFS_CUDA_LAUNCH_CHECK(stream, "training.bilateral.slice_backward_exposure_chroma");
         bilateral_grid_slice_backward_exposure_chroma_rgbgrad_kernel<false>
             <<<pix_grid, block, 0, stream>>>(
@@ -1164,9 +1367,15 @@ namespace lfs::training::kernels {
         const dim3 block(kBwdThreads, kBwdThreads);
         const dim3 pix_grid((w + kBwdThreads - 1) / kBwdThreads, (h + kBwdThreads - 1) / kBwdThreads);
         const dim3 tile_grid((w + kBwdTileX - 1) / kBwdTileX, (h + kBwdTileY - 1) / kBwdTileY);
-        bilateral_grid_slice_exposure_chroma_gridgrad_kernel<true>
-            <<<tile_grid, block, bwd_hist_smem_bytes(9, L), stream>>>(
-                grid, rgb, grad_output, grad_grid, L, H, W, h, w, shared_offset);
+        if (use_gridgrad_gather(L, H, W, h, w)) {
+            bilateral_grid_slice_exposure_chroma_gridgrad_gather_kernel<true>
+                <<<tile_grid, block, 0, stream>>>(
+                    grid, rgb, grad_output, grad_grid, L, H, W, h, w, shared_offset);
+        } else {
+            bilateral_grid_slice_exposure_chroma_gridgrad_kernel<true>
+                <<<tile_grid, block, bwd_hist_smem_bytes(9, L), stream>>>(
+                    grid, rgb, grad_output, grad_grid, L, H, W, h, w, shared_offset);
+        }
         LFS_CUDA_LAUNCH_CHECK(stream, "training.bilateral.slice_backward_exposure_chroma_chw");
         bilateral_grid_slice_backward_exposure_chroma_rgbgrad_kernel<true>
             <<<pix_grid, block, 0, stream>>>(

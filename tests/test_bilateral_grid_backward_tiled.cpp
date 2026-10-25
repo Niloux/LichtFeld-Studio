@@ -193,6 +193,28 @@ namespace {
         }
     }
 
+    // Cells wider than a backward tile take the exposure-chroma gather kernel.
+    TEST_F(BilateralGridBackwardTiledTest, ChromaGatherMatchesReferenceOnLargeCells) {
+        {
+            BilateralGrid grid(1, 16, 16, 8, 20, {}, BilateralGridParameterization::ExposureChroma);
+            fill_grid(grid, 3.1f);
+            const auto image = random_image({601, 1003, 3}, 10.0f);
+            const auto gout = random_grad(image.shape(), 11.0f);
+            compare_new_vs_reference(grid, image, gout, false,
+                                     launch_bilateral_grid_slice_backward_exposure_chroma_reference,
+                                     "chroma HWC gather");
+        }
+        {
+            BilateralGrid grid(1, 16, 16, 8, 20, {}, BilateralGridParameterization::ExposureChroma);
+            fill_grid(grid, 3.7f);
+            const auto image = random_image({3, 601, 1003}, 12.0f);
+            const auto gout = random_grad(image.shape(), 13.0f);
+            compare_new_vs_reference(grid, image, gout, true,
+                                     launch_bilateral_grid_slice_backward_exposure_chroma_chw_reference,
+                                     "chroma CHW gather");
+        }
+    }
+
     TEST_F(BilateralGridBackwardTiledTest, BicycleImageMatchesReferenceBothParameterizations) {
         const auto hwc = load_bicycle_hwc();
         if (!hwc.is_valid() || hwc.numel() == 0) {
