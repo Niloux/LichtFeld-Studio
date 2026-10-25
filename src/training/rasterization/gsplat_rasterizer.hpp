@@ -50,6 +50,7 @@ namespace lfs::training {
         // Valid from forward through backward on this thread; released by the
         // cache release hook or at thread shutdown.
         int64_t* isect_ids_ptr = nullptr;
+        bool sub_tile_masks = false; // isect_ids hold sub-tile masks in place of depths
         int32_t* flatten_ids_ptr = nullptr;
         int64_t n_isects = 0;
         std::vector<gsplat_lfs::TileBatch> batches;

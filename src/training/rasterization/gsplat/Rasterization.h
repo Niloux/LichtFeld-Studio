@@ -52,7 +52,8 @@ namespace gsplat_lfs {
         float* alphas,     // [C, image_height, image_width, 1]
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {});
+        const FreeSpaceRender& free_space = {},
+        const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
 
     /////////////////////////////////////////////////
     // rasterize_to_pixels_from_world_3dgs - Backward

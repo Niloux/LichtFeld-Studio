@@ -48,7 +48,8 @@ namespace gsplat_lfs {
         float* alphas,
         int32_t* last_ids,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space) {
+        const FreeSpaceRender& free_space,
+        const ScreenFootprint& footprint) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -68,7 +69,8 @@ namespace gsplat_lfs {
             ut_params, rs_type,                                      \
             radial_coeffs, tangential_coeffs, thin_prism_coeffs,     \
             tile_offsets, flatten_ids,                               \
-            renders, alphas, last_ids, stream, tiles, free_space);   \
+            renders, alphas, last_ids, stream, tiles, free_space,    \
+            footprint);                                              \
         break;
 
         switch (channels) {
@@ -315,6 +317,7 @@ namespace gsplat_lfs {
             result.isect_ids = batch.isect_ids;
             result.flatten_ids = batch.flatten_ids;
             result.n_sort = batch.n_sort;
+            result.sub_tile_masks = batch.sub_tile_masks;
             const uint32_t raster_n_isects = static_cast<uint32_t>(batch.n_sort);
             rasterize_to_pixels_from_world_3dgs_fwd(
                 means, quats, scaled_scales, result.colors, opacities,
@@ -326,7 +329,9 @@ namespace gsplat_lfs {
                 radial_coeffs, tangential_coeffs, thin_prism_coeffs,
                 result.tile_offsets, result.flatten_ids,
                 result.render_colors, result.render_alphas, result.last_ids,
-                stream, tiles, free_space);
+                stream, tiles, free_space,
+                ScreenFootprint{.means2d = result.means2d, .conics = result.conics, .radii = result.radii,
+                                .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr});
         };
         result.n_isects = whole.n_isects;
         result.batches.clear();
@@ -355,6 +360,7 @@ namespace gsplat_lfs {
         result.isect_ids = nullptr;
         result.flatten_ids = nullptr;
         result.n_sort = 0;
+        result.sub_tile_masks = false;
     }
 
     //=========================================================================
@@ -421,7 +427,8 @@ namespace gsplat_lfs {
         const std::vector<TileBatch>& batches, int32_t* tiles_per_gauss,
         const float* reference_viewmats,
         const FreeSpaceRender& free_space,
-        const float* conics) {
+        const float* conics,
+        const int64_t* tile_keys) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -465,7 +472,7 @@ namespace gsplat_lfs {
                 densification_info, densification_error_map,
                 edge_weight_map, edge_score_out,
                 stream, tiles, free_space,
-                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii});
+                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys});
         };
         if (batches.empty()) {
             render_backward({});
@@ -481,6 +488,7 @@ namespace gsplat_lfs {
                                                   conics);
                 LFS_ASSERT(batch.n_isects == saved.count && batch.n_sort > 0);
                 flatten_ids = batch.flatten_ids;
+                tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr;
                 n_isects = static_cast<uint32_t>(batch.n_sort);
                 render_backward(saved.tiles);
             }

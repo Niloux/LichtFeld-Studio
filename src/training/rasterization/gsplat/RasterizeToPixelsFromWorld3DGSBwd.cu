@@ -926,7 +926,7 @@ namespace gsplat_lfs {
     // per step. Pixel state lives in shared memory and the splat's gradient in
     // registers, flushed once per sub-tile instead of reduced across the warp for
     // every splat. Splats whose ellipse misses the sub-tile are dropped first.
-    constexpr uint32_t kSplatBwdSub = 8;
+    constexpr uint32_t kSplatBwdSub = kCullSubTile;
     constexpr uint32_t kSplatBwdPixels = kSplatBwdSub * kSplatBwdSub;
     constexpr int kSplatBwdSurvivors = 8 * 32;
 
@@ -1077,6 +1077,7 @@ namespace gsplat_lfs {
         const int32_t range_end = tile_offsets[tile_id + 1];
         const float sub_x0 = static_cast<float>(sub_x * kSplatBwdSub);
         const float sub_y0 = static_cast<float>(sub_y * kSplatBwdSub);
+        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
         const uint32_t depth_channel = free_space.depth_channel;
         const bool cull = footprint.means2d != nullptr && footprint.conics != nullptr &&
                           footprint.radii != nullptr;
@@ -1090,20 +1091,12 @@ namespace gsplat_lfs {
                 const int32_t gi = s - static_cast<int32_t>(lane);
                 bool keep = false;
                 if (gi >= range_start) {
-                    keep = true;
-                    if (cull) {
-                        const int32_t g = flatten_ids[gi];
-                        const float qa = footprint.conics[g * 3];
-                        const float qb = footprint.conics[g * 3 + 1];
-                        const float qc = footprint.conics[g * 3 + 2];
-                        float level;
-                        if (footprint_level(qa, qb, qc, static_cast<float>(footprint.radii[g * 2]),
-                                            static_cast<float>(footprint.radii[g * 2 + 1]), level)) {
-                            const float x0 = sub_x0 - footprint.means2d[g * 2];
-                            const float y0 = sub_y0 - footprint.means2d[g * 2 + 1];
-                            keep = ellipse_overlaps_rect(qa, qb, qc, level, x0, x0 + kSplatBwdSub,
-                                                         y0, y0 + kSplatBwdSub);
-                        }
+                    if (footprint.tile_keys != nullptr) {
+                        keep = (static_cast<uint64_t>(footprint.tile_keys[gi]) >> sub_bit) & 1u;
+                    } else {
+                        keep = !cull || footprint_overlaps_square(
+                                            footprint.means2d, footprint.conics, footprint.radii,
+                                            flatten_ids[gi], sub_x0, sub_y0, kSplatBwdSub);
                     }
                 }
                 const uint32_t ballot = __ballot_sync(0xffffffffu, keep);

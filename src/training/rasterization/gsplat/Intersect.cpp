@@ -656,6 +656,9 @@ namespace gsplat_lfs {
             result.isect_ids = keys_out;
             result.flatten_ids = vals_out;
             result.n_sort = static_cast<int32_t>(sort_n);
+            // Mirrors the intersect kernel's choice of what the low key bits hold.
+            result.sub_tile_masks = depth_order != nullptr && conics != nullptr &&
+                                    tile_keys_fit_sub_masks(tile_size);
         };
 
         auto launch_offsets = [&]() {
