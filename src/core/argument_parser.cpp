@@ -1562,9 +1562,9 @@ namespace {
             auto apply_cmd_overrides = [&params,
                                         // Capture values, not references
                                         iterations_val = cli_option_present({"-i", "--iter"}) ? std::optional<uint32_t>(::args::get(iterations)) : std::optional<uint32_t>(),
-                                        resize_factor_val = resize_factor ? std::optional<int>(::args::get(resize_factor)) : std::optional<int>(1), // default 1
+                                        resize_factor_val = resize_factor ? std::optional<int>(::args::get(resize_factor)) : std::optional<int>(),
                                         resize_factor_explicit = static_cast<bool>(resize_factor),
-                                        max_width_val = max_width ? std::optional<int>(::args::get(max_width)) : std::optional<int>(3840),
+                                        max_width_val = max_width ? std::optional<int>(::args::get(max_width)) : std::optional<int>(),
                                         max_width_explicit = static_cast<bool>(max_width),
                                         min_track_length_val = cli_option_present({"--min-track-length"}) ? std::optional<int>(::args::get(min_track_length)) : std::optional<int>(),
                                         no_cpu_cache_flag = static_cast<bool>(no_cpu_cache),
@@ -1737,9 +1737,16 @@ namespace {
                                              color_variance_warmup_iters_val.has_value() ||
                                              (eval_steps_val && !eval_steps_val->empty());
                 note_opt("iterations", iterations_val.has_value());
-                setVal(resize_factor_val, ds.resize_factor);
+                // Without the flag a --config dataset value stands; otherwise the CLI defaults apply.
+                if (resize_factor_val)
+                    ds.resize_factor = *resize_factor_val;
+                else if (!params.overrides.has_dataset_key("resize_factor"))
+                    ds.resize_factor = 1;
                 note_ds("resize_factor", resize_factor_explicit);
-                setVal(max_width_val, ds.max_width);
+                if (max_width_val)
+                    ds.max_width = *max_width_val;
+                else if (!params.overrides.has_dataset_key("max_width"))
+                    ds.max_width = 3840;
                 note_ds("max_width", max_width_explicit);
                 setVal(min_track_length_val, ds.min_track_length);
                 note_ds("min_track_length", min_track_length_val.has_value());
@@ -2126,6 +2133,19 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[]) {
     }
 
     params->dataset.loading_params = lfs::core::param::LoadingParams{};
+
+    // The config's dataset section sits under the command line. Paths only come
+    // from --data-path and --output-path.
+    if (!params->overrides.dataset_json.empty()) {
+        auto config_dataset = nlohmann::json::parse(params->overrides.dataset_json, nullptr, false);
+        if (config_dataset.is_object()) {
+            for (const char* key : {"data_path", "output_folder", "output_path"})
+                config_dataset.erase(key);
+            lfs::core::param::ExplicitTrainingOverrides dataset_only;
+            dataset_only.dataset_json = config_dataset.dump();
+            lfs::core::param::apply_explicit_training_overrides(*params, dataset_only);
+        }
+    }
 
     const auto flag_given = [&args](const std::string_view flag) {
         return std::ranges::any_of(args, [flag](const std::string& arg) {

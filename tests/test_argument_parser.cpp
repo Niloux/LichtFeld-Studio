@@ -998,6 +998,94 @@ TEST(ArgumentParserTest, CommandLineOverridesConfigAfterLoading) {
     EXPECT_FLOAT_EQ((*parsed)->optimization.opacity_lr, 0.0375f);
 }
 
+namespace {
+
+    // Writes a saved-training-config style file whose dataset section sets the
+    // image size and leaves the paths empty, as a reusable config does.
+    std::filesystem::path write_dataset_config(const std::filesystem::path& dir) {
+        const auto config_path = dir / "config.json";
+        const auto config = nlohmann::json{
+            {"optimization", lfs::core::param::OptimizationParameters::mrnf_defaults().to_json()},
+            {"dataset",
+             {{"data_path", ""},
+              {"output_folder", ""},
+              {"resize_factor", 2},
+              {"max_width", 2000},
+              {"test_every", 4}}},
+        };
+        std::ofstream(config_path) << config.dump(2);
+        return config_path;
+    }
+
+} // namespace
+
+TEST(ArgumentParserTest, ConfigDatasetSectionAppliesWithoutCliFlags) {
+    const auto dir = std::filesystem::path(make_test_path("lfs_arg_parser_config_dataset"));
+    const auto data_path = dir / "data";
+    const auto output_path = dir / "output";
+    std::filesystem::create_directories(data_path);
+    const auto config_path = write_dataset_config(dir);
+
+    const auto data_str = data_path.string();
+    const auto output_str = output_path.string();
+    const auto config_str = config_path.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_str.c_str(),
+        "--output-path",
+        output_str.c_str(),
+        "--config",
+        config_str.c_str()};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    EXPECT_EQ((*parsed)->dataset.resize_factor, 2);
+    EXPECT_EQ((*parsed)->dataset.max_width, 2000);
+    EXPECT_EQ((*parsed)->dataset.test_every, 4);
+    // Empty config paths do not clear the command-line paths.
+    EXPECT_EQ((*parsed)->dataset.data_path.filename(), "data");
+    EXPECT_EQ((*parsed)->dataset.output_path, output_path);
+}
+
+TEST(ArgumentParserTest, CliResizeFlagsOverrideConfigDatasetSection) {
+    const auto dir = std::filesystem::path(make_test_path("lfs_arg_parser_config_dataset_cli"));
+    const auto data_path = dir / "data";
+    const auto output_path = dir / "output";
+    std::filesystem::create_directories(data_path);
+    const auto config_path = write_dataset_config(dir);
+
+    const auto data_str = data_path.string();
+    const auto output_str = output_path.string();
+    const auto config_str = config_path.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_str.c_str(),
+        "--output-path",
+        output_str.c_str(),
+        "--config",
+        config_str.c_str(),
+        "-r",
+        "4",
+        "--max-width",
+        "1600"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    EXPECT_EQ((*parsed)->dataset.resize_factor, 4);
+    EXPECT_EQ((*parsed)->dataset.max_width, 1600);
+    EXPECT_EQ((*parsed)->dataset.test_every, 4);
+}
+
 TEST(ArgumentParserTest, ConfigRejectsWrongDatasetJsonTypeBeforeApplyingOverrides) {
     const auto dir = std::filesystem::path(make_test_path("lfs_arg_parser_config_wrong_dataset_type"));
     const auto config_path = dir / "config.json";
