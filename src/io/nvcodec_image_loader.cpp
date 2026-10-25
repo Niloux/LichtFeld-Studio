@@ -1115,13 +1115,27 @@ namespace lfs::io {
     namespace {
         constexpr size_t DECODER_POOL_SIZE = 8;
         constexpr int LANCZOS_KERNEL_SIZE = 2;
+        // nvImageCodec's 0 means one thread per CPU core in every decoder's own
+        // pool, and each thread that decodes keeps device scratch sized to the
+        // largest image it saw (~72 MB for a 16-bit 4000x3000 prior). On a 3M
+        // RTX 4090 run, 0 held ~3 GB across ~42 threads; 2 cost no step time.
+        // Two rather than one keeps the CPU Huffman stage of a batch parallel.
+        constexpr int DEFAULT_MAX_CPU_THREADS = 2;
+
+        [[nodiscard]] int resolve_max_cpu_threads(const int requested) {
+            if (requested > 0)
+                return requested;
+            if (const auto env = lfs::core::environment::unsigned_integer<unsigned>("LFS_NVCODEC_CPU_THREADS"))
+                return static_cast<int>(*env); // 0 restores nvImageCodec's one-per-core default
+            return DEFAULT_MAX_CPU_THREADS;
+        }
     } // namespace
 
     NvCodecImageLoader::NvCodecImageLoader(const Options& options)
         : impl_(std::make_unique<Impl>()) {
 
         impl_->device_id = options.device_id;
-        impl_->max_num_cpu_threads = options.max_num_cpu_threads;
+        impl_->max_num_cpu_threads = resolve_max_cpu_threads(options.max_num_cpu_threads);
         impl_->fallback_enabled = options.enable_fallback;
         impl_->sentinel_test_skipped_member = options.sentinel_validation_test_seam.skipped_member;
         impl_->sentinel_test_skip_cuda_retry = options.sentinel_validation_test_seam.skip_cuda_retry;
@@ -1175,7 +1189,7 @@ namespace lfs::io {
             nullptr,
             impl_->decode_pool ? &impl_->device_allocator : nullptr,
             &impl_->pinned_allocator,
-            options.max_num_cpu_threads,
+            impl_->max_num_cpu_threads,
             nullptr,
             options.device_id,
             options.create_eagerly ? 1 : 0,

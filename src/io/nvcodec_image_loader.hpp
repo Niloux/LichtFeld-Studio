@@ -53,7 +53,7 @@ namespace lfs::io {
             };
 
             int device_id = 0;
-            int max_num_cpu_threads = 0;
+            int max_num_cpu_threads = 0; // 0 = small default (LFS_NVCODEC_CPU_THREADS overrides)
             bool enable_fallback = true;
             size_t decoder_pool_size = 8;
             // Create every codec handle in the constructor instead of on the first decode and encode.
