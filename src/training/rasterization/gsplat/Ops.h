@@ -56,6 +56,7 @@ namespace gsplat_lfs {
         int32_t* flatten_ids;     // [n_sort] sorted ids (sentinel-padded)
         int64_t n_isects;         // Exact count, including an over-budget count-only result
         int32_t n_sort;           // Sorted key count (high-water capacity)
+        bool sub_tile_masks;      // Keys hold sub-tile masks in place of depths
     };
 
     // An over-budget result has n_isects > 0 and n_sort == 0: subdivide whole
@@ -213,7 +214,8 @@ namespace gsplat_lfs {
         float* alphas,     // [C, image_height, image_width, 1]
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {});
+        const FreeSpaceRender& free_space = {},
+        const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
 
     //=========================================================================
     // Rasterization - Backward
@@ -293,6 +295,7 @@ namespace gsplat_lfs {
         int32_t* flatten_ids; // [n_sort]
         int64_t n_isects;
         int32_t n_sort = 0;
+        bool sub_tile_masks = false;    // isect_ids hold sub-tile masks in place of depths
         std::vector<TileBatch> batches; // Empty on the ordinary single-batch path
     };
 
@@ -409,6 +412,7 @@ namespace gsplat_lfs {
         const std::vector<TileBatch>& batches = {}, int32_t* tiles_per_gauss = nullptr,
         const float* reference_viewmats = nullptr, // as in the forward
         const FreeSpaceRender& free_space = {},
-        const float* conics = nullptr); // [C, N, 3] the forward's, so tile batches re-cull alike
+        const float* conics = nullptr,      // [C, N, 3] the forward's, so tile batches re-cull alike
+        const int64_t* tile_keys = nullptr); // the forward's keys when they hold sub-tile masks
 
 } // namespace gsplat_lfs

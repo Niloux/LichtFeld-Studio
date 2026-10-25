@@ -105,11 +105,60 @@ namespace gsplat_lfs {
             }
         };
 
+        // Pairs emitted in depth order are sorted on camera and tile only, so their
+        // low key bits are free for the sub-tiles the ellipse reaches. Both passes then
+        // find a row's tiles from the sub-tiles each 8-pixel band of the ellipse spans,
+        // and a tile gets a pair when its mask is not empty.
+        const bool sub_masks = order != nullptr && conics != nullptr && tile_keys_fit_sub_masks(tile_size);
+        const uint32_t subs = tile_size / kCullSubTile;
+        constexpr uint32_t kMaxSubs = 5; // tile_keys_fit_sub_masks caps subs * subs at 32
+        auto for_each_masked_tile = [&](const uint32_t row, const uint32_t x_begin, const uint32_t x_end,
+                                        auto&& visit) {
+            // Inclusive sub-tile column span of each band of the row; lo > hi is empty.
+            int32_t lo[kMaxSubs], hi[kMaxSubs];
+            for (uint32_t sy = 0; sy < subs; ++sy) {
+                lo[sy] = static_cast<int32_t>(x_begin * subs);
+                hi[sy] = static_cast<int32_t>(x_end * subs) - 1;
+                if (!cull) {
+                    continue;
+                }
+                const float y0 = static_cast<float>(row * tile_size + sy * kCullSubTile) - mean2d.y;
+                float x_lo, x_hi;
+                if (!ellipse_band_span(qa, qb, qc, level, y0, y0 + static_cast<float>(kCullSubTile), x_lo, x_hi)) {
+                    hi[sy] = lo[sy] - 1;
+                    continue;
+                }
+                const float inv_sub = 1.0f / static_cast<float>(kCullSubTile);
+                // Clamp in float: off-screen spans may exceed the int range.
+                lo[sy] = static_cast<int32_t>(fmaxf(floorf((mean2d.x + x_lo) * inv_sub), static_cast<float>(lo[sy])));
+                hi[sy] = static_cast<int32_t>(fminf(floorf((mean2d.x + x_hi) * inv_sub), static_cast<float>(hi[sy])));
+            }
+            for (uint32_t j = x_begin; j < x_end; ++j) {
+                const int32_t first = static_cast<int32_t>(j * subs);
+                const int32_t last = first + static_cast<int32_t>(subs) - 1;
+                uint32_t mask = 0;
+                for (uint32_t sy = 0; sy < subs; ++sy) {
+                    const int32_t a = max(lo[sy], first);
+                    const int32_t b = min(hi[sy], last);
+                    if (a <= b) {
+                        mask |= ((1u << (b - a + 1)) - 1u) << (sy * subs + (a - first));
+                    }
+                }
+                if (mask != 0 && !visit(j, mask)) {
+                    return;
+                }
+            }
+        };
+
         if (first_pass && cull) {
             int32_t count = 0;
             for (uint32_t i = tile_min.y; i < tile_max.y; ++i) {
                 uint32_t x_begin, x_end;
                 row_span(i, x_begin, x_end);
+                if (sub_masks) {
+                    for_each_masked_tile(i, x_begin, x_end, [&](uint32_t, uint32_t) { ++count; return true; });
+                    continue;
+                }
                 for (uint32_t j = x_begin; j < x_end; ++j) {
                     count += tile_hit(j, i) ? 1 : 0;
                 }
@@ -155,6 +204,24 @@ namespace gsplat_lfs {
         for (uint32_t i = tile_min.y; i < tile_max.y; ++i) {
             uint32_t x_begin, x_end;
             row_span(i, x_begin, x_end);
+            if (sub_masks) {
+                bool full = false;
+                for_each_masked_tile(i, x_begin, x_end, [&](const uint32_t j, const uint32_t mask) {
+                    if (max_isects >= 0 && cur_idx >= max_isects) {
+                        full = true;
+                        return false;
+                    }
+                    const int64_t tile_id = i * tile_width + j;
+                    isect_ids[cur_idx] = cid_enc | (tile_id << 32) | static_cast<int64_t>(mask);
+                    flatten_ids[cur_idx] = static_cast<int32_t>(idx);
+                    ++cur_idx;
+                    return true;
+                });
+                if (full) {
+                    return;
+                }
+                continue;
+            }
             for (uint32_t j = x_begin; j < x_end; ++j) {
                 if (!tile_hit(j, i)) {
                     continue;

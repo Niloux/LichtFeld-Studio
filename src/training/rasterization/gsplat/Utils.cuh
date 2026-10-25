@@ -266,4 +266,44 @@ namespace gsplat_lfs {
         return true;
     }
 
+    // The x-interval [lo, hi] that q(d) <= level covers within the band y in [y0, y1]
+    // (offsets from the ellipse centre), or false when the band misses the ellipse.
+    // The extreme x of a band lies where the band meets the ellipse's x-extreme points.
+    __device__ __forceinline__ bool ellipse_band_span(
+        const float a, const float b, const float c, const float level,
+        const float y0, const float y1, float& lo, float& hi) {
+        const float det = a * c - b * b;
+        const float y_extent = sqrtf(a * level / det);
+        if (y1 < -y_extent || y0 > y_extent) {
+            return false;
+        }
+        const float y_right = -b * sqrtf(c * level / det) / c;
+        const float v_hi = fminf(fmaxf(y_right, y0), y1);
+        const float v_lo = fminf(fmaxf(-y_right, y0), y1);
+        const float inv_a = 1.0f / a;
+        hi = inv_a * (-b * v_hi + sqrtf(fmaxf(a * level - det * v_hi * v_hi, 0.f)));
+        lo = inv_a * (-b * v_lo - sqrtf(fmaxf(a * level - det * v_lo * v_lo, 0.f)));
+        return true;
+    }
+
+    // Whether projected element g's footprint ellipse may touch the square of side
+    // `size` at pixel (x0, y0). Forward and backward cull sub-tiles with this one test
+    // so they drop the same splats.
+    __device__ __forceinline__ bool footprint_overlaps_square(
+        const float* __restrict__ means2d, const float* __restrict__ conics,
+        const int32_t* __restrict__ radii, const int32_t g,
+        const float x0, const float y0, const float size) {
+        const float qa = conics[g * 3];
+        const float qb = conics[g * 3 + 1];
+        const float qc = conics[g * 3 + 2];
+        float level;
+        if (!footprint_level(qa, qb, qc, static_cast<float>(radii[g * 2]),
+                             static_cast<float>(radii[g * 2 + 1]), level)) {
+            return true;
+        }
+        const float dx = x0 - means2d[g * 2];
+        const float dy = y0 - means2d[g * 2 + 1];
+        return ellipse_overlaps_rect(qa, qb, qc, level, dx, dx + size, dy, dy + size);
+    }
+
 } // namespace gsplat_lfs

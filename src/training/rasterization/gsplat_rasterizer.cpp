@@ -680,6 +680,7 @@ namespace lfs::training {
 
             // Borrowed TLS VMM pointers (valid through backward; do not free)
             ctx.isect_ids_ptr = result.isect_ids;
+            ctx.sub_tile_masks = result.sub_tile_masks;
             ctx.flatten_ids_ptr = result.flatten_ids;
             ctx.n_isects = result.n_isects;
             ctx.batches = std::move(result.batches);
@@ -1013,7 +1014,7 @@ namespace lfs::training {
                 edge_weight_map_ptr,
                 edge_score_out_ptr,
                 stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr, free_space,
-                ctx.conics_ptr);
+                ctx.conics_ptr, ctx.sub_tile_masks ? ctx.isect_ids_ptr : nullptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
 
