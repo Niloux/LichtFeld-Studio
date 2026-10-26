@@ -223,7 +223,8 @@ namespace {
 
 TEST(EvalMetricsCsv, HeaderAppendsGeometryColumnsWithoutRenamingExisting) {
     EXPECT_EQ(EvalMetrics::to_csv_header(),
-              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip");
+              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip,"
+              "depth_prior_err_median_mm,depth_prior_err_p90_mm,depth_prior_low_alpha");
 
     EvalMetrics missing;
     missing.iteration = 200;
@@ -231,7 +232,7 @@ TEST(EvalMetricsCsv, HeaderAppendsGeometryColumnsWithoutRenamingExisting) {
     missing.ssim = 0.5f;
     missing.elapsed_time = 0.01f;
     missing.num_gaussians = 10;
-    EXPECT_EQ(missing.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,,,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,");
+    EXPECT_EQ(missing.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,,,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,,,,");
 
     EvalMetrics present = missing;
     present.normal_angle_deg = 12.5f;
@@ -240,7 +241,10 @@ TEST(EvalMetricsCsv, HeaderAppendsGeometryColumnsWithoutRenamingExisting) {
     present.bias_g = -0.002f;
     present.bias_b = 0.003f;
     present.flip = 0.125f;
-    EXPECT_EQ(present.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,12.500000,0.250000,0.001000,-0.002000,0.003000,0.000000,0.000000,0.000000,0.125000");
+    present.depth_prior_err_median_mm = 12.5f;
+    present.depth_prior_err_p90_mm = 60.0f;
+    present.depth_prior_low_alpha = 0.25f;
+    EXPECT_EQ(present.to_csv_row(), "200,1.000000,0.500000,,0.010000,10,12.500000,0.250000,0.001000,-0.002000,0.003000,0.000000,0.000000,0.000000,0.125000,12.500000,60.000000,0.250000");
 }
 
 TEST(EvalMetricsEvent, ZeroLpipsRemainsPresent) {
@@ -392,9 +396,10 @@ TEST(GeomMetricHelpers, FlatRenderedDepthAbsRel) {
     constexpr int kH = 8;
     constexpr int kW = 8;
     const std::vector<float> depth(static_cast<size_t>(kH * kW), 4.0f);
+    const std::vector<float> alpha(static_cast<size_t>(kH * kW), 1.0f);
     const std::vector<lfs::training::DepthAbsRelSample> samples{{3.5f, 4.5f, 5.0f}};
 
-    const auto absrel = median_depth_absrel(cpu_hw(depth, kH, kW), samples);
+    const auto absrel = median_depth_absrel(cpu_hw(depth, kH, kW), cpu_hw(alpha, kH, kW), samples);
     ASSERT_TRUE(absrel.has_value());
     EXPECT_NEAR(*absrel, 0.2f, 1.0e-5f);
 }
@@ -406,11 +411,63 @@ TEST(GeomMetricHelpers, SampleNextToEmptyDepthIsSkipped) {
     std::vector<float> depth(static_cast<size_t>(kH * kW), 2.0f);
     for (int y = 0; y < kH; ++y)
         depth[static_cast<size_t>(y) * kW + 4] = 0.0f;
+    const std::vector<float> alpha(static_cast<size_t>(kH * kW), 1.0f);
     const std::vector<lfs::training::DepthAbsRelSample> samples{{4.0f, 4.5f, 2.0f}, {1.5f, 4.5f, 2.0f}};
 
-    const auto absrel = median_depth_absrel(cpu_hw(depth, kH, kW), samples);
+    const auto absrel = median_depth_absrel(cpu_hw(depth, kH, kW), cpu_hw(alpha, kH, kW), samples);
     ASSERT_TRUE(absrel.has_value());
     EXPECT_NEAR(*absrel, 0.0f, 1.0e-6f);
+}
+
+// Catches the accumulated sum(w * d) being scored as depth: at alpha 0.5 it reads half the true depth.
+TEST(GeomMetricHelpers, AbsRelDividesAccumulatedDepthByAlpha) {
+    constexpr int kH = 8;
+    constexpr int kW = 8;
+    const std::vector<float> accumulated(static_cast<size_t>(kH * kW), 2.5f);
+    const std::vector<float> alpha(static_cast<size_t>(kH * kW), 0.5f);
+    const std::vector<lfs::training::DepthAbsRelSample> samples{{3.5f, 4.5f, 5.0f}};
+
+    const auto absrel = median_depth_absrel(cpu_hw(accumulated, kH, kW), cpu_hw(alpha, kH, kW), samples);
+    ASSERT_TRUE(absrel.has_value());
+    EXPECT_NEAR(*absrel, 0.0f, 1.0e-5f);
+}
+
+// Catches unnormalized depth, prior holes counted as error, too-transparent pixels scored, or those
+// pixels left out of the low-alpha share.
+TEST(GeomMetricHelpers, DepthPriorErrorScoresExpectedDepthOnPriorPixels) {
+    constexpr int kH = 4;
+    constexpr int kW = 5;
+    std::vector<float> prior(static_cast<size_t>(kH * kW), 2.0f);
+    std::vector<float> alpha(static_cast<size_t>(kH * kW), 1.0f);
+    std::vector<float> accumulated(static_cast<size_t>(kH * kW), 2.0f);
+    // Row 0: prior holes, whatever is rendered there.
+    for (int x = 0; x < kW; ++x) {
+        prior[static_cast<size_t>(x)] = 0.0f;
+        accumulated[static_cast<size_t>(x)] = 9.0f;
+    }
+    // Row 1: translucent but scorable (alpha 0.8, expected depth 2.1 m -> 0.1 m error).
+    for (int x = 0; x < kW; ++x) {
+        alpha[static_cast<size_t>(kW + x)] = 0.8f;
+        accumulated[static_cast<size_t>(kW + x)] = 0.8f * 2.1f;
+    }
+    // One pixel too transparent to score, with a wild depth.
+    alpha[static_cast<size_t>(2 * kW)] = 0.2f;
+    accumulated[static_cast<size_t>(2 * kW)] = 0.2f * 50.0f;
+
+    const auto error = lfs::training::depth_prior_error(
+        cpu_hw(accumulated, kH, kW), cpu_hw(alpha, kH, kW), cpu_hw(prior, kH, kW));
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(error->prior_pixels, static_cast<size_t>(3 * kW));
+    // 14 scored pixels: 9 exact, 5 off by 0.1 m.
+    EXPECT_NEAR(error->median_m, 0.0f, 1.0e-5f);
+    EXPECT_NEAR(error->p90_m, 0.1f, 1.0e-4f);
+    EXPECT_NEAR(error->low_alpha_fraction, 6.0f / 15.0f, 1.0e-6f);
+}
+
+TEST(GeomMetricHelpers, DepthPriorErrorNeedsMatchingShapes) {
+    const std::vector<float> a(12, 1.0f);
+    const std::vector<float> b(16, 1.0f);
+    EXPECT_FALSE(lfs::training::depth_prior_error(cpu_hw(a, 3, 4), cpu_hw(a, 3, 4), cpu_hw(b, 4, 4)).has_value());
 }
 
 TEST(MetricsEvaluatorGeom, MatchingRenderedAndPriorNormalIsNearZero) {
@@ -449,7 +506,8 @@ TEST(MetricsEvaluatorGeom, MatchingRenderedAndPriorNormalIsNearZero) {
     ASSERT_TRUE(metrics.normal_angle_deg.has_value());
     EXPECT_NEAR(*metrics.normal_angle_deg, 0.0f, 2.0f);
     EXPECT_EQ(EvalMetrics::to_csv_header(),
-              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip");
+              "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip,"
+              "depth_prior_err_median_mm,depth_prior_err_p90_mm,depth_prior_low_alpha");
 
     std::filesystem::remove_all(tmp);
 }
@@ -486,7 +544,17 @@ TEST(MetricsEvaluator, FlipIsReportedAndSavedOnlyWhenEnabled) {
         EXPECT_EQ(metrics.views[0].flip.has_value(), enabled);
         EXPECT_EQ(metrics.flip.has_value(), enabled);
         EXPECT_EQ(std::filesystem::exists(flip_png), enabled);
-        EXPECT_EQ(metrics.to_csv_row().ends_with(","), !enabled);
+        const auto row = metrics.to_csv_row();
+        std::vector<std::string> columns;
+        for (size_t start = 0;;) {
+            const size_t comma = row.find(',', start);
+            columns.push_back(row.substr(start, comma - start));
+            if (comma == std::string::npos)
+                break;
+            start = comma + 1;
+        }
+        ASSERT_GT(columns.size(), 14u);
+        EXPECT_EQ(columns[14].empty(), !enabled); // flip
         if (!enabled)
             continue;
         EXPECT_GT(*metrics.views[0].flip, 0.0f);
