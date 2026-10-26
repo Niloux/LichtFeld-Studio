@@ -139,6 +139,11 @@ namespace lfs::training {
         bool cancelled = false;
         std::optional<float> normal_angle_deg;
         std::optional<float> depth_absrel;
+        // Rendered depth against a metric depth prior: per-image median and p90 absolute error (mm), and the
+        // share of prior pixels the model covers with alpha below kDepthPriorSolidAlpha, averaged over views.
+        std::optional<float> depth_prior_err_median_mm;
+        std::optional<float> depth_prior_err_p90_mm;
+        std::optional<float> depth_prior_low_alpha;
         float bias_r = 0.0f;
         float bias_g = 0.0f;
         float bias_b = 0.0f;
@@ -179,6 +184,14 @@ namespace lfs::training {
             if (depth_absrel && std::isfinite(*depth_absrel)) {
                 ss << ", depth_absrel: " << *depth_absrel;
             }
+            if (depth_prior_err_median_mm && std::isfinite(*depth_prior_err_median_mm)) {
+                ss << ", depth_prior_err_mm: " << *depth_prior_err_median_mm;
+                if (depth_prior_err_p90_mm && std::isfinite(*depth_prior_err_p90_mm))
+                    ss << " (p90 " << *depth_prior_err_p90_mm << ")";
+            }
+            if (depth_prior_low_alpha && std::isfinite(*depth_prior_low_alpha)) {
+                ss << ", depth_prior_low_alpha: " << *depth_prior_low_alpha;
+            }
             return ss.str();
         }
 
@@ -199,7 +212,8 @@ namespace lfs::training {
         }
 
         static std::string to_csv_header() {
-            return "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip";
+            return "iteration,psnr,ssim,lpips,time_per_image,num_gaussians,normal_angle_deg,depth_absrel,bias_r,bias_g,bias_b,bias_corr_r,bias_corr_g,bias_corr_b,flip,"
+                   "depth_prior_err_median_mm,depth_prior_err_p90_mm,depth_prior_low_alpha";
         }
 
         [[nodiscard]] std::string to_csv_row() const {
@@ -225,6 +239,12 @@ namespace lfs::training {
                << "," << bias_corr_r << "," << bias_corr_g << "," << bias_corr_b << ",";
             if (flip && std::isfinite(*flip)) {
                 ss << *flip;
+            }
+            for (const auto& value : {depth_prior_err_median_mm, depth_prior_err_p90_mm, depth_prior_low_alpha}) {
+                ss << ",";
+                if (value && std::isfinite(*value)) {
+                    ss << *value;
+                }
             }
             return ss.str();
         }
@@ -370,9 +390,32 @@ namespace lfs::training {
         float true_depth = 0.0f;
     };
 
+    // rendered_depth is the rasterizers' accumulated sum(w * d); it is divided by rendered_alpha
+    // before scoring, as the depth loss does.
     [[nodiscard]] std::optional<float> median_depth_absrel(
         const lfs::core::Tensor& rendered_depth,
+        const lfs::core::Tensor& rendered_alpha,
         const std::vector<DepthAbsRelSample>& samples);
+
+    // Pixels covered at or above this alpha count as solid surface.
+    inline constexpr float kDepthPriorSolidAlpha = 0.98f;
+    // Pixels below this alpha are too transparent for their expected depth to be scored.
+    inline constexpr float kDepthPriorMinAlpha = 0.5f;
+
+    struct DepthPriorError {
+        float median_m = 0.0f;
+        float p90_m = 0.0f;
+        // Share of valid prior pixels with alpha below kDepthPriorSolidAlpha.
+        float low_alpha_fraction = 0.0f;
+        size_t prior_pixels = 0;
+    };
+
+    // Per-pixel |sum(w * d) / alpha - prior| over pixels whose metric prior (metres, [H, W]) is positive.
+    // rendered_depth and rendered_alpha are [H, W] or [1, H, W] at the prior's resolution.
+    [[nodiscard]] std::optional<DepthPriorError> depth_prior_error(
+        const lfs::core::Tensor& rendered_depth,
+        const lfs::core::Tensor& rendered_alpha,
+        const lfs::core::Tensor& prior_depth_m);
 
     // Configured evaluation steps a run with this last iteration never reaches.
     [[nodiscard]] std::vector<size_t> unreachable_eval_steps(const std::vector<size_t>& eval_steps,
