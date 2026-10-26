@@ -651,6 +651,8 @@ namespace lfs::training {
             return trainer.compute_photometric_loss_with_mask(
                 image, target, mask, {}, {}, params, raw, structure);
         }
+        // The empty-mask check reads each view's normalization a step later; this waits for it.
+        static void flush_mask_check(Trainer& trainer) { trainer.flush_empty_ignore_mask_check(); }
     };
 } // namespace lfs::training
 
@@ -685,6 +687,7 @@ protected:
         return lfs::training::TrainerMaskSupervisionTestAccess::loss(
             *trainer, image, target, mask, params, raw, structure);
     }
+    void flush() { lfs::training::TrainerMaskSupervisionTestAccess::flush_mask_check(*trainer); }
 };
 
 TEST_P(TrainerMaskSupervisionTest, EmptyIgnoreMaskWarnsOnceAndKeepsZeroGradient) {
@@ -695,6 +698,7 @@ TEST_P(TrainerMaskSupervisionTest, EmptyIgnoreMaskWarnsOnceAndKeepsZeroGradient)
         EXPECT_EQ(result->loss.item<float>(), 0.0f);
         EXPECT_EQ(result->grad_corrected.abs().max().item<float>(), 0.0f);
     }
+    flush();
     ASSERT_EQ(warnings.size(), 1u);
     EXPECT_NE(warnings.front().find("threshold"), std::string::npos);
     EXPECT_NE(warnings.front().find("inversion"), std::string::npos);
@@ -703,6 +707,7 @@ TEST_P(TrainerMaskSupervisionTest, EmptyIgnoreMaskWarnsOnceAndKeepsZeroGradient)
 TEST_P(TrainerMaskSupervisionTest, EmptyIgnoreMaskWithStructureWeightWarns) {
     params.thin_structure_weight = 2.0f;
     ASSERT_TRUE(loss(Tensor::zeros({32, 32}, Device::CUDA), Tensor::ones({32, 32}, Device::CUDA)));
+    flush();
     EXPECT_EQ(warnings.size(), 1u);
 }
 
@@ -731,6 +736,7 @@ TEST_P(TrainerMaskSupervisionTest, UsableMasksKeepReferenceLossAndGradientWithou
         EXPECT_EQ(result->loss.item<float>(), reference_loss.item<float>());
         EXPECT_EQ(result->grad_corrected.cpu().to_vector(), reference_gradient.cpu().to_vector());
     }
+    flush();
     EXPECT_TRUE(warnings.empty());
 }
 
@@ -742,14 +748,17 @@ TEST_P(TrainerMaskSupervisionTest, OtherModesAndMissingMasksDoNotWarn) {
         params.mask_mode = mode;
         ASSERT_TRUE(loss(mask));
     }
+    flush();
     EXPECT_TRUE(warnings.empty());
 }
 
 TEST_P(TrainerMaskSupervisionTest, MixedEmptyAndUsableViewsRemainAccepted) {
     ASSERT_TRUE(loss(Tensor::zeros({32, 32}, Device::CUDA)));
+    flush();
     const auto result = loss(Tensor::ones({32, 32}, Device::CUDA));
     ASSERT_TRUE(result);
     EXPECT_GT(result->loss.item<float>(), 0.0f);
+    flush();
     EXPECT_EQ(warnings.size(), 1u);
 }
 
@@ -792,7 +801,10 @@ TEST_F(MaskLossTest, ForwardOnlyMaskedValueMatchesTheTrainingForward) {
             lfs::training::kernels::MaskedL1SSIMValueWorkspace value;
             lfs::training::kernels::masked_fused_l1_ssim_value(rendered, {}, *gt, region, 0.2f, value, denominator);
             EXPECT_EQ(value.loss.cpu().item<float>(), training_loss.cpu().item<float>());
-            EXPECT_EQ(value.mask_sum.cpu().item<float>(), context.mask_sum_value);
+            // Without a host denominator the normalization stays on the device.
+            EXPECT_EQ(context.mask_sum_value, denominator);
+            EXPECT_EQ(value.mask_sum.cpu().item<float>(),
+                      denominator > 0.0f ? denominator : context.mask_sum.cpu().item<float>());
 
             lfs::training::kernels::MaskedDecoupledFusedL1SSIMWorkspace decoupled;
             auto [decoupled_loss, decoupled_context] = lfs::training::kernels::masked_decoupled_fused_l1_ssim_forward(
@@ -806,4 +818,44 @@ TEST_F(MaskLossTest, ForwardOnlyMaskedValueMatchesTheTrainingForward) {
     lfs::training::kernels::masked_fused_l1_ssim_value(rendered, {}, target, Tensor::zeros({H, W}, Device::CUDA),
                                                        0.2f, empty);
     EXPECT_LT(empty.mask_sum.cpu().item<float>(), 1.0f);
+}
+
+// A structure-weighted loss normalized by its base weight on the device matches the host
+// denominator 3 * sum(base) in value and in every gradient, without a host readback.
+TEST_F(MaskLossTest, DeviceDenominatorWeightMatchesHostDenominator) {
+    using namespace lfs::training::kernels;
+    constexpr size_t C = 3, H = 48, W = 64;
+    const auto rendered = Tensor::rand({C, H, W}, Device::CUDA);
+    const auto raw = Tensor::rand({C, H, W}, Device::CUDA);
+    const auto target = Tensor::rand({C, H, W}, Device::CUDA);
+    const auto base = create_binary_mask(H, W, 0.4f);
+    const auto weight = (base * (Tensor::rand({H, W}, Device::CUDA) + 1.0f)).contiguous();
+    const float host_denominator = 3.0f * base.sum().item<float>() + SSIM_EPSILON;
+
+    MaskedFusedL1SSIMWorkspace host_ws, device_ws;
+    auto [host_loss, host_ctx] = masked_fused_l1_ssim_forward(rendered, target, weight, 0.2f, host_ws, host_denominator);
+    auto [device_loss, device_ctx] = masked_fused_l1_ssim_forward(rendered, target, weight, 0.2f, device_ws, 0.0f, base);
+    EXPECT_EQ(device_ctx.mask_sum_value, 0.0f);
+    EXPECT_NEAR(device_ctx.mask_sum.cpu().item<float>(), host_denominator, 1e-3f);
+    EXPECT_NEAR(device_loss.cpu().item<float>(), host_loss.cpu().item<float>(), 1e-6f);
+    const auto host_grad = masked_fused_l1_ssim_backward(host_ctx, host_ws).clone();
+    const auto device_grad = masked_fused_l1_ssim_backward(device_ctx, device_ws);
+    EXPECT_LT((device_grad - host_grad).abs().max().item<float>(), 1e-9f);
+
+    MaskedDecoupledFusedL1SSIMWorkspace host_dec_ws, device_dec_ws;
+    auto [host_dec_loss, host_dec_ctx] =
+        masked_decoupled_fused_l1_ssim_forward(rendered, raw, target, weight, 0.2f, host_dec_ws, host_denominator);
+    auto [device_dec_loss, device_dec_ctx] =
+        masked_decoupled_fused_l1_ssim_forward(rendered, raw, target, weight, 0.2f, device_dec_ws, 0.0f, base);
+    EXPECT_NEAR(device_dec_loss.cpu().item<float>(), host_dec_loss.cpu().item<float>(), 1e-6f);
+    auto host_dec_grad = masked_decoupled_fused_l1_ssim_backward(host_dec_ctx, host_dec_ws).grad_corrected.clone();
+    auto device_dec_grad = masked_decoupled_fused_l1_ssim_backward(device_dec_ctx, device_dec_ws).grad_corrected.clone();
+    accumulate_decoupled_raw_gradient(decoupled_raw_gradient(host_dec_ctx), host_dec_grad);
+    accumulate_decoupled_raw_gradient(decoupled_raw_gradient(device_dec_ctx), device_dec_grad);
+    EXPECT_LT((device_dec_grad - host_dec_grad).abs().max().item<float>(), 1e-9f);
+
+    MaskedL1SSIMValueWorkspace host_value, device_value;
+    masked_fused_l1_ssim_value(rendered, raw, target, weight, 0.2f, host_value, host_denominator);
+    masked_fused_l1_ssim_value(rendered, raw, target, weight, 0.2f, device_value, 0.0f, base);
+    EXPECT_NEAR(device_value.loss.cpu().item<float>(), host_value.loss.cpu().item<float>(), 1e-6f);
 }

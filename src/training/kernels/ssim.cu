@@ -1452,7 +1452,8 @@ namespace {
     template <typename TargetT, typename MaskT, bool HasSigmaPartials = true, bool Accumulate = false, bool ScaledMeanPartial = false>
     __global__ void maskedFusedL1SSIMBackwardCUDA(
         float ssim_weight,
-        float inv_mask_sum, // 1.0 / mask_sum for normalization
+        float inv_mask_sum,                 // 1.0 / mask_sum for normalization
+        const float* __restrict__ mask_sum, // when set, the device normalization replaces inv_mask_sum
         int H,
         int W,
         int CH,
@@ -1466,6 +1467,9 @@ namespace {
         const __half* __restrict__ dm_dsigma1_sq,
         const __half* __restrict__ dm_dsigma12) {
 
+        if (mask_sum != nullptr) {
+            inv_mask_sum = 1.0f / *mask_sum;
+        }
         auto block = cg::this_thread_block();
         const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
         const int pix_x = block.group_index().x * BLOCK_X + block.thread_index().x;
@@ -2020,6 +2024,29 @@ namespace lfs::training::kernels {
             validate_derivative(ctx.dm_dmu1, "SSIM dmu derivative");
             validate_derivative(ctx.dm_dsigma1_sq, "SSIM variance derivative");
             validate_derivative(ctx.dm_dsigma12, "SSIM covariance derivative");
+        }
+
+        // A masked loss normalizes by the host value when the forward was given one, else by
+        // the scalar its reduction left on the device, so the step never reads it back.
+        std::pair<float, const float*> loss_normalization(const float host_value, const lfs::core::Tensor& device_value) {
+            if (host_value > 0.0f) {
+                LFS_ASSERT_MSG(std::isfinite(host_value), "Masked loss normalization must be finite");
+                return {1.0f / host_value, nullptr};
+            }
+            LFS_ASSERT_MSG(device_value.is_valid() && device_value.device() == lfs::core::Device::CUDA &&
+                               device_value.dtype() == lfs::core::DataType::Float32 && device_value.numel() == 1,
+                           "Masked loss needs a host or a device normalization");
+            return {0.0f, device_value.ptr<float>()};
+        }
+
+        // Float [H, W] weights whose sum, times the channels, normalizes the loss in place of the mask's.
+        const float* denominator_weight_ptr(const lfs::core::Tensor& weight, const int H, const int W) {
+            if (!weight.is_valid())
+                return nullptr;
+            LFS_ASSERT_MSG(weight.device() == lfs::core::Device::CUDA && weight.dtype() == lfs::core::DataType::Float32 &&
+                               weight.is_contiguous() && weight.numel() == static_cast<size_t>(H) * W,
+                           "Loss denominator weight must be a contiguous Float32 CUDA [H, W] tensor");
+            return weight.ptr<float>();
         }
     } // namespace
 
@@ -2744,6 +2771,7 @@ namespace lfs::training::kernels {
             .raw_dm_dsigma1_sq = ctx.raw_dm_dsigma1_sq,
             .raw_dm_dsigma12 = ctx.raw_dm_dsigma12,
             .mask_sum_value = ctx.mask_sum_value,
+            .mask_sum = ctx.mask_sum,
             .H = ctx.H,
             .W = ctx.W};
     }
@@ -2762,17 +2790,15 @@ namespace lfs::training::kernels {
         const dim3 block(BLOCK_X, BLOCK_Y);
 
         if (raw.mask.is_valid()) {
-            LFS_ASSERT_MSG(std::isfinite(raw.mask_sum_value) && raw.mask_sum_value > 0.0f,
-                           "Masked loss normalization must be positive and finite");
+            const auto [inv_mask_sum, mask_sum_device] = loss_normalization(raw.mask_sum_value, raw.mask_sum);
             const auto mask = prepare_loss_mask(raw.mask, raw.raw_img);
-            const float inv_mask_sum = 1.0f / raw.mask_sum_value;
             dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
                 using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
                 dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
                     using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
                     maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/true, /*Accumulate=*/true, /*ScaledMeanPartial=*/true>
                         <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                            1.0f, inv_mask_sum, raw.H, raw.W, static_cast<int>(C), C1, C2,
+                            1.0f, inv_mask_sum, mask_sum_device, raw.H, raw.W, static_cast<int>(C), C1, C2,
                             raw.raw_img.ptr<float>(), gt_ptr, mask_ptr,
                             grad_image.ptr<float>(),
                             raw.raw_dm_dmu1.ptr<__half>(),
@@ -2817,7 +2843,8 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& img2_input,
         const lfs::core::Tensor& mask_input,
         float ssim_weight,
-        MaskedFusedL1SSIMWorkspace& workspace, float denominator) {
+        MaskedFusedL1SSIMWorkspace& workspace, float denominator,
+        const lfs::core::Tensor& denominator_weight) {
         LFS_ASSERT(std::isfinite(denominator) && denominator >= 0.0f);
 
         constexpr float C1 = 0.01f * 0.01f;
@@ -2864,12 +2891,11 @@ namespace lfs::training::kernels {
                     workspace.masked_loss.ptr<float>(),
                     workspace.mask_sum.ptr<float>(),
                     N, C, H, W,
-                    stream, denominator);
+                    stream, denominator, denominator_weight_ptr(denominator_weight, H, W));
             });
         });
 
         auto loss_scalar = workspace.masked_loss;
-        const float mask_sum = denominator > 0.0f ? denominator : workspace.mask_sum.item<float>();
 
         MaskedFusedL1SSIMContext ctx{
             .img1 = img1,
@@ -2879,7 +2905,8 @@ namespace lfs::training::kernels {
             .dm_dsigma1_sq = workspace.dm_dsigma1_sq,
             .dm_dsigma12 = workspace.dm_dsigma12,
             .ssim_weight = ssim_weight,
-            .mask_sum_value = mask_sum,
+            .mask_sum_value = denominator,
+            .mask_sum = workspace.mask_sum,
             .H = H,
             .W = W};
 
@@ -2893,7 +2920,8 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& mask_input,
         float ssim_weight,
         MaskedL1SSIMValueWorkspace& workspace,
-        const float denominator) {
+        const float denominator,
+        const lfs::core::Tensor& denominator_weight) {
         LFS_ASSERT(std::isfinite(denominator) && denominator >= 0.0f);
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
@@ -2960,7 +2988,7 @@ namespace lfs::training::kernels {
                     workspace.loss.ptr<float>(),
                     workspace.mask_sum.ptr<float>(),
                     N, C, H, W,
-                    stream, denominator);
+                    stream, denominator, denominator_weight_ptr(denominator_weight, H, W));
             });
         });
         // A fixed denominator skips the mask sum; it is the normalization then.
@@ -2974,8 +3002,7 @@ namespace lfs::training::kernels {
 
         validate_loss_context_images(ctx.img1, ctx.img2, ctx.H, ctx.W);
         validate_loss_weight(ctx.ssim_weight);
-        LFS_ASSERT_MSG(std::isfinite(ctx.mask_sum_value) && ctx.mask_sum_value > 0.0f,
-                       "Masked loss normalization must be positive and finite");
+        const auto [inv_mask_sum, mask_sum_device] = loss_normalization(ctx.mask_sum_value, ctx.mask_sum);
         const auto mask = prepare_loss_mask(ctx.mask, ctx.img1);
         workspace.ensure_size(ctx.img1.shape().dims());
 
@@ -2984,7 +3011,6 @@ namespace lfs::training::kernels {
 
         const size_t N = ctx.img1.shape()[0];
         const size_t C = ctx.img1.shape()[1];
-        const float inv_mask_sum = 1.0f / ctx.mask_sum_value;
 
         const dim3 grid((ctx.W + BLOCK_X - 1) / BLOCK_X, (ctx.H + BLOCK_Y - 1) / BLOCK_Y, N);
         const dim3 block(BLOCK_X, BLOCK_Y);
@@ -2995,7 +3021,7 @@ namespace lfs::training::kernels {
                 using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
                 maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/true>
                     <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                        ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
+                        ctx.ssim_weight, inv_mask_sum, mask_sum_device, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                         ctx.img1.ptr<float>(), img2_ptr, mask_ptr,
                         workspace.grad_img.ptr<float>(),
                         ctx.dm_dmu1.ptr<__half>(), ctx.dm_dsigma1_sq.ptr<__half>(),
@@ -3013,7 +3039,8 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& gt_input,
         const lfs::core::Tensor& mask_input,
         float ssim_weight,
-        MaskedDecoupledFusedL1SSIMWorkspace& workspace, float denominator) {
+        MaskedDecoupledFusedL1SSIMWorkspace& workspace, float denominator,
+        const lfs::core::Tensor& denominator_weight) {
         LFS_ASSERT(std::isfinite(denominator) && denominator >= 0.0f);
 
         constexpr float C1 = 0.01f * 0.01f;
@@ -3066,12 +3093,11 @@ namespace lfs::training::kernels {
                     workspace.masked_loss.ptr<float>(),
                     workspace.mask_sum.ptr<float>(),
                     N, C, H, W,
-                    stream, denominator);
+                    stream, denominator, denominator_weight_ptr(denominator_weight, H, W));
             });
         });
 
         auto loss_scalar = workspace.masked_loss;
-        const float mask_sum = denominator > 0.0f ? denominator : workspace.mask_sum.item<float>();
 
         MaskedDecoupledFusedL1SSIMContext ctx{
             .corrected_img = corrected,
@@ -3083,7 +3109,8 @@ namespace lfs::training::kernels {
             .raw_dm_dsigma1_sq = workspace.raw_dm_dsigma1_sq,
             .raw_dm_dsigma12 = workspace.raw_dm_dsigma12,
             .ssim_weight = ssim_weight,
-            .mask_sum_value = mask_sum,
+            .mask_sum_value = denominator,
+            .mask_sum = workspace.mask_sum,
             .H = H,
             .W = W};
 
@@ -3097,8 +3124,7 @@ namespace lfs::training::kernels {
         validate_loss_context_images(ctx.corrected_img, ctx.gt_img, ctx.H, ctx.W);
         validate_loss_context_images(ctx.raw_img, ctx.gt_img, ctx.H, ctx.W);
         validate_loss_weight(ctx.ssim_weight);
-        LFS_ASSERT_MSG(std::isfinite(ctx.mask_sum_value) && ctx.mask_sum_value > 0.0f,
-                       "Masked loss normalization must be positive and finite");
+        const auto [inv_mask_sum, mask_sum_device] = loss_normalization(ctx.mask_sum_value, ctx.mask_sum);
         const auto mask = prepare_loss_mask(ctx.mask, ctx.corrected_img);
         workspace.ensure_size(ctx.corrected_img.shape().dims());
 
@@ -3107,7 +3133,6 @@ namespace lfs::training::kernels {
 
         const size_t N = ctx.corrected_img.shape()[0];
         const size_t C = ctx.corrected_img.shape()[1];
-        const float inv_mask_sum = 1.0f / ctx.mask_sum_value;
 
         const dim3 grid((ctx.W + BLOCK_X - 1) / BLOCK_X, (ctx.H + BLOCK_Y - 1) / BLOCK_Y, N);
         const dim3 block(BLOCK_X, BLOCK_Y);
@@ -3118,7 +3143,7 @@ namespace lfs::training::kernels {
                 using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
                 maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/false>
                     <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                        ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
+                        ctx.ssim_weight, inv_mask_sum, mask_sum_device, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                         ctx.corrected_img.ptr<float>(), gt_ptr, mask_ptr,
                         workspace.grad_corrected.ptr<float>(),
                         ctx.app_dm_dmu1.ptr<__half>(),

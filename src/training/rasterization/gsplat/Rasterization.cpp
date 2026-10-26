@@ -287,16 +287,8 @@ namespace gsplat_lfs {
             result.radii, result.means2d, result.depths, result.conics,
             result.compensations, stream);
 
-        // The first call retains the existing speculative warm-cache path.
-        auto intersect = [&](TileRange tiles) {
-            return intersect_tile(result.means2d, result.radii, result.depths,
-                                  nullptr, nullptr, C, N, tile_size, tile_width, tile_height,
-                                  true, result.tiles_per_gauss, stream, result.tile_offsets, tiles,
-                                  result.conics, tile_sub_masks);
-        };
-        const auto whole = intersect({});
-
-        // Step 3: Compute viewing directions and evaluate SH
+        // Step 2: Compute viewing directions and evaluate SH. Nothing here needs the tile
+        // pairs, so it is queued before the intersection waits on the host for their count.
         if (render_mode == 0 || render_mode >= 3) {
             if (sh_degree > 0) {
                 compute_view_dirs(means, reference, C, N, result.dirs, stream);
@@ -334,10 +326,29 @@ namespace gsplat_lfs {
                 ScreenFootprint{.means2d = result.means2d, .conics = result.conics, .radii = result.radii,
                                 .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr});
         };
+
+        // Step 3: Tile intersection. The first call retains the existing speculative warm-cache path.
+        auto intersect = [&](TileRange tiles, const IntersectQueuedFn& before_count_wait = {}) {
+            return intersect_tile(result.means2d, result.radii, result.depths,
+                                  nullptr, nullptr, C, N, tile_size, tile_width, tile_height,
+                                  true, result.tiles_per_gauss, stream, result.tile_offsets, tiles,
+                                  result.conics, tile_sub_masks, before_count_wait);
+        };
+        // A warm cache queues its pairs before the host waits for their count; rendering them
+        // right away keeps the GPU busy through that wait. A list that turns out short is redone.
+        IntersectTileResult speculative{};
+        const auto whole = intersect({}, [&](const IntersectTileResult& queued) {
+            speculative = queued;
+            render(queued, {});
+        });
         result.n_isects = whole.n_isects;
         result.batches.clear();
         if (whole.n_isects == 0 || whole.n_sort > 0) {
-            render(whole, {});
+            const bool rendered = speculative.isect_ids != nullptr && speculative.isect_ids == whole.isect_ids &&
+                                  speculative.n_sort == whole.n_sort;
+            if (!rendered) {
+                render(whole, {});
+            }
             return;
         }
         // Only the exceptional path counts additional ranges. Recursion depth

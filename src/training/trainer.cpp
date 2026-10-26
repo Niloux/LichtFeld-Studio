@@ -505,6 +505,12 @@ namespace lfs::training {
             return depth_prior_mode_is_metric(mode) ? kMetricDepthLossFinalScale : kDepthLossFinalScale;
         }
 
+        // Float [H, W] base weights can normalize a structure-weighted loss on the device.
+        [[nodiscard]] bool is_device_denominator_weight(const lfs::core::Tensor& weight) {
+            return weight.is_valid() && weight.ndim() == 2 && weight.dtype() == lfs::core::DataType::Float32 &&
+                   weight.device() == lfs::core::Device::CUDA && weight.is_contiguous();
+        }
+
         // Prior samples decode to [0,1] for integer files, so one stored unit is
         // quantization_step of a decoded value.
         [[nodiscard]] float metric_depth_metres_per_decoded_unit(const float quantization_step) {
@@ -1744,17 +1750,22 @@ namespace lfs::training {
             region, mode == MaskMode::SegmentAndIgnore);
         core::Tensor weight = base_weight;
         float denominator = 0.0f;
+        core::Tensor denominator_weight;
         if (structure_map.is_valid()) {
             kernels::structure_photometric_weight(structure_map, base_weight, roi_report_structure_weight_,
                                                   params.thin_structure_weight, false);
             weight = roi_report_structure_weight_;
-            denominator = kernels::structure_base_denominator(
-                base_weight, static_cast<int>(target.shape()[1]), static_cast<int>(target.shape()[2]),
-                params.lambda_dssim > 0.0f);
+            if (is_device_denominator_weight(base_weight))
+                denominator_weight = base_weight;
+            else
+                denominator = kernels::structure_base_denominator(
+                    base_weight, static_cast<int>(target.shape()[1]), static_cast<int>(target.shape()[2]),
+                    params.lambda_dssim > 0.0f);
         }
         const bool decoupled = raw.is_valid() && raw.numel() > 0 && params.lambda_dssim > 0.0f;
         kernels::masked_fused_l1_ssim_value(corrected, decoupled ? raw : core::Tensor{}, target, weight,
-                                            params.lambda_dssim, roi_report_loss_, denominator);
+                                            params.lambda_dssim, roi_report_loss_, denominator,
+                                            denominator_weight);
         auto loss = roi_report_loss_.loss;
         if (params.gradient_loss_weight > 0.0f && iteration >= kernels::GRADIENT_LOSS_START_STEP) {
             const auto& image = raw.is_valid() && raw.numel() > 0 ? raw : corrected;
@@ -1925,15 +1936,20 @@ namespace lfs::training {
 
         Tensor photometric_weight = base_photometric_weight;
         float base_denominator = 0.0f;
+        Tensor base_denominator_weight;
         if (structure_map.is_valid()) {
             kernels::structure_photometric_weight(
                 structure_map, base_photometric_weight, thin_structure_weight_buffer_,
                 opt_params.thin_structure_weight,
                 !base_photometric_weight.is_valid() && opt_params.lambda_dssim > 0.0f);
             photometric_weight = thin_structure_weight_buffer_;
-            base_denominator = kernels::structure_base_denominator(
-                base_photometric_weight, static_cast<int>(gt_image.shape()[1]),
-                static_cast<int>(gt_image.shape()[2]), opt_params.lambda_dssim > 0.0f);
+            // Float base weights normalize the structure-weighted loss on the device.
+            if (is_device_denominator_weight(base_photometric_weight))
+                base_denominator_weight = base_photometric_weight;
+            else
+                base_denominator = kernels::structure_base_denominator(
+                    base_photometric_weight, static_cast<int>(gt_image.shape()[1]),
+                    static_cast<int>(gt_image.shape()[2]), opt_params.lambda_dssim > 0.0f);
         }
 
         Tensor loss, grad_corrected, grad_alpha;
@@ -1946,12 +1962,14 @@ namespace lfs::training {
 
         if (photometric_weight.is_valid()) {
             float mask_normalization = 0.0f;
+            Tensor mask_normalization_device;
             if (use_decoupled_appearance_loss) {
                 auto& masked_decoupled_ws = photometric_loss_.arena().masked_decoupled();
                 auto [loss_tensor, ctx] = lfs::training::kernels::masked_decoupled_fused_l1_ssim_forward(
                     corrected, raw_rendered, gt_image, photometric_weight, opt_params.lambda_dssim,
-                    masked_decoupled_ws, base_denominator);
+                    masked_decoupled_ws, base_denominator, base_denominator_weight);
                 mask_normalization = ctx.mask_sum_value;
+                mask_normalization_device = ctx.mask_sum;
                 auto grads = lfs::training::kernels::masked_decoupled_fused_l1_ssim_backward(
                     ctx, masked_decoupled_ws);
 
@@ -1965,8 +1983,10 @@ namespace lfs::training {
             } else {
                 auto& masked_ws = photometric_loss_.arena().masked_fused();
                 auto [loss_tensor, ctx] = lfs::training::kernels::masked_fused_l1_ssim_forward(
-                    corrected, gt_image, photometric_weight, opt_params.lambda_dssim, masked_ws, base_denominator);
+                    corrected, gt_image, photometric_weight, opt_params.lambda_dssim, masked_ws, base_denominator,
+                    base_denominator_weight);
                 mask_normalization = ctx.mask_sum_value;
+                mask_normalization_device = ctx.mask_sum;
                 grad_corrected = lfs::training::kernels::masked_fused_l1_ssim_backward(ctx, masked_ws);
                 loss = loss_tensor;
 
@@ -1975,14 +1995,8 @@ namespace lfs::training {
                 }
             }
 
-            // The loss already reads this normalization; epsilon alone means no contributing pixels.
-            if (has_user_mask && mode == param::MaskMode::Ignore && !empty_ignore_mask_warned_ &&
-                mask_normalization <= kernels::SSIM_EPSILON) {
-                empty_ignore_mask_warned_ = true;
-                LOG_WARN("Effective ignore mask excludes every pixel in a training view: no photometric supervision. "
-                         "If all views are masked out, zero loss does not indicate a trained model. "
-                         "Check mask threshold and inversion.");
-            }
+            if (has_user_mask && mode == param::MaskMode::Ignore)
+                check_empty_ignore_mask(mask_normalization, mask_normalization_device);
 
             if (has_user_mask &&
                 (mode == param::MaskMode::Segment || mode == param::MaskMode::SegmentAndIgnore) &&
@@ -2322,6 +2336,12 @@ namespace lfs::training {
                 loss_slots_[i].pinned != nullptr,
                 std::format("Trainer loss slot {} pinned allocation failed", i));
         }
+        LFS_CUDA_TRY(
+            cudaEventCreateWithFlags(&mask_norm_done_, cudaEventDisableTiming),
+            nullptr, "Trainer mask-normalization event creation");
+        mask_norm_pinned_ = static_cast<float*>(
+            lfs::core::PinnedMemoryAllocator::instance().allocate(sizeof(float)));
+        LFS_ASSERT_MSG(mask_norm_pinned_ != nullptr, "Trainer mask-normalization pinned allocation failed");
     }
 
     void Trainer::destroySyncPrimitives() {
@@ -2353,11 +2373,60 @@ namespace lfs::training {
             }
             slot.in_flight = false;
         }
+        if (mask_norm_done_) {
+            LFS_CUDA_LOG_TEARDOWN(cudaEventDestroy(mask_norm_done_), nullptr,
+                                  "destroy mask-normalization event");
+            mask_norm_done_ = nullptr;
+        }
+        if (mask_norm_pinned_) {
+            lfs::core::PinnedMemoryAllocator::instance().deallocate(mask_norm_pinned_, nullptr);
+            mask_norm_pinned_ = nullptr;
+        }
+        mask_norm_in_flight_ = false;
         for (const cudaEvent_t event : orphaned_sidecar_events_) {
             LFS_CUDA_LOG_TEARDOWN(cudaEventDestroy(event), nullptr,
                                   "destroy orphaned sidecar event");
         }
         orphaned_sidecar_events_.clear();
+    }
+
+    void Trainer::check_empty_ignore_mask(const float host_value, const lfs::core::Tensor& device_value) {
+        if (empty_ignore_mask_warned_)
+            return;
+        float value = host_value;
+        if (value <= 0.0f) {
+            if (!mask_norm_pinned_ || !mask_norm_done_ || !device_value.is_valid())
+                return;
+            // A finished copy from an earlier view is checked now; one still in flight is left alone.
+            if (mask_norm_in_flight_) {
+                if (cudaEventQuery(mask_norm_done_) != cudaSuccess)
+                    return;
+                mask_norm_in_flight_ = false;
+                value = *mask_norm_pinned_;
+            }
+            const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+            if (cudaMemcpyAsync(mask_norm_pinned_, device_value.ptr<float>(), sizeof(float),
+                                cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                cudaEventRecord(mask_norm_done_, stream) == cudaSuccess)
+                mask_norm_in_flight_ = true;
+            if (value <= 0.0f)
+                return;
+        }
+        // The loss divides by this normalization; epsilon alone means no contributing pixels.
+        if (value <= kernels::SSIM_EPSILON) {
+            empty_ignore_mask_warned_ = true;
+            LOG_WARN("Effective ignore mask excludes every pixel in a training view: no photometric supervision. "
+                     "If all views are masked out, zero loss does not indicate a trained model. "
+                     "Check mask threshold and inversion.");
+        }
+    }
+
+    void Trainer::flush_empty_ignore_mask_check() {
+        if (!mask_norm_in_flight_)
+            return;
+        mask_norm_in_flight_ = false;
+        if (cudaEventSynchronize(mask_norm_done_) == cudaSuccess)
+            check_empty_ignore_mask(*mask_norm_pinned_, {});
     }
 
     void Trainer::submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
@@ -9480,7 +9549,9 @@ namespace lfs::training {
                 train_phase = StepPhase::AcquireData;
                 // Dataloader wait is outside train_step / steady_ms.
                 const auto dl_wait_t0 = std::chrono::steady_clock::now();
+                nvtxRangePushA("dataloader_wait");
                 auto example_opt = train_dataloader->next();
+                nvtxRangePop();
                 const auto dl_wait_t1 = std::chrono::steady_clock::now();
                 const double dl_wait_ms =
                     std::chrono::duration<double, std::milli>(dl_wait_t1 - dl_wait_t0).count();
@@ -9639,6 +9710,7 @@ namespace lfs::training {
             active_image_loader_guard.release();
 
             maybe_publish_camera_loss_heatmap(current_iteration_.load(), true);
+            flush_empty_ignore_mask_check();
 
             if (auto harvested = harvestLossReadbacks(true, false); !harvested) {
                 auto typed = lfs::from_legacy_expected<void>(

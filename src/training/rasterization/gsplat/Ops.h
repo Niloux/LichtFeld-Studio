@@ -9,6 +9,7 @@
 #include "TileBatch.h"
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <functional>
 #include <tuple>
 #include <vector>
 
@@ -59,6 +60,10 @@ namespace gsplat_lfs {
         bool sub_tile_masks;      // Keys hold sub-tile masks in place of depths
     };
 
+    // Called with a pair list that is sorted and has tile offsets but whose count the host has
+    // not checked yet; work queued here overlaps that check.
+    using IntersectQueuedFn = std::function<void(const IntersectTileResult&)>;
+
     // An over-budget result has n_isects > 0 and n_sort == 0: subdivide whole
     // tiles before rendering. No partial list may be accepted.
     // isect_ids / flatten_ids point into a thread-local grow-only cache.
@@ -80,7 +85,8 @@ namespace gsplat_lfs {
         cudaStream_t stream = nullptr,
         int32_t* isect_offsets = nullptr, TileRange tiles = {}, // [C * tile_h * tile_w + 1]
         const float* conics = nullptr,                          // [C, N, 3] optional: cull missed tiles
-        const uint32_t* tile_sub_masks = nullptr);              // [C, tile_h, tile_w] optional: live sub-tiles
+        const uint32_t* tile_sub_masks = nullptr,               // [C, tile_h, tile_w] optional: live sub-tiles
+        const IntersectQueuedFn& before_count_wait = {});
 
     bool release_intersect_thread_local_cache() noexcept;
 
