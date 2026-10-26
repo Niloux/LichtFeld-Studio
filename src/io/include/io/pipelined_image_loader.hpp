@@ -86,6 +86,9 @@ namespace lfs::io {
         std::chrono::milliseconds batch_collect_timeout{config::DEFAULT_BATCH_TIMEOUT_MS};
         std::chrono::milliseconds output_wait_timeout{config::DEFAULT_OUTPUT_TIMEOUT_MS};
         bool use_16bit_color = false;
+        // Share of physical RAM cached images may occupy as decoded pixels; 0 caches them
+        // compressed only.
+        float raw_cache_memory_ratio = 0.0f;
 
         // Default preserves today's unconditional "skip and continue" behavior
         // for every optional sidecar. Required fails the whole camera
@@ -601,6 +604,10 @@ namespace lfs::io {
         // Cleared on the first failed JPEG 2000 encode (e.g. nvjpeg2k extension not
         // built) so 16-bit runs degrade to uncached decoding with a single error.
         std::atomic<bool> jpeg2k_cache_available_{true};
+        // Decoded-pixel cache entries reserve their bytes here against the budget.
+        size_t raw_cache_budget_bytes_ = 0;
+        std::atomic<size_t> raw_cache_bytes_{0};
+        [[nodiscard]] bool reserve_raw_cache(size_t bytes);
 
         mutable std::mutex stats_mutex_;
         mutable CacheStats stats_;

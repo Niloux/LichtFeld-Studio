@@ -87,6 +87,54 @@ namespace lfs::io {
             return cpu.to(lfs::core::Device::CUDA, stream);
         }
 
+        // Run-local cache payload: a decoded tensor kept as raw host bytes, so a cache hit is a
+        // host-to-device copy instead of a decode. Header: magic, dtype, ndim, dims.
+        constexpr std::array<uint8_t, 8> RAW_PIXEL_MAGIC{'L', 'F', 'R', 'A', 'W', 'P', 'X', 1};
+        constexpr size_t RAW_PIXEL_HEADER_BYTES = 32;
+
+        bool is_raw_pixel_cache(const std::vector<uint8_t>& bytes) {
+            return bytes.size() >= RAW_PIXEL_HEADER_BYTES &&
+                   std::memcmp(bytes.data(), RAW_PIXEL_MAGIC.data(), RAW_PIXEL_MAGIC.size()) == 0;
+        }
+
+        std::vector<uint8_t> encode_raw_pixel_cache(const lfs::core::Tensor& tensor) {
+            if (tensor.ndim() < 1 || tensor.ndim() > 3)
+                throw std::runtime_error("Raw pixel cache expects a 1-3D tensor");
+            const auto cpu = tensor.contiguous().cpu();
+            std::vector<uint8_t> bytes(RAW_PIXEL_HEADER_BYTES + cpu.bytes(), 0);
+            std::memcpy(bytes.data(), RAW_PIXEL_MAGIC.data(), RAW_PIXEL_MAGIC.size());
+            bytes[8] = static_cast<uint8_t>(cpu.dtype());
+            bytes[9] = static_cast<uint8_t>(cpu.ndim());
+            for (size_t d = 0; d < cpu.ndim(); ++d) {
+                const auto dim = static_cast<uint32_t>(cpu.shape()[d]);
+                std::memcpy(bytes.data() + 12 + 4 * d, &dim, sizeof(dim));
+            }
+            std::memcpy(bytes.data() + RAW_PIXEL_HEADER_BYTES, cpu.data_ptr(), cpu.bytes());
+            return bytes;
+        }
+
+        lfs::core::Tensor decode_raw_pixel_cache(const std::vector<uint8_t>& bytes, cudaStream_t stream) {
+            const auto dtype = static_cast<lfs::core::DataType>(bytes[8]);
+            const size_t ndim = bytes[9];
+            if (ndim < 1 || ndim > 3)
+                throw std::runtime_error("Invalid raw pixel cache rank");
+            std::vector<size_t> dims(ndim);
+            size_t elements = 1;
+            for (size_t d = 0; d < ndim; ++d) {
+                uint32_t dim = 0;
+                std::memcpy(&dim, bytes.data() + 12 + 4 * d, sizeof(dim));
+                dims[d] = dim;
+                elements *= dim;
+            }
+            if (elements == 0 || bytes.size() - RAW_PIXEL_HEADER_BYTES != elements * lfs::core::dtype_size(dtype))
+                throw std::runtime_error("Invalid raw pixel cache size");
+            auto cpu = lfs::core::Tensor::empty(lfs::core::TensorShape(dims), lfs::core::Device::CPU, dtype);
+            std::memcpy(cpu.data_ptr(), bytes.data() + RAW_PIXEL_HEADER_BYTES, cpu.bytes());
+            auto gpu = cpu.to(lfs::core::Device::CUDA, stream);
+            gpu.set_stream(stream);
+            return gpu;
+        }
+
         constexpr double HOST_FREE_RAM_EVICTION_RATIO = 0.10;
         constexpr double HOST_FREE_RAM_RELIEF_HYSTERESIS_RATIO = 0.05;
         constexpr std::chrono::milliseconds HOST_MEMORY_CHECK_INTERVAL{500};
@@ -708,6 +756,10 @@ namespace lfs::io {
         if (config_.max_cache_bytes == 0)
             config_.max_cache_bytes = static_cast<size_t>(
                 static_cast<double>(get_total_physical_memory()) * 0.90);
+        raw_cache_budget_bytes_ = std::min(
+            config_.max_cache_bytes,
+            static_cast<size_t>(static_cast<double>(get_total_physical_memory()) *
+                                std::clamp(config_.raw_cache_memory_ratio, 0.0f, 0.9f)));
         {
             std::lock_guard<std::mutex> lock(adaptive_mutex_);
             adaptive_max_target_ = config_.decode_frame_ring_capacity - 2;
@@ -1508,12 +1560,39 @@ namespace lfs::io {
         return decoded;
     }
 
+    bool PipelinedImageLoader::reserve_raw_cache(const size_t bytes) {
+        size_t used = raw_cache_bytes_.load(std::memory_order_relaxed);
+        do {
+            if (used + bytes > raw_cache_budget_bytes_)
+                return false;
+        } while (!raw_cache_bytes_.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
+        return true;
+    }
+
     void PipelinedImageLoader::write_derived_cache(NvCodecImageLoader& nvcodec,
                                                    const lfs::core::Tensor& tensor,
                                                    const std::string& cache_key,
                                                    void* cuda_stream,
                                                    const LoadParams& params) {
         const bool lossless = decodes_16bit(params);
+        if (!lossless && reserve_raw_cache(tensor.numel())) {
+            try {
+                lfs::core::Tensor pixels = tensor;
+                if (pixels.dtype() == lfs::core::DataType::Float32) {
+                    pixels = lfs::core::Tensor::empty(tensor.shape(), lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
+                    cuda::launch_float32_chw_to_uint8_chw(
+                        tensor.ptr<float>(), pixels.ptr<uint8_t>(), tensor.shape()[1], tensor.shape()[2],
+                        tensor.shape()[0], static_cast<cudaStream_t>(cuda_stream));
+                }
+                if (cuda_stream)
+                    cudaStreamSynchronize(static_cast<cudaStream_t>(cuda_stream));
+                put_in_jpeg_cache(cache_key, std::make_shared<std::vector<uint8_t>>(encode_raw_pixel_cache(pixels)));
+            } catch (...) {
+                LOG_DEBUG("[PipelinedImageLoader] Raw cache write skipped for key {}: {}", cache_key,
+                          describe_current_exception("raw cache"));
+            }
+            return;
+        }
         if (lossless && !jpeg2k_cache_available_.load(std::memory_order_relaxed))
             return;
 
@@ -1589,6 +1668,25 @@ namespace lfs::io {
         if (!is_nvcodec_available())
             return;
         if (kind != SidecarCacheFormat::DepthFloat && !jpeg2k_cache_available_.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        // Depth stays float32. Normals [3,H,W] in [-1,1] take the byte encoding of the
+        // normal maps themselves, round(127.5 * (n + 1)).
+        const bool normal = kind == SidecarCacheFormat::Normal;
+        if (reserve_raw_cache(normal ? tensor.numel() : tensor.bytes())) {
+            try {
+                const auto stored = normal
+                                        ? ((tensor + 1.0f) * 127.5f + 0.5f).clamp(0.0f, 255.0f).to(lfs::core::DataType::UInt8)
+                                        : tensor;
+                if (cuda_stream)
+                    cudaStreamSynchronize(static_cast<cudaStream_t>(cuda_stream));
+                put_in_jpeg_cache(item.cache_key,
+                                  std::make_shared<std::vector<uint8_t>>(encode_raw_pixel_cache(stored)));
+            } catch (...) {
+                LOG_DEBUG("[PipelinedImageLoader] Raw sidecar cache write skipped for {}: {}",
+                          lfs::core::path_to_utf8(item.path), describe_current_exception("raw cache"));
+            }
             return;
         }
 
@@ -2713,6 +2811,16 @@ namespace lfs::io {
                         !batch[i].needs_processing &&
                         batch[i].jpeg_data) {
                         const auto& bytes = *batch[i].jpeg_data;
+                        if (is_raw_pixel_cache(bytes)) {
+                            auto pixels = decode_raw_pixel_cache(bytes, decode_stream_);
+                            if (!batch[i].params.output_uint8)
+                                pixels = pixels.to(lfs::core::DataType::Float32).div(255.0f);
+                            try_complete_pair(batch[i].sequence_id, batch[i].loader_generation,
+                                              std::move(pixels), std::nullopt, nullptr, std::nullopt,
+                                              std::nullopt, nullptr);
+                            decoded_as_pair[i] = true;
+                            continue;
+                        }
                         const bool is_jpeg2k = bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0x4f;
                         if (is_jpeg2k) {
                             rgb_jpeg2k_batch_indices.push_back(i);
@@ -2815,6 +2923,13 @@ namespace lfs::io {
                                 complete_sidecar(batch[i], decode_float_depth_cache(*batch[i].jpeg_data, decode_stream_));
                                 continue;
                             }
+                            if (batch[i].jpeg_data && is_raw_pixel_cache(*batch[i].jpeg_data)) {
+                                auto sidecar = decode_raw_pixel_cache(*batch[i].jpeg_data, decode_stream_);
+                                if (sidecar.dtype() == lfs::core::DataType::UInt8)
+                                    sidecar = sidecar.to(lfs::core::DataType::Float32).div(127.5f).sub(1.0f);
+                                complete_sidecar(batch[i], std::move(sidecar));
+                                continue;
+                            }
                             size_t pair_index = batch.size();
                             for (size_t j = i + 1; j < batch.size(); ++j) {
                                 if (!decoded_as_pair[j] &&
@@ -2822,6 +2937,7 @@ namespace lfs::io {
                                     batch[j].is_depth != batch[i].is_depth &&
                                     (batch[j].is_depth || batch[j].is_normal) &&
                                     batch[i].jpeg_data && batch[j].jpeg_data &&
+                                    !is_raw_pixel_cache(*batch[j].jpeg_data) &&
                                     !(batch[j].is_depth && is_float_depth_cache(*batch[j].jpeg_data))) {
                                     pair_index = j;
                                     break;
@@ -2855,7 +2971,10 @@ namespace lfs::io {
                             lfs::core::Tensor mask_tensor;
                             const auto& bytes = *batch[i].jpeg_data;
                             const bool is_jpeg2k = bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0x4f;
-                            if (is_jpeg2k) {
+                            if (is_raw_pixel_cache(bytes)) {
+                                mask_tensor = lfs::core::cuda::normalize_mask_bytes(
+                                    decode_raw_pixel_cache(bytes, decode_stream_));
+                            } else if (is_jpeg2k) {
                                 // UINT8 streams decode to raw bytes; UINT16 streams (16-bit alpha)
                                 // decode to normalized Float32.
                                 auto raw = nvcodec->decode_jpeg2k_16bit_from_memory_gpu(
@@ -3268,7 +3387,15 @@ namespace lfs::io {
                                                    : lfs::core::Tensor{};
                     if (share_processed_mask_source)
                         item.mask_source_promise->set_value(mask_bytes);
-                    if (item.is_mask && is_nvcodec_available()) {
+                    if (item.is_mask && reserve_raw_cache(mask_bytes.numel())) {
+                        try {
+                            put_in_jpeg_cache(item.cache_key, std::make_shared<std::vector<uint8_t>>(
+                                                                  encode_raw_pixel_cache(mask_bytes)));
+                        } catch (...) {
+                            LOG_DEBUG("[PipelinedImageLoader] Raw mask cache write skipped for {}: {}",
+                                      lfs::core::path_to_utf8(item.path), describe_current_exception("raw cache"));
+                        }
+                    } else if (item.is_mask && is_nvcodec_available()) {
                         try {
                             auto jpeg_bytes = nvcodec->encode_grayscale_to_jpeg2k(mask_bytes, nullptr, true, true);
                             put_in_jpeg_cache(item.cache_key,
