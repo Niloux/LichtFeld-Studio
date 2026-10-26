@@ -1251,7 +1251,7 @@ namespace gsplat_lfs {
                     gpuAtomicAdd(v_quat_ptr + 1, v_quat.y);
                     gpuAtomicAdd(v_quat_ptr + 2, v_quat.z);
                     gpuAtomicAdd(v_quat_ptr + 3, v_quat.w);
-                    gpuAtomicAdd(v_opacities + g, v_opacity * opac * (1.0f - opac));
+                    gpuAtomicAdd(v_opacities + g, v_opacity * lfs::core::sigmoid_derivative_from_logit(opacities[g]));
                     if (do_dens) {
                         gpuAtomicAdd(densification_info + g, dens_w);
                         gpuAtomicAdd(densification_info + N + g, dens_e);
