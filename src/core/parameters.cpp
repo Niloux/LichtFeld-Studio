@@ -266,7 +266,7 @@ namespace lfs::core {
                             return std::format("Invalid type for dataset.loading_params.{}; expected boolean", key);
                     }
                     for (const auto key : {"min_cpu_free_memory_ratio", "min_cpu_free_GB", "sharpen_amount",
-                                           "sharpen_radius", "sharpen_threshold"}) {
+                                           "sharpen_radius", "sharpen_threshold", "raw_cache_memory_ratio"}) {
                         if (loading.contains(key) && !loading.at(key).is_number())
                             return std::format("Invalid type for dataset.loading_params.{}; expected number", key);
                     }
@@ -1244,6 +1244,11 @@ namespace lfs::core {
                 return std::format("min_track_length must be nonnegative (got {})", min_track_length);
             if (!std::isfinite(mask_threshold) || mask_threshold < 0.0f || mask_threshold > 1.0f)
                 return std::format("dataset mask_threshold must be finite and within [0, 1] (got {})", mask_threshold);
+            if (!std::isfinite(loading_params.raw_cache_memory_ratio) ||
+                loading_params.raw_cache_memory_ratio < 0.0f ||
+                loading_params.raw_cache_memory_ratio > 0.9f)
+                return std::format("raw_cache_memory_ratio must be finite and within [0, 0.9] (got {})",
+                                   loading_params.raw_cache_memory_ratio);
             if (!std::isfinite(loading_params.min_cpu_free_memory_ratio) ||
                 loading_params.min_cpu_free_memory_ratio < 0.0f ||
                 loading_params.min_cpu_free_memory_ratio > 1.0f)
@@ -1612,6 +1617,9 @@ namespace lfs::core {
             if (j.contains("print_status_freq_num")) {
                 params.print_status_freq_num = j["print_status_freq_num"];
             }
+            if (j.contains("raw_cache_memory_ratio")) {
+                params.raw_cache_memory_ratio = j["raw_cache_memory_ratio"].get<float>();
+            }
             if (j.contains("use_16bit_color")) {
                 params.use_16bit_color = j["use_16bit_color"];
             } else if (j.contains("use_8bit_color")) {
@@ -1642,6 +1650,7 @@ namespace lfs::core {
             loading_json["print_cache_status"] = print_cache_status;
             loading_json["print_status_freq_num"] = print_status_freq_num;
             loading_json["use_16bit_color"] = use_16bit_color;
+            loading_json["raw_cache_memory_ratio"] = raw_cache_memory_ratio;
             loading_json["sharpen_kernel"] = std::string(sharpen_kernel_name(sharpen.kernel));
             loading_json["sharpen_amount"] = sharpen.amount;
             loading_json["sharpen_radius"] = sharpen.radius;

@@ -494,6 +494,10 @@ namespace lfs::core {
             bool print_cache_status = true;
             int print_status_freq_num = 500; // every print_status_freq_num calls for load print cache status
             bool use_16bit_color = false;
+            // Share of physical RAM the training loader may fill with decoded pixels, which
+            // a cache hit copies to the GPU instead of decoding again; the rest stays
+            // compressed. 0 keeps every cached image compressed.
+            float raw_cache_memory_ratio = 0.35f;
             // Training images only; evaluation and the GT view load the photos unchanged.
             SharpenParams sharpen;
             nlohmann::json to_json() const;

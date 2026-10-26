@@ -9253,6 +9253,8 @@ namespace lfs::training {
             pipelined_config.output_queue_size = 4;
             pipelined_config.io_threads = 2;
             pipelined_config.use_16bit_color = params_.dataset.loading_params.use_16bit_color;
+            if (params_.dataset.loading_params.use_cpu_memory)
+                pipelined_config.raw_cache_memory_ratio = params_.dataset.loading_params.raw_cache_memory_ratio;
 
             // Non-JPEG images (PNG, WebP) need CPU decoding - use more threads until cache warms
             constexpr size_t MIN_COLD_THREADS = 4;

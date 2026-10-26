@@ -1038,3 +1038,28 @@ TEST_F(TrainingParametersTest, BuiltinCapacityResetDoesNotReuseEditedCapacity) {
                   optimization_meta("max_cap"), active)),
               original);
 }
+
+// The decoded-pixel cache share round-trips through the loading parameters, older settings
+// without it get the default, and a share outside [0, 0.9] does not validate.
+TEST(LoadingParametersTest, RawCacheMemoryRatioRoundTripsAndValidates) {
+    using lfs::core::param::DatasetConfig;
+    using lfs::core::param::LoadingParams;
+    LoadingParams params;
+    EXPECT_FLOAT_EQ(params.raw_cache_memory_ratio, 0.35f);
+    params.raw_cache_memory_ratio = 0.2f;
+    EXPECT_FLOAT_EQ(LoadingParams::from_json(params.to_json()).raw_cache_memory_ratio, 0.2f);
+
+    auto older = params.to_json();
+    older.erase("raw_cache_memory_ratio");
+    EXPECT_FLOAT_EQ(LoadingParams::from_json(older).raw_cache_memory_ratio, 0.35f);
+
+    DatasetConfig dataset;
+    for (const float ratio : {0.0f, 0.35f, 0.9f}) {
+        dataset.loading_params.raw_cache_memory_ratio = ratio;
+        EXPECT_EQ(dataset.validate().find("raw_cache_memory_ratio"), std::string::npos) << ratio;
+    }
+    for (const float ratio : {-0.1f, 0.95f, std::numeric_limits<float>::quiet_NaN()}) {
+        dataset.loading_params.raw_cache_memory_ratio = ratio;
+        EXPECT_NE(dataset.validate().find("raw_cache_memory_ratio"), std::string::npos) << ratio;
+    }
+}
