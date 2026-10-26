@@ -31,8 +31,22 @@ namespace gsplat_lfs {
         int32_t* flatten_ids,     // [n_isects] optional (for second pass)
         cudaStream_t stream = nullptr,
         int64_t max_isects = -1, TileRange tiles = {},
-        const int32_t* order = nullptr,  // [C * N] optional: element visited by thread k
-        const float* conics = nullptr); // [C, N, 3] optional: cull tiles the ellipse misses
+        const int32_t* order = nullptr,            // [C * N] optional: element visited by thread k
+        const float* conics = nullptr,             // [C, N, 3] optional: cull tiles the ellipse misses
+        const uint32_t* tile_sub_masks = nullptr); // [C, tile_height, tile_width] optional: live sub-tiles
+
+    // Per tile, one bit per kCullSubTile sub-tile (row-major) that has a pixel of
+    // weight > 0 within one sub-tile of it. The margin keeps windowed losses such as
+    // SSIM exact at the mask border.
+    void launch_tile_sub_masks_from_pixels(
+        const float* pixel_weights, // [H, W]
+        uint32_t width,
+        uint32_t height,
+        uint32_t tile_size,
+        uint32_t tile_width,
+        uint32_t tile_height,
+        uint32_t* tile_sub_masks, // [tile_height, tile_width]
+        cudaStream_t stream);
 
     void launch_fill_isect_sentinels_kernel(
         int64_t* isect_ids,

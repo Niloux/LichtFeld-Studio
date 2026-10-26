@@ -249,7 +249,8 @@ namespace gsplat_lfs {
         RasterizeWithSHResult& result,
         cudaStream_t stream,
         const float* reference_viewmats,
-        const FreeSpaceRender& free_space) {
+        const FreeSpaceRender& free_space,
+        const uint32_t* tile_sub_masks) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -291,7 +292,7 @@ namespace gsplat_lfs {
             return intersect_tile(result.means2d, result.radii, result.depths,
                                   nullptr, nullptr, C, N, tile_size, tile_width, tile_height,
                                   true, result.tiles_per_gauss, stream, result.tile_offsets, tiles,
-                                  result.conics);
+                                  result.conics, tile_sub_masks);
         };
         const auto whole = intersect({});
 
@@ -428,7 +429,8 @@ namespace gsplat_lfs {
         const float* reference_viewmats,
         const FreeSpaceRender& free_space,
         const float* conics,
-        const int64_t* tile_keys) {
+        const int64_t* tile_keys,
+        const uint32_t* tile_sub_masks) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -485,7 +487,7 @@ namespace gsplat_lfs {
                 const auto batch = intersect_tile(means2d, radii, depths, nullptr, nullptr,
                                                   C, N, tile_size, tile_width, tile_height, true,
                                                   tiles_per_gauss, stream, const_cast<int32_t*>(tile_offsets), saved.tiles,
-                                                  conics);
+                                                  conics, tile_sub_masks);
                 LFS_ASSERT(batch.n_isects == saved.count && batch.n_sort > 0);
                 flatten_ids = batch.flatten_ids;
                 tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr;

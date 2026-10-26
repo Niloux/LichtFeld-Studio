@@ -38,7 +38,8 @@ namespace gsplat_lfs {
         int32_t* __restrict__ flatten_ids,
         const int64_t max_isects, const TileRange tiles,
         const int32_t* __restrict__ order,
-        const scalar_t* __restrict__ conics) {
+        const scalar_t* __restrict__ conics,
+        const uint32_t* __restrict__ tile_sub_masks) {
         // Thread k handles element order[k], so the pairs come out in that order;
         // counts and offsets are indexed by k.
         const uint32_t k = cg::this_grid().thread_rank();
@@ -47,6 +48,11 @@ namespace gsplat_lfs {
             return;
         }
         const uint32_t idx = order != nullptr ? static_cast<uint32_t>(order[k]) : k;
+        // Sub-tiles a pixel mask leaves without any weighted pixel nearby get no pair.
+        const uint32_t* const live_subs =
+            tile_sub_masks != nullptr
+                ? tile_sub_masks + (packed ? static_cast<uint32_t>(camera_ids[idx]) : idx / N) * tile_width * tile_height
+                : nullptr;
 
         const float radius_x = radii[idx * 2];
         const float radius_y = radii[idx * 2 + 1];
@@ -86,6 +92,9 @@ namespace gsplat_lfs {
             cull = footprint_level(qa, qb, qc, radius_x, radius_y, level);
         }
         auto tile_hit = [&](const uint32_t tx, const uint32_t ty) {
+            if (live_subs != nullptr && live_subs[ty * tile_width + tx] == 0) {
+                return false;
+            }
             if (!cull) {
                 return true;
             }
@@ -144,13 +153,16 @@ namespace gsplat_lfs {
                         mask |= ((1u << (b - a + 1)) - 1u) << (sy * subs + (a - first));
                     }
                 }
+                if (live_subs != nullptr) {
+                    mask &= live_subs[row * tile_width + j];
+                }
                 if (mask != 0 && !visit(j, mask)) {
                     return;
                 }
             }
         };
 
-        if (first_pass && cull) {
+        if (first_pass && (cull || live_subs != nullptr)) {
             int32_t count = 0;
             for (uint32_t i = tile_min.y; i < tile_max.y; ++i) {
                 uint32_t x_begin, x_end;
@@ -255,7 +267,8 @@ namespace gsplat_lfs {
         int64_t* isect_ids,
         int32_t* flatten_ids,
         cudaStream_t stream,
-        int64_t max_isects, TileRange tiles, const int32_t* order, const float* conics) {
+        int64_t max_isects, TileRange tiles, const int32_t* order, const float* conics,
+        const uint32_t* tile_sub_masks) {
         int64_t n_elements = packed ? nnz : C * N;
 
         uint32_t n_tiles = tile_width * tile_height;
@@ -276,7 +289,7 @@ namespace gsplat_lfs {
                 means2d, radii, depths,
                 cum_tiles_per_gauss,
                 tile_size, tile_width, tile_height, tile_n_bits,
-                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order, conics);
+                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order, conics, tile_sub_masks);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.intersect_tile");
         };
         if (tiles.end == UINT32_MAX)
@@ -517,6 +530,68 @@ namespace gsplat_lfs {
                 return cub::DeviceScan::InclusiveSum(
                     workspace, workspace_bytes, cast_iter, output, n_elements, stream);
             });
+    }
+
+    __global__ void tile_sub_masks_from_pixels_kernel(
+        const float* __restrict__ pixel_weights,
+        const uint32_t width,
+        const uint32_t height,
+        const uint32_t tile_size,
+        const uint32_t tile_width,
+        const uint32_t tile_height,
+        uint32_t* __restrict__ tile_sub_masks) {
+        const uint32_t tile = cg::this_grid().thread_rank();
+        if (tile >= tile_width * tile_height) {
+            return;
+        }
+        const uint32_t subs = tile_size / kCullSubTile;
+        const int32_t x0 = static_cast<int32_t>((tile % tile_width) * tile_size);
+        const int32_t y0 = static_cast<int32_t>((tile / tile_width) * tile_size);
+        constexpr int32_t margin = static_cast<int32_t>(kCullSubTile);
+        uint32_t mask = 0;
+        for (uint32_t sy = 0; sy < subs; ++sy) {
+            for (uint32_t sx = 0; sx < subs; ++sx) {
+                const int32_t bx = x0 + static_cast<int32_t>(sx * kCullSubTile);
+                const int32_t by = y0 + static_cast<int32_t>(sy * kCullSubTile);
+                const int32_t x_begin = max(bx - margin, 0);
+                const int32_t x_end = min(bx + static_cast<int32_t>(kCullSubTile) + margin, static_cast<int32_t>(width));
+                const int32_t y_begin = max(by - margin, 0);
+                const int32_t y_end = min(by + static_cast<int32_t>(kCullSubTile) + margin, static_cast<int32_t>(height));
+                bool live = false;
+                for (int32_t y = y_begin; y < y_end && !live; ++y) {
+                    const float* const row = pixel_weights + static_cast<size_t>(y) * width;
+                    for (int32_t x = x_begin; x < x_end; ++x) {
+                        if (row[x] > 0.0f) {
+                            live = true;
+                            break;
+                        }
+                    }
+                }
+                if (live) {
+                    mask |= 1u << (sy * subs + sx);
+                }
+            }
+        }
+        tile_sub_masks[tile] = mask;
+    }
+
+    void launch_tile_sub_masks_from_pixels(
+        const float* pixel_weights,
+        const uint32_t width,
+        const uint32_t height,
+        const uint32_t tile_size,
+        const uint32_t tile_width,
+        const uint32_t tile_height,
+        uint32_t* tile_sub_masks,
+        cudaStream_t stream) {
+        const uint32_t n_tiles = tile_width * tile_height;
+        if (n_tiles == 0) {
+            return;
+        }
+        constexpr uint32_t threads = 128;
+        tile_sub_masks_from_pixels_kernel<<<(n_tiles + threads - 1) / threads, threads, 0, stream>>>(
+            pixel_weights, width, height, tile_size, tile_width, tile_height, tile_sub_masks);
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.tile_sub_masks_from_pixels");
     }
 
 } // namespace gsplat_lfs

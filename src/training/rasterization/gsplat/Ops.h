@@ -79,7 +79,8 @@ namespace gsplat_lfs {
         int32_t* tiles_per_gauss_out, // [C, N] pre-allocated output
         cudaStream_t stream = nullptr,
         int32_t* isect_offsets = nullptr, TileRange tiles = {}, // [C * tile_h * tile_w + 1]
-        const float* conics = nullptr);                         // [C, N, 3] optional: cull missed tiles
+        const float* conics = nullptr,                          // [C, N, 3] optional: cull missed tiles
+        const uint32_t* tile_sub_masks = nullptr);              // [C, tile_h, tile_w] optional: live sub-tiles
 
     bool release_intersect_thread_local_cache() noexcept;
 
@@ -343,7 +344,9 @@ namespace gsplat_lfs {
         // Rolling shutter: the reference camera for view directions and per-splat
         // depth/normal features. nullptr uses viewmats0.
         const float* reference_viewmats = nullptr,
-        const FreeSpaceRender& free_space = {});
+        const FreeSpaceRender& free_space = {},
+        // [C, tile_height, tile_width] live sub-tile bits; pairs only reach those sub-tiles.
+        const uint32_t* tile_sub_masks = nullptr);
 
     void rasterize_from_world_with_sh_bwd(
         // Gaussian parameters
@@ -412,7 +415,8 @@ namespace gsplat_lfs {
         const std::vector<TileBatch>& batches = {}, int32_t* tiles_per_gauss = nullptr,
         const float* reference_viewmats = nullptr, // as in the forward
         const FreeSpaceRender& free_space = {},
-        const float* conics = nullptr,      // [C, N, 3] the forward's, so tile batches re-cull alike
-        const int64_t* tile_keys = nullptr); // the forward's keys when they hold sub-tile masks
+        const float* conics = nullptr,             // [C, N, 3] the forward's, so tile batches re-cull alike
+        const int64_t* tile_keys = nullptr,        // the forward's keys when they hold sub-tile masks
+        const uint32_t* tile_sub_masks = nullptr); // the forward's, so tile batches re-cull alike
 
 } // namespace gsplat_lfs

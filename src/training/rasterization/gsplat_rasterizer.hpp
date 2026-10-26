@@ -124,6 +124,8 @@ namespace lfs::training {
 
         // T_front render in front of a laser scan (disabled = gt_depth null)
         gsplat_lfs::FreeSpaceRender free_space;
+
+        lfs::core::Tensor tile_sub_masks; // [tile_height, tile_width] live sub-tiles, or empty for all
     };
 
     // Accumulates FP64 removal energy into aligned CUDA UInt8 [N, sizeof(double)] storage.
@@ -146,7 +148,10 @@ namespace lfs::training {
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
         bool use_gut = false,
         const lfs::core::Tensor& bg_image = {},
-        const gsplat_lfs::FreeSpaceRender& free_space = {});
+        const gsplat_lfs::FreeSpaceRender& free_space = {},
+        // [H, W] Float32 pixel weights: pixels farther than one 8 px sub-tile from any
+        // weight > 0 are not rasterized and stay background with zero alpha.
+        const lfs::core::Tensor& pixel_weights = {});
 
     // Explicit backward pass - computes gradients and accumulates into optimizer
     void gsplat_rasterize_backward(
