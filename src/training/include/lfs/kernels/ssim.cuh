@@ -203,6 +203,7 @@ namespace lfs::training::kernels {
         lfs::core::Tensor raw_dm_dsigma1_sq;
         lfs::core::Tensor raw_dm_dsigma12;
         float mask_sum_value = 0.0f;
+        lfs::core::Tensor mask_sum; // [1] device normalization, read when mask_sum_value is 0
         int H = 0;
         int W = 0;
         bool apply_valid_padding = true;
@@ -281,7 +282,8 @@ namespace lfs::training::kernels {
         lfs::core::Tensor dm_dsigma1_sq;
         lfs::core::Tensor dm_dsigma12;
         float ssim_weight;
-        float mask_sum_value;
+        float mask_sum_value;       // 0: the forward left the normalization in mask_sum
+        lfs::core::Tensor mask_sum; // [1] device normalization, read when mask_sum_value is 0
         int H, W;
     };
 
@@ -291,7 +293,9 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& img2,
         const lfs::core::Tensor& mask,
         float ssim_weight,
-        MaskedFusedL1SSIMWorkspace& workspace, float denominator = 0.0f);
+        MaskedFusedL1SSIMWorkspace& workspace, float denominator = 0.0f,
+        // Float [H, W] weights whose sum normalizes the loss in place of the mask's, on the device.
+        const lfs::core::Tensor& denominator_weight = {});
 
     // Fused masked L1+SSIM backward
     lfs::core::Tensor masked_fused_l1_ssim_backward(
@@ -317,7 +321,8 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& mask,
         float ssim_weight,
         MaskedL1SSIMValueWorkspace& workspace,
-        float denominator = 0.0f);
+        float denominator = 0.0f,
+        const lfs::core::Tensor& denominator_weight = {});
 
     struct MaskedDecoupledFusedL1SSIMWorkspace {
         lfs::core::Tensor ssim_map; // [N, 1, H, W]
@@ -473,7 +478,8 @@ namespace lfs::training::kernels {
         lfs::core::Tensor raw_dm_dsigma1_sq;
         lfs::core::Tensor raw_dm_dsigma12;
         float ssim_weight;
-        float mask_sum_value;
+        float mask_sum_value;       // 0: the forward left the normalization in mask_sum
+        lfs::core::Tensor mask_sum; // [1] device normalization, read when mask_sum_value is 0
         int H, W;
     };
 
@@ -483,7 +489,8 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& gt_img,
         const lfs::core::Tensor& mask,
         float ssim_weight,
-        MaskedDecoupledFusedL1SSIMWorkspace& workspace, float denominator = 0.0f);
+        MaskedDecoupledFusedL1SSIMWorkspace& workspace, float denominator = 0.0f,
+        const lfs::core::Tensor& denominator_weight = {});
 
     DecoupledGradients masked_decoupled_fused_l1_ssim_backward(
         const MaskedDecoupledFusedL1SSIMContext& ctx,

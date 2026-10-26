@@ -496,7 +496,7 @@ namespace gsplat_lfs {
         int32_t* tiles_per_gauss_out,
         cudaStream_t stream,
         int32_t* isect_offsets, TileRange tiles, const float* conics,
-        const uint32_t* tile_sub_masks) {
+        const uint32_t* tile_sub_masks, const IntersectQueuedFn& before_count_wait) {
         auto bounds_failure = [](const std::string& message, lfs::ErrorCode code = lfs::ErrorCode::BoundsViolation) {
             throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
                 .code = code,
@@ -696,6 +696,9 @@ namespace gsplat_lfs {
 
         fill_and_sort_capacity(cache.isect_capacity);
         launch_offsets();
+        if (before_count_wait && isect_offsets) {
+            before_count_wait(result);
+        }
         // Count event was recorded before fill; fill/sort/offsets are already
         // queued so this wait does not drain the GPU.
         const int64_t n_isects = drain_count();

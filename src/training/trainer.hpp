@@ -1011,6 +1011,11 @@ namespace lfs::training {
         // (fused kernels; grow-only for allocation-free steady state when masks/ROI on).
         lfs::training::losses::MaskPreprocessWorkspace mask_preprocess_workspace_;
         bool empty_ignore_mask_warned_ = false;
+        // The ignore-mask warning reads a view's loss normalization through this pinned slot
+        // on a later step, so the loss never waits for it.
+        float* mask_norm_pinned_ = nullptr;
+        cudaEvent_t mask_norm_done_ = nullptr;
+        bool mask_norm_in_flight_ = false;
 
         // Pre-allocated error map buffer for densification (avoids per-iteration allocation)
         core::Tensor densification_error_map_;
@@ -1169,6 +1174,11 @@ namespace lfs::training {
                                               const core::param::OptimizationParameters& params, int iteration);
         void submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
                                 const lfs::core::Tensor& region_weight = {});
+        // Warns once when an ignore mask leaves a view no pixel. A zero host value means the
+        // normalization is only on the device; it is then checked a step or more later.
+        void check_empty_ignore_mask(float host_value, const lfs::core::Tensor& device_value);
+        // Waits for the last normalization copy and checks it, for the end of a run.
+        void flush_empty_ignore_mask_check();
         std::expected<void, std::string> harvestLossReadbacks(bool drain, bool in_controller_phase);
 
         int invisible_iteration_streak_ = 0;
