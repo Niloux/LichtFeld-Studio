@@ -2009,9 +2009,9 @@ def save_laz_file_dialog(default_name: str = 'export') -> str:
 def save_text_file_dialog(default_name: str = 'lichtfeld_logs') -> str:
     """Choose a text log export path. Returns empty string if cancelled."""
 
-def save_json_file_dialog(default_name: str = 'config.json') -> str:
+def save_json_file_dialog(default_name: str = 'config.json', with_overwrite_confirmation: bool = False) -> object:
     """
-    Open a save file dialog for JSON files. Returns empty string if cancelled.
+    Choose a JSON path; empty on cancellation. Optionally return (path, overwrite_confirmed).
     """
 
 def save_png_file_dialog(default_name: str = 'export.png') -> str:
@@ -2334,7 +2334,7 @@ def apply_cropbox() -> None:
     """Apply the selected cropbox"""
 
 def set_crop_tool_shape(shape: str) -> None:
-    """Set the active crop tool shape: box or ellipsoid"""
+    """Set the active crop tool shape: box, ellipsoid, or polygon"""
 
 def get_crop_tool_shape() -> str:
     """Get the active crop tool shape"""
@@ -2350,6 +2350,11 @@ def get_crop_tool_operation() -> str:
 def apply_crop_tool() -> None:
     """
     Apply the active crop tool primitive through the node-backed crop command path
+    """
+
+def start_crop_polygon() -> None:
+    """
+    Edit the selected splat's or point cloud's crop polygon, or start drawing one on a camera-facing plane
     """
 
 def can_apply_align() -> bool:
@@ -2391,6 +2396,16 @@ def reset_crop_tool() -> None:
 
 def delete_crop_tool_volume() -> None:
     """Delete the active crop tool primitive and leave the crop tool"""
+
+def toggle_crop_tool_inverse() -> None:
+    """
+    Invert the selected crop polygon, crop box or ellipsoid, as the pie menu's Invert does
+    """
+
+def get_crop_tool_inverse() -> bool | None:
+    """
+    Whether the crop volume Invert acts on is inverted, or None without one
+    """
 
 def fit_cropbox_to_scene(use_percentile: bool = False) -> None:
     """Fit cropbox to scene bounds"""

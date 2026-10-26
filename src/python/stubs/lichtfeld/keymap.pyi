@@ -191,7 +191,13 @@ class Action(enum.Enum):
 
     APPLY_ALIGNMENT = 95
 
+    INSERT_CROP_POLYGON_VERTEX = 96
+
+    REMOVE_CROP_POLYGON_VERTEX = 97
+
     UNGROUP_SELECTED_SCENE_NODE = 86
+
+    EXIT_WALK = 98
 
 class ToolMode(enum.Enum):
     GLOBAL = 0
@@ -207,6 +213,8 @@ class ToolMode(enum.Enum):
     ALIGN = 6
 
     CROP_BOX = 7
+
+    WALK = 8
 
 class Modifier(enum.Enum):
     NONE = 0

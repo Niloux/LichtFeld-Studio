@@ -62,11 +62,18 @@ namespace lfs::vis::gui {
         if (timeline.size() < 2)
             return false;
 
+        if (sm) {
+            (void)sm->getModelForRendering();
+            if (sm->getScene().combinedModelBuildPending())
+                return false;
+        }
+
         const auto state = timeline.evaluate(time);
         const glm::mat3 cam_rot = glm::mat3_cast(state.rotation);
 
         const auto image = rm->renderPreviewImage(sm, cam_rot, state.position, state.focal_length_mm,
-                                                  THUMB_WIDTH, THUMB_HEIGHT);
+                                                  THUMB_WIDTH, THUMB_HEIGHT, std::nullopt, std::nullopt, std::nullopt,
+                                                  false, /*deterministic_export=*/false);
         // Vulkan preview readback is already in the orientation RmlUi samples.
         const bool ok = image &&
                         slots_[slot_idx].texture.upload(*image, THUMB_WIDTH, THUMB_HEIGHT, /*flip_y=*/false);

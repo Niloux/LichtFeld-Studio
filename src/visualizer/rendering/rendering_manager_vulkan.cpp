@@ -57,6 +57,11 @@
 namespace lfs::vis {
 
     namespace {
+        bool hasMeshOrCollisionPreview(const FrameContext& ctx) {
+            return !ctx.scene_state.meshes.empty() ||
+                   (ctx.scene_manager && hasVisibleCollisionPreview(*ctx.scene_manager));
+        }
+
         constexpr double kGpuLodRenderCapacityOverhead = 1.20;
         constexpr float kInteractiveResizeRenderScale = 0.33f;
         constexpr auto kTrainingOutputResizeStableDelay = std::chrono::milliseconds(500);
@@ -1020,7 +1025,7 @@ namespace lfs::vis {
             const auto vp_data = frame_ctx.makeViewportData();
             frame.view_projection = vp_data.getProjectionMatrix() * vp_data.getViewMatrix();
             frame.camera_position = vp_data.translation;
-            if (!frame_ctx.scene_state.meshes.empty()) {
+            if (hasMeshOrCollisionPreview(frame_ctx)) {
                 frame.depth_view = settings.depth_view;
                 frame.depth_view_min = settings.depth_view_min;
                 frame.depth_view_max = settings.depth_view_max;
@@ -1070,6 +1075,13 @@ namespace lfs::vis {
             vk_req.crop_ellipsoid = PointCloudVulkanRenderer::CropEllipsoid{
                 .to_local = ellipsoid->transform,
                 .radii = ellipsoid->radii,
+                .inverse = pc_request.filters.crop_inverse,
+                .desaturate = pc_request.filters.crop_desaturate};
+        } else if (const auto& polygon = pc_request.filters.crop_polygon) {
+            vk_req.crop_polygon = PointCloudVulkanRenderer::CropPolygon{
+                .to_local = polygon->transform,
+                .vertices = polygon->vertices,
+                .half_depth = polygon->half_depth,
                 .inverse = pc_request.filters.crop_inverse,
                 .desaturate = pc_request.filters.crop_desaturate};
         }
@@ -1896,6 +1908,8 @@ namespace lfs::vis {
 
     RenderingManager::VulkanFrameResult RenderingManager::renderVulkanFrame(const RenderContext& context) {
         LOG_TIMER("renderVulkanFrame");
+        if (context.deterministic_export)
+            markDirty(DirtyFlag::ALL, FrameReason::AsyncCompletion, "deterministic_capture");
         if (vksplat_stale_frame_guard_.takeRecoveryRequest() && vksplat_viewport_renderer_) {
             // clear_external_backing waits for the arena to be idle. Do this
             // before taking either trainer lock, after the failed frame's borrow
@@ -2337,7 +2351,8 @@ namespace lfs::vis {
                 scene_state.point_cloud != nullptr && scene_state.point_cloud->size() > 0;
             has_meshes = std::any_of(scene_state.meshes.begin(),
                                      scene_state.meshes.end(),
-                                     [](const auto& mesh) { return mesh.mesh != nullptr; });
+                                     [](const auto& mesh) { return mesh.mesh != nullptr; }) ||
+                         (scene_manager && hasVisibleCollisionPreview(*scene_manager));
             has_environment = environmentBackgroundEnabled(frame_settings);
             has_render_content =
                 has_visible_gaussian_model || has_point_cloud || has_comparison_point_cloud || has_meshes || has_environment;
@@ -2433,6 +2448,7 @@ namespace lfs::vis {
 
         DirtyMask frame_dirty = dirty_mask_.exchange(0);
         if (vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_->invalidateStochasticHistory(frame_dirty);
             vksplat_viewport_renderer_->setCameraNavigating(
                 is_training && (frame_dirty & DirtyFlag::CAMERA) != 0);
         }
@@ -2664,6 +2680,7 @@ namespace lfs::vis {
             .viewport_pos = {0, 0},
             .frame_dirty = frame_dirty,
             .training_active = is_training,
+            .deterministic_export = context.deterministic_export,
             .gaussian_selection_visible = gaussian_selection_visible_,
             .cursor_preview = viewport_overlay_service_.cursorPreview(),
             .gizmo = viewport_overlay_service_.makeFrameGizmoState(),
@@ -2837,6 +2854,9 @@ namespace lfs::vis {
                 if (result.lod_streaming_active) {
                     requestRenderFollowUp();
                 }
+                if (result.stochastic_accumulation_active) {
+                    markDirty(DirtyFlag::CAMERA, FrameReason::StochasticAccumulation);
+                }
             };
         // Meshes draw over this panel after composition.
         const auto mesh_background_panel = [&]() -> RenderedPanel {
@@ -2907,7 +2927,7 @@ namespace lfs::vis {
 
             if (!panel_has_visible_gaussian_model) {
                 if (splitViewUsesIndependentPanels(frame_settings.split_view_mode) &&
-                    !frame_ctx.scene_state.meshes.empty()) {
+                    hasMeshOrCollisionPreview(frame_ctx)) {
                     return mesh_background_panel();
                 }
                 return std::unexpected("No renderable model for split-view panel");
@@ -4216,7 +4236,7 @@ namespace lfs::vis {
                 viewport_interaction_context_.scene_manager = scene_manager;
                 split_view_service_.updateInfo(FrameResources{});
 
-                if (!frame_ctx.scene_state.meshes.empty() ||
+                if (hasMeshOrCollisionPreview(frame_ctx) ||
                     environmentBackgroundEnabled(frame_settings)) {
                     auto mesh_frame = populateMeshFrame(frame_ctx, frame_settings, pending_split_view, environment_map_path);
                     populate_split_mesh_panels(mesh_frame);
@@ -4500,7 +4520,7 @@ namespace lfs::vis {
                             // Republish here so overlays and mesh/environment passes see
                             // the current camera and splat depth view.
                             const bool publish_mesh_frame =
-                                !frame_ctx.scene_state.meshes.empty() ||
+                                hasMeshOrCollisionPreview(frame_ctx) ||
                                 environmentBackgroundEnabled(frame_settings) ||
                                 render_result.depth_image_view != VK_NULL_HANDLE;
                             if (publish_mesh_frame) {
@@ -4751,6 +4771,7 @@ namespace lfs::vis {
 
                     const DirtyMask non_overlay_dirty = frame_dirty & ~DirtyFlag::SELECTION;
                     const bool can_rerender_selection_overlay =
+                        request.transparency_mode == lfs::rendering::GaussianTransparencyMode::AlphaBlend &&
                         // Object contour membership is classified during projection.
                         // Reusing its flags after a tree selection change retains
                         // the previous object's contour, including on deselection.
@@ -4859,12 +4880,12 @@ namespace lfs::vis {
                 frame_ctx.current_camera_id);
         }
 
-        if (frame_ctx.scene_state.meshes.empty()) {
+        if (!hasMeshOrCollisionPreview(frame_ctx)) {
             clearVulkanMeshFrame();
         }
 
         if ((rendered_image || render_error.empty() || pending_split_view.enabled) &&
-            (environmentBackgroundEnabled(frame_settings) || !frame_ctx.scene_state.meshes.empty() ||
+            (environmentBackgroundEnabled(frame_settings) || hasMeshOrCollisionPreview(frame_ctx) ||
              pending_split_view.enabled)) {
             VulkanMeshFrame gpu_mesh_frame = populateMeshFrame(frame_ctx, frame_settings, pending_split_view, environment_map_path);
             populate_split_mesh_panels(gpu_mesh_frame);
@@ -4907,7 +4928,7 @@ namespace lfs::vis {
         render_lock.reset();
 
         const bool has_gpu_only_pass =
-            !frame_ctx.scene_state.meshes.empty() ||
+            hasMeshOrCollisionPreview(frame_ctx) ||
             environmentBackgroundEnabled(frame_settings) ||
             pending_split_view.enabled;
 

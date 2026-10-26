@@ -1739,7 +1739,8 @@ namespace lfs::training {
     core::Tensor Trainer::report_region_image_loss(
         const core::Tensor& corrected, const core::Tensor& raw, const core::Tensor& target,
         const core::Tensor& mask, const core::Tensor& region, const core::Tensor& structure_map,
-        const core::param::OptimizationParameters& params, const int iteration) {
+        const core::param::OptimizationParameters& params, const int iteration,
+        const core::Tensor& mask_regularization_loss) {
         using core::param::MaskMode;
         const auto mode = params.mask_mode;
         const bool user_masks_photometric =
@@ -1772,7 +1773,9 @@ namespace lfs::training {
             loss = loss + kernels::gradient_residual_loss(image, target, base_weight, params.gradient_loss_weight,
                                                           roi_report_residual_);
         }
-        return loss;
+        // Mask penalties keep their training weights, like the other regularizers. They were
+        // included in the image loss being replaced, but are not part of the forward-only RGB loss.
+        return mask_regularization_loss.is_valid() ? loss + mask_regularization_loss : loss;
     }
 
     // Compute photometric loss AND gradient manually
@@ -1952,7 +1955,7 @@ namespace lfs::training {
                     static_cast<int>(gt_image.shape()[2]), opt_params.lambda_dssim > 0.0f);
         }
 
-        Tensor loss, grad_corrected, grad_alpha;
+        Tensor loss, grad_corrected, grad_alpha, mask_regularization_loss;
         std::optional<lfs::training::kernels::DecoupledRawGradient> raw_gradient;
         std::optional<RawGradientResidual> raw_residual;
         const bool use_decoupled_appearance_loss =
@@ -2013,6 +2016,7 @@ namespace lfs::training {
                     mode == param::MaskMode::SegmentAndIgnore);
                 grad_alpha = penalty.grad_alpha;
                 loss = loss + penalty.loss;
+                mask_regularization_loss = penalty.loss;
             }
         } else {
             auto fallback = compute_photometric_loss_with_gradient(corrected, gt_image, opt_params, raw_rendered, iteration);
@@ -2045,6 +2049,7 @@ namespace lfs::training {
                 ALPHA_CONSISTENCY_WEIGHT);
             loss = loss + alpha_term.loss;
             grad_alpha = alpha_term.grad_alpha;
+            mask_regularization_loss = alpha_term.loss;
         }
 
         if (photometric_weight.is_valid())
@@ -2057,7 +2062,8 @@ namespace lfs::training {
             .raw_gradient = raw_gradient,
             .raw_residual = raw_residual,
             .grad_alpha = grad_alpha,
-            .normal_pixel_weight = user_masks_photometric && normal_terms_on ? base_photometric_weight : Tensor{}};
+            .normal_pixel_weight = user_masks_photometric && normal_terms_on ? base_photometric_weight : Tensor{},
+            .mask_regularization_loss = mask_regularization_loss};
     }
 
     // Returns GPU tensor for loss - NO SYNC!
@@ -2138,6 +2144,12 @@ namespace lfs::training {
                        ? deleted.ptr<bool>()
                        : nullptr;
         }
+
+        lfs::training::kernels::RoiPolygon roi_polygon(const TrainingCropBoxGeometry& region) {
+            return {.vertices = region.polygon.data(),
+                    .count = static_cast<int>(region.polygon.size()),
+                    .half_depth = region.max.z};
+        }
     } // namespace
 
     void Trainer::install_cropbox_view_damping(
@@ -2155,17 +2167,24 @@ namespace lfs::training {
         const auto means = model.get_means().contiguous();
         const auto scales = model.scaling_raw().contiguous();
         auto rejected = bool_rows(cropbox_view_reject_, n);
-        lfs::training::kernels::launch_roi_view_reject_mask(
-            means.ptr<float>(), scales.ptr<float>(), n, cropbox_->model_to_cropbox, cropbox_->world_to_cropbox,
-            camera.cam_position_ptr(), cropbox_->min, cropbox_->max, cropbox_->inverse,
-            deleted_rows(model), rejected.ptr<bool>(), lfs::core::getCurrentCUDAStream());
+        if (cropbox_->is_polygon()) {
+            lfs::training::kernels::launch_roi_view_reject_mask(
+                means.ptr<float>(), scales.ptr<float>(), n, cropbox_->model_to_cropbox, cropbox_->world_to_cropbox,
+                camera.cam_position_ptr(), roi_polygon(*cropbox_), cropbox_->inverse,
+                deleted_rows(model), rejected.ptr<bool>(), lfs::core::getCurrentCUDAStream());
+        } else {
+            lfs::training::kernels::launch_roi_view_reject_mask(
+                means.ptr<float>(), scales.ptr<float>(), n, cropbox_->model_to_cropbox, cropbox_->world_to_cropbox,
+                camera.cam_position_ptr(), cropbox_->min, cropbox_->max, cropbox_->inverse,
+                deleted_rows(model), rejected.ptr<bool>(), lfs::core::getCurrentCUDAStream());
+        }
         optimizer.set_crop_damping_mask(rejected);
     }
 
     void Trainer::crop_to_training_cropbox() {
         refresh_cropbox_snapshot();
         if (!cropbox_ || !strategy_) {
-            LOG_WARN("--crop: the training model has no active crop box, nothing is removed");
+            LOG_WARN("--crop: the training model has no active crop box or polygon, nothing is removed");
             return;
         }
         std::unique_lock render_lock(render_mutex_);
@@ -2181,8 +2200,8 @@ namespace lfs::training {
         if (outside->sum_scalar() > 0)
             strategy_->remove_gaussians(*outside);
         // MCMC soft-deletes removed splats, so count the live ones.
-        LOG_INFO("Cropped the trained model to its crop box: {} of {} splats kept",
-                 strategy_->get_model().visible_count(), before);
+        LOG_INFO("Cropped the trained model to its crop {}: {} of {} splats kept",
+                 cropbox_->is_polygon() ? "polygon" : "box", strategy_->get_model().visible_count(), before);
     }
 
     bool Trainer::cropbox_contains_camera(const lfs::core::Camera& camera) const {
@@ -2199,8 +2218,7 @@ namespace lfs::training {
         const glm::vec3 centre(-(r[0] * t[0] + r[3] * t[1] + r[6] * t[2]),
                                -(r[1] * t[0] + r[4] * t[1] + r[7] * t[2]),
                                -(r[2] * t[0] + r[5] * t[1] + r[8] * t[2]));
-        const glm::vec3 p = glm::vec3(cropbox_->world_to_cropbox * glm::vec4(centre, 1.0f));
-        return glm::all(glm::greaterThanEqual(p, cropbox_->min)) && glm::all(glm::lessThanEqual(p, cropbox_->max));
+        return training_crop_region_contains(*cropbox_, glm::vec3(cropbox_->world_to_cropbox * glm::vec4(centre, 1.0f)));
     }
 
     void Trainer::install_cropbox_score_damping(
@@ -2240,11 +2258,19 @@ namespace lfs::training {
         const auto scales = model.scaling_raw().contiguous();
         auto rejected = bool_rows(cropbox_score_reject_, n);
         auto in_roi = bool_rows(cropbox_roi_rows_, n);
-        lfs::training::kernels::launch_roi_relevance_reject_mask(
-            means.ptr<float>(), scales.ptr<float>(), n, cropbox_->model_to_cropbox, cropbox_camera_centres_.ptr<float>(),
-            static_cast<int>(cropbox_camera_centres_.size(0)), cropbox_->min, cropbox_->max,
-            cropbox_->inverse, deleted_rows(model), rejected.ptr<bool>(), in_roi.ptr<bool>(),
-            lfs::core::getCurrentCUDAStream());
+        if (cropbox_->is_polygon()) {
+            lfs::training::kernels::launch_roi_relevance_reject_mask(
+                means.ptr<float>(), scales.ptr<float>(), n, cropbox_->model_to_cropbox,
+                cropbox_camera_centres_.ptr<float>(), static_cast<int>(cropbox_camera_centres_.size(0)),
+                roi_polygon(*cropbox_), cropbox_->inverse, deleted_rows(model), rejected.ptr<bool>(),
+                in_roi.ptr<bool>(), lfs::core::getCurrentCUDAStream());
+        } else {
+            lfs::training::kernels::launch_roi_relevance_reject_mask(
+                means.ptr<float>(), scales.ptr<float>(), n, cropbox_->model_to_cropbox, cropbox_camera_centres_.ptr<float>(),
+                static_cast<int>(cropbox_camera_centres_.size(0)), cropbox_->min, cropbox_->max,
+                cropbox_->inverse, deleted_rows(model), rejected.ptr<bool>(), in_roi.ptr<bool>(),
+                lfs::core::getCurrentCUDAStream());
+        }
         optimizer.set_crop_score_mask(scale == 1.0f ? lfs::core::Tensor{} : rejected);
         optimizer.set_crop_roi_rows(growth_inside > 0.0f ? in_roi : lfs::core::Tensor{}, growth_inside);
     }
@@ -3400,7 +3426,8 @@ namespace lfs::training {
                                  cloud->means.shape()[0], (*splat)[0], (*splat)[1]);
                     } else if (lfs::core::param::is_eval_mask_cropbox(params_.optimization.eval_mask)) {
                         const auto cropbox = scene_ ? lfs::training::resolve_training_cropbox_geom(*scene_) : std::nullopt;
-                        if (!cropbox)
+                        // A crop polygon trains as the ROI, but the evaluation mask stays box-only.
+                        if (!cropbox || cropbox->is_polygon())
                             return std::unexpected("Evaluation mask 'cropbox' needs an enabled crop box on the training model");
                         evaluator_->set_eval_mesh(lfs::training::make_evaluation_box(
                             lfs::training::training_cropbox_model_corners(*cropbox), cropbox->inverse));
@@ -5429,6 +5456,10 @@ namespace lfs::training {
                             }
                             document
                                 ->remove_geometry_payloads_not_bound_by_scene();
+                            for (const auto& [uuid, volume] : chapters->collisions) {
+                                if (auto stored = document->set_collision(uuid, volume); !stored)
+                                    return stored;
+                            }
                             if (auto synced =
                                     lfs::io::project::sync_sfm_observations(
                                         *document,
@@ -6740,7 +6771,7 @@ namespace lfs::training {
                     if (!color_variance_loss_.is_valid())
                         color_variance_loss_ = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
                     color_variance_loss_.zero_();
-                    color_variance = {gt_image, color_variance_loss_, step_params.color_variance_weight_at(iter)};
+                    color_variance = {color_variance_loss_, step_params.color_variance_weight_at(iter)};
                 }
                 if (fastgs_path && core::param::is_mrnf_strategy(params_.optimization.strategy) &&
                     params_.optimization.opacity_decay_rendered_only) {
@@ -7240,25 +7271,46 @@ namespace lfs::training {
                                                                lfs::core::DataType::Float32);
                             if (map.stream() != roi_stream)
                                 map.set_stream(roi_stream);
-                            lfs::training::kernels::launch_roi_weight_map(
-                                cam->world_view_transform_ptr(),
-                                cam->cam_position_ptr(),
-                                fx,
-                                fy,
-                                cx,
-                                cy,
-                                output.width,
-                                output.height,
-                                cropbox_->world_to_cropbox,
-                                cropbox_->min,
-                                cropbox_->max,
-                                cropbox_->inverse,
-                                outside_weight,
-                                roi_rays,
-                                roi_surface ? roi_surface_depth.ptr<float>() : nullptr,
-                                roi_surface ? roi_surface_alpha.ptr<float>() : nullptr,
-                                map.ptr<float>(),
-                                roi_stream);
+                            if (cropbox_->is_polygon()) {
+                                lfs::training::kernels::launch_roi_weight_map(
+                                    cam->world_view_transform_ptr(),
+                                    cam->cam_position_ptr(),
+                                    fx,
+                                    fy,
+                                    cx,
+                                    cy,
+                                    output.width,
+                                    output.height,
+                                    cropbox_->world_to_cropbox,
+                                    roi_polygon(*cropbox_),
+                                    cropbox_->inverse,
+                                    outside_weight,
+                                    roi_rays,
+                                    roi_surface ? roi_surface_depth.ptr<float>() : nullptr,
+                                    roi_surface ? roi_surface_alpha.ptr<float>() : nullptr,
+                                    map.ptr<float>(),
+                                    roi_stream);
+                            } else {
+                                lfs::training::kernels::launch_roi_weight_map(
+                                    cam->world_view_transform_ptr(),
+                                    cam->cam_position_ptr(),
+                                    fx,
+                                    fy,
+                                    cx,
+                                    cy,
+                                    output.width,
+                                    output.height,
+                                    cropbox_->world_to_cropbox,
+                                    cropbox_->min,
+                                    cropbox_->max,
+                                    cropbox_->inverse,
+                                    outside_weight,
+                                    roi_rays,
+                                    roi_surface ? roi_surface_depth.ptr<float>() : nullptr,
+                                    roi_surface ? roi_surface_alpha.ptr<float>() : nullptr,
+                                    map.ptr<float>(),
+                                    roi_stream);
+                            }
                             map.sync_to_stream(lfs::core::getCurrentCUDAStream());
                         };
                         if (roi_loss_weighting) {
@@ -7314,6 +7366,7 @@ namespace lfs::training {
                         PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::LossBegin, iter);
                         lfs::core::Tensor tile_loss;
                         lfs::core::Tensor tile_grad;
+                        lfs::core::Tensor tile_mask_regularization_loss;
 
                         {
                             LFS_VRAM_SCOPE("train.photometric_loss");
@@ -7362,6 +7415,7 @@ namespace lfs::training {
                                 }
                                 tile_loss = result->loss;
                                 tile_grad = result->grad_corrected;
+                                tile_mask_regularization_loss = result->mask_regularization_loss;
                             } else {
                                 auto result = compute_photometric_loss_with_gradient(
                                     corrected_image, gt_tile, step_params, raw_loss_input, iter);
@@ -7385,7 +7439,7 @@ namespace lfs::training {
                             if (roi_report_weight.is_valid()) {
                                 region_image_loss = report_region_image_loss(
                                     corrected_image, raw_loss_input, gt_tile, mask, roi_report_weight, structure_map,
-                                    step_params, iter);
+                                    step_params, iter, tile_mask_regularization_loss);
                                 reported_image_loss = tile_loss;
                             }
                         }
@@ -7438,6 +7492,15 @@ namespace lfs::training {
 
                         lfs::core::Tensor corrected_image = output.image;
                         lfs::core::Tensor ppisp_input;
+                        // Until a correction writes a new image, corrected_image is the raw render,
+                        // which the color variance backward still reads: clamp a copy of it then.
+                        const auto clamp_corrected = [&]() {
+                            if (color_variance.weight > 0.0f &&
+                                corrected_image.ptr<float>() == output.image.ptr<float>())
+                                corrected_image = corrected_image.clamp(0.0f, 1.0f);
+                            else
+                                corrected_image.clamp_(0.0f, 1.0f);
+                        };
                         if (exposure_correction) {
                             if (ppisp_on) {
                                 nvtxRangePush("ppisp_forward");
@@ -7459,7 +7522,7 @@ namespace lfs::training {
                                 }
                                 nvtxRangePop();
                             }
-                            corrected_image.clamp_(0.0f, 1.0f);
+                            clamp_corrected();
                         } else {
                             if (grid_on) {
                                 nvtxRangePush("bilateral_grid_forward");
@@ -7481,7 +7544,7 @@ namespace lfs::training {
                             // Final tonemapping: clamp to [0, 1] for loss computation.
                             // skip when PPISP is active — CRF already clamps.
                             if (!ppisp_on) {
-                                corrected_image.clamp_(0.0f, 1.0f);
+                                clamp_corrected();
                             }
                         }
                         // For decoupled D-SSIM, the active appearance model provides the corrected image
@@ -7493,6 +7556,7 @@ namespace lfs::training {
                         PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::LossBegin, iter);
                         lfs::core::Tensor tile_loss;
                         lfs::core::Tensor tile_grad;
+                        lfs::core::Tensor tile_mask_regularization_loss;
                         std::optional<lfs::training::kernels::DecoupledRawGradient> tile_raw_gradient;
                         std::optional<RawGradientResidual> tile_raw_residual;
                         lfs::core::Tensor tile_grad_alpha;
@@ -7613,6 +7677,7 @@ namespace lfs::training {
                                 tile_raw_gradient = result->raw_gradient;
                                 tile_raw_residual = result->raw_residual;
                                 tile_grad_alpha = result->grad_alpha;
+                                tile_mask_regularization_loss = result->mask_regularization_loss;
                                 normal_terms_weight = result->normal_pixel_weight;
                             } else {
                                 auto result = compute_photometric_loss_with_gradient(
@@ -7638,7 +7703,7 @@ namespace lfs::training {
                             if (roi_report_weight.is_valid()) {
                                 region_image_loss = report_region_image_loss(
                                     corrected_image, raw_loss_input, gt_tile, mask_tile, roi_report_weight,
-                                    structure_map, step_params, iter);
+                                    structure_map, step_params, iter, tile_mask_regularization_loss);
                                 reported_image_loss = tile_loss;
                             }
                         }

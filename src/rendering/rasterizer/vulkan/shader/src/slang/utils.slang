@@ -1226,9 +1226,9 @@ struct Uniforms {
     float rasterization_scale;
     // Distance the orthographic eye was moved back; subtracted from every depth output.
     float depth_offset;
-    uint depth_offset_pad0;
-    uint depth_offset_pad1;
-    uint depth_offset_pad2;
+    uint stochastic_frame;
+    uint stochastic_mode;
+    uint stochastic_history_valid;
 }
 
 // mip_filter packs MIP filtering (bit 0), exact depth replay (bit 1),
@@ -1316,7 +1316,16 @@ static const uint OVERLAY_PARAM_CROP_EXTRA_COUNT = 15;
 static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE = OVERLAY_PARAM_CROP_EXTRA_BASE + OVERLAY_PARAM_CROP_STRIDE * OVERLAY_PARAM_CROP_EXTRA_COUNT;
 static const uint OVERLAY_PARAM_ELLIPSOID_STRIDE = 5;
 static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT = 15;
-static const uint OVERLAY_PARAM_COUNT = OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE + OVERLAY_PARAM_ELLIPSOID_STRIDE * OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT;
+// Polygon slots: flags, (half_depth, vertex_count), world->local rows, then two
+// vertices per float4. Mirrors vksplat_overlay_params.hpp.
+static const uint OVERLAY_PARAM_CROP_POLYGON_BASE = OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE + OVERLAY_PARAM_ELLIPSOID_STRIDE * OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT;
+static const uint OVERLAY_PARAM_CROP_POLYGON_PARAMS = 1;
+static const uint OVERLAY_PARAM_CROP_POLYGON_TRANSFORM = 2;
+static const uint OVERLAY_PARAM_CROP_POLYGON_VERTICES = 6;
+static const uint OVERLAY_PARAM_CROP_POLYGON_MAX_VERTICES = 64;
+static const uint OVERLAY_PARAM_CROP_POLYGON_STRIDE = OVERLAY_PARAM_CROP_POLYGON_VERTICES + OVERLAY_PARAM_CROP_POLYGON_MAX_VERTICES / 2;
+static const uint OVERLAY_PARAM_CROP_POLYGON_COUNT = 16;
+static const uint OVERLAY_PARAM_COUNT = OVERLAY_PARAM_CROP_POLYGON_BASE + OVERLAY_PARAM_CROP_POLYGON_STRIDE * OVERLAY_PARAM_CROP_POLYGON_COUNT;
 
 [ForceInline]
 bool overlay_enabled(float value)

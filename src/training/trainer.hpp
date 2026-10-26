@@ -637,6 +637,8 @@ namespace lfs::training {
             std::optional<RawGradientResidual> raw_residual;
             lfs::core::Tensor grad_alpha;
             lfs::core::Tensor normal_pixel_weight;
+            // Already included in loss; retain it when replacing only the image terms for ROI reporting.
+            lfs::core::Tensor mask_regularization_loss;
         };
 
         // Masked photometric loss with optional alpha gradient
@@ -1171,7 +1173,8 @@ namespace lfs::training {
         core::Tensor report_region_image_loss(const core::Tensor& corrected, const core::Tensor& raw,
                                               const core::Tensor& target, const core::Tensor& mask,
                                               const core::Tensor& region, const core::Tensor& structure_map,
-                                              const core::param::OptimizationParameters& params, int iteration);
+                                              const core::param::OptimizationParameters& params, int iteration,
+                                              const core::Tensor& mask_regularization_loss = {});
         void submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
                                 const lfs::core::Tensor& region_weight = {});
         // Warns once when an ignore mask leaves a view no pixel. A zero host value means the

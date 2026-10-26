@@ -534,6 +534,8 @@ namespace lfs::app {
                 return "crop_box";
             case core::NodeType::ELLIPSOID:
                 return "ellipsoid";
+            case core::NodeType::CROP_POLYGON:
+                return "crop_polygon";
             case core::NodeType::DATASET:
                 return "dataset";
             case core::NodeType::CAMERA_GROUP:
@@ -546,6 +548,8 @@ namespace lfs::app {
                 return "image";
             case core::NodeType::MESH:
                 return "mesh";
+            case core::NodeType::COLLISION:
+                return "collision";
             case core::NodeType::KEYFRAME_GROUP:
                 return "keyframe_group";
             case core::NodeType::KEYFRAME:
@@ -1138,6 +1142,8 @@ namespace lfs::app {
                                  {"split_position", settings.split_position},
                                  {"split_view_offset", settings.split_view_offset},
                                  {"raster_backend", std::string(lfs::rendering::gaussianRasterBackendId(static_cast<lfs::rendering::GaussianRasterBackend>(settings.raster_backend)))},
+                                 {"transparency_mode", std::string(lfs::rendering::gaussianTransparencyModeId(static_cast<lfs::rendering::GaussianTransparencyMode>(settings.transparency_mode)))},
+                                 {"stochastic_max_frames", settings.stochastic_max_frames},
                                  {"equirectangular", settings.equirectangular},
                                  {"orthographic", settings.orthographic},
                                  {"ortho_scale", settings.ortho_scale},
@@ -1365,6 +1371,21 @@ namespace lfs::app {
             }
             if (auto result = set_raster_backend(settings); !result)
                 return std::unexpected(result.error());
+            if (args.contains("transparency_mode")) {
+                const auto& value = args["transparency_mode"];
+                if (!value.is_string() || !lfs::rendering::isGaussianTransparencyModeId(value.get<std::string>()))
+                    return std::unexpected("Field 'transparency_mode' must be 'alpha_blend', 'stochastic', or 'steady_splats'");
+                settings.transparency_mode = static_cast<int>(
+                    lfs::rendering::gaussianTransparencyModeFromId(value.get<std::string>()));
+                touched = true;
+            }
+            if (args.contains("stochastic_max_frames")) {
+                const auto& value = args["stochastic_max_frames"];
+                if (!value.is_number_integer() || value < 1 || value > 1024)
+                    return std::unexpected("Field 'stochastic_max_frames' must be an integer in [1, 1024]");
+                settings.stochastic_max_frames = value.get<int>();
+                touched = true;
+            }
             set_bool("equirectangular", settings.equirectangular);
             set_bool("orthographic", settings.orthographic);
             set_float("ortho_scale", settings.ortho_scale);
@@ -2496,6 +2517,33 @@ namespace lfs::app {
         }
 
         // --- Scene operations (posted to GUI thread) ---
+        registry.register_tool(
+            McpTool{.name = "scene.generate_collision",
+                    .description = "Voxelize exactly one selected loaded splat into a new undoable collision node; observe collision.main",
+                    .input_schema = {.type = "object", .properties = json{{"voxel_size", {{"type", "number"}}}, {"opacity", {{"type", "number"}}}, {"auto_resolution", {{"type", "boolean"}}}, {"cleanup", {{"type", "boolean"}}}, {"max_gaussian_area", {{"type", "number"}}}}, .required = {}},
+                    .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
+            [viewer, viewer_impl](const json& args) -> json {
+                return post_and_wait(viewer, [viewer_impl, args]() -> json {
+                    if (!viewer_impl->getGuiManager())
+                        throw std::runtime_error("GUI manager is not initialized");
+                    viewer_impl->getGuiManager()->asyncTasks().startCollision({.voxel_size = args.value("voxel_size", .05f), .opacity = args.value("opacity", .1f), .max_gaussian_area = args.value("max_gaussian_area", 0.f), .auto_resolution = args.value("auto_resolution", false), .cleanup = args.value("cleanup", true)});
+                    return json{{"job_id", "collision.main"}};
+                });
+            });
+        registry.register_tool(
+            McpTool{.name = "scene.export_collision",
+                    .description = "Export a collision node UUID to a voxel JSON/binary pair; caller approves replacing both files",
+                    .input_schema = {.type = "object", .properties = json{{"uuid", {{"type", "string"}}}, {"path", {{"type", "string"}}}}, .required = {"uuid", "path"}},
+                    .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
+            [viewer, viewer_impl](const json& args) -> json {
+                return post_and_wait(viewer, [viewer_impl, args]() -> json {
+                    const auto uuid = core::Uuid::from_string(args.at("uuid").get<std::string>());
+                    if (!uuid || !viewer_impl->getGuiManager())
+                        throw std::invalid_argument("Invalid collision UUID or unavailable GUI");
+                    viewer_impl->getGuiManager()->asyncTasks().startCollisionExport(*uuid, core::utf8_to_path(args.at("path").get<std::string>()));
+                    return json{{"job_id", "collision.main"}};
+                });
+            });
 
         registry.register_tool(
             McpTool{
@@ -2815,7 +2863,7 @@ namespace lfs::app {
                         if (const auto crop = trainer_manager ? trainer_manager->exportCropBox() : std::nullopt)
                             cropped = training::crop_copy_to_training_cropbox(*model, *crop);
                         if (cropped && cropped->size() == 0)
-                            return std::unexpected("No splat lies inside the crop box");
+                            return std::unexpected("No splat lies inside the crop box or polygon");
 
                         io::PlySaveOptions options{.output_path = path, .binary = true, .provenance = stamp};
                         auto result = io::save_ply(cropped ? *cropped : *model, options);
@@ -2972,15 +3020,12 @@ namespace lfs::app {
                 auto result = [&]() -> lfs::Result<std::string> {
                     if (panel_id.empty())
                         return lfs::from_legacy_expected(
-                            capture_after_gui_render(viewer, [viewer, width, height]() {
-                                return capture_full_window_to_base64(viewer, width, height);
-                            }),
-                            lfs::LegacyErrorContext{
-                                .code = lfs::ErrorCode::Unavailable,
-                                .domain = lfs::ErrorDomain::MCP,
-                                .operation = "Capture composited app window",
-                                .source = LFS_SOURCE_SITE_CURRENT(),
-                            });
+                            capture_after_gui_render(viewer, [viewer, width, height]() { return capture_full_window_to_base64(viewer, width, height); }, true), lfs::LegacyErrorContext{
+                                                                                                                                                                    .code = lfs::ErrorCode::Unavailable,
+                                                                                                                                                                    .domain = lfs::ErrorDomain::MCP,
+                                                                                                                                                                    .operation = "Capture composited app window",
+                                                                                                                                                                    .source = LFS_SOURCE_SITE_CURRENT(),
+                                                                                                                                                                });
                     auto promise = std::make_shared<std::promise<lfs::Result<vis::VulkanContext::WindowCapture>>>();
                     auto future = promise->get_future();
                     const auto accepted = capture_after_gui_render(viewer, [viewer, panel_id, promise]() -> lfs::Result<bool> {
@@ -3403,6 +3448,8 @@ namespace lfs::app {
                         {"environment_exposure", json{{"type", "number"}}},
                         {"environment_rotation_degrees", json{{"type", "number"}}},
                         {"raster_backend", json{{"type", "string"}, {"enum", json::array({"3dgs", "3dgut"})}}},
+                        {"transparency_mode", json{{"type", "string"}, {"enum", json::array({"alpha_blend", "stochastic", "steady_splats"})}}},
+                        {"stochastic_max_frames", json{{"type", "integer"}, {"minimum", 1}, {"maximum", 1024}}},
                         {"antialiasing", json{{"type", "boolean"}}},
                         {"show_grid", json{{"type", "boolean"}}},
                         {"show_camera_frustums", json{{"type", "boolean"}}},
@@ -6057,9 +6104,7 @@ namespace lfs::app {
                 .description = "Base64-encoded PNG capture of the full composited app window, including the live viewport, panels, toolbars, and GUI overlays",
                 .mime_type = "image/png"},
             [viewer](const std::string& uri) -> std::expected<std::vector<McpResourceContent>, std::string> {
-                auto result = capture_after_gui_render(viewer, [viewer]() {
-                    return capture_full_window_to_base64(viewer);
-                });
+                auto result = capture_after_gui_render(viewer, [viewer]() { return capture_full_window_to_base64(viewer); }, true);
                 if (!result)
                     return std::unexpected(result.error());
 
@@ -6073,9 +6118,7 @@ namespace lfs::app {
                 if (uri == "lichtfeld://render/current") {
                     result = capture_after_gui_render(viewer, [viewer]() { return capture_live_viewport_to_base64(viewer); }, true);
                 } else if (uri == "lichtfeld://render/window") {
-                    result = capture_after_gui_render(viewer, [viewer]() {
-                        return capture_full_window_to_base64(viewer);
-                    });
+                    result = capture_after_gui_render(viewer, [viewer]() { return capture_full_window_to_base64(viewer); }, true);
                 }
                 if (!result)
                     return std::unexpected(result.error());

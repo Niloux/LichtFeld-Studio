@@ -112,6 +112,16 @@ class SplatData:
         Reserve capacity for Gaussians (for densification). Raises if the model is renderer-backed.
         """
 
+def generate_collision(voxel_size: float = 0.05000000074505806, opacity: float = 0.10000000149011612, auto_resolution: bool = False, cleanup: bool = True, max_gaussian_area: float = 0.0) -> None: ...
+
+def export_collision(uuid: str, path: str) -> None: ...
+
+def cancel_collision() -> None: ...
+
+def get_collision_state() -> dict: ...
+
+def set_walk_settings(height: float, radius: float, step: float, speed: float) -> None: ...
+
 class SceneSplatSnapshot:
     @property
     def transform(self) -> tuple: ...
@@ -149,9 +159,13 @@ class NodeType(enum.Enum):
 
     MESH = 10
 
+    COLLISION = 15
+
     KEYFRAME_GROUP = 11
 
     KEYFRAME = 12
+
+    CROP_POLYGON = 14
 
 class MeshInfo:
     @property
@@ -231,6 +245,31 @@ class Ellipsoid:
     @property
     def __property_group__(self) -> str:
         """Property group name for introspection"""
+
+    def get(self, name: str) -> object:
+        """Get property value by name"""
+
+    def set(self, name: str, value: object) -> None:
+        """Set property value by name"""
+
+    def prop_info(self, name: str) -> dict:
+        """Get metadata for a property"""
+
+    def __getattr__(self, arg: str, /) -> object: ...
+
+    def __setattr__(self, arg0: str, arg1: object, /) -> None: ...
+
+    def __dir__(self) -> list:
+        """List available attributes"""
+
+class CropPolygon:
+    @property
+    def __property_group__(self) -> str:
+        """Property group name for introspection"""
+
+    @property
+    def vertices(self) -> list[tuple[float, float]]:
+        """Outline vertices (x, y) in the node's local XY plane"""
 
     def get(self, name: str) -> object:
         """Get property value by name"""
@@ -384,6 +423,9 @@ class SceneNode:
 
     def ellipsoid(self) -> Ellipsoid | None:
         """Get Ellipsoid for ELLIPSOID nodes (None otherwise)"""
+
+    def crop_polygon(self) -> CropPolygon | None:
+        """Get CropPolygon for CROP_POLYGON nodes (None otherwise)"""
 
     def keyframe_data(self) -> KeyframeData | None:
         """Get KeyframeData for KEYFRAME nodes (None otherwise)"""
@@ -609,7 +651,7 @@ class Scene:
 
     def apply_crop_filter(self, mask: lichtfeld.Tensor) -> None:
         """
-        Filter a combined-model CUDA bool mask in place by enabled render crop boxes and ellipsoids. Scene selection is unchanged.
+        Filter a combined-model CUDA bool mask in place by enabled render crop boxes, ellipsoids and polygons. Scene selection is unchanged.
         """
 
     def training_model(self) -> SplatData | None:

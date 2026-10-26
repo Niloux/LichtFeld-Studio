@@ -199,7 +199,10 @@ namespace lfs::python {
             .value("PREVIOUS_SIDEBAR_CATEGORY", Action::PREVIOUS_SIDEBAR_CATEGORY)
             .value("REMOVE_LAST_POINT", Action::REMOVE_LAST_POINT)
             .value("APPLY_ALIGNMENT", Action::APPLY_ALIGNMENT)
-            .value("UNGROUP_SELECTED_SCENE_NODE", Action::UNGROUP_SELECTED_SCENE_NODE);
+            .value("INSERT_CROP_POLYGON_VERTEX", Action::INSERT_CROP_POLYGON_VERTEX)
+            .value("REMOVE_CROP_POLYGON_VERTEX", Action::REMOVE_CROP_POLYGON_VERTEX)
+            .value("UNGROUP_SELECTED_SCENE_NODE", Action::UNGROUP_SELECTED_SCENE_NODE)
+            .value("EXIT_WALK", Action::EXIT_WALK);
 
         // Expose ToolMode enum
         nb::enum_<ToolMode>(keymap, "ToolMode")
@@ -209,7 +212,8 @@ namespace lfs::python {
             .value("ROTATE", ToolMode::ROTATE)
             .value("SCALE", ToolMode::SCALE)
             .value("ALIGN", ToolMode::ALIGN)
-            .value("CROP_BOX", ToolMode::CROP_BOX);
+            .value("CROP_BOX", ToolMode::CROP_BOX)
+            .value("WALK", ToolMode::WALK);
 
         // Expose Modifier enum
         nb::enum_<Modifier>(keymap, "Modifier")

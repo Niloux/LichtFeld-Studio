@@ -168,6 +168,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         operator/operator_id.cpp
         operator/operator_registry.cpp
         operator/ops/align_ops.cpp
+        operator/ops/crop_polygon_ops.cpp
         operator/ops/edit_ops.cpp
         operator/ops/scene_ops.cpp
         operator/ops/selection_ops.cpp
@@ -278,6 +279,7 @@ target_sources(lfs_visualizer
         rendering/vksplat_input_packer.cpp
         rendering/vksplat_input_packer_cuda.cu
         rendering/vksplat_viewport_renderer.cpp
+        rendering/stochastic_viewport.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
 
@@ -323,6 +325,8 @@ compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/frustum.vert" "
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.vert.spv.h" kMeshVertSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.geom" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.geom.spv.h" kMeshGeomSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.frag.spv.h" kMeshFragSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/collision_overlay.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/collision_overlay.vert.spv.h" kCollisionOverlayVertSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/collision_overlay.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/collision_overlay.frag.spv.h" kCollisionOverlayFragSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_shadow.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_shadow.vert.spv.h" kMeshShadowVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_shadow.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_shadow.frag.spv.h" kMeshShadowFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_wireframe.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_wireframe.vert.spv.h" kMeshWireframeVertSpv)

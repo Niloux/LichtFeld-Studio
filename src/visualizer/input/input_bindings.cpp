@@ -78,7 +78,7 @@ namespace lfs::vis::input {
             publishKeymapNotice(lfs::ErrorCode::InvalidArgument, std::move(message));
         }
 
-        constexpr int PROFILE_VERSION = 35; // Add rebindable Align tool point controls.
+        constexpr int PROFILE_VERSION = 37; // Add the focus-aware Walk exit action.
 
         [[nodiscard]] std::optional<Binding> parseStoredBinding(const nlohmann::json& value);
         [[nodiscard]] std::string triggerIdentity(const Binding& binding);
@@ -139,7 +139,7 @@ namespace lfs::vis::input {
 
         static_assert(kLatestHistoricalProfileVersion == PROFILE_VERSION - 1,
                       "Snapshot the previous keymap defaults before bumping PROFILE_VERSION");
-        constexpr Action LAST_ACTION = Action::APPLY_ALIGNMENT;
+        constexpr Action LAST_ACTION = Action::EXIT_WALK;
         constexpr int REMOVED_TOOL_MODE_2 = 2;
         constexpr int REMOVED_ACTION_39 = 39;
         constexpr int REMOVED_ACTION_66 = 66;
@@ -1286,6 +1286,7 @@ namespace lfs::vis::input {
                 def.action == Action::SELECT_MODE_BOX ||
                 def.action == Action::SELECT_MODE_SPHERE;
             const bool should_add =
+                (version < 37 && def.action == Action::EXIT_WALK) ||
                 (version < 6 && def.action == Action::CAMERA_ROLL) ||
                 (version < 7 && def.action == Action::BRUSH_RESIZE && !brush_resize_shift_scroll) ||
                 (version < 9 && def.action == Action::CONFIRM_POLYGON) ||
@@ -2131,6 +2132,7 @@ namespace lfs::vis::input {
                                     KeyTrigger{KEY_C, MODIFIER_CTRL | MODIFIER_ALT},
                                     Action::TOGGLE_SELECTION_CROP_FILTER,
                                     "Crop filter"});
+        profile.bindings.push_back({ToolMode::WALK, KeyTrigger{KEY_ESCAPE, MODIFIER_NONE}, Action::EXIT_WALK, "Exit Walk"});
         profile.bindings.push_back({ToolMode::CROP_BOX,
                                     KeyTrigger{KEY_ENTER, MODIFIER_NONE},
                                     Action::APPLY_CROP_BOX,
@@ -2139,6 +2141,15 @@ namespace lfs::vis::input {
                                     KeyTrigger{KEY_KP_ENTER, MODIFIER_NONE},
                                     Action::APPLY_CROP_BOX,
                                     "Apply/confirm"});
+        // Closed crop polygon editing, as on the closed selection polygon.
+        profile.bindings.push_back({ToolMode::CROP_BOX,
+                                    MouseButtonTrigger{MouseButton::LEFT, MODIFIER_SHIFT},
+                                    Action::INSERT_CROP_POLYGON_VERTEX,
+                                    "Insert polygon vertex"});
+        profile.bindings.push_back({ToolMode::CROP_BOX,
+                                    MouseButtonTrigger{MouseButton::LEFT, MODIFIER_CTRL},
+                                    Action::REMOVE_CROP_POLYGON_VERTEX,
+                                    "Remove polygon vertex"});
         profile.bindings.push_back({ToolMode::ALIGN,
                                     KeyTrigger{KEY_BACKSPACE, MODIFIER_NONE},
                                     Action::REMOVE_LAST_POINT,
@@ -2251,6 +2262,9 @@ namespace lfs::vis::input {
         case Action::PREVIOUS_SIDEBAR_CATEGORY: return "Previous Sidebar Category";
         case Action::REMOVE_LAST_POINT: return "Remove Last Point";
         case Action::APPLY_ALIGNMENT: return "Apply Alignment";
+        case Action::INSERT_CROP_POLYGON_VERTEX: return "Insert Crop Polygon Vertex";
+        case Action::REMOVE_CROP_POLYGON_VERTEX: return "Remove Crop Polygon Vertex";
+        case Action::EXIT_WALK: return "Exit Walk";
         case Action::TOGGLE_CAMERA_FRUSTUMS: return "Toggle Camera Frustums";
         case Action::OPEN_PREFERENCES: return "Open Preferences";
         case Action::TOGGLE_MCP_SERVER: return "Toggle MCP Server";
@@ -2351,6 +2365,9 @@ namespace lfs::vis::input {
         case Action::PREVIOUS_SIDEBAR_CATEGORY: return "previous_sidebar_category";
         case Action::REMOVE_LAST_POINT: return "remove_last_point";
         case Action::APPLY_ALIGNMENT: return "apply_alignment";
+        case Action::INSERT_CROP_POLYGON_VERTEX: return "insert_crop_polygon_vertex";
+        case Action::REMOVE_CROP_POLYGON_VERTEX: return "remove_crop_polygon_vertex";
+        case Action::EXIT_WALK: return "exit_walk";
         case Action::TOGGLE_CAMERA_FRUSTUMS: return "toggle_camera_frustums";
         case Action::OPEN_PREFERENCES: return "open_preferences";
         case Action::TOGGLE_MCP_SERVER: return "toggle_mcp_server";
@@ -2393,6 +2410,7 @@ namespace lfs::vis::input {
             {ToolMode::SCALE, "scale", "Scale"},
             {ToolMode::ALIGN, "align", "Align"},
             {ToolMode::CROP_BOX, "crop_box", "Crop Box"},
+            {ToolMode::WALK, "walk", "Walk"},
         };
     } // namespace
 
@@ -2435,6 +2453,8 @@ namespace lfs::vis::input {
     }
 
     std::string getLocalizedToolModeName(const ToolMode mode) {
+        if (mode == ToolMode::WALK)
+            return lookupLocale("collision.walk", "Walk");
         for (const auto& [m, suffix, english] : kToolModeEntries) {
             if (m == mode)
                 return lookupLocale(std::string("input_settings.mode.").append(suffix), english);
@@ -2652,7 +2672,8 @@ namespace lfs::vis::input {
             return;
 
         // Escape cancels capture except when capturing its own Cancel action.
-        if (key == KEY_ESCAPE && capture_state_.action != Action::CANCEL_POLYGON) {
+        if (key == KEY_ESCAPE && capture_state_.action != Action::CANCEL_POLYGON &&
+            capture_state_.action != Action::EXIT_WALK) {
             cancelCapture();
             return;
         }
@@ -2971,6 +2992,11 @@ namespace lfs::vis::input {
             .allowed_kinds = K::TRIGGER_KIND_KEY,
             .ui_section = ActionSection::CropBox,
         };
+        static constexpr ActionDescriptor d_crop_box_click{
+            .allowed_kinds = K::TRIGGER_KIND_MOUSE_BUTTON,
+            .prefers_single_click = true,
+            .ui_section = ActionSection::CropBox,
+        };
         static constexpr ActionDescriptor d_align_key{
             .allowed_kinds = K::TRIGGER_KIND_KEY,
             .ui_section = ActionSection::Align,
@@ -3037,6 +3063,7 @@ namespace lfs::vis::input {
         case Action::CAMERA_RESET_HOME:
         case Action::CAMERA_SET_HOME:
         case Action::CAMERA_RESTORE_HOME:
+        case Action::EXIT_WALK:
         case Action::CAMERA_FOCUS_SELECTION:
         case Action::CAMERA_NEXT_VIEW:
         case Action::CAMERA_PREV_VIEW:
@@ -3105,6 +3132,9 @@ namespace lfs::vis::input {
 
         case Action::APPLY_CROP_BOX:
             return d_crop_box_key;
+        case Action::INSERT_CROP_POLYGON_VERTEX:
+        case Action::REMOVE_CROP_POLYGON_VERTEX:
+            return d_crop_box_click;
         case Action::REMOVE_LAST_POINT:
         case Action::APPLY_ALIGNMENT:
             return d_align_key;
@@ -3164,6 +3194,7 @@ namespace lfs::vis::input {
         case Action::CAMERA_NEXT_VIEW:
         case Action::CAMERA_PREV_VIEW:
         case Action::PIE_MENU:
+        case Action::EXIT_WALK:
             return ShortcutScope::Viewport;
 
         default:

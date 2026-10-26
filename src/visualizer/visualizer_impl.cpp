@@ -32,6 +32,7 @@
 #include "operation/undo_history.hpp"
 #include "operator/operator_registry.hpp"
 #include "operator/ops/align_ops.hpp"
+#include "operator/ops/crop_polygon_ops.hpp"
 #include "operator/ops/edit_ops.hpp"
 #include "operator/ops/scene_ops.hpp"
 #include "operator/ops/selection_ops.hpp"
@@ -208,7 +209,8 @@ namespace lfs::vis {
                    node.type == core::NodeType::POINTCLOUD ||
                    node.type == core::NodeType::SPLAT ||
                    node.type == core::NodeType::CROPBOX ||
-                   node.type == core::NodeType::ELLIPSOID;
+                   node.type == core::NodeType::ELLIPSOID ||
+                   node.type == core::NodeType::CROP_POLYGON;
         }
 
         [[nodiscard]] std::unordered_map<std::string, glm::mat4> collectResetTransforms(const core::Scene& scene) {
@@ -369,6 +371,7 @@ namespace lfs::vis {
         op::registerTransformOperators();
         op::registerAlignOperators();
         op::registerSelectionOperators();
+        op::registerCropPolygonOperators();
         op::registerEditOperators();
         op::registerSceneOperators();
 
@@ -401,6 +404,7 @@ namespace lfs::vis {
         // Clear operator system
         op::unregisterEditOperators();
         op::unregisterSceneOperators();
+        op::unregisterCropPolygonOperators();
         op::unregisterSelectionOperators();
         op::unregisterAlignOperators();
         op::unregisterTransformOperators();
@@ -1117,7 +1121,31 @@ namespace lfs::vis {
             if (!rendering_manager_)
                 return std::nullopt;
 
+            if (!window_manager_)
+                return std::nullopt;
+            ViewportRegion region;
+            if (gui_manager_) {
+                const auto pos = gui_manager_->getSceneRenderViewportPos();
+                const auto size = gui_manager_->getSceneRenderViewportSize();
+                region.x = pos.x;
+                region.y = pos.y;
+                region.width = size.x;
+                region.height = size.y;
+            }
+            const RenderingManager::RenderContext capture_context{
+                .viewport = viewport_,
+                .settings = rendering_manager_->getSettings(),
+                .screen_size_px = window_manager_->getFramebufferSize(),
+                .viewport_region = gui_manager_ ? &region : nullptr,
+                .scene_manager = scene_manager_.get(),
+                .vulkan_context = window_manager_->getVulkanContext(),
+                .deterministic_export = true};
+            const auto frame = rendering_manager_->renderVulkanFrame(capture_context);
+            if (!frame.rendered)
+                return std::nullopt;
             auto image = rendering_manager_->captureViewportImage();
+            // The next interactive frame resumes its normal transparency mode.
+            rendering_manager_->markDirty(DirtyFlag::CAMERA, FrameReason::AsyncCompletion);
             if (!image)
                 return std::nullopt;
 
@@ -2672,7 +2700,12 @@ namespace lfs::vis {
         // above the display rate when presenting does not block. Wakes without input start at most
         // one display interval after the last presented frame started; requests stay queued for this
         // frame, and work posted meanwhile is picked up by the next wait.
-        if (last_presented_frame_start_) {
+        // Stochastic refinement is finite work, not a periodic animation. Keep
+        // polling input between samples, but let available GPU slots advance it.
+        const bool refinement_pending = rendering_manager_ &&
+                                        rendering_manager_->frameDemandLedger().hasPendingRequest(
+                                            FrameReason::StochasticAccumulation);
+        if (last_presented_frame_start_ && !refinement_pending) {
             const auto ready_at = *last_presented_frame_start_ +
                                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                       std::chrono::duration<double>(displayFrameInterval()));
@@ -2790,6 +2823,7 @@ namespace lfs::vis {
         if (gui_manager_) {
             rendering_manager_->setCropboxGizmoActive(gui_manager_->gizmo().isCropboxGizmoActive());
             rendering_manager_->setEllipsoidGizmoActive(gui_manager_->gizmo().isEllipsoidGizmoActive());
+            rendering_manager_->setCropPolygonGizmoActive(gui_manager_->gizmo().isCropPolygonGizmoActive());
         }
 
         bool store_dirty = false;
@@ -2805,9 +2839,11 @@ namespace lfs::vis {
         if (scene_capture_jobs_.hasPending()) {
             const bool has_mesh = scene_manager_ &&
                                   !scene_manager_->getScene().getVisibleMeshes().empty();
-            if (scene_capture_jobs_.beginFrame(has_mesh))
+            if (scene_capture_jobs_.beginFrame(has_mesh)) {
+                context.deterministic_export = true;
                 rendering_manager_->markDirty(DirtyFlag::ALL, FrameReason::AsyncCompletion,
                                               "viewport_capture");
+            }
         }
 
         const bool is_training = trainer_manager_ && trainer_manager_->isTrainingActive();
@@ -4180,8 +4216,10 @@ namespace lfs::vis {
         if (scene_capture_jobs_.hasActive()) {
             if (!frame_recorded)
                 scene_capture_jobs_.cancelActive();
-            else
+            else {
                 scene_capture_jobs_.completeFrame();
+                rendering_manager_->markDirty(DirtyFlag::CAMERA, FrameReason::AsyncCompletion);
+            }
         }
         if (scene_capture_jobs_.hasPending())
             wakeMainLoop();

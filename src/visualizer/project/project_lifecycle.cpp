@@ -1653,65 +1653,6 @@ namespace lfs::vis::project {
             }
         }
 
-        void resolveParameterPathReferences(
-            const lfs::io::project::ReferencesChapter&
-                references,
-            const std::filesystem::path& project_root,
-            lfs::io::project::ParameterManagerSnapshot&
-                snapshot) {
-            using Role = std::tuple<
-                lfs::core::param::OptimizationParameters*,
-                const lfs::io::project::
-                    ParameterManagerSnapshot::
-                        ReferenceBindings*>;
-            const std::array roles{
-                Role{&snapshot.mcmc_session,
-                     &snapshot.mcmc_session_references},
-                Role{&snapshot.mrnf_session,
-                     &snapshot.mrnf_session_references},
-                Role{&snapshot.igs_session,
-                     &snapshot.igs_session_references},
-                Role{&snapshot.mcmc_current,
-                     &snapshot.mcmc_current_references},
-                Role{&snapshot.mrnf_current,
-                     &snapshot.mrnf_current_references},
-                Role{&snapshot.igs_current,
-                     &snapshot.igs_current_references},
-            };
-            for (const auto& [params, bindings] :
-                 roles) {
-                if (bindings
-                        ->background_image_reference) {
-                    if (auto resolved =
-                            lfs::io::project::
-                                resolve_path_reference(
-                                    references,
-                                    project_root,
-                                    *bindings
-                                         ->background_image_reference,
-                                    params
-                                        ->bg_image_path)) {
-                        params->bg_image_path =
-                            *resolved;
-                    }
-                }
-                if (bindings->ppisp_reference) {
-                    if (auto resolved =
-                            lfs::io::project::
-                                resolve_path_reference(
-                                    references,
-                                    project_root,
-                                    *bindings
-                                         ->ppisp_reference,
-                                    params
-                                        ->ppisp_sidecar_path)) {
-                        params->ppisp_sidecar_path =
-                            *resolved;
-                    }
-                }
-            }
-        }
-
         [[nodiscard]] std::vector<lfs::core::Uuid>
         selectedNodeUuids(VisualizerImpl& viewer);
 
@@ -3721,6 +3662,7 @@ namespace lfs::vis::project {
         document_ =
             std::make_shared<ProjectDocument>(
                 std::move(*opened));
+        epoch_.fetch_add(1, std::memory_order_acq_rel);
         last_captured_selection_serial_.reset();
         captured_splat_serials_.clear();
         cached_project_info_.reset();
@@ -5846,6 +5788,7 @@ namespace lfs::vis::project {
                     std::make_shared<
                         ProjectDocument>(
                         std::move(*reopened));
+                epoch_.fetch_add(1, std::memory_order_acq_rel);
                 last_captured_selection_serial_.reset();
                 captured_splat_serials_.clear();
                 cached_bound_checkpoint_iteration_
@@ -6446,6 +6389,7 @@ namespace lfs::vis::project {
         document_ =
             std::make_shared<ProjectDocument>(
                 std::move(*opened));
+        epoch_.fetch_add(1, std::memory_order_acq_rel);
         if (adopts_pending_preparation)
             pending_training_document_ = document_;
         last_captured_selection_serial_.reset();
@@ -6566,7 +6510,7 @@ namespace lfs::vis::project {
 
     lfs::Result<void>
     ProjectLifecycle::synchronizeDocumentFromViewer(
-        const DocumentSyncMode mode) {
+        const DocumentSyncMode mode) try {
         const auto sync_started = std::chrono::steady_clock::now();
         const auto sync_scene_serial = scene_mutation_serial_.load(
             std::memory_order_acquire);
@@ -6689,10 +6633,14 @@ namespace lfs::vis::project {
                 });
         }
 
-        auto captured_scene =
-            lfs::io::project::capture_scene_graph(
+        auto captured_state =
+            lfs::io::project::capture_scene_graph_state(
                 scene, bindings,
                 omitted_nodes);
+        if (!captured_state)
+            return lfs::Status::failure(std::move(captured_state).error());
+        auto collisions = std::move(captured_state->collisions);
+        auto captured_scene = lfs::io::project::materialize_scene_graph_chapter(std::move(*captured_state));
         if (!captured_scene) {
             return lfs::Status::failure(
                 std::move(captured_scene).error());
@@ -6741,10 +6689,14 @@ namespace lfs::vis::project {
             clearStoredTrainingSession();
         }
         // Same bookkeeping as the trainer writer after a
-        // wholesale SCNG install: drop SPLT/PCLD/MESH
+        // wholesale SCNG install: drop SPLT/PCLD/MESH/COLV
         // payloads the captured scene no longer binds.
         document_
             ->remove_geometry_payloads_not_bound_by_scene();
+        for (const auto& [uuid, volume] : collisions) {
+            if (auto stored = document_->set_collision(uuid, volume); !stored)
+                return stored;
+        }
 
         std::unordered_set<lfs::core::Uuid>
             live_splats;
@@ -7373,6 +7325,18 @@ namespace lfs::vis::project {
                 sync_finished - sync_started)
                 .count());
         return {};
+    } catch (const std::bad_alloc& error) {
+        // LFS-CENSUS-OK(empty-catch): capture failure must settle the save request, not escape into the frame loop.
+        return fail<void>(lfs::ErrorCode::ResourceExhausted,
+                          "The project could not be captured in memory.", error.what(), "project.capture");
+    } catch (const std::length_error& error) {
+        // LFS-CENSUS-OK(empty-catch): chapter size limits fail the request rather than triggering a frame retry.
+        return fail<void>(lfs::ErrorCode::ResourceExhausted,
+                          "The project exceeds its serialization budget.", error.what(), "project.capture");
+    } catch (const std::exception& error) {
+        // LFS-CENSUS-OK(empty-catch): serializers and legacy scene APIs report exceptions through the save Result.
+        return fail<void>(lfs::ErrorCode::InvalidArgument,
+                          "The project could not be captured.", error.what(), "project.capture");
     }
 
     lfs::Result<std::vector<std::byte>>
@@ -8181,7 +8145,7 @@ namespace lfs::vis::project {
             return lfs::Status::failure(
                 std::move(parameters).error());
         }
-        resolveParameterPathReferences(
+        lfs::io::project::resolve_parameter_path_references(
             candidate->references(), project_root,
             *parameters);
         auto* parameter_manager =

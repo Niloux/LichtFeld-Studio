@@ -4,6 +4,7 @@
 
 #include "viewport_request_builder.hpp"
 #include "core/camera.hpp"
+#include "core/services.hpp"
 #include "frustum_depth_coverage.hpp"
 #include "rendering/model_renderability.hpp"
 #include "scene/scene_manager.hpp"
@@ -248,6 +249,28 @@ namespace lfs::vis {
             }
             return singleEnabledEllipsoid(ellipsoids);
         }
+        [[nodiscard]] const lfs::core::Scene::RenderableCropPolygon* activePointCloudCropPolygonFilter(
+            const FrameContext& ctx) {
+            const core::NodeId selected_polygon_id =
+                ctx.scene_manager ? ctx.scene_manager->getSelectedNodeCropPolygonId() : core::NULL_NODE;
+            const lfs::core::Scene::RenderableCropPolygon* single = nullptr;
+            bool several = false;
+            for (const auto& polygon : ctx.scene_state.crop_polygons) {
+                if (!polygon.data || !polygon.data->enabled)
+                    continue;
+                if (selected_polygon_id != core::NULL_NODE && polygon.node_id == selected_polygon_id)
+                    return &polygon;
+                if (!polygon.parent_effectively_visible)
+                    continue;
+                several = several || single;
+                single = &polygon;
+            }
+
+            if ((ctx.scene_manager && ctx.scene_manager->hasSelectedNode()) || several) {
+                return nullptr;
+            }
+            return single;
+        }
         void upsertScopedCropBox(std::vector<lfs::rendering::GaussianScopedBoxFilter>& filters,
                                  lfs::rendering::GaussianScopedBoxFilter filter) {
             if (filter.parent_node_index < 0) {
@@ -301,6 +324,7 @@ namespace lfs::vis {
                     .max = ctx.gizmo.cropbox_max,
                     .transform = glm::inverse(ctx.gizmo.cropbox_transform)};
                 filters.crop_ellipsoid.reset();
+                filters.crop_polygon.reset();
                 filters.crop_inverse = false;
                 filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
@@ -311,7 +335,23 @@ namespace lfs::vis {
                     .radii = ctx.gizmo.ellipsoid_radii,
                     .transform = glm::inverse(ctx.gizmo.ellipsoid_transform)};
                 filters.crop_box.reset();
+                filters.crop_polygon.reset();
                 filters.crop_inverse = false;
+                filters.crop_desaturate = ctx.settings.desaturate_cropping;
+                return;
+            }
+
+            const auto* const polygon = activePointCloudCropPolygonFilter(ctx);
+            // The crop tool previews its pending transform; the polygon keeps its own inverse, as for splats.
+            if (ctx.gizmo.crop_polygon_active && ctx.gizmo.crop_polygon_affects_render &&
+                !ctx.gizmo.crop_polygon_vertices.empty()) {
+                filters.crop_polygon = lfs::rendering::CropPolygon{
+                    .vertices = ctx.gizmo.crop_polygon_vertices,
+                    .half_depth = ctx.gizmo.crop_polygon_half_depth,
+                    .transform = glm::inverse(ctx.gizmo.crop_polygon_transform)};
+                filters.crop_box.reset();
+                filters.crop_ellipsoid.reset();
+                filters.crop_inverse = polygon && polygon->data->inverse;
                 filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
             }
@@ -322,21 +362,33 @@ namespace lfs::vis {
                     .max = cb->data->max,
                     .transform = glm::inverse(cb->world_transform)};
                 filters.crop_ellipsoid.reset();
+                filters.crop_polygon.reset();
                 filters.crop_inverse = cb->data->inverse;
                 filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
             }
 
-            const auto* const el = activePointCloudEllipsoidFilter(ctx);
-            if (!el) {
+            if (const auto* const el = activePointCloudEllipsoidFilter(ctx)) {
+                filters.crop_ellipsoid = lfs::rendering::Ellipsoid{
+                    .radii = el->data->radii,
+                    .transform = glm::inverse(el->world_transform)};
+                filters.crop_box.reset();
+                filters.crop_polygon.reset();
+                filters.crop_inverse = el->data->inverse;
+                filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
             }
 
-            filters.crop_ellipsoid = lfs::rendering::Ellipsoid{
-                .radii = el->data->radii,
-                .transform = glm::inverse(el->world_transform)};
+            if (!polygon) {
+                return;
+            }
+            filters.crop_polygon = lfs::rendering::CropPolygon{
+                .vertices = polygon->data->vertices,
+                .half_depth = polygon->data->half_depth,
+                .transform = glm::inverse(polygon->world_transform)};
             filters.crop_box.reset();
-            filters.crop_inverse = el->data->inverse;
+            filters.crop_ellipsoid.reset();
+            filters.crop_inverse = polygon->data->inverse;
             filters.crop_desaturate = ctx.settings.desaturate_cropping;
         }
 
@@ -382,6 +434,45 @@ namespace lfs::vis {
 
             if (!filters.ellipsoid_regions.empty()) {
                 filters.ellipsoid_region = filters.ellipsoid_regions.front();
+            }
+        }
+        void applyGaussianCropPolygon(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
+            const auto filter_for = [&](const std::vector<glm::vec2>& vertices, const float half_depth,
+                                        const glm::mat4& world_transform, const bool inverse,
+                                        const int parent_node_index) {
+                return lfs::rendering::GaussianScopedCropPolygonFilter{
+                    .bounds = {.vertices = vertices,
+                               .half_depth = half_depth,
+                               .transform = glm::inverse(world_transform)},
+                    .inverse = inverse,
+                    .desaturate = ctx.settings.desaturate_cropping,
+                    .parent_node_index = parent_node_index};
+            };
+            auto& regions = filters.crop_polygon_regions;
+            for (const auto& polygon : ctx.scene_state.crop_polygons) {
+                if (!polygon.data || !polygon.data->enabled || polygon.parent_node_index < 0) {
+                    continue;
+                }
+                regions.push_back(filter_for(polygon.data->vertices, polygon.data->half_depth,
+                                             polygon.world_transform, polygon.data->inverse,
+                                             polygon.parent_node_index));
+            }
+
+            // The crop tool previews its pending transform during a drag.
+            if (ctx.gizmo.crop_polygon_active && ctx.gizmo.crop_polygon_affects_render &&
+                ctx.gizmo.crop_polygon_parent_node_index >= 0 && !ctx.gizmo.crop_polygon_vertices.empty()) {
+                auto live = filter_for(ctx.gizmo.crop_polygon_vertices, ctx.gizmo.crop_polygon_half_depth,
+                                       ctx.gizmo.crop_polygon_transform, false,
+                                       ctx.gizmo.crop_polygon_parent_node_index);
+                const auto existing = std::find_if(regions.begin(), regions.end(), [&](const auto& region) {
+                    return region.parent_node_index == live.parent_node_index;
+                });
+                if (existing != regions.end()) {
+                    live.inverse = existing->inverse;
+                    *existing = std::move(live);
+                } else {
+                    regions.push_back(std::move(live));
+                }
             }
         }
         void applyGaussianViewVolume(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
@@ -453,9 +544,12 @@ namespace lfs::vis {
 
         lfs::rendering::ViewportRenderRequest request{
             .frame_view = frame_view,
+            .deterministic_export = ctx.deterministic_export,
             .color_exposure = ctx.settings.color_exposure,
             .color_tonemapping = ctx.settings.color_tonemapping,
             .splat_render_profile = ctx.settings.splat_render_profile,
+            .transparency_mode = ctx.settings.transparency_mode,
+            .stochastic_max_frames = ctx.settings.stochastic_max_frames,
             .scaling_modifier = ctx.settings.scaling_modifier,
             .antialiasing = ctx.settings.antialiasing,
             .mip_filter = ctx.settings.mip_filter,
@@ -524,6 +618,7 @@ namespace lfs::vis {
 
         applyGaussianCropBox(request.filters, ctx);
         applyGaussianEllipsoid(request.filters, ctx);
+        applyGaussianCropPolygon(request.filters, ctx);
         applyGaussianViewVolume(request.filters, ctx);
         request.frame_view.subregion_origin = subregion_origin;
         request.frame_view.subregion_full_size = subregion_full_size;
@@ -619,6 +714,14 @@ namespace lfs::vis {
         return request;
     }
 
+    bool hasVisibleCollisionPreview(const SceneManager& manager) {
+        const auto& scene = manager.getScene();
+        for (const auto* node : scene.getNodes())
+            if (node->collision && scene.isNodeEffectivelyVisible(node->id))
+                return true;
+        return false;
+    }
+
     std::vector<VulkanMeshDrawItem> buildViewportMeshDrawItems(
         const SceneRenderState& scene_state,
         const RenderSettings& settings,
@@ -660,6 +763,17 @@ namespace lfs::vis {
             item.shadow_enabled = settings.mesh_shadow_enabled;
             item.shadow_map_resolution = settings.mesh_shadow_resolution;
             items.push_back(item);
+        }
+        if (const auto* manager = services().sceneOrNull()) {
+            for (const auto* node : manager->getScene().getNodes()) {
+                if (!node->collision || !manager->getScene().isNodeEffectivelyVisible(node->id))
+                    continue;
+                VulkanMeshDrawItem item{};
+                item.collision = node->collision;
+                item.collision_opacity = settings.collision_preview_opacity;
+                item.model = lfs::rendering::dataWorldTransformToVisualizerWorld(manager->getScene().getWorldTransform(node->id));
+                items.push_back(std::move(item));
+            }
         }
         return items;
     }
@@ -899,6 +1013,7 @@ namespace lfs::vis {
         };
         keep_matching(state.cropboxes);
         keep_matching(state.ellipsoids);
+        keep_matching(state.crop_polygons);
         state.selected_cropbox_index = -1;
         for (size_t i = 0; i < state.cropboxes.size(); ++i) {
             if (state.cropboxes[i].data && state.cropboxes[i].data->enabled) {

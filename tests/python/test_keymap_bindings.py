@@ -21,9 +21,11 @@ TOOL_MODE_NAMES = (
     "SCALE",
     "ALIGN",
     "CROP_BOX",
+    "WALK",
 )
 
 ACTION_NAMES = (
+    "EXIT_WALK",
     "NONE",
     "CAMERA_ORBIT",
     "CAMERA_PAN",
@@ -118,6 +120,8 @@ ACTION_NAMES = (
     "PREVIOUS_SIDEBAR_CATEGORY",
     "REMOVE_LAST_POINT",
     "APPLY_ALIGNMENT",
+    "INSERT_CROP_POLYGON_VERTEX",
+    "REMOVE_CROP_POLYGON_VERTEX",
 )
 
 
@@ -622,6 +626,7 @@ def test_keymap_builds_profile_and_mode_records(keymap_bindings_module):
         {"index": "4", "label": "Mode SCALE"},
         {"index": "5", "label": "Mode ALIGN"},
         {"index": "6", "label": "Mode CROP_BOX"},
+        {"index": "7", "label": "Mode WALK"},
     ]
 
 

@@ -2722,9 +2722,14 @@ namespace lfs::vis::gui {
         if (!pip_initialized_)
             initPipPreview();
 
+        (void)sm->getModelForRendering();
+        if (sm->getScene().combinedModelBuildPending())
+            return;
+
         const glm::mat3 cam_rot = glm::mat3_cast(key.rotation);
         const auto image = rm->renderPreviewImage(sm, cam_rot, key.position, key.focal_length_mm,
-                                                  key.width, key.height);
+                                                  key.width, key.height, std::nullopt, std::nullopt, std::nullopt,
+                                                  false, /*deterministic_export=*/false);
         // Vulkan preview readback is already in the orientation RmlUi samples.
         // upload() recreates the VkImage when width/height change.
         if (image && pip_texture_.upload(*image, key.width, key.height, /*flip_y=*/false)) {
