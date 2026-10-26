@@ -1322,6 +1322,83 @@ TEST_F(GsplatRasterizerTest, GutFromWorldThinPrismGradParity) {
     run_gut_from_world_parity(camera, "GUT_THIN_PRISM_GRAD_DUMP", "GUT_THIN_PRISM_GRAD_REF");
 }
 
+// Pixel weights cull the sub-tiles with no weighted pixel within one sub-tile: those stay
+// background, the rest render bit-identically, and gradients through the weights match.
+TEST_F(GsplatRasterizerTest, GutPixelWeightsCullFarSubTilesOnly) {
+    constexpr int kW = 96;
+    constexpr int kH = 64;
+    constexpr int kKeptColumns = 40;
+    auto camera = make_camera(kW, kH);
+    constexpr int kN = 50000;
+    auto splat = make_parity_splat(kN, 0xC0FFEE02u);
+    splat->_max_screen_share = Tensor::zeros({static_cast<size_t>(kN)}, Device::CUDA);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+    bg.fill_(0.25f);
+
+    auto weights_cpu = Tensor::zeros({static_cast<size_t>(kH), static_cast<size_t>(kW)}, Device::CPU);
+    for (int y = 0; y < kH; ++y)
+        for (int x = 0; x < kKeptColumns; ++x)
+            weights_cpu.ptr<float>()[y * kW + x] = 1.0f;
+    const auto weights = weights_cpu.cuda();
+
+    AdamConfig cfg;
+    cfg.lr = 1e-3f;
+    cfg.initial_capacity = static_cast<size_t>(kN);
+    AdamOptimizer opt(*splat, cfg);
+    opt.allocate_gradients(static_cast<size_t>(kN));
+
+    struct Run {
+        Tensor image, alpha, means_g, opa_g, color_g;
+        int64_t pairs = 0;
+    };
+    auto run = [&](const Tensor& pixel_weights) {
+        Run out;
+        opt.zero_grad(1);
+        auto r = gsplat_rasterize_forward(
+            camera, *splat, bg, 0, 0, 0, 0, 1.0f, false, GsplatRenderMode::RGB,
+            /*use_gut=*/true, Tensor{}, {}, pixel_weights);
+        EXPECT_TRUE(r.has_value()) << r.error();
+        auto output = std::move(r->first);
+        auto ctx = std::move(r->second);
+        out.pairs = ctx.n_isects;
+        auto grad_image = weights.unsqueeze(0).expand({3, kH, kW}).contiguous();
+        auto grad_alpha = Tensor::zeros_like(output.alpha);
+        gsplat_rasterize_backward(ctx, grad_image, grad_alpha, *splat, opt, Tensor{});
+        out.image = output.image.clone().cpu();
+        out.alpha = output.alpha.clone().cpu();
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        out.means_g = opt.get_grad(ParamType::Means).clone();
+        out.opa_g = opt.get_grad(ParamType::Opacity).clone();
+        out.color_g = opt.get_grad(ParamType::Sh0).clone();
+        return out;
+    };
+
+    const Run full = run(Tensor{});
+    const Run culled = run(weights);
+    EXPECT_LT(culled.pairs, full.pairs);
+
+    // Sub-tiles starting at x >= 48 have no weighted pixel within 8 px.
+    constexpr int kFirstCulledColumn = 48;
+    for (int c = 0; c < 3; ++c) {
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                const size_t i = (static_cast<size_t>(c) * kH + y) * kW + x;
+                if (x < kFirstCulledColumn)
+                    ASSERT_EQ(culled.image.ptr<float>()[i], full.image.ptr<float>()[i]) << x << "," << y;
+                else
+                    ASSERT_EQ(culled.image.ptr<float>()[i], 0.25f) << x << "," << y;
+            }
+        }
+    }
+    for (int y = 0; y < kH; ++y) {
+        for (int x = kFirstCulledColumn; x < kW; ++x)
+            ASSERT_EQ(culled.alpha.ptr<float>()[y * kW + x], 0.0f);
+    }
+    EXPECT_LT(max_rel_diff_tensors(culled.means_g, full.means_g), 1e-4f);
+    EXPECT_LT(max_rel_diff_tensors(culled.opa_g, full.opa_g), 1e-4f);
+    EXPECT_LT(max_rel_diff_tensors(culled.color_g, full.color_g), 1e-4f);
+}
+
 // Geometry render modes with image, alpha, depth, normal and free-space gradients all nonzero.
 // GUT_GEOMETRY_GRAD_DUMP=<dir> writes the gradients; GUT_GEOMETRY_GRAD_REF=<dir> compares against them.
 void run_gut_geometry_parity(Camera& camera, const GsplatRenderMode mode, const std::string& tag) {

@@ -13,6 +13,7 @@
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "gsplat/GeometryFeatures.h"
+#include "gsplat/Intersect.h"
 #include "gsplat/Ops.h"
 #include "training/components/rolling_shutter.hpp"
 #include "training/kernels/densification_kernels.hpp"
@@ -101,6 +102,7 @@ namespace lfs::training {
             core::Tensor camera_rays;
             core::Tensor geometry_bg;
             core::Tensor geometry_bg_image;
+            core::Tensor tile_sub_masks;
             core::Tensor shN_dequant;
         };
 
@@ -120,7 +122,8 @@ namespace lfs::training {
         GsplatRenderMode render_mode,
         bool use_gut,
         const core::Tensor& bg_image,
-        const gsplat_lfs::FreeSpaceRender& free_space_in) {
+        const gsplat_lfs::FreeSpaceRender& free_space_in,
+        const core::Tensor& pixel_weights) {
 
         // Begin arena frame for memory allocation
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -443,6 +446,24 @@ namespace lfs::training {
                 free_space.depth_channel = channels == 1 ? 0 : 3;
             }
 
+            // Weighted pixels decide which sub-tiles get pairs; only whole-frame renders.
+            core::Tensor tile_sub_masks;
+            if (pixel_weights.is_valid() && tile_width == 0 && tile_height == 0 &&
+                pixel_weights.dtype() == core::DataType::Float32 && pixel_weights.is_contiguous() &&
+                pixel_weights.device() == core::Device::CUDA && pixel_weights.numel() == size_t{H} * W) {
+                auto& cached = gsplat_thread_caches.tile_sub_masks;
+                const core::TensorShape shape{num_tiles_y, num_tiles_x};
+                if (!cached.is_valid() || cached.shape() != shape)
+                    cached = core::Tensor::empty(shape, core::Device::CUDA, core::DataType::Int32);
+                tile_sub_masks = cached;
+                tile_sub_masks.set_stream(fwd_stream);
+                gsplat_lfs::launch_tile_sub_masks_from_pixels(
+                    pixel_weights.ptr<float>(), W, H, tile_size, num_tiles_x, num_tiles_y,
+                    reinterpret_cast<uint32_t*>(tile_sub_masks.ptr<int32_t>()), fwd_stream);
+            }
+            const auto* const tile_sub_masks_ptr =
+                tile_sub_masks.is_valid() ? reinterpret_cast<const uint32_t*>(tile_sub_masks.ptr<int32_t>()) : nullptr;
+
             // Geometry has zero background; only RGB contributes background color.
             core::Tensor feature_bg, feature_bg_image;
             if (channels != 3) {
@@ -607,7 +628,8 @@ namespace lfs::training {
                 result,
                 fwd_stream,
                 viewmat_ptr,
-                free_space);
+                free_space,
+                tile_sub_masks_ptr);
             // isect_ids / flatten_ids are borrowed from the TLS VMM cache —
             // never transfer ownership or free on error paths.
 
@@ -743,6 +765,7 @@ namespace lfs::training {
             ctx.render_tile_width = tile_width;
             ctx.render_tile_height = tile_height;
             ctx.free_space = free_space;
+            ctx.tile_sub_masks = tile_sub_masks;
 
             return std::pair{render_output, ctx};
         } catch (const lfs::Exception& exception) {
@@ -1014,7 +1037,10 @@ namespace lfs::training {
                 edge_weight_map_ptr,
                 edge_score_out_ptr,
                 stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr, free_space,
-                ctx.conics_ptr, ctx.sub_tile_masks ? ctx.isect_ids_ptr : nullptr);
+                ctx.conics_ptr, ctx.sub_tile_masks ? ctx.isect_ids_ptr : nullptr,
+                ctx.tile_sub_masks.is_valid()
+                    ? reinterpret_cast<const uint32_t*>(ctx.tile_sub_masks.ptr<int32_t>())
+                    : nullptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
 

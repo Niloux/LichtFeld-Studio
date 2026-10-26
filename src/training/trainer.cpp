@@ -6924,6 +6924,20 @@ namespace lfs::training {
                         LOG_VRAM_DIFF("train.rasterize_forward");
                         current_phase = StepPhase::Forward;
                         if (step_params.gut) {
+                            // Ignored pixels carry no loss, so GUT skips the sub-tiles that have
+                            // no kept pixel nearby. LFS_GUT_MASK_CULL=0 renders the whole frame.
+                            static const bool mask_cull_enabled = [] {
+                                const char* value = std::getenv("LFS_GUT_MASK_CULL");
+                                return value == nullptr || value[0] != '0';
+                            }();
+                            lfs::core::Tensor cull_weights;
+                            if (mask_cull_enabled && step_params.mask_mode == lfs::core::param::MaskMode::Ignore &&
+                                !composite_target_alpha_ && pipelined_mask_.is_valid() &&
+                                pipelined_mask_.dtype() == lfs::core::DataType::Float32 &&
+                                pipelined_mask_.is_contiguous() &&
+                                pipelined_mask_.numel() == static_cast<size_t>(cam->image_width()) * cam->image_height()) {
+                                cull_weights = pipelined_mask_;
+                            }
                             const MutationStamp forward_stamp{
                                 static_cast<std::uint64_t>(iter), mutation_epoch_,
                                 StepPhase::Forward, fastgs_strategy_hooks_at_start};
@@ -6942,7 +6956,7 @@ namespace lfs::training {
                                            roi_surface_weights || free_space.enabled())
                                             ? GsplatRenderMode::RGB_D
                                             : GsplatRenderMode::RGB,
-                                        true, bg_tile, free_space);
+                                        true, bg_tile, free_space, cull_weights);
                                     if (!rasterize_result) {
                                         auto typed = lfs::from_legacy_expected<
                                             std::pair<RenderOutput, GsplatRasterizeContext>>(
