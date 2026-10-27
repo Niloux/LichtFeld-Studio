@@ -218,7 +218,7 @@ namespace gsplat_lfs {
         const float* scales,
         const float* opacities,
         const float* sh0,
-        const float* shN,
+        const ShRestSource& shN,
         uint32_t sh_degree,
         uint32_t sh_layout_degree,
         const float* backgrounds,
@@ -293,10 +293,9 @@ namespace gsplat_lfs {
             if (sh_degree > 0) {
                 compute_view_dirs(means, reference, C, N, result.dirs, stream);
             }
-            spherical_harmonics_swizzled_fwd(
+            spherical_harmonics_streamed_fwd(
                 sh_degree, sh_layout_degree, sh_degree > 0 ? result.dirs : nullptr,
-                sh0, shN, nullptr, static_cast<int64_t>(C) * N,
-                result.colors, channels, stream);
+                sh0, shN, C, N, result.colors, channels, stream);
         }
         if (channels != 3) {
             geometry_features_fwd(means, quats, scales, reference, result.colors,
@@ -384,8 +383,6 @@ namespace gsplat_lfs {
         const float* quats,
         const float* scales,
         const float* opacities,
-        const float* sh0,
-        const float* shN,
         uint32_t sh_degree,
         uint32_t sh_layout_degree,
         const float* backgrounds,
@@ -393,7 +390,6 @@ namespace gsplat_lfs {
         const bool* masks,
         uint32_t N,
         uint32_t C,
-        uint32_t K,
         uint32_t image_width,
         uint32_t image_height,
         uint32_t tile_size,
@@ -430,7 +426,8 @@ namespace gsplat_lfs {
         float* v_quats,
         float* v_scales,
         float* v_opacities,
-        float* v_sh_coeffs,
+        float* v_sh0,
+        float* v_shN,
         float* densification_info,
         const float* densification_error_map,
         const float* edge_weight_map,
@@ -512,21 +509,11 @@ namespace gsplat_lfs {
                                   N, C, channels, camera_model, stream);
         }
 
-        // Backward through SH
+        // Backward through SH, straight into the optimizer's gradients
         if (render_mode == 0 || render_mode >= 3) {
-            spherical_harmonics_swizzled_bwd(
-                K, sh_degree, sh_layout_degree,
-                dirs,
-                sh0,
-                shN,
-                nullptr, // masks
-                v_colors,
-                static_cast<int64_t>(C) * N,
-                false, // compute_v_dirs
-                v_sh_coeffs,
-                nullptr, // v_dirs
-                channels,
-                stream);
+            spherical_harmonics_streamed_bwd(
+                sh_degree, sh_layout_degree, dirs, v_colors, C, N, channels,
+                v_sh0, v_shN, stream);
         }
 
         // Apply scaling modifier to scale gradients

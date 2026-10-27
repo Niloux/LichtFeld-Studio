@@ -47,6 +47,42 @@ namespace gsplat_lfs {
         uint32_t color_stride = 3,
         cudaStream_t stream = nullptr);
 
+    // SH-rest storage as the model keeps it: q16 cells with one (min, max) bound per
+    // 256 splats, or fp32 in the float4-swizzled layout. Set exactly one of them.
+    struct ShRestSource {
+        const float* f32_swizzled = nullptr;
+        const uint16_t* q16_codes = nullptr;
+        const float* q16_bounds = nullptr; // float2 per 256 splats
+        uint32_t q16_cells = 0;            // cells per splat
+    };
+
+    // One thread per splat; reads the rest coefficients straight from their storage.
+    void spherical_harmonics_streamed_fwd(
+        uint32_t degrees_to_use,
+        uint32_t layout_degree,
+        const float* dirs, // [C, N, 3]
+        const float* sh0,  // [N, 3]
+        const ShRestSource& sh_rest,
+        uint32_t C,
+        uint32_t N,
+        float* colors, // [C, N, color_stride]
+        uint32_t color_stride,
+        cudaStream_t stream);
+
+    // Adds dL/d(sh0) and the swizzled dL/d(shN) straight into the optimizer's gradient
+    // buffers, summing the C cameras. One thread per splat; v_shN may be null.
+    void spherical_harmonics_streamed_bwd(
+        uint32_t degrees_to_use,
+        uint32_t layout_degree,
+        const float* dirs,     // [C, N, 3]
+        const float* v_colors, // [C, N, color_stride]
+        uint32_t C,
+        uint32_t N,
+        uint32_t color_stride,
+        float* v_sh0, // [N, 3], accumulated
+        float* v_shN, // swizzled at layout_degree, accumulated
+        cudaStream_t stream);
+
     //=========================================================================
     // Tile Intersection
     //=========================================================================
@@ -313,7 +349,7 @@ namespace gsplat_lfs {
         const float* scales,    // [N, 3]
         const float* opacities, // [N]
         const float* sh0,       // [N, 1, 3]
-        const float* shN,       // swizzled SH-rest storage
+        const ShRestSource& shN,
         uint32_t sh_degree,
         uint32_t sh_layout_degree,
         const float* backgrounds, // [C, channels] optional - solid color
@@ -360,8 +396,6 @@ namespace gsplat_lfs {
         const float* quats,     // [N, 4]
         const float* scales,    // [N, 3]
         const float* opacities, // [N]
-        const float* sh0,       // [N, 1, 3]
-        const float* shN,       // swizzled SH-rest storage
         uint32_t sh_degree,
         uint32_t sh_layout_degree,
         const float* backgrounds, // [C, channels] optional - solid color
@@ -370,7 +404,6 @@ namespace gsplat_lfs {
         // dimensions
         uint32_t N,
         uint32_t C,
-        uint32_t K,
         uint32_t image_width,
         uint32_t image_height,
         uint32_t tile_size,
@@ -412,7 +445,8 @@ namespace gsplat_lfs {
         float* v_quats,                       // [N, 4]
         float* v_scales,                      // [N, 3]
         float* v_opacities,                   // [N]
-        float* v_sh_coeffs,                   // [N, K, 3]
+        float* v_sh0,                         // [N, 3], accumulated
+        float* v_shN,                         // swizzled SH-rest, accumulated; may be null
         float* densification_info,            // [2, N] flattened or nullptr
         const float* densification_error_map, // [H, W] or nullptr
         const float* edge_weight_map,         // [H, W] or nullptr

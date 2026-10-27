@@ -103,7 +103,6 @@ namespace lfs::training {
             core::Tensor geometry_bg;
             core::Tensor geometry_bg_image;
             core::Tensor tile_sub_masks;
-            core::Tensor shN_dequant;
         };
 
         thread_local GsplatThreadLocalCaches gsplat_thread_caches;
@@ -215,36 +214,15 @@ namespace lfs::training {
             const float* scales_ptr = scales.ptr<float>();
             const float* quats_ptr = quats.ptr<float>();
             const float* sh0_ptr = sh0.ptr<float>();
-            // gsplat is float-native — dequant q16 shN into a temporary float4
-            // buffer (does not mutate resident storage). FastGS path decodes in-registers.
-            core::Tensor shN_dequant_temp;
-            const float* shN_ptr = nullptr;
+            // The SH kernels read q16 shN in place, like the FastGS path.
+            gsplat_lfs::ShRestSource shN_source;
             if (sh_degree > 0 && shN.is_valid() && shN.numel() > 0) {
                 if (gaussian_model.shN_value_quantized() &&
                     gaussian_model.shN_value_bounds().is_valid()) {
-                    const auto n_prims = static_cast<std::size_t>(gaussian_model.size());
-                    const auto rest =
-                        static_cast<std::uint32_t>(gaussian_model.max_sh_coeffs_rest());
-                    const auto n_floats = core::sh_swizzled_float_count(n_prims, rest);
-                    auto& dequant = gsplat_thread_caches.shN_dequant;
-                    if (!dequant.is_valid() || dequant.numel() < n_floats) {
-                        dequant = core::Tensor::empty(
-                            core::TensorShape({n_floats}), core::Device::CUDA,
-                            core::DataType::Float32);
-                    }
-                    if (dequant.stream() != fwd_stream) {
-                        dequant.set_stream(fwd_stream);
-                    }
-                    shN_dequant_temp = dequant;
                     const auto q16 = lfs::core::resolve_q16_bind_ptrs(gaussian_model);
-                    lfs::core::sh_value_quant::decode_shN_u16_to_float4(
-                        reinterpret_cast<const std::uint16_t*>(q16.codes),
-                        q16.bounds,
-                        shN_dequant_temp.ptr<float>(),
-                        n_prims,
-                        rest,
-                        fwd_stream);
-                    shN_ptr = shN_dequant_temp.ptr<float>();
+                    shN_source.q16_codes = reinterpret_cast<const std::uint16_t*>(q16.codes);
+                    shN_source.q16_bounds = q16.bounds;
+                    shN_source.q16_cells = q16.n_cells_per_prim;
                 } else {
                     if (shN.dtype() != core::DataType::Float32) {
                         LOG_ERROR(
@@ -254,7 +232,7 @@ namespace lfs::training {
                             "gsplat_rasterize_forward: unsupported SH-rest storage; "
                             "expected Float32 or valid q16 codes+bounds");
                     }
-                    shN_ptr = shN.ptr<float>();
+                    shN_source.f32_swizzled = shN.ptr<float>();
                 }
             }
 
@@ -597,7 +575,7 @@ namespace lfs::training {
                 scales_ptr,
                 opacities_ptr,
                 sh0_ptr,
-                shN_ptr,
+                shN_source,
                 sh_degree,
                 sh_layout_degree,
                 bg_color_ptr,
@@ -716,10 +694,7 @@ namespace lfs::training {
             ctx.scales = scales;
             ctx.opacities = opacities;
             ctx.sh0 = sh0;
-            // backward calls ctx.shN.ptr<float>(). When resident shN is q16
-            // (Float16 bit-patterns), the forward dequant temp is the float4 buffer
-            // the kernels actually read — must save that, not the raw codes.
-            ctx.shN = shN_dequant_temp.is_valid() ? shN_dequant_temp : shN;
+            ctx.shN = shN;
 
             // Store camera pointers
             ctx.viewmat_ptr = viewmat_ptr;
@@ -821,7 +796,6 @@ namespace lfs::training {
             }
 
             const uint32_t N = ctx.N;
-            const uint32_t K = ctx.K_sh;
             const uint32_t H = ctx.image_height;
             const uint32_t W = ctx.image_width;
             const uint32_t channels = ctx.channels;
@@ -840,11 +814,10 @@ namespace lfs::training {
             size_t v_quats_size = align(N * 4 * sizeof(float));
             size_t v_scales_size = align(N * 3 * sizeof(float));
             size_t v_opacities_size = align(N * sizeof(float));
-            size_t v_sh_coeffs_size = align(N * K * 3 * sizeof(float));
 
             size_t total_bwd_size = v_render_colors_size + v_render_alphas_size +
                                     v_means_size + v_quats_size + v_scales_size +
-                                    v_opacities_size + v_sh_coeffs_size;
+                                    v_opacities_size;
 
             char* bwd_blob = arena_allocator(total_bwd_size);
             if (bwd_blob == nullptr) {
@@ -880,8 +853,6 @@ namespace lfs::training {
             auto* v_scales_ptr = reinterpret_cast<float*>(bwd_ptr);
             bwd_ptr += v_scales_size;
             auto* v_opacities_ptr = reinterpret_cast<float*>(bwd_ptr);
-            bwd_ptr += v_opacities_size;
-            auto* v_sh_coeffs_ptr = reinterpret_cast<float*>(bwd_ptr);
 
             LFS_CUDA_CHECK_MSG(
                 cudaMemsetAsync(bwd_blob, 0, total_bwd_size, stream),
@@ -978,14 +949,24 @@ namespace lfs::training {
                 free_space.v_T_front = grad_T_front.ptr<float>();
             }
 
+            // The SH backward adds straight into the optimizer's sh0 and swizzled shN gradients.
+            auto& sh0_grad = optimizer.get_grad(ParamType::Sh0);
+            sh0_grad.set_stream(stream);
+            float* dst_shN = nullptr;
+            if (ctx.sh_degree > 0) {
+                auto& shN_grad = optimizer.get_grad(ParamType::ShN);
+                if (shN_grad.is_valid() && shN_grad.numel() > 0) {
+                    shN_grad.set_stream(stream);
+                    dst_shN = shN_grad.ptr<float>();
+                }
+            }
+
             // Call backward with raw pointers
             gsplat_lfs::rasterize_from_world_with_sh_bwd(
                 ctx.means.ptr<float>(),
                 ctx.quats.ptr<float>(),
                 ctx.scales.ptr<float>(),
                 ctx.opacities.ptr<float>(),
-                ctx.sh0.ptr<float>(),
-                (ctx.sh_degree > 0 && ctx.shN.is_valid() && ctx.shN.numel() > 0) ? ctx.shN.ptr<float>() : nullptr,
                 ctx.sh_degree,
                 ctx.sh_layout_degree,
                 bg_color_ptr,
@@ -993,7 +974,6 @@ namespace lfs::training {
                 nullptr,      // masks
                 N,
                 1, // C
-                K,
                 ctx.image_width,
                 ctx.image_height,
                 ctx.tile_size,
@@ -1031,7 +1011,8 @@ namespace lfs::training {
                 v_quats_ptr,
                 v_scales_ptr,
                 v_opacities_ptr,
-                v_sh_coeffs_ptr,
+                sh0_grad.ptr<float>(),
+                dst_shN,
                 densification_info_ptr,
                 pixel_error_map_ptr,
                 edge_weight_map_ptr,
@@ -1083,27 +1064,6 @@ namespace lfs::training {
                 N,
                 stream);
 
-            // SH coefficients: [N, K, 3] -> sh0 [N, 1, 3] + swizzled shN.
-            float* dst_shN = nullptr;
-            if (K > 1) {
-                auto& shN_grad = optimizer.get_grad(ParamType::ShN);
-                if (shN_grad.is_valid() && shN_grad.numel() > 0) {
-                    shN_grad.set_stream(stream);
-                    dst_shN = shN_grad.ptr<float>();
-                }
-            }
-
-            auto& sh0_grad = optimizer.get_grad(ParamType::Sh0);
-            sh0_grad.set_stream(stream);
-            kernels::launch_grad_accumulate_sh_swizzled(
-                sh0_grad.ptr<float>(),
-                dst_shN,
-                v_sh_coeffs_ptr,
-                N,
-                K,
-                static_cast<std::uint32_t>(gaussian_model.max_sh_coeffs_rest()),
-                stream);
-
             // Accumulate gradient norms when pixel-error map is not provided
             if (update_densification_info && pixel_error_map_ptr == nullptr) {
                 gaussian_model._densification_info.set_stream(stream);
@@ -1148,7 +1108,6 @@ namespace lfs::training {
         gsplat_thread_caches.camera_rays = {};
         gsplat_thread_caches.geometry_bg = {};
         gsplat_thread_caches.geometry_bg_image = {};
-        gsplat_thread_caches.shN_dequant = {};
         return !gsplat_thread_caches.K.is_valid() &&
                !gsplat_thread_caches.image_chw.is_valid() &&
                !gsplat_thread_caches.alpha_chw.is_valid() &&
