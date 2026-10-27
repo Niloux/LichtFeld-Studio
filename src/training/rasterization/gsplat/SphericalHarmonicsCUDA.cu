@@ -6,8 +6,13 @@
 #include <cuda_runtime.h>
 
 #include "Common.h"
+#include "Ops.h"
 #include "SphericalHarmonics.h"
 #include "Utils.cuh"
+#include "core/sh_value_codec.cuh"
+
+#include <stdexcept>
+#include <type_traits>
 
 namespace gsplat_lfs {
 
@@ -572,6 +577,266 @@ namespace gsplat_lfs {
                 v_coeffs,
                 compute_v_dirs ? v_dirs : nullptr);
         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.sh_swizzled_bwd");
+    }
+
+    // Streamed SH: one thread per splat, the degree a template parameter so every
+    // coefficient index is a constant. The per-(splat, channel) kernels above index
+    // 48-entry arrays at run time, which puts them in local memory.
+
+    constexpr uint32_t kShStreamThreads = 256u;
+
+    __host__ __device__ constexpr uint32_t shRestCount(const uint32_t degree) {
+        return degree == 0u ? 0u : (degree + 1u) * (degree + 1u) - 1u;
+    }
+
+    __host__ __device__ constexpr uint32_t shRestSlots(const uint32_t degree) {
+        return (shRestCount(degree) * 3u + 3u) / 4u;
+    }
+
+    // Rest coefficient `cell` = 3 * rest_index + channel of splat p. `units` is the
+    // splat's cell count for q16 and its float4 slot count for fp32.
+    template <bool kQ16>
+    __device__ __forceinline__ float sh_rest_cell(
+        const ShRestSource& src, const uint32_t p, const uint32_t cell,
+        const uint32_t units, const float2 bounds) {
+        if constexpr (kQ16) {
+            return lfs::core::sh_value::DeviceCodec16::decode(
+                src.q16_codes[lfs::core::sh_value::shAtU16(p, cell, units)], bounds.x, bounds.y);
+        } else {
+            const float4* const rest = reinterpret_cast<const float4*>(src.f32_swizzled);
+            return float4_component(rest[shAt(p, cell / 4u, units)], cell % 4u);
+        }
+    }
+
+    // Y_k(dir) for k < (DEG + 1)^2 with the forward's signs and constants, so a
+    // coefficient's gradient is b[k] * dL/dcolor exactly as the canonical backward forms it.
+    template <uint32_t DEG>
+    __device__ __forceinline__ void sh_basis(const vec3& dir, float (&b)[16]) {
+        b[0] = SH_C0;
+        if constexpr (DEG >= 1) {
+            const float inorm = rsqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+            const float x = dir.x * inorm;
+            const float y = dir.y * inorm;
+            const float z = dir.z * inorm;
+            b[1] = -SH_C1 * y;
+            b[2] = SH_C1 * z;
+            b[3] = -SH_C1 * x;
+            if constexpr (DEG >= 2) {
+                const float z2 = z * z;
+                const float fTmp0B = -1.092548430592079f * z;
+                const float fC1 = x * x - y * y;
+                const float fS1 = 2.f * x * y;
+                b[4] = 0.5462742152960395f * fS1;
+                b[5] = fTmp0B * y;
+                b[6] = 0.9461746957575601f * z2 - 0.3153915652525201f;
+                b[7] = fTmp0B * x;
+                b[8] = 0.5462742152960395f * fC1;
+                if constexpr (DEG >= 3) {
+                    const float fTmp0C = -2.285228997322329f * z2 + 0.4570457994644658f;
+                    const float fTmp1B = 1.445305721320277f * z;
+                    const float fC2 = x * fC1 - y * fS1;
+                    const float fS2 = x * fS1 + y * fC1;
+                    b[9] = -0.5900435899266435f * fS2;
+                    b[10] = fTmp1B * fS1;
+                    b[11] = fTmp0C * y;
+                    b[12] = z * (1.865881662950577f * z2 - 1.119528997770346f);
+                    b[13] = fTmp0C * x;
+                    b[14] = fTmp1B * fC1;
+                    b[15] = -0.5900435899266435f * fC2;
+                }
+            }
+        }
+    }
+
+    template <uint32_t DEG, bool kQ16>
+    __global__ void __launch_bounds__(kShStreamThreads) spherical_harmonics_streamed_fwd_kernel(
+        const uint32_t C,
+        const uint32_t N,
+        const uint32_t units,
+        const uint32_t color_stride,
+        const vec3* __restrict__ dirs,
+        const float* __restrict__ sh0,
+        const ShRestSource src,
+        float* __restrict__ colors) {
+        const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= C * N) {
+            return;
+        }
+        const uint32_t p = idx % N;
+
+        float x = 0.f, y = 0.f, z = 0.f;
+        float b[16];
+        if constexpr (DEG >= 1) {
+            const vec3 dir = dirs[idx];
+            const float inorm = rsqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+            x = dir.x * inorm;
+            y = dir.y * inorm;
+            z = dir.z * inorm;
+            sh_basis<DEG>(dir, b);
+        }
+        float2 bounds = make_float2(0.f, 0.f);
+        if constexpr (kQ16 && DEG >= 1) {
+            bounds = reinterpret_cast<const float2*>(src.q16_bounds)[p / 256u];
+        }
+
+#pragma unroll
+        for (uint32_t c = 0; c < 3u; ++c) {
+            const auto r = [&](const uint32_t rest_idx) {
+                return sh_rest_cell<kQ16>(src, p, rest_idx * 3u + c, units, bounds);
+            };
+            // Same grouping per band as the per-(splat, channel) forward.
+            float result = SH_C0 * sh0[p * 3u + c];
+            if constexpr (DEG >= 1) {
+                result += SH_C1 * (-y * r(0) + z * r(1) - x * r(2));
+            }
+            if constexpr (DEG >= 2) {
+                result += b[4] * r(3) + b[5] * r(4) + b[6] * r(5) + b[7] * r(6) + b[8] * r(7);
+            }
+            if constexpr (DEG >= 3) {
+                result += b[9] * r(8) + b[10] * r(9) + b[11] * r(10) + b[12] * r(11) +
+                          b[13] * r(12) + b[14] * r(13) + b[15] * r(14);
+            }
+            colors[idx * color_stride + c] = result + SH_DC_OFFSET;
+        }
+    }
+
+    template <uint32_t DEG>
+    __global__ void __launch_bounds__(kShStreamThreads) spherical_harmonics_streamed_bwd_kernel(
+        const uint32_t C,
+        const uint32_t N,
+        const uint32_t layout_slots,
+        const uint32_t color_stride,
+        const vec3* __restrict__ dirs,
+        const float* __restrict__ v_colors,
+        float* __restrict__ v_sh0,
+        float4* __restrict__ v_shN) {
+        const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+        if (p >= N) {
+            return;
+        }
+        constexpr uint32_t kCells = shRestCount(DEG) * 3u;
+
+        float g0[3] = {0.f, 0.f, 0.f};
+        float g[kCells > 0u ? kCells : 1u];
+#pragma unroll
+        for (uint32_t i = 0; i < kCells; ++i) {
+            g[i] = 0.f;
+        }
+        for (uint32_t cam = 0; cam < C; ++cam) {
+            const uint32_t idx = cam * N + p;
+            const float* const v = v_colors + static_cast<size_t>(idx) * color_stride;
+            const float v0 = v[0], v1 = v[1], v2 = v[2];
+            g0[0] += SH_C0 * v0;
+            g0[1] += SH_C0 * v1;
+            g0[2] += SH_C0 * v2;
+            if constexpr (DEG >= 1) {
+                float b[16];
+                sh_basis<DEG>(dirs[idx], b);
+#pragma unroll
+                for (uint32_t k = 0; k < shRestCount(DEG); ++k) {
+                    g[k * 3u + 0u] += b[k + 1u] * v0;
+                    g[k * 3u + 1u] += b[k + 1u] * v1;
+                    g[k * 3u + 2u] += b[k + 1u] * v2;
+                }
+            }
+        }
+
+        v_sh0[p * 3u + 0u] += g0[0];
+        v_sh0[p * 3u + 1u] += g0[1];
+        v_sh0[p * 3u + 2u] += g0[2];
+        if constexpr (DEG >= 1) {
+            if (v_shN == nullptr) {
+                return;
+            }
+            // Cells past the active degree in the last slot belong to inactive
+            // coefficients; they get zero, as the canonical accumulate leaves them.
+#pragma unroll
+            for (uint32_t s = 0; s < shRestSlots(DEG); ++s) {
+                float4& dst = v_shN[shAt(p, s, layout_slots)];
+                float4 acc = dst;
+                acc.x += g[4u * s + 0u];
+                if (4u * s + 1u < kCells)
+                    acc.y += g[4u * s + 1u];
+                if (4u * s + 2u < kCells)
+                    acc.z += g[4u * s + 2u];
+                if (4u * s + 3u < kCells)
+                    acc.w += g[4u * s + 3u];
+                dst = acc;
+            }
+        }
+    }
+
+    namespace {
+        template <typename F>
+        void dispatch_sh_degree(const uint32_t degree, F&& launch) {
+            switch (degree > 3u ? 3u : degree) {
+            case 0: launch(std::integral_constant<uint32_t, 0>{}); break;
+            case 1: launch(std::integral_constant<uint32_t, 1>{}); break;
+            case 2: launch(std::integral_constant<uint32_t, 2>{}); break;
+            default: launch(std::integral_constant<uint32_t, 3>{}); break;
+            }
+        }
+    } // namespace
+
+    void spherical_harmonics_streamed_fwd(
+        const uint32_t degrees_to_use,
+        const uint32_t layout_degree,
+        const float* dirs,
+        const float* sh0,
+        const ShRestSource& sh_rest,
+        const uint32_t C,
+        const uint32_t N,
+        float* colors,
+        const uint32_t color_stride,
+        cudaStream_t stream) {
+        const uint64_t total = static_cast<uint64_t>(C) * N;
+        if (total == 0) {
+            return;
+        }
+        const bool q16 = sh_rest.q16_codes != nullptr;
+        const uint32_t degree = dirs != nullptr ? degrees_to_use : 0u;
+        if (degree > 0 && (q16 ? sh_rest.q16_bounds == nullptr || sh_rest.q16_cells < shRestCount(degree) * 3u
+                               : sh_rest.f32_swizzled == nullptr)) {
+            throw std::invalid_argument("spherical_harmonics_streamed_fwd: SH-rest storage does not cover the active degree");
+        }
+        const uint32_t units = q16 ? sh_rest.q16_cells : shRestSlots(layout_degree);
+        const uint32_t blocks = static_cast<uint32_t>((total + kShStreamThreads - 1) / kShStreamThreads);
+        dispatch_sh_degree(degree, [&](auto deg) {
+            constexpr uint32_t D = decltype(deg)::value;
+            if (q16) {
+                spherical_harmonics_streamed_fwd_kernel<D, true><<<blocks, kShStreamThreads, 0, stream>>>(
+                    C, N, units, color_stride, reinterpret_cast<const vec3*>(dirs), sh0, sh_rest, colors);
+            } else {
+                spherical_harmonics_streamed_fwd_kernel<D, false><<<blocks, kShStreamThreads, 0, stream>>>(
+                    C, N, units, color_stride, reinterpret_cast<const vec3*>(dirs), sh0, sh_rest, colors);
+            }
+        });
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.sh_streamed_fwd");
+    }
+
+    void spherical_harmonics_streamed_bwd(
+        const uint32_t degrees_to_use,
+        const uint32_t layout_degree,
+        const float* dirs,
+        const float* v_colors,
+        const uint32_t C,
+        const uint32_t N,
+        const uint32_t color_stride,
+        float* v_sh0,
+        float* v_shN,
+        cudaStream_t stream) {
+        if (N == 0 || C == 0) {
+            return;
+        }
+        const uint32_t degree = dirs != nullptr ? degrees_to_use : 0u;
+        const uint32_t blocks = (N + kShStreamThreads - 1) / kShStreamThreads;
+        dispatch_sh_degree(degree, [&](auto deg) {
+            constexpr uint32_t D = decltype(deg)::value;
+            spherical_harmonics_streamed_bwd_kernel<D><<<blocks, kShStreamThreads, 0, stream>>>(
+                C, N, shRestSlots(layout_degree), color_stride, reinterpret_cast<const vec3*>(dirs),
+                v_colors, v_sh0, reinterpret_cast<float4*>(v_shN));
+        });
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.sh_streamed_bwd");
     }
 
     // Compute viewing directions: dir = mean - camera_position

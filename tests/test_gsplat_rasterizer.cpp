@@ -452,6 +452,127 @@ TEST_F(GsplatRasterizerTest, ForwardPassBasic) {
     release_ctx_arena(ctx);
 }
 
+TEST_F(GsplatRasterizerTest, StreamedShMatchesCanonicalKernelsForQ16AndFp32) {
+    // Spans several 256-splat bound blocks and ends mid swizzle block.
+    constexpr uint32_t count = 600;
+    for (const uint32_t layout_degree : {1u, 2u, 3u}) {
+        const uint32_t layout_rest = (layout_degree + 1u) * (layout_degree + 1u) - 1u;
+        const uint32_t cells = layout_rest * 3u;
+        const uint32_t slots = (cells + 3u) / 4u;
+        const uint32_t padded = (count + 31u) / 32u * 32u;
+        const uint32_t n_bounds = (count + 255u) / 256u;
+
+        // q16 codes in their swizzled layout and the fp32 copy they decode to.
+        std::vector<uint16_t> codes(static_cast<size_t>(padded) * cells, 0);
+        std::vector<float> bounds(n_bounds * 2u);
+        std::vector<float> swizzled(static_cast<size_t>(padded) * slots * 4u, 0.0f);
+        for (uint32_t b = 0; b < n_bounds; ++b) {
+            bounds[b * 2u + 0] = -0.3f - 0.05f * static_cast<float>(b);
+            bounds[b * 2u + 1] = 0.25f + 0.07f * static_cast<float>(b);
+        }
+        for (uint32_t p = 0; p < count; ++p) {
+            const float lo = bounds[(p / 256u) * 2u], hi = bounds[(p / 256u) * 2u + 1u];
+            for (uint32_t cell = 0; cell < cells; ++cell) {
+                const auto q = static_cast<uint16_t>((p * 7919u + cell * 104729u) % 65536u);
+                codes[(p / 32u) * (cells * 32u) + cell * 32u + p % 32u] = q;
+                const float value = lo + (hi - lo) * (static_cast<float>(q) * (1.0f / 65535.0f));
+                swizzled[((p / 32u) * (slots * 32u) + (cell / 4u) * 32u + p % 32u) * 4u + cell % 4u] = value;
+            }
+        }
+        std::vector<float> dirs(count * 3u), sh0(count * 3u);
+        for (uint32_t p = 0; p < count; ++p) {
+            dirs[p * 3u + 0] = std::sin(0.37f * static_cast<float>(p));
+            dirs[p * 3u + 1] = std::cos(0.11f * static_cast<float>(p)) - 0.2f;
+            dirs[p * 3u + 2] = 0.5f + 0.001f * static_cast<float>(p);
+            for (uint32_t c = 0; c < 3u; ++c)
+                sh0[p * 3u + c] = 0.01f * static_cast<float>((p + c * 13u) % 17u) - 0.08f;
+        }
+
+        uint16_t* codes_gpu = nullptr;
+        ASSERT_EQ(cudaMalloc(&codes_gpu, codes.size() * sizeof(uint16_t)), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(codes_gpu, codes.data(), codes.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+                  cudaSuccess);
+        const auto bounds_gpu = Tensor::from_vector(bounds, {bounds.size()}, Device::CUDA);
+        const auto shn_gpu = Tensor::from_vector(swizzled, {swizzled.size()}, Device::CUDA);
+        const auto dirs_gpu = Tensor::from_vector(dirs, {count, 3u}, Device::CUDA);
+        const auto sh0_gpu = Tensor::from_vector(sh0, {count, 3u}, Device::CUDA);
+        const gsplat_lfs::ShRestSource q16_source{
+            .q16_codes = codes_gpu, .q16_bounds = bounds_gpu.ptr<float>(), .q16_cells = cells};
+        const gsplat_lfs::ShRestSource f32_source{.f32_swizzled = shn_gpu.ptr<float>()};
+
+        for (uint32_t active = 0; active <= layout_degree; ++active) {
+            for (const uint32_t stride : {3u, 8u}) {
+                SCOPED_TRACE("layout " + std::to_string(layout_degree) + " active " + std::to_string(active) +
+                             " stride " + std::to_string(stride));
+                const float* dirs_ptr = active > 0 ? dirs_gpu.ptr<float>() : nullptr;
+
+                auto reference = Tensor::zeros({count, stride}, Device::CUDA);
+                gsplat_lfs::spherical_harmonics_swizzled_fwd(
+                    active, layout_degree, dirs_ptr, sh0_gpu.ptr<float>(), shn_gpu.ptr<float>(), nullptr,
+                    count, reference.ptr<float>(), stride);
+                const auto expected = reference.cpu();
+                for (const auto* source : {&q16_source, &f32_source}) {
+                    auto colors = Tensor::zeros({count, stride}, Device::CUDA);
+                    gsplat_lfs::spherical_harmonics_streamed_fwd(
+                        active, layout_degree, dirs_ptr, sh0_gpu.ptr<float>(), *source, 1u, count,
+                        colors.ptr<float>(), stride, nullptr);
+                    const auto actual = colors.cpu();
+                    float error = 0.0f;
+                    for (uint32_t i = 0; i < count * stride; ++i)
+                        error = std::max(error, std::abs(actual.ptr<float>()[i] - expected.ptr<float>()[i]));
+                    EXPECT_LT(error, 1e-6f) << (source == &q16_source ? "q16" : "fp32") << " forward";
+                }
+
+                // Backward: canonical kernel + the old host-side accumulate into preset buffers.
+                std::vector<float> v_colors(count * stride);
+                for (uint32_t i = 0; i < count * stride; ++i)
+                    v_colors[i] = 0.001f * static_cast<float>((i * 31u) % 97u) - 0.04f;
+                std::vector<float> preset_sh0(count * 3u), preset_shn(swizzled.size());
+                for (size_t i = 0; i < preset_sh0.size(); ++i)
+                    preset_sh0[i] = 0.5f + 0.001f * static_cast<float>(i % 13u);
+                for (size_t i = 0; i < preset_shn.size(); ++i)
+                    preset_shn[i] = -0.25f + 0.002f * static_cast<float>(i % 11u);
+                const auto v_colors_gpu = Tensor::from_vector(v_colors, {count, stride}, Device::CUDA);
+
+                const uint32_t K = (active + 1u) * (active + 1u);
+                auto canonical = Tensor::zeros({count, K, 3u}, Device::CUDA);
+                gsplat_lfs::spherical_harmonics_swizzled_bwd(
+                    K, active, layout_degree, dirs_ptr, sh0_gpu.ptr<float>(), shn_gpu.ptr<float>(), nullptr,
+                    v_colors_gpu.ptr<float>(), count, false, canonical.ptr<float>(), nullptr, stride);
+                const auto canonical_cpu = canonical.cpu();
+                std::vector<float> expected_sh0 = preset_sh0, expected_shn = preset_shn;
+                for (uint32_t p = 0; p < count; ++p) {
+                    for (uint32_t c = 0; c < 3u; ++c)
+                        expected_sh0[p * 3u + c] += canonical_cpu.ptr<float>()[p * K * 3u + c];
+                    for (uint32_t k = 1; k < K; ++k) {
+                        for (uint32_t c = 0; c < 3u; ++c) {
+                            const uint32_t cell = (k - 1u) * 3u + c;
+                            expected_shn[((p / 32u) * (slots * 32u) + (cell / 4u) * 32u + p % 32u) * 4u + cell % 4u] +=
+                                canonical_cpu.ptr<float>()[p * K * 3u + k * 3u + c];
+                        }
+                    }
+                }
+
+                auto v_sh0 = Tensor::from_vector(preset_sh0, {count, 3u}, Device::CUDA);
+                auto v_shn = Tensor::from_vector(preset_shn, {preset_shn.size()}, Device::CUDA);
+                gsplat_lfs::spherical_harmonics_streamed_bwd(
+                    active, layout_degree, dirs_ptr, v_colors_gpu.ptr<float>(), 1u, count, stride,
+                    v_sh0.ptr<float>(), v_shn.ptr<float>(), nullptr);
+                const auto actual_sh0 = v_sh0.cpu();
+                const auto actual_shn = v_shn.cpu();
+                float sh0_error = 0.0f, shn_error = 0.0f;
+                for (size_t i = 0; i < expected_sh0.size(); ++i)
+                    sh0_error = std::max(sh0_error, std::abs(actual_sh0.ptr<float>()[i] - expected_sh0[i]));
+                for (size_t i = 0; i < expected_shn.size(); ++i)
+                    shn_error = std::max(shn_error, std::abs(actual_shn.ptr<float>()[i] - expected_shn[i]));
+                EXPECT_LT(sh0_error, 1e-6f) << "sh0 gradient";
+                EXPECT_LT(shn_error, 1e-6f) << "shN gradient (incl. untouched padding and inactive cells)";
+            }
+        }
+        cudaFree(codes_gpu);
+    }
+}
+
 TEST_F(GsplatRasterizerTest, ShDegreeRampUpUsesAllocatedLayoutForForwardAndGradient) {
     constexpr uint32_t count = 65;
     constexpr uint32_t active_degree = 1;
@@ -754,16 +875,20 @@ TEST(GsplatRasterizerQuantTest, GutForwardBackwardWithDefaultQuantAndShDegree) {
         /*use_gut=*/true);
     ASSERT_TRUE(result.has_value()) << result.error();
     auto& [output, ctx] = *result;
-    // ctx must hold float dequant, not raw Float16 codes.
+    // The SH kernels read the q16 codes in place; no fp32 copy is made.
     ASSERT_TRUE(ctx.shN.is_valid());
-    EXPECT_EQ(ctx.shN.dtype(), DataType::Float32)
-        << "backward requires float dequant temp in ctx under q16";
+    EXPECT_NE(ctx.shN.dtype(), DataType::Float32) << "q16 shN should stay resident, not be dequantized";
 
     auto grad_image = Tensor::ones_like(output.image);
     auto grad_alpha = Tensor::zeros_like(output.alpha);
     ASSERT_NO_THROW({
         gsplat_rasterize_backward(ctx, grad_image, grad_alpha, splat, opt, Tensor{});
     });
+    const auto sh0_grad = opt.get_grad(ParamType::Sh0).cpu();
+    float sh0_grad_sum = 0.0f;
+    for (size_t i = 0; i < n * 3; ++i)
+        sh0_grad_sum += std::abs(sh0_grad.ptr<float>()[i]);
+    EXPECT_GT(sh0_grad_sum, 0.0f) << "the SH backward wrote no sh0 gradient";
 
     // Arena cleanup
     ctx.isect_ids_ptr = nullptr;
