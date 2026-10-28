@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "input/input_controller.hpp"
+#include "core/collision.hpp"
 #include "core/error_bus.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
@@ -17,6 +18,9 @@
 #include "gui/scale_gizmo.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/translation_gizmo.hpp"
+#include "gui/utils/native_file_dialog.hpp"
+#include "gui/utils/native_file_drag.hpp"
+#include "input/gamepad_profiles.hpp"
 #include "input/input_router.hpp"
 #include "input/input_types.hpp"
 #include "input/key_codes.hpp"
@@ -34,6 +38,7 @@
 #include "rendering/viewport_request_builder.hpp"
 #include "scene/scene_manager.hpp"
 #include "tools/align_tool.hpp"
+#include "tools/scale_distance_tool.hpp"
 #include "tools/selection_tool.hpp"
 #include "tools/tool_base.hpp"
 #include "tools/unified_tool_registry.hpp"
@@ -44,6 +49,7 @@
 #include "visualizer/preferences.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/visualizer.hpp"
+#include "window/window_manager.hpp"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_keyboard.h>
 #include <algorithm>
@@ -62,16 +68,6 @@ namespace lfs::vis {
         constexpr double kCameraContextMenuDragThreshold = 4.0;
         constexpr double kCameraFrustumClickThreshold = 5.0;
         namespace string_keys = lichtfeld::Strings;
-
-        std::string localizedWalkError(const std::string_view message) {
-            if (message == "No collision nodes are loaded")
-                return LOC("collision.walk_no_collision");
-            if (message == "No Walk support below the camera")
-                return LOC("collision.walk_no_support");
-            if (message == "Walk capsule does not fit at the camera")
-                return LOC("collision.walk_blocked");
-            return std::string(message);
-        }
 
         // Expand [world_min, world_max] by a node's local AABB transformed to world
         // space. With use_percentile, the splat/point-cloud box is the trimmed
@@ -177,7 +173,9 @@ namespace lfs::vis {
                 ((modal_id == op::to_string(op::BuiltinOp::SelectionStroke) ||
                   modal_id == op::to_string(op::BuiltinOp::CropPolygonDraw)) &&
                  isSelectionModalAction(action)) ||
-                (modal_id == op::to_string(op::BuiltinOp::AlignPickPoint) && isAlignModalAction(action));
+                ((modal_id == op::to_string(op::BuiltinOp::AlignPickPoint) ||
+                  modal_id == op::to_string(op::BuiltinOp::ScaleDistancePickPoint)) &&
+                 isAlignModalAction(action));
             if (!accepted) {
                 return false;
             }
@@ -333,6 +331,8 @@ namespace lfs::vis {
                 return ToolType::Mirror;
             case input::Action::TOOL_ALIGN:
                 return ToolType::Align;
+            case input::Action::TOOL_SCALE_DISTANCE:
+                return ToolType::ScaleDistance;
             default:
                 return std::nullopt;
             }
@@ -487,6 +487,7 @@ namespace lfs::vis {
         });
 
         split_toggle_handler_id_ = cmd::ToggleSplitView::when([this](const auto&) {
+            suspendGamepadNavigation();
             clearViewportDragState();
             clearWasdMomentumViewport();
             resetSplitPanelFocus();
@@ -495,6 +496,7 @@ namespace lfs::vis {
             }
         });
         independent_split_toggle_handler_id_ = cmd::ToggleIndependentSplitView::when([this](const auto&) {
+            suspendGamepadNavigation();
             clearViewportDragState();
             clearWasdMomentumViewport();
             resetSplitPanelFocus();
@@ -503,6 +505,7 @@ namespace lfs::vis {
             }
         });
         gt_comparison_toggle_handler_id_ = cmd::ToggleGTComparison::when([this](const auto&) {
+            suspendGamepadNavigation();
             clearViewportDragState();
             clearWasdMomentumViewport();
             resetSplitPanelFocus();
@@ -511,6 +514,7 @@ namespace lfs::vis {
             }
         });
         scene_cleared_handler_id_ = state::SceneCleared::when([this](const auto&) {
+            suspendGamepadNavigation();
             clearViewportDragState();
             clearWasdMomentumViewport();
             scene_extent_ = 0.0f;
@@ -518,6 +522,7 @@ namespace lfs::vis {
             resetSplitPanelFocus();
         });
         scene_loaded_handler_id_ = state::SceneLoaded::when([this](const auto&) {
+            suspendGamepadNavigation();
             clearViewportDragState();
             clearWasdMomentumViewport();
             scene_extent_ = 0.0f;
@@ -526,6 +531,7 @@ namespace lfs::vis {
         });
 
         window_focus_lost_handler_id_ = internal::WindowFocusLost::when([this](const auto&) {
+            pauseGamepadNavigation();
             cancelValueDrag(false);
             drag_mode_ = DragMode::None;
             syncLookPointerLock(false);
@@ -579,6 +585,12 @@ namespace lfs::vis {
 
     void InputController::initialize() {
         instance_ = this;
+        try {
+            gamepad_settings_ = input::GamepadNavigationSettings::fromJson(nlohmann::json::parse(UserPreferences::instance().gamepadNavigation()));
+        } catch (const std::exception& error) {
+            gamepad_configuration_error_ = error.what();
+            LOG_WARN("Gamepad configuration was not loaded: {}", error.what());
+        }
         applyNewProjectNavigationDefaults();
 
         // The GUI is initialized before this controller exists.
@@ -653,79 +665,101 @@ namespace lfs::vis {
     }
 
     core::CapsuleQuery InputController::walkQuery() const {
-        struct Collider {
-            std::shared_ptr<const core::CollisionVolume> volume;
-            glm::mat4 transform;
-        };
-        std::vector<Collider> colliders;
+        std::vector<core::Scene::VisibleMesh> colliders;
         if (const auto* manager = services().sceneOrNull()) {
             const auto& scene = manager->getScene();
             for (const auto* node : scene.getNodes())
                 if (node && node->type == core::NodeType::COLLISION && node->collision)
-                    colliders.push_back({node->collision, lfs::rendering::dataWorldTransformToVisualizerWorld(scene.getWorldTransform(node->id))});
+                    colliders.push_back({.mesh = nullptr, .transform = lfs::rendering::dataWorldTransformToVisualizerWorld(scene.getWorldTransform(node->id)), .collision = node->collision});
         }
         if (colliders.empty())
-            throw std::runtime_error("No collision nodes are loaded");
+            throw core::collisionError("collision.walk_no_collision", "No collision nodes are loaded");
         return [colliders = std::move(colliders)](glm::vec3 feet, glm::vec3 up, float height, float radius) {
             return std::ranges::any_of(colliders, [&](const auto& collider) {
-                return core::collisionCapsuleIntersects(*collider.volume, collider.transform, feet, up, height, radius);
+                return core::collisionCapsuleIntersects(*collider.collision, collider.transform, feet, up, height, radius);
             });
         };
+    }
+
+    void InputController::ensureWalkViewport(Viewport& target) {
+        if (walk_viewport_ == &target && walk_state_.presentation == target.camera.t)
+            return;
+        // Validate the handoff before replacing the previous owner's physics.
+        core::WalkState candidate{.eye = target.camera.t, .presentation = target.camera.t};
+        core::settleWalk(candidate, walk_settings, target.camera.navigationUp(), walkQuery());
+        walk_state_ = candidate;
+        walk_viewport_ = &target;
     }
 
     void InputController::setWalkSettings(core::WalkSettings settings) {
         settings.validate();
         if (camera_navigation_mode_ == CameraNavigationMode::Walk) {
-            auto& camera = activeKeyboardViewport().camera;
+            auto& target = walk_viewport_ ? *walk_viewport_ : activeKeyboardViewport();
+            ensureWalkViewport(target);
+            auto& camera = target.camera;
             const auto up = camera.navigationUp();
             const auto feet = walk_state_.feet;
             if (walkQuery()(feet, up, settings.height, settings.radius))
-                throw std::runtime_error("The edited Walk capsule does not fit");
+                throw core::collisionError("collision.walk_blocked", "The edited Walk capsule does not fit");
             walk_state_.eye = feet + up * settings.height;
             walk_state_.presentation = walk_state_.eye;
             camera.pivot += walk_state_.eye - camera.t;
             camera.t = walk_state_.eye;
         }
+        pauseGamepadNavigation();
         walk_settings = settings;
         publish_viewport_toolbar_generation();
     }
 
     bool InputController::setCameraNavigationMode(const CameraNavigationMode mode) {
+        return setCameraNavigationModeImpl(mode, true);
+    }
+
+    bool InputController::setCameraNavigationModeImpl(const CameraNavigationMode mode, const bool report_failure, Viewport* target) {
+        auto& navigation_viewport = target ? *target : activeKeyboardViewport();
         if (camera_navigation_mode_ == mode)
             return true;
 
         if (mode == CameraNavigationMode::Walk) {
-            auto& camera = activeKeyboardViewport().camera;
+            auto& camera = navigation_viewport.camera;
             core::WalkState candidate{.eye = camera.t, .presentation = camera.t};
             try {
                 core::settleWalk(candidate, walk_settings, camera.navigationUp(), walkQuery());
             } catch (const std::exception& error) {
-                if (walk_error != error.what()) {
+                if (!report_failure)
+                    return false;
+                const auto message = core::localizedCollisionError(error);
+                if (walk_error != message) {
                     lfs::ErrorBus::instance().publish(lfs::ErrorNotification{
                         .error = lfs::make_error({.code = lfs::ErrorCode::InvalidArgument,
                                                   .domain = lfs::ErrorDomain::App,
                                                   .severity = lfs::Severity::Warning,
-                                                  .user_message = LOCF("collision.walk_enter_failed", localizedWalkError(error.what())),
+                                                  .user_message = message,
+                                                  .detail = error.what(),
                                                   .detection = LFS_SOURCE_SITE_CURRENT()})
                                      .with_context("enter_walk", LFS_SOURCE_SITE_CURRENT()),
                         .surface = lfs::ErrorSurface::Toast,
                         .actions = {},
                         .operation_id = lfs::OperationId::generate(),
                     });
-                    walk_error = error.what();
+                    walk_error = message;
                     publish_viewport_toolbar_generation();
                 }
                 python::request_redraw();
                 return false;
             }
             walk_state_ = candidate;
+            walk_viewport_ = &navigation_viewport;
             camera.t = walk_state_.eye;
             camera.clearTransientMotion();
             walk_error.clear();
         }
         clearViewportDragState();
+        pauseGamepadNavigation();
         const bool leaving_drone = camera_navigation_mode_ == CameraNavigationMode::Drone;
         camera_navigation_mode_ = mode;
+        if (mode != CameraNavigationMode::Walk)
+            walk_viewport_ = nullptr;
         // The pivot is left untouched: orbit modes work with any pivot and FPV
         // re-seeds it on every look drag, so switching modes must not discard a
         // user-set pivot.
@@ -737,14 +771,14 @@ namespace lfs::vis {
                 finished_viewport = wasd_momentum_viewport_;
                 wasd_momentum_viewport_ = nullptr;
             }
-            auto& keyboard_viewport = activeKeyboardViewport();
+            auto& keyboard_viewport = navigation_viewport;
             if (&keyboard_viewport != finished_viewport) {
                 keyboard_viewport.camera.finishDrone();
                 publishCameraMove(&keyboard_viewport);
             }
         } else if (mode == CameraNavigationMode::Drone) {
             clearWasdMomentumViewport();
-            auto& keyboard_viewport = activeKeyboardViewport();
+            auto& keyboard_viewport = navigation_viewport;
             keyboard_viewport.camera.enterDrone();
             publishCameraMove(&keyboard_viewport);
         }
@@ -760,6 +794,7 @@ namespace lfs::vis {
     }
 
     void InputController::setNavigationUpAxis(const NavigationUpAxis axis, const bool align_grid) {
+        pauseGamepadNavigation();
         clearViewportDragState();
         clearWasdMomentumViewport();
         orbit_coast_viewport_ = nullptr;
@@ -793,6 +828,7 @@ namespace lfs::vis {
     }
 
     void InputController::onWindowFocusLost() {
+        pauseGamepadNavigation();
         if (current_cursor_ != CursorType::Default) {
             SDL_SetCursor(SDL_GetDefaultCursor());
             current_cursor_ = CursorType::Default;
@@ -903,6 +939,24 @@ namespace lfs::vis {
 
     // Core handlers
     void InputController::handleMouseButton(int button, int action, double x, double y) {
+        if (action == input::ACTION_PRESS) {
+            if (input_router_ && input_router_->pointerTarget(x, y) == input::InputTarget::Viewport)
+                pauseGamepadNavigation();
+            gamepad_click_candidate_ = button == static_cast<int>(input::AppMouseButton::LEFT) &&
+                                       hasViewportKeyboardFocus() && isInViewport(x, y) && input_router_ &&
+                                       input_router_->pointerTarget(x, y) == input::InputTarget::Viewport;
+            gamepad_press_pos_ = {x, y};
+        } else if (action == input::ACTION_RELEASE && button == static_cast<int>(input::AppMouseButton::LEFT)) {
+            if (gamepad_click_candidate_ && hasViewportKeyboardFocus() && isInViewport(x, y) &&
+                glm::length(glm::dvec2(x, y) - gamepad_press_pos_) < 4.0) {
+                if (const auto interaction = resolvePanelInteraction(x, y); interaction && interaction->valid()) {
+                    stopGamepadMotion();
+                    gamepad_panel_ = interaction->panel;
+                    ++gamepad_click_epoch_;
+                }
+            }
+            gamepad_click_candidate_ = false;
+        }
         decayHeldDragMomentum();
         LOG_PERF("InputController::handleMouseButton button={} action={} pos=({},{}) drag_mode={}",
                  button, action, x, y, static_cast<int>(drag_mode_));
@@ -1321,14 +1375,18 @@ namespace lfs::vis {
                             }
                             // Operator is now modal, don't set drag mode - modal dispatch handles it
                         }
-                    } else if (align_tool_ && align_tool_->isEnabled() &&
+                    } else if (((align_tool_ && align_tool_->isEnabled()) ||
+                                (scale_distance_tool_ && scale_distance_tool_->isEnabled())) &&
                                !op::operators().hasModalOperator()) {
                         op::OperatorProperties props;
                         props.set("x", x);
                         props.set("y", y);
                         props.set("button", button);
                         props.set("modifiers", mods);
-                        const auto result = op::operators().invoke(op::BuiltinOp::AlignPickPoint, &props);
+                        const auto id = align_tool_ && align_tool_->isEnabled()
+                                            ? op::BuiltinOp::AlignPickPoint
+                                            : op::BuiltinOp::ScaleDistancePickPoint;
+                        const auto result = op::operators().invoke(id, &props);
                         if (result.status == op::OperatorResult::RUNNING_MODAL) {
                             return;
                         }
@@ -1346,14 +1404,19 @@ namespace lfs::vis {
 
             case input::Action::NONE:
             default:
-                if (align_tool_ && align_tool_->isEnabled() && tool_context_ && !over_gui &&
+                if (((align_tool_ && align_tool_->isEnabled()) ||
+                     (scale_distance_tool_ && scale_distance_tool_->isEnabled())) &&
+                    tool_context_ && !over_gui &&
                     !op::operators().hasModalOperator()) {
                     op::OperatorProperties props;
                     props.set("x", x);
                     props.set("y", y);
                     props.set("button", button);
                     props.set("modifiers", mods);
-                    const auto result = op::operators().invoke(op::BuiltinOp::AlignPickPoint, &props);
+                    const auto id = align_tool_ && align_tool_->isEnabled()
+                                        ? op::BuiltinOp::AlignPickPoint
+                                        : op::BuiltinOp::ScaleDistancePickPoint;
+                    const auto result = op::operators().invoke(id, &props);
                     if (result.status == op::OperatorResult::RUNNING_MODAL) {
                         return;
                     }
@@ -1558,6 +1621,8 @@ namespace lfs::vis {
     }
 
     void InputController::handleMouseMove(double x, double y, const std::optional<glm::dvec2> motion) {
+        if (glm::length(glm::dvec2(x, y) - gamepad_press_pos_) >= 4.0)
+            gamepad_click_candidate_ = false;
         decayHeldDragMomentum();
         LOG_PERF("InputController::handleMouseMove pos=({},{}) drag_mode={}",
                  x, y, static_cast<int>(drag_mode_));
@@ -1609,6 +1674,10 @@ namespace lfs::vis {
         if (align_tool_ && align_tool_->isEnabled() && (delta_x != 0.0 || delta_y != 0.0)) {
             if (auto* rendering = services().renderingOrNull())
                 rendering->markDirty(DirtyFlag::OVERLAY, FrameReason::Overlay, "align_cursor_moved");
+        }
+        if (scale_distance_tool_ && scale_distance_tool_->isEnabled() && (delta_x != 0.0 || delta_y != 0.0)) {
+            if (auto* rendering = services().renderingOrNull())
+                rendering->markDirty(DirtyFlag::OVERLAY, FrameReason::Overlay, "scale_distance_cursor_moved");
         }
 
         // Dispatch to modal operators first - if consumed, don't continue
@@ -1889,6 +1958,7 @@ namespace lfs::vis {
         if (camera_navigation_mode_ == CameraNavigationMode::Walk)
             return;
 
+        pauseGamepadNavigation();
         if (scroll_action == input::Action::CAMERA_ROLL) {
             target_viewport.camera.rotate_roll(delta);
         } else if (scroll_action == input::Action::CAMERA_ZOOM) {
@@ -1933,6 +2003,8 @@ namespace lfs::vis {
 
     void InputController::handleKey(const int physical_key, const int logical_key,
                                     const int scancode, int action, int mods, const bool owned_release, const bool gui_consumed) {
+        if ((action == input::ACTION_PRESS || action == input::ACTION_REPEAT) && hasViewportKeyboardFocus())
+            pauseGamepadNavigation();
         // Clear before any GUI/modal early return, including owned key releases.
         if (action == input::ACTION_RELEASE)
             camera_browse_repeat_.release(physical_key);
@@ -2599,6 +2671,307 @@ namespace lfs::vis {
         }
     }
 
+    bool InputController::configureGamepadNavigation(input::GamepadNavigationSettings settings, SDL_JoystickID device) {
+        settings.validate();
+        auto* window = services().windowOrNull();
+        if (!window) {
+            stopGamepadMotion();
+            return false;
+        }
+        const auto previous_device = window->gamepads().navigationSelected();
+        window->updateGamepadService(settings.enabled || gamepad_settings_.enabled);
+        if (!window->gamepads().selectNavigation(device)) {
+            if (settings.enabled) {
+                window->updateGamepadService(gamepad_settings_.enabled);
+                return false;
+            }
+            (void)window->gamepads().selectNavigation(0);
+        }
+        suspendGamepadNavigation();
+        if (settings.json() != gamepad_settings_.json() || !gamepad_configuration_error_.empty()) {
+            if (const auto result = UserPreferences::instance().setGamepadNavigation(settings.json().dump()); !result) {
+                (void)window->gamepads().selectNavigation(previous_device);
+                window->updateGamepadService(gamepad_settings_.enabled);
+                throw std::runtime_error(lfs::format_for_developer(result.error()));
+            }
+            gamepad_configuration_error_.clear();
+        }
+        settings.revision = gamepad_settings_.revision + 1;
+        gamepad_settings_ = settings;
+        window->updateGamepadService(gamepad_settings_.enabled);
+        python::request_redraw();
+        return true;
+    }
+
+    bool InputController::configureGamepadProfiles(const std::string& serialized, const bool disable, const std::string& expected) {
+        const auto profiles = input::GamepadProfiles::fromJson(nlohmann::json::parse(serialized));
+        auto settings = profiles.activeSettings(disable ? false : gamepad_settings_.enabled);
+        if (auto result = UserPreferences::instance().setGamepadProfiles(profiles.value.dump(), settings.enabled, expected); !result)
+            throw std::runtime_error(lfs::format_for_developer(result.error()));
+        suspendGamepadNavigation();
+        settings.revision = gamepad_settings_.revision + 1;
+        gamepad_settings_ = std::move(settings);
+        if (auto* window = services().windowOrNull())
+            window->updateGamepadService(gamepad_settings_.enabled);
+        gamepad_configuration_error_.clear();
+        python::request_redraw();
+        return true;
+    }
+
+    void InputController::stopGamepadMotion() {
+        if (gamepad_owned_) {
+            auto& target = *gamepad_motion_viewport_;
+            if (camera_navigation_mode_ == CameraNavigationMode::Drone)
+                target.camera.finishDrone();
+            target.camera.clearTransientMotion();
+            if (wasd_momentum_viewport_ == &target)
+                wasd_momentum_viewport_ = nullptr;
+            gamepad_owned_ = false;
+            publishCameraMove(&target);
+            onCameraMovementEnd();
+        }
+        gamepad_frame_demand_ = false;
+    }
+
+    SDL_JoystickID InputController::gamepadNavigationDevice() const {
+        auto* window = services().windowOrNull();
+        return window ? window->gamepads().navigationSelected() : 0;
+    }
+
+    SplitViewPanelId InputController::gamepadNavigationPanel() const {
+        return gamepad_panel_;
+    }
+
+    Viewport& InputController::gamepadViewport() const {
+        if (auto* rendering = services().renderingOrNull())
+            return rendering->resolvePanelViewport(viewport_, gamepad_panel_);
+        return viewport_;
+    }
+
+    void InputController::pauseGamepadNavigation() {
+        stopGamepadMotion();
+        gamepad_session_.pause();
+    }
+
+    void InputController::suspendGamepadNavigation() {
+        stopGamepadMotion();
+        gamepad_session_.suspend(gamepad_click_epoch_);
+        gamepad_click_candidate_ = false;
+        gamepad_panel_ = SplitViewPanelId::Left;
+    }
+
+    bool InputController::updateGamepadNavigation(float delta_time) {
+        if (!gamepad_settings_.enabled) {
+            stopGamepadMotion();
+            return false;
+        }
+        // Selection/generation is session-local. A remembered model only chooses
+        // settings; it never enables navigation or grants viewport ownership.
+        if (auto* window = services().windowOrNull()) {
+            const auto& sample = window->gamepads().navigationSample();
+            if (sample.id != gamepad_profile_device_ || sample.generation != gamepad_profile_generation_) {
+                gamepad_profile_device_ = sample.id;
+                gamepad_profile_generation_ = sample.generation;
+                suspendGamepadNavigation();
+                try {
+                    auto profiles = input::GamepadProfiles::fromJson(nlohmann::json::parse(UserPreferences::instance().gamepadProfiles()));
+                    const auto& links = profiles.value["device_profiles"];
+                    const auto match = links.find(window->gamepads().navigationProfileKey());
+                    if (match != links.end() && *match != profiles.value["active"]) {
+                        profiles.value["active"] = *match;
+                        configureGamepadProfiles(profiles.value.dump());
+                    }
+                } catch (const std::exception& error) {
+                    gamepad_configuration_error_ = error.what();
+                    LOG_WARN("Gamepad device profile was not loaded: {}", error.what());
+                }
+            }
+        }
+        auto* window = services().windowOrNull();
+        if (!window) {
+            stopGamepadMotion();
+            return false;
+        }
+        const auto dialog_epoch = gui::nativeFileDialogEpoch();
+        if (dialog_epoch != gamepad_dialog_epoch_) {
+            pauseGamepadNavigation();
+            gamepad_dialog_epoch_ = dialog_epoch;
+        }
+        auto& target = gamepadViewport();
+        auto& camera = target.camera;
+        auto* gui = services().guiOrNull();
+        const auto gui_state = gui ? gui->inputState() : gui::GuiInputState{};
+        const bool keys_held = std::any_of(std::begin(keys_movement_), std::end(keys_movement_), [](bool held) { return held; });
+        const auto flags = window_ ? SDL_GetWindowFlags(window_) : 0;
+        float pointer_x = 0, pointer_y = 0;
+        const bool mouse_down = input::mouseStateInPixels(window_, &pointer_x, &pointer_y) != 0;
+        const bool viewport_mouse = mouse_down && input_router_ &&
+                                    input_router_->pointerTarget(pointer_x, pointer_y) == input::InputTarget::Viewport;
+        input::GamepadNavigationContext context;
+        // Native floating panels are SDL windows in this process too. Moving
+        // focus to the Sequencer must not look like leaving the application.
+        context.allowed = window_ && SDL_GetKeyboardFocus() && !(flags & SDL_WINDOW_MINIMIZED) &&
+                          !gui_state.modal_open && !gui::nativeFileDialogActive() &&
+                          !keys_held && !viewport_mouse && drag_mode_ == DragMode::None &&
+                          !bindings_.isCapturing() && !lfs::python::has_keyboard_capture_request() &&
+                          !op::operators().hasModalOperator() &&
+                          !gui::preserveNativeDragInput() && window->manualResizeEdgeMask() == 0 &&
+                          !gui::PanelRegistry::instance().is_panel_enabled("lfs.preferences") &&
+                          (!gui || (!gui->sequencer().isPlaying() && gui->sequencer().state() != PlaybackState::SCRUBBING)) &&
+                          window->gamepads().diagnosticSelected() == 0;
+        context.target = reinterpret_cast<uintptr_t>(&target);
+        context.click_epoch = gamepad_click_epoch_;
+        context.sequencer_open = gui && gui->isSequencerVisible() && !gui_state.text_input_active;
+        context.sequencer_commands_allowed = !gui || !gui->sequencerUI().isTimelineGestureActive();
+        switch (camera_navigation_mode_) {
+        case CameraNavigationMode::Orbit: context.mode = input::GamepadNavigationMode::Orbit; break;
+        case CameraNavigationMode::Trackball: context.mode = input::GamepadNavigationMode::Trackball; break;
+        case CameraNavigationMode::FPV: context.mode = input::GamepadNavigationMode::FPV; break;
+        case CameraNavigationMode::Drone: context.mode = input::GamepadNavigationMode::Drone; break;
+        case CameraNavigationMode::Walk: context.mode = input::GamepadNavigationMode::Walk; break;
+        }
+        auto* rendering = services().renderingOrNull();
+        const auto projection = rendering ? rendering->getCameraProjectionSettings()
+                                          : RenderingManager::CameraProjectionSettings{};
+        context.supported_projection = !projection.orthographic ||
+                                       camera_navigation_mode_ == CameraNavigationMode::Orbit || camera_navigation_mode_ == CameraNavigationMode::Trackball;
+        const auto intent = gamepad_session_.update(window->gamepads().navigationSample(), gamepad_settings_, context, delta_time);
+        const auto status = std::string_view(gamepad_session_.status());
+        if (status != "ready" && status != "moving") {
+            stopGamepadMotion();
+            gamepad_frame_demand_ = gamepad_session_.awaitingNeutral();
+            return false;
+        }
+        if (context.sequencer_open && (intent.add_keyframe || intent.remove_selected_keyframe || intent.deselect_keyframe || intent.update_selected_keyframe || intent.keyframe_step)) {
+            stopGamepadMotion();
+            auto& sequencer_ui = gui->sequencerUI();
+            if (intent.add_keyframe)
+                sequencer_ui.captureKeyframeFromView(target);
+            else if (intent.remove_selected_keyframe)
+                sequencer_ui.removeSelectedKeyframe();
+            else if (intent.deselect_keyframe)
+                sequencer_ui.deselectKeyframe();
+            else if (intent.update_selected_keyframe)
+                sequencer_ui.updateSelectedKeyframeFromView(target);
+            else
+                sequencer_ui.selectAdjacentKeyframe(intent.keyframe_step, &target);
+            gamepad_frame_demand_ = true;
+            return true;
+        }
+        if (!context.supported_projection) {
+            // Editing remains available, but old perspective-camera momentum
+            // must not continue after switching to an incompatible projection.
+            stopGamepadMotion();
+            return false;
+        }
+        if (intent.exit_walk) {
+            setCameraNavigationMode(CameraNavigationMode::Orbit);
+            return true;
+        }
+        if (intent.navigation_step) {
+            const bool changed = input::cycleGamepadNavigation(context.mode, intent.navigation_step, projection.orthographic,
+                                                               [&](input::GamepadNavigationMode candidate) {
+                                                                   const auto mode = cameraNavigationModeFromName(std::string(input::gamepad_modes[static_cast<size_t>(candidate)]));
+                                                                   return mode && setCameraNavigationModeImpl(*mode, false, &target);
+                                                               });
+            if (changed) {
+                // This deliberate command came from an armed viewport. Keep its
+                // ownership, but require released controls before resuming motion.
+                gamepad_frame_demand_ = true;
+            }
+            return true;
+        }
+        if (intent.rendering_step && rendering) {
+            const auto& settings = rendering->getSettings();
+            const int current = settings.point_cloud_mode ? 1 : settings.show_rings        ? 2
+                                                            : settings.show_center_markers ? 3
+                                                                                           : 0;
+            constexpr std::array<std::string_view, 4> modes{"splats", "points", "rings", "centers"};
+            rendering->setViewportRenderMode(modes[(current + intent.rendering_step + 4) % 4]);
+            return true;
+        }
+        const bool settling = gamepad_owned_ &&
+                              (camera.hasWasdMomentum() || camera.hasDroneMotion());
+        if (!intent.active && !settling) {
+            if (gamepad_owned_) {
+                gamepad_owned_ = false;
+                onCameraMovementEnd();
+            }
+            gamepad_frame_demand_ = false;
+            return false;
+        }
+        const bool acquiring = !gamepad_owned_;
+        if (acquiring) {
+            clearWasdMomentumViewport();
+            if (orbit_coast_viewport_)
+                orbit_coast_viewport_->camera.clearOrbitMomentum();
+            if (pan_coast_viewport_)
+                pan_coast_viewport_->camera.clearPanMomentum();
+            orbit_coast_viewport_ = pan_coast_viewport_ = nullptr;
+            camera.clearTransientMotion();
+            if (camera_navigation_mode_ == CameraNavigationMode::Drone)
+                camera.enterDrone();
+            gamepad_motion_viewport_ = &target;
+            gamepad_owned_ = true;
+        }
+        const float dt = std::min(delta_time, 0.05f);
+        const auto movement = input::NavigationMovement::fromAnalog({intent.move.x, intent.vertical, intent.move.y});
+        const float additional_speed = (intent.speed - 1.0f) * camera.getWasdSpeed();
+        switch (camera_navigation_mode_) {
+        case CameraNavigationMode::Orbit:
+        case CameraNavigationMode::Trackball: {
+            camera.advanceOrbit(dt, intent.look, camera_navigation_mode_ == CameraNavigationMode::Trackball);
+            float pan_factor = 0.5f * intent.speed;
+            if (projection.orthographic && target.windowSize.y > 0) {
+                const float scale = target.ortho_scale_override.value_or(projection.ortho_scale);
+                const float distance = std::max(glm::length(camera.pivot - camera.t), 0.01f);
+                const float perspective_scale = target.windowSize.y /
+                                                (2.0f * distance * std::tan(glm::radians(lfs::rendering::focalLengthToVFov(projection.focal_length_mm)) * 0.5f));
+                pan_factor *= perspective_scale / std::max(scale, 1e-6f);
+                const float next_scale = camera.advanceOrthographicDolly(dt, intent.vertical * 0.8f * intent.speed, scale);
+                if (next_scale != scale) {
+                    if (&target != &viewport_ || target.ortho_scale_override)
+                        target.ortho_scale_override = next_scale;
+                    if (&target == &viewport_ && rendering)
+                        rendering->setOrthographicScale(next_scale);
+                }
+            } else {
+                camera.advanceDolly(dt, intent.vertical * 0.8f * intent.speed);
+            }
+            camera.advancePan(dt, intent.move * pan_factor);
+            break;
+        }
+        case CameraNavigationMode::FPV:
+            camera.advanceLook(dt, intent.look);
+            camera.advanceWasd(dt, movement, additional_speed);
+            break;
+        case CameraNavigationMode::Drone:
+            camera.advanceDroneLook(dt, intent.look);
+            camera.advanceDrone(dt, movement, additional_speed);
+            break;
+        case CameraNavigationMode::Walk:
+            camera.advanceLook(dt, intent.look);
+            try {
+                ensureWalkViewport(target);
+                core::advanceWalk(walk_state_, walk_settings, camera.navigationUp(),
+                                  camera.walkVelocity(movement, walk_settings.speed * intent.speed), dt, walkQuery());
+                const auto delta = walk_state_.presentation - camera.t;
+                camera.t += delta;
+                camera.pivot += delta;
+            } catch (const std::exception& e) {
+                walk_error = core::localizedCollisionError(e);
+                LOG_ERROR("Walk stopped: {}", e.what());
+                setCameraNavigationMode(CameraNavigationMode::Orbit);
+                return true;
+            }
+            break;
+        }
+        gamepad_frame_demand_ = intent.active || camera.hasWasdMomentum() || camera.hasDroneMotion();
+        onCameraMovementStart();
+        publishCameraMove(&target);
+        return true;
+    }
+
     void InputController::update(float delta_time) {
         updateCameraBrowseRepeat();
         decayHeldDragMomentum();
@@ -2719,6 +3092,11 @@ namespace lfs::vis {
             }
         }
 
+        if (updateGamepadNavigation(delta_time)) {
+            checkCameraMovementTimeout();
+            return;
+        }
+
         // Orbit ease-out: while dragging, let a held-still pause fade the stored
         // motion; once released, coast the remembered rotation to a smooth stop.
         if (orbit_coast_viewport_ && drag_mode_ != DragMode::Orbit) {
@@ -2782,7 +3160,7 @@ namespace lfs::vis {
         // Handle continuous WASD movement. The camera carries a damped velocity,
         // so motion eases in on press and glides to rest on release. Drive it
         // every frame while momentum remains so a released key decays to zero.
-        auto* const active_movement_viewport = &activeKeyboardViewport();
+        auto* active_movement_viewport = &activeKeyboardViewport();
         const bool camera_can_move = shouldCameraHandleInput() &&
                                      drag_mode_ != DragMode::Gizmo && drag_mode_ != DragMode::Splitter;
         const bool keys_active = camera_can_move &&
@@ -2801,20 +3179,19 @@ namespace lfs::vis {
             (keys_active && (getModifierKeys() & input::KEYMOD_SHIFT) != 0) ? kWasdShiftSpeedBonus : 0.0f;
 
         if (camera_navigation_mode_ == CameraNavigationMode::Walk) {
+            // Neutral input continues the current owner's gravity/settling. Only
+            // deliberate keyboard motion may hand Walk over to the keyboard view.
+            if (!keys_active && walk_viewport_)
+                active_movement_viewport = walk_viewport_;
             auto& camera = active_movement_viewport->camera;
             try {
+                ensureWalkViewport(*active_movement_viewport);
                 const auto up = camera.navigationUp();
-                auto forward = -camera.R[2];
-                forward -= up * glm::dot(forward, up);
-                if (glm::length(forward) < 1e-5f)
-                    forward = glm::cross(up, camera.R[0]);
-                forward = glm::normalize(forward);
-                const auto right = glm::normalize(glm::cross(forward, up));
-                auto velocity = keys_active ? forward * float(keys_movement_[0] - keys_movement_[2]) +
-                                                  right * float(keys_movement_[3] - keys_movement_[1])
-                                            : glm::vec3(0);
-                if (glm::length(velocity) > 0)
-                    velocity = glm::normalize(velocity) * walk_settings.speed;
+                const auto movement = input::NavigationMovement::fromKeys(
+                    keys_active && keys_movement_[0], keys_active && keys_movement_[2],
+                    keys_active && keys_movement_[1], keys_active && keys_movement_[3],
+                    false, false);
+                const auto velocity = camera.walkVelocity(movement, walk_settings.speed);
                 core::advanceWalk(walk_state_, walk_settings, up, velocity, delta_time, walkQuery());
                 const auto delta = walk_state_.presentation - camera.t;
                 camera.t += delta;
@@ -2822,8 +3199,8 @@ namespace lfs::vis {
                 if (glm::length(delta) > 0)
                     publishCameraMove(active_movement_viewport);
             } catch (const std::exception& e) {
-                walk_error = e.what();
-                LOG_ERROR("Walk stopped: {}", walk_error);
+                walk_error = core::localizedCollisionError(e);
+                LOG_ERROR("Walk stopped: {}", e.what());
                 setCameraNavigationMode(CameraNavigationMode::Orbit);
             }
         } else if (camera_navigation_mode_ == CameraNavigationMode::Drone) {
@@ -2921,6 +3298,7 @@ namespace lfs::vis {
     }
 
     void InputController::handleFileDrop(const std::vector<std::string>& paths) {
+        suspendGamepadNavigation();
         using namespace lfs::core::events;
         ui::FileDropReceived{}.emit();
 
@@ -3491,6 +3869,9 @@ namespace lfs::vis {
         if (auto* const rendering = services().renderingOrNull()) {
             const bool changed =
                 rendering->getFocusedSplitPanel() != panel;
+            if (changed) {
+                pauseGamepadNavigation();
+            }
             rendering->setFocusedSplitPanel(panel);
             if (changed) {
                 if (auto* const viewer = lfs::python::get_visualizer()) {
@@ -3501,6 +3882,9 @@ namespace lfs::vis {
     }
 
     void InputController::resetSplitPanelFocus() {
+        // Split-layout and scene changes may replace the secondary view's pose.
+        // Do not keep integrating physics owned by that old layout.
+        walk_viewport_ = nullptr;
         focusSplitPanel(SplitViewPanelId::Left);
         if (selection_tool_) {
             selection_tool_->setFilterPanel(SplitViewPanelId::Left);
@@ -4034,6 +4418,8 @@ namespace lfs::vis {
         if (selection_tool_ && selection_tool_->isEnabled())
             return input::ToolMode::SELECTION;
         if (align_tool_ && align_tool_->isEnabled())
+            return input::ToolMode::ALIGN;
+        if (scale_distance_tool_ && scale_distance_tool_->isEnabled())
             return input::ToolMode::ALIGN;
         // Check GUI tool mode for transform tools
         if (services().guiOrNull()) {

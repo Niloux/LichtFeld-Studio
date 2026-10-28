@@ -34,6 +34,7 @@
 #include "operator/ops/align_ops.hpp"
 #include "operator/ops/crop_polygon_ops.hpp"
 #include "operator/ops/edit_ops.hpp"
+#include "operator/ops/scale_distance_ops.hpp"
 #include "operator/ops/scene_ops.hpp"
 #include "operator/ops/selection_ops.hpp"
 #include "operator/ops/transform_ops.hpp"
@@ -48,6 +49,7 @@
 #include "scene/scene_manager.hpp"
 #include "tools/align_tool.hpp"
 #include "tools/builtin_tools.hpp"
+#include "tools/scale_distance_tool.hpp"
 #include "tools/selection_tool.hpp"
 #include "tools/unified_tool_registry.hpp"
 #include "training/training_setup.hpp"
@@ -370,6 +372,7 @@ namespace lfs::vis {
         op::operators().setSceneManager(scene_manager_.get());
         op::registerTransformOperators();
         op::registerAlignOperators();
+        op::registerScaleDistanceOperators();
         op::registerSelectionOperators();
         op::registerCropPolygonOperators();
         op::registerEditOperators();
@@ -406,6 +409,7 @@ namespace lfs::vis {
         op::unregisterSceneOperators();
         op::unregisterCropPolygonOperators();
         op::unregisterSelectionOperators();
+        op::unregisterScaleDistanceOperators();
         op::unregisterAlignOperators();
         op::unregisterTransformOperators();
         op::operators().clear();
@@ -463,6 +467,14 @@ namespace lfs::vis {
             align_tool_.reset();
         } else if (input_controller_) {
             input_controller_->setAlignTool(align_tool_);
+        }
+
+        scale_distance_tool_ = std::make_shared<tools::ScaleDistanceTool>();
+        if (!scale_distance_tool_->initialize(*tool_context_)) {
+            LOG_ERROR("Failed to initialize scale distance tool");
+            scale_distance_tool_.reset();
+        } else if (input_controller_) {
+            input_controller_->setScaleDistanceTool(scale_distance_tool_);
         }
 
         selection_tool_ = std::make_shared<tools::SelectionTool>();
@@ -748,7 +760,8 @@ namespace lfs::vis {
             []() -> bool {
                 auto* gm = python::get_gui_manager();
                 return gm ? (gm->sequencer().timeline().realKeyframeCount() > 0 ||
-                             gm->sequencer().timeline().hasAnimationClip())
+                             gm->sequencer().timeline().hasAnimationClip() ||
+                             gm->sequencer().timeline().revealClip().has_value())
                           : false;
             },
             [](const std::string& path) -> bool {
@@ -860,6 +873,12 @@ namespace lfs::vis {
                     state.equirectangular = s.equirectangular;
                 if (s.sequence_fps != last.sequence_fps)
                     state.sequence_fps = s.sequence_fps;
+                if ((s.camera_width != last.camera_width || s.camera_height != last.camera_height) &&
+                    s.camera_width >= 1 && s.camera_width <= 8192 && s.camera_height >= 1 && s.camera_height <= 8192) {
+                    state.camera_width = s.camera_width;
+                    state.camera_height = s.camera_height;
+                    projectMarkSessionChapterCommitted("SEQR");
+                }
             }
 
             s.show_camera_path = state.show_camera_path;
@@ -872,6 +891,11 @@ namespace lfs::vis {
             s.show_film_strip = state.show_film_strip;
             s.equirectangular = state.equirectangular;
             s.sequence_fps = state.sequence_fps;
+            s.camera_width = state.camera_width;
+            s.camera_height = state.camera_height;
+            s.framerate = state.framerate;
+            s.framerate_denominator = state.framerate_denominator;
+            s.export_fit = state.export_fit;
             const auto sel = gm->sequencer().selectedKeyframe();
             s.selected_keyframe = sel.has_value() ? static_cast<int>(*sel) : -1;
             if (!sequencer_ui_last_handed_out_)
@@ -1434,6 +1458,9 @@ namespace lfs::vis {
         if (auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
             context->cancelSceneCaptureRequest();
 
+        if (gui_manager_)
+            gui_manager_->asyncTasks().shutdownAprilTagScan();
+
         std::function<void()> shutdown_callback;
         {
             std::lock_guard lock(shutdown_callback_mutex_);
@@ -1546,7 +1573,7 @@ namespace lfs::vis {
                         : ProjectSwitchDisposition::RequireClean,
                     command.stop_training,
                     command.allow_existing_destination_replacement);
-                last_project_create_succeeded_ = created.has_value();
+                last_project_create_succeeded_ = created.has_value() && !projectCreatePending();
             });
 
         cmd::SwitchToEditMode::when(
@@ -2342,6 +2369,9 @@ namespace lfs::vis {
         if (align_tool_ && align_tool_->isEnabled() && tool_context_) {
             align_tool_->update(*tool_context_);
         }
+        if (scale_distance_tool_ && scale_distance_tool_->isEnabled() && tool_context_) {
+            scale_distance_tool_->update(*tool_context_);
+        }
 
         if (!gui_frame_rendered_) {
             // Wait for at least one GUI frame to render before loading data
@@ -2783,6 +2813,9 @@ namespace lfs::vis {
                 input_controller_->update(delta_time);
             }
         }
+        // Event pumps may run more than once before an input update. Acknowledge
+        // navigation edges only here; diagnostics has its own consuming reader.
+        window_manager_->gamepads().consumeNavigationPresses();
 
         if (gui_manager_) {
             gui_manager_->updateInteractiveTransitions();
@@ -3456,6 +3489,12 @@ namespace lfs::vis {
             return std::unexpected("No data loader available");
         }
 
+        if (scene_manager_ && scene_manager_->canClearScene() && gui_manager_ &&
+            gui_manager_->asyncTasks().deferSceneReplacement([this] {
+                if (auto result = clearScene(); !result)
+                    LOG_ERROR("Deferred scene clear failed: {}", result.error());
+            }))
+            return {};
         if (scene_manager_ && scene_manager_->canClearScene()) {
             data_loader_->cancelPendingImports();
             if (gui_manager_)
@@ -4956,6 +4995,7 @@ namespace lfs::vis {
             if (!path.empty()) {
                 const auto created = performCreateProject(
                     path, disposition, allow_existing);
+                last_project_create_succeeded_ = created.has_value() && !projectCreatePending();
                 if (!created) {
                     pending_load_files_.clear();
                     pending_project_dataset_embed_ = false;

@@ -24,12 +24,13 @@ namespace gsplat_lfs {
         uint32_t layout_degree,
         const float* dirs,             // [..., 3] flattened
         const float* sh0,              // [N, 1, 3] / [N, 3]
-        const float* sh_rest_swizzled, // vksplat swizzled SH-rest storage
+        const float* sh_rest_swizzled, // FP32 swizzle, or q16 codes when bounds are supplied
         const bool* masks,             // [...] optional (can be nullptr)
         int64_t total_elements,        // total batch size
         float* colors,                 // [..., 3] output (pre-allocated)
         uint32_t color_stride = 3,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr,
+        const float* sh_value_bounds = nullptr);
 
     void spherical_harmonics_swizzled_bwd(
         uint32_t K,
@@ -37,7 +38,7 @@ namespace gsplat_lfs {
         uint32_t layout_degree,
         const float* dirs,             // [..., 3]
         const float* sh0,              // [N, 1, 3] / [N, 3]
-        const float* sh_rest_swizzled, // vksplat swizzled SH-rest storage
+        const float* sh_rest_swizzled, // FP32 swizzle, or q16 codes when bounds are supplied
         const bool* masks,             // [...] optional
         const float* v_colors,         // [..., 3] gradient
         int64_t total_elements,
@@ -45,7 +46,8 @@ namespace gsplat_lfs {
         float* v_coeffs, // [..., K, 3] canonical output for accumulation
         float* v_dirs,   // [..., 3] optional output
         uint32_t color_stride = 3,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr,
+        const float* sh_value_bounds = nullptr);
 
     // SH-rest storage as the model keeps it: q16 cells with one (min, max) bound per
     // 256 splats, or fp32 in the float4-swizzled layout. Set exactly one of them.

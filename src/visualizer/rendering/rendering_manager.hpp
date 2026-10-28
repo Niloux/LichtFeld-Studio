@@ -299,6 +299,16 @@ namespace lfs::vis {
         }
 
         void setOverlayAnimationActive(const bool active) { animation_state_.setOverlayAnimationActive(active); }
+        void setSequencerReveal(std::optional<lfs::rendering::GaussianRevealState> reveal) {
+            if (sequencer_reveal_ == reveal)
+                return;
+            sequencer_reveal_ = reveal;
+            markDirty(DirtyFlag::SPLATS, FrameReason::SettingsChange);
+        }
+
+        [[nodiscard]] bool revealMovesSplats() const {
+            return sequencer_reveal_ && (sequencer_reveal_->effect <= 8 || sequencer_reveal_->effect == 10);
+        }
 
         // Interactive edits validate changed environment maps before committing settings.
         [[nodiscard]] lfs::Result<void> updateSettingsFromUser(const RenderSettings& settings);
@@ -306,6 +316,7 @@ namespace lfs::vis {
         // Settings management (also used for restoring saved state).
         void restoreSettingsFromProject(const RenderSettings& settings);
         void updateSettings(const RenderSettings& settings);
+        bool setViewportRenderMode(std::string_view mode);
         void updateSettings(const RenderSettings& settings, DirtyMask dirty_flags);
         RenderSettings getSettings() const;
         struct CameraProjectionSettings {
@@ -1059,6 +1070,7 @@ namespace lfs::vis {
         bool has_training_preview_iteration_ = false;
 
         RenderAnimationState animation_state_;
+        std::optional<lfs::rendering::GaussianRevealState> sequencer_reveal_;
         FramebufferViewportRect framebuffer_viewport_rect_;
         ViewportArtifactService viewport_artifact_service_;
         std::unique_ptr<ViewportInteropService> viewport_interop_;

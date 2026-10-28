@@ -3,6 +3,8 @@
 
 #include "preferences.hpp"
 #include "core/native_fs.hpp"
+#include "input/gamepad_navigation.hpp"
+#include "input/gamepad_profiles.hpp"
 #include "rendering/rendering_types.hpp"
 #include "visualizer/navigation_up_axis.hpp"
 
@@ -716,6 +718,99 @@ namespace lfs::vis {
 
         settings = std::move(candidate);
         return {};
+    }
+
+    namespace {
+        input::GamepadProfiles gamepadProfilesFromValues(const json& values) {
+            if (const auto legacy = values.find("gamepad_navigation"); legacy != values.end())
+                (void)input::GamepadNavigationSettings::fromJson(*legacy);
+            if (const auto profiles = values.find("gamepad_profiles"); profiles != values.end())
+                return input::GamepadProfiles::fromJson(*profiles);
+            return input::GamepadProfiles::migrate(input::GamepadNavigationSettings::fromJson(
+                values.value("gamepad_navigation", json::object())));
+        }
+    } // namespace
+
+    std::string UserPreferences::gamepadNavigation() {
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto found = impl_->values.find("gamepad_navigation");
+        if (!impl_->values.contains("gamepad_profiles"))
+            return found == impl_->values.end() ? "{}" : found->dump();
+        const bool enabled = found != impl_->values.end() ? found->value("enabled", false) : false;
+        return gamepadProfilesFromValues(impl_->values).activeSettings(enabled).json().dump();
+    }
+
+    std::string UserPreferences::gamepadProfiles() {
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        return gamepadProfilesFromValues(impl_->values).value.dump();
+    }
+
+    lfs::Status UserPreferences::setGamepadProfiles(const std::string_view serialized, bool enabled, const std::string_view expected) {
+        try {
+            auto profiles = input::GamepadProfiles::fromJson(json::parse(serialized));
+            std::lock_guard lock(impl_->mutex);
+            impl_->loadLocked();
+            if (!impl_->paths || !impl_->writable)
+                return invalidRenderingPreference("Gamepad preferences are not writable");
+            // Never replace unreadable/newer data, including via reset.
+            const auto previous = gamepadProfilesFromValues(impl_->values);
+            if (!expected.empty() && previous.value.dump() != expected)
+                return invalidRenderingPreference("Gamepad profiles changed while editing");
+            auto candidate = impl_->values;
+            candidate["gamepad_profiles"] = profiles.value;
+            candidate["gamepad_navigation"] = profiles.activeSettings(enabled).json();
+            auto merged = core::persisted_settings::mergeForWrite(impl_->paths->preferencesFile(), candidate,
+                                                                  "schema_version", 1, nullptr, {}, impl_->paths->backupDir());
+            merged["gamepad_profiles"] = candidate["gamepad_profiles"];
+            merged["gamepad_navigation"] = candidate["gamepad_navigation"];
+            if (auto result = impl_->paths->writePreferencesAtomically(merged.dump(2) + '\n'); !result)
+                return result;
+            impl_->values = merged;
+            impl_->persisted_values = std::move(merged);
+            return {};
+        } catch (const std::exception& error) {
+            return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = error.what(),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+        }
+    }
+
+    lfs::Status UserPreferences::setGamepadNavigation(const std::string_view serialized) {
+        try {
+            const auto settings = input::GamepadNavigationSettings::fromJson(json::parse(serialized));
+            // Read/modify/write under the same mutex: slider/binding edits update
+            // only the active profile and cannot resurrect deleted profiles/overrides.
+            std::lock_guard lock(impl_->mutex);
+            impl_->loadLocked();
+            if (!impl_->paths || !impl_->writable)
+                return invalidRenderingPreference("Gamepad preferences are not writable");
+            auto profiles = gamepadProfilesFromValues(impl_->values);
+            profiles.updateActive(settings);
+            auto candidate = impl_->values;
+            candidate["gamepad_navigation"] = settings.json();
+            candidate["gamepad_profiles"] = profiles.value;
+            auto merged = core::persisted_settings::mergeForWrite(impl_->paths->preferencesFile(), candidate,
+                                                                  "schema_version", 1, nullptr, {}, impl_->paths->backupDir());
+            merged["gamepad_navigation"] = candidate["gamepad_navigation"];
+            merged["gamepad_profiles"] = candidate["gamepad_profiles"];
+            if (auto result = impl_->paths->writePreferencesAtomically(merged.dump(2) + '\n'); !result)
+                return result;
+            impl_->values = merged;
+            impl_->persisted_values = std::move(merged);
+            return {};
+        } catch (const std::exception& error) {
+            return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = error.what(),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+        }
     }
 
     lfs::Status UserPreferences::setRenderingDefaults(const std::string_view serialized) {

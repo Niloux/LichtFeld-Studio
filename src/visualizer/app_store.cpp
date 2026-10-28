@@ -48,12 +48,12 @@ namespace lfs::vis {
                                Field::SplatSimplifyStateValue,
                                "splat_simplify_state",
                                TaskProgressState{}),
-          collision_state(store_, Field::CollisionStateValue, "collision_state", TaskProgressState{}),
           scripts_generation(store_, Field::ScriptsGeneration, "scripts_generation", 0),
           language_generation(store_, Field::LanguageGeneration, "language_generation", 0),
           render_settings_generation(store_, Field::RenderSettingsGeneration, "render_settings_generation", 0),
           viewport_toolbar_generation(store_, Field::ViewportToolbarGeneration, "viewport_toolbar_generation", 0),
-          align_state_generation(store_, Field::AlignStateGeneration, "align_state_generation", 0) {}
+          align_state_generation(store_, Field::AlignStateGeneration, "align_state_generation", 0),
+          scale_distance_state_generation(store_, Field::ScaleDistanceStateGeneration, "scale_distance_state_generation", 0) {}
 
     AppStore& app_store() {
         static AppStore instance;
@@ -62,6 +62,11 @@ namespace lfs::vis {
 
     void publish_align_state_generation() {
         auto& signal = app_store().align_state_generation;
+        signal.set(signal.get() + 1);
+    }
+
+    void publish_scale_distance_state_generation() {
+        auto& signal = app_store().scale_distance_state_generation;
         signal.set(signal.get() + 1);
     }
 

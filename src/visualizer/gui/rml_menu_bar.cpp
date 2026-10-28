@@ -2071,17 +2071,20 @@ namespace lfs::vis::gui {
 
         if (render_buttons != render_buttons_) {
             render_buttons_ = std::move(render_buttons);
-            menu_model_.DirtyVariable("menu_render_buttons");
+            if (menu_model_)
+                menu_model_.DirtyVariable("menu_render_buttons");
             render_needed_ = true;
         }
         if (camera_buttons != camera_buttons_) {
             camera_buttons_ = std::move(camera_buttons);
-            menu_model_.DirtyVariable("menu_camera_buttons");
+            if (menu_model_)
+                menu_model_.DirtyVariable("menu_camera_buttons");
             render_needed_ = true;
         }
         if (projection_buttons != projection_buttons_) {
             projection_buttons_ = std::move(projection_buttons);
-            menu_model_.DirtyVariable("menu_projection_buttons");
+            if (menu_model_)
+                menu_model_.DirtyVariable("menu_projection_buttons");
             render_needed_ = true;
         }
     }
@@ -2178,18 +2181,7 @@ namespace lfs::vis::gui {
         if (action == "set_render_mode") {
             if (!rm)
                 return;
-            auto settings = rm->getSettings();
-            const bool enable_point_cloud = value == "points";
-            const bool point_cloud_changed = settings.point_cloud_mode != enable_point_cloud;
-            settings.point_cloud_mode = enable_point_cloud;
-            settings.show_rings = value == "rings";
-            settings.show_center_markers = value == "centers";
-            rm->updateSettings(settings,
-                               point_cloud_changed && enable_point_cloud
-                                   ? lfs::vis::DirtyFlag::ALL
-                                   : lfs::vis::DirtyFlag::SELECTION);
-            if (auto* const viewer = lfs::python::get_visualizer())
-                viewer->projectMarkSessionChapterCommitted("VIEW");
+            rm->setViewportRenderMode(value);
         } else if (action == "set_camera_navigation_mode") {
             auto* ic = lfs::vis::InputController::instance();
             if (!ic)

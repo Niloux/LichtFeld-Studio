@@ -20,6 +20,7 @@
 
 #include "notification_bridge.hpp"
 #include "py_animation.hpp"
+#include "py_apriltag.hpp"
 #include "py_cameras.hpp"
 #include "py_command.hpp"
 #include "py_diagnostics.hpp"
@@ -56,6 +57,7 @@
 #include "control/control_boundary.hpp"
 #include "core/error.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/events.hpp"
 #include "core/guarded_task.hpp"
@@ -91,6 +93,7 @@
 #include "visualizer/core/editor_context.hpp"
 #include "visualizer/core/parameter_manager.hpp"
 #include "visualizer/core/services.hpp"
+#include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui_capabilities.hpp"
 #include "visualizer/ipc/view_context.hpp"
@@ -111,6 +114,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <span>
 #include <sstream>
 #include <string>
@@ -931,6 +935,7 @@ NB_MODULE(lichtfeld, m) {
         m, "ProjectOpenOutcome")
         .value("OPENED",
                lfs::vis::ProjectOpenOutcome::Opened)
+        .value("DEFERRED", lfs::vis::ProjectOpenOutcome::Deferred)
         .value(
             "RECOVERY_PROMPT_PENDING",
             lfs::vis::ProjectOpenOutcome::
@@ -1557,13 +1562,14 @@ NB_MODULE(lichtfeld, m) {
             if (project_path.empty() || stop_training ||
                 keep_asset_manager_open) {
                 nb::gil_scoped_release release;
+                bool deferred = false;
                 emit_project_cmd_marshaled(
                     project_path.empty()
                         ? "python.project_open_dialog"
                         : "python.project_open",
                     [project_path, discard_changes,
                      stop_training,
-                     keep_asset_manager_open] {
+                     keep_asset_manager_open, &deferred] {
                         lfs::core::events::cmd::
                             ProjectOpen{
                                 .path = project_path,
@@ -1574,9 +1580,10 @@ NB_MODULE(lichtfeld, m) {
                                 .keep_asset_manager_open =
                                     keep_asset_manager_open}
                                 .emit();
+                        if (const auto* gui = lfs::vis::services().guiOrNull())
+                            deferred = gui->asyncTasks().sceneReplacementPending();
                     });
-                return lfs::vis::
-                    ProjectOpenOutcome::Opened;
+                return deferred ? lfs::vis::ProjectOpenOutcome::Deferred : lfs::vis::ProjectOpenOutcome::Opened;
             }
             auto* const viewer =
                 lfs::python::get_visualizer();
@@ -4030,6 +4037,8 @@ Example:
             return result->dataset;
         },
         nb::arg("path"), "Read training parameters from a checkpoint (None if failed)");
+
+    lfs::python::register_apriltag(m);
 
     lfs::python::set_invalidate_poll_cache_callback([](uint8_t dependency) {
         const auto dep = static_cast<lfs::vis::op::PollDependency>(dependency);

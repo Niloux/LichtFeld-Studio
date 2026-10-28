@@ -288,8 +288,6 @@ namespace lfs::vis {
                         target = TransportContextMenuRequest::Target::SNAP;
                     else if (id == "btn-preview")
                         target = TransportContextMenuRequest::Target::PREVIEW;
-                    else if (id == "btn-format")
-                        target = TransportContextMenuRequest::Target::FORMAT;
 
                     if (target != TransportContextMenuRequest::Target::NONE) {
                         transport_ctx_request_ = {target, input.mouse_x, input.mouse_y};
@@ -316,7 +314,7 @@ namespace lfs::vis {
         const float s = cached_dp_ratio_;
 
         const auto& timeline = controller_.timeline();
-        if (timeline.empty() && !controller_.hasPlySequence())
+        if (timeline.empty() && !controller_.hasPlySequence() && !timeline.revealClip())
             return;
 
         // Resolve actual rendered Y of #track-area (where diamonds live) from
@@ -353,23 +351,34 @@ namespace lfs::vis {
 
         const float mx = input.mouse_x;
         const float my = input.mouse_y;
+        // The reveal controls overlap the timeline visually. Let RmlUi handle
+        // their input instead of interpreting the same click as a scrub or drag.
+        if (reveal_selected_ && reveal_drag_edge_ == 0 && document_) {
+            if (auto* settings = document_->GetElementById("reveal-settings")) {
+                const auto offset = settings->GetAbsoluteOffset(Rml::BoxArea::Border);
+                const auto size = settings->GetBox().GetSize(Rml::BoxArea::Border);
+                if (size.x > 0.0f && size.y > 0.0f &&
+                    mx >= cached_panel_x_ + offset.x && mx <= cached_panel_x_ + offset.x + size.x &&
+                    my >= cached_panel_y_ + offset.y && my <= cached_panel_y_ + offset.y + size.y)
+                    return;
+            }
+        }
         const bool mouse_in_x = mx >= pos.x && mx <= pos.x + width;
         // Click-to-scrub / diamond hits stay in #track-area.
-        const bool mouse_in_timeline = mouse_in_x &&
+        const bool mouse_in_panel_y = my >= cached_panel_y_ && my <= cached_panel_y_ + cached_total_height_;
+        const bool mouse_in_timeline = mouse_in_panel_y && mouse_in_x &&
                                        my >= track_area_top && my <= track_area_bottom;
-        const bool mouse_in_ruler = mouse_in_x &&
+        const bool mouse_in_ruler = mouse_in_panel_y && mouse_in_x &&
                                     my >= ruler_top && my <= ruler_bottom;
 
         // Wheel zoom/pan covers the whole timeline column: ruler top through
         // the film strip (when visible) or the easing stripe otherwise.
-        const float easing_bottom = cached_panel_y_ + cached_height_ + EASING_STRIPE_HEIGHT * s;
-        float wheel_y_bottom = easing_bottom;
-        if (film_strip_attached_) {
-            const float strip_y = cached_panel_y_ + cached_height_ + EASING_STRIPE_HEIGHT * s -
-                                  BORDER_OVERLAP * s;
-            wheel_y_bottom = strip_y + gui::FilmStripRenderer::STRIP_HEIGHT;
+        auto* bottom_element = film_strip_attached_ ? el_film_strip_panel_ : el_easing_stripe_;
+        float wheel_y_bottom = cached_panel_y_ + cached_total_height_;
+        if (bottom_element) {
+            wheel_y_bottom = cached_panel_y_ + bottom_element->GetAbsoluteOffset(Rml::BoxArea::Border).y + bottom_element->GetOffsetHeight();
         }
-        const bool mouse_in_wheel_zone = mouse_in_x && my >= ruler_top && my <= wheel_y_bottom;
+        const bool mouse_in_wheel_zone = mouse_in_panel_y && mouse_in_x && my >= ruler_top && my <= wheel_y_bottom;
 
         if (mouse_in_wheel_zone && !input.want_capture_mouse) {
             const float wheel = input.mouse_wheel;
@@ -441,6 +450,91 @@ namespace lfs::vis {
 
         if (el_playhead_handle_)
             el_playhead_handle_->SetClass("hot", on_playhead_handle || dragging_playhead_);
+
+        if (const auto& reveal = timeline.revealClip(); reveal) {
+            const float left = timeToX(reveal->start, pos.x, width);
+            const float right = timeToX(reveal->end, pos.x, width);
+            bool mouse_on_reveal_row = mouse_in_timeline;
+            if (document_) {
+                if (auto* strip = document_->GetElementById("reveal-strip")) {
+                    const auto offset = strip->GetAbsoluteOffset(Rml::BoxArea::Border);
+                    const auto size = strip->GetBox().GetSize(Rml::BoxArea::Border);
+                    if (size.y > 0.0f)
+                        mouse_on_reveal_row = mouse_in_panel_y && mouse_in_x &&
+                                              my >= cached_panel_y_ + offset.y &&
+                                              my <= cached_panel_y_ + offset.y + size.y;
+                }
+            }
+            if (input.mouse_clicked[1] && mouse_on_reveal_row && !hovered_keyframe_ &&
+                mx >= left && mx <= right) {
+                context_menu_reveal_ = true;
+                context_menu_keyframe_ = std::nullopt;
+                context_menu_open_ = true;
+                return;
+            }
+            if (input.mouse_clicked[0] && mouse_on_reveal_row && !hovered_keyframe_ && !on_playhead_handle &&
+                mx >= left - 6.0f * s && mx <= right + 6.0f * s) {
+                controller_.beginRevealEdit();
+                selectReveal(true);
+                if (std::abs(mx - left) <= 6.0f * s)
+                    reveal_drag_edge_ = -1;
+                else if (std::abs(mx - right) <= 6.0f * s)
+                    reveal_drag_edge_ = 1;
+                else {
+                    reveal_drag_edge_ = 2;
+                    reveal_drag_origin_x_ = mx;
+                    reveal_drag_origin_start_ = reveal->start;
+                    reveal_drag_origin_end_ = reveal->end;
+                    reveal_drag_seconds_per_pixel_ = getDisplayEndTime() / width;
+                }
+            }
+            if (reveal_drag_edge_ != 0) {
+                if (input.mouse_down[0]) {
+                    auto edited = *reveal;
+                    const float time = std::clamp(xToTime(mx, pos.x, width), 0.0f, sequencer::MAX_SEQUENCER_TIME_SECONDS);
+                    if (reveal_drag_edge_ == 2) {
+                        const float delta = std::clamp((mx - reveal_drag_origin_x_) * reveal_drag_seconds_per_pixel_,
+                                                       -reveal_drag_origin_start_,
+                                                       sequencer::MAX_SEQUENCER_TIME_SECONDS - reveal_drag_origin_end_);
+                        edited.start = reveal_drag_origin_start_ + delta;
+                        edited.end = reveal_drag_origin_end_ + delta;
+                    } else if (reveal_drag_edge_ < 0)
+                        edited.start = std::max(0.0f, std::min(time, edited.end - 0.01f));
+                    else
+                        edited.end = std::min(sequencer::MAX_SEQUENCER_TIME_SECONDS, std::max(time, edited.start + 0.01f));
+                    if (edited.end > edited.start)
+                        controller_.setRevealClip(edited);
+                    selectReveal(true);
+                } else {
+                    controller_.endRevealEdit();
+                    reveal_drag_edge_ = 0;
+                }
+                return;
+            }
+        } else {
+            if (reveal_drag_edge_ != 0)
+                controller_.endRevealEdit();
+            reveal_drag_edge_ = 0;
+        }
+
+        if (input.mouse_clicked[0] && mouse_in_panel_y && mouse_in_x &&
+            !hovered_keyframe_ && !on_playhead_handle && document_) {
+            if (const auto* sequence = controller_.plySequence(); sequence && !sequence->frames.empty()) {
+                if (auto* strip = document_->GetElementById("sequence-strip")) {
+                    const auto offset = strip->GetAbsoluteOffset(Rml::BoxArea::Border);
+                    const auto size = strip->GetBox().GetSize(Rml::BoxArea::Border);
+                    const float end = timeToX(sequence->duration(), pos.x, width);
+                    if (my >= cached_panel_y_ + offset.y && my <= cached_panel_y_ + offset.y + size.y &&
+                        mx >= timeToX(0.0f, pos.x, width) && mx <= end) {
+                        selectReveal(false);
+                        ply_sequence_selected_ = true;
+                        selected_keyframes_.clear();
+                        controller_.deselectKeyframe();
+                        return;
+                    }
+                }
+            }
+        }
 
         const float clip_duration = timeline.clipDuration();
         const float max_pan = sequencer_ui::maxPanOffset(timeline, zoom_level_);
@@ -586,13 +680,6 @@ namespace lfs::vis {
             else if (auto selected_id = controller_.selectedKeyframeId(); selected_id.has_value())
                 to_delete.push_back(*selected_id);
 
-            for (const auto& keyframe : keyframes) {
-                if (!keyframe.is_loop_point) {
-                    std::erase(to_delete, keyframe.id);
-                    break;
-                }
-            }
-
             op::TransactionGuard transaction("Delete Keyframes");
             bool removed_any = false;
             for (const auto id : to_delete)
@@ -620,8 +707,10 @@ namespace lfs::vis {
     void RmlSequencerPanel::handleEasingStripeInteraction(const float timeline_x, const float timeline_width,
                                                           const PanelInputState& input) {
         const float dp = cached_dp_ratio_;
-        const float stripe_y = cached_panel_y_ + cached_height_;
-        const float stripe_h = EASING_STRIPE_HEIGHT * dp;
+        if (!el_easing_stripe_)
+            return;
+        const float stripe_y = cached_panel_y_ + el_easing_stripe_->GetAbsoluteOffset(Rml::BoxArea::Border).y;
+        const float stripe_h = el_easing_stripe_->GetOffsetHeight();
         const float mx = input.mouse_x;
         const float my = input.mouse_y;
 
@@ -629,6 +718,7 @@ namespace lfs::vis {
             return;
 
         if (mx < timeline_x || mx > timeline_x + timeline_width ||
+            my < cached_panel_y_ || my > cached_panel_y_ + cached_total_height_ ||
             my < stripe_y || my > stripe_y + stripe_h) {
             return;
         }

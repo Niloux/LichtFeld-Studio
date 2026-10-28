@@ -337,6 +337,10 @@ class Panel:
 
     def on_unmount(self, doc): ...
 
+    def on_visibility_changed(self, visible: bool):
+        """Release transient resources when hidden without unmounting the document."""
+        ...
+
     def on_update(self, doc): ...
 
     def on_scene_changed(self, doc): ...
@@ -2009,10 +2013,11 @@ def save_laz_file_dialog(default_name: str = 'export') -> str:
 def save_text_file_dialog(default_name: str = 'lichtfeld_logs') -> str:
     """Choose a text log export path. Returns empty string if cancelled."""
 
-def save_json_file_dialog(default_name: str = 'config.json', with_overwrite_confirmation: bool = False) -> object:
-    """
-    Choose a JSON path; empty on cancellation. Optionally return (path, overwrite_confirmed).
-    """
+def save_json_file_dialog(default_name: str = 'config.json') -> str:
+    """Choose a JSON path. Returns empty string if cancelled."""
+
+def save_json_file_dialog_with_confirmation(default_name: str = 'config.json') -> tuple[str, bool]:
+    """Return (JSON path, overwrite_confirmed); empty path on cancellation."""
 
 def save_png_file_dialog(default_name: str = 'export.png') -> str:
     """
@@ -2384,6 +2389,21 @@ def get_align_edge_to_axis() -> bool:
 def set_align_edge_to_axis(enabled: bool) -> None:
     """Enable or disable align edge-to-+X in-plane yaw (session lifetime)"""
 
+def can_apply_scale_distance() -> bool:
+    """True when 2 valid points are picked for scale distance"""
+
+def get_scale_distance_measured() -> float:
+    """Get measured distance between 2 picked points"""
+
+def apply_scale_distance(target_distance: float) -> bool:
+    """Request scale distance modal to rescale scene"""
+
+def clear_scale_distance() -> None:
+    """Request scale distance modal to clear picked points"""
+
+def get_scale_distance_points() -> list[list[float]]:
+    """Get picked points for scale distance tool"""
+
 def fit_crop_tool(use_percentile: bool = False) -> None:
     """
     Fit the active crop tool primitive through the node-backed crop command path
@@ -2582,10 +2602,45 @@ class SequencerUIState:
     def sequence_fps(self, arg: float, /) -> None: ...
 
     @property
+    def camera_width(self) -> int:
+        """Sequence camera aspect width (1-8192)"""
+
+    @camera_width.setter
+    def camera_width(self, arg: int, /) -> None: ...
+
+    @property
+    def camera_height(self) -> int:
+        """Sequence camera aspect height (1-8192)"""
+
+    @camera_height.setter
+    def camera_height(self, arg: int, /) -> None: ...
+
+    @property
+    def framerate(self) -> int:
+        """Video export FPS numerator"""
+
+    @property
+    def framerate_denominator(self) -> int:
+        """Video export FPS denominator"""
+
+    @property
+    def export_fit(self) -> int:
+        """Video fitting: 0 fit, 1 crop, 2 stretch"""
+
+    @property
     def selected_keyframe(self) -> int: ...
 
 def get_sequencer_state() -> SequencerUIState:
     """Get sequencer UI state for modification"""
+
+def get_reveal_clip() -> object:
+    """Read the live sequencer reveal clip, or None if absent"""
+
+def set_reveal_clip(value: dict) -> bool:
+    """Set the live sequencer reveal clip; returns false for invalid input"""
+
+def remove_reveal_clip() -> bool:
+    """Remove the live sequencer reveal clip"""
 
 def has_keyframes() -> bool:
     """Check if sequencer has any keyframes"""
@@ -2610,9 +2665,9 @@ def clear_keyframes() -> None:
 def set_playback_speed(speed: float) -> None:
     """Set sequencer playback speed"""
 
-def export_video(width: int, height: int, framerate: int, crf: int, path: str = '', include_provenance: bool = True) -> None:
+def export_video(width: int, height: int, framerate: int, crf: int, path: str = '', include_provenance: bool = True, framerate_denominator: int = 1, camera_width: int = 0, camera_height: int = 0, framing: str = 'fit') -> None:
     """
-    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly. include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded.
+    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly. include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded. FPS is framerate/framerate_denominator. Camera aspect defaults to the output size (0, 0); framing is 'fit', 'crop' (alias 'fill'), or 'stretch'.
     """
 
 def add_keyframe() -> None:
@@ -2632,7 +2687,7 @@ def select_keyframe(index: int) -> None:
 
 def delete_keyframe(index: int) -> None:
     """
-    Delete keyframe by index; raises ValueError for the protected first keyframe
+    Delete a real keyframe by index, including the first; synthetic loop points cannot be deleted
     """
 
 def set_keyframe_easing(index: int, easing: int) -> None:
@@ -2824,6 +2879,31 @@ def set_camera_browse_repeat_rate(rate: float, persist: bool = True) -> None:
 
 def get_navigation_speed_preference() -> float:
     """Get the default WASD navigation speed"""
+
+def get_gamepad_test_state() -> dict:
+    """Read connected controllers and the selected input-test sample; does not move the camera."""
+    ...
+
+def take_gamepad_test_state() -> dict:
+    """Read and consume diagnostic presses without consuming navigation commands."""
+    ...
+
+def set_gamepad_test_device(device_id: int) -> bool:
+    """Select a connected mapped controller for diagnostics; zero clears selection."""
+    ...
+
+def set_gamepad_test_active(active: bool) -> None:
+    """Keep controller discovery active only while the gamepad page is visible."""
+    ...
+
+def get_gamepad_navigation_state() -> dict:
+    """Read saved preferences, current device selection and viewport routing status."""
+    ...
+
+def set_gamepad_navigation(enabled: bool, device_id: int, dead_zone: float = 0.15,
+                          look_speed: float = 1.5, move_speed: float = 1.0) -> bool:
+    """Select/configure the navigation controller independently of input testing."""
+    ...
 
 def get_rendering_defaults_json() -> str:
     """
@@ -3095,3 +3175,32 @@ def unregister_property_group(group_id: str) -> None:
 
 def property_group_info(group_id: str) -> dict:
     """Get registered property metadata for a property group"""
+
+def get_gamepad_profile_json() -> str:
+    """Return saved enablement, tuning and semantic assignments, excluding connection identifiers and arming state."""
+    ...
+def get_gamepad_default_profile_json() -> str: ...
+def get_gamepad_binding_catalog_json() -> str: ...
+def set_gamepad_profile_json(serialized: str) -> bool:
+    """Validate and atomically save assignments, suspending navigation until rearmed."""
+    ...
+
+def set_gamepad_bindings_json(serialized: str, expected_revision: int) -> bool:
+    """Atomically edit bindings, preserving global enablement and tuning.
+
+    Rejects edits if the live configuration revision has changed.
+    """
+    ...
+
+
+def get_gamepad_profiles_json() -> str:
+    """Get the named controller layouts and optional model associations, independent of keymaps."""
+    ...
+
+def set_gamepad_profiles_json(serialized: str, expected: str = "") -> bool:
+    """Validate and atomically apply profiles without changing global enablement or device selection."""
+    ...
+
+def reset_gamepad_profiles() -> bool:
+    """Reset all joypad profiles/associations and disable navigation; keyboard profiles are preserved."""
+    ...

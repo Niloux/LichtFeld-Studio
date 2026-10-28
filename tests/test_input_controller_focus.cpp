@@ -10,6 +10,7 @@
 #include "core/splat_data.hpp"
 #include "core/user_paths.hpp"
 #include "gui/gui_focus_state.hpp"
+#include "gui/rml_menu_bar.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "input/camera_animation_cadence.hpp"
 #include "input/frame_input_buffer.hpp"
@@ -19,6 +20,7 @@
 #include "input/sdl_key_mapping.hpp"
 #include "internal/viewport.hpp"
 #include "keymap_history_helpers.hpp"
+#include "licht_test_support.hpp"
 #include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
@@ -166,6 +168,60 @@ namespace lfs::vis {
                 1.0f);
         }
     } // namespace
+
+    TEST_F(InputControllerFocusTest, WalkRejectionDoesNotEscapeNativeDispatch) {
+        SceneManager manager;
+        services().set(&manager);
+        auto& scene = manager.getScene();
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        controller.initialize();
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::Orbit);
+        gui::RmlMenuBar bar;
+        bar.rebuildToolbarButtons();
+        EXPECT_FALSE(bar.camera_buttons_.back().enabled);
+        EXPECT_NO_THROW(bar.dispatchToolbarAction("set_camera_navigation_mode", "walk"));
+        EXPECT_EQ(controller.walk_error, LOC("collision.walk_no_collision"));
+        const auto floor = scene.addCollision("Floor", collision_test::box({-8, -1, -8}, {16, 1, 16}));
+        scene.setNodeTransform(floor, lfs::rendering::VISUALIZER_TO_DATA_WORLD_AXES_4);
+        scene.setNodeVisibility(floor, false);
+        bar.rebuildToolbarButtons();
+        EXPECT_TRUE(bar.camera_buttons_.back().enabled);
+        viewport.camera.t = {0, 20, 0};
+        EXPECT_NO_THROW(bar.dispatchToolbarAction("set_camera_navigation_mode", "walk"));
+        EXPECT_EQ(controller.walk_error, LOC("collision.walk_no_support"));
+        EXPECT_EQ(controller.cameraNavigationMode(), InputController::CameraNavigationMode::Orbit);
+        EXPECT_EQ(viewport.camera.t, glm::vec3(0, 20, 0));
+    }
+
+    TEST_F(InputControllerFocusTest, WalkIdleAndSettingsKeepThePhysicsOwnerAcrossSplitFocusChanges) {
+        SceneManager manager;
+        services().set(&manager);
+        auto& scene = manager.getScene();
+        const auto floor = scene.addCollision("Floor", collision_test::box({-8, -1, -8}, {16, 1, 16}));
+        scene.setNodeTransform(floor, lfs::rendering::VISUALIZER_TO_DATA_WORLD_AXES_4);
+        Viewport primary(200, 200);
+        InputController controller(nullptr, primary);
+        RenderingManager rendering;
+        services().set(&rendering);
+        rendering.restoreSplitViewMode(SplitViewMode::IndependentDual, primary);
+        auto& secondary = rendering.resolvePanelViewport(primary, SplitViewPanelId::Right);
+        primary.camera.t = {-4, 1.7f, 0};
+        secondary.camera.t = {4, 1.7f, 0};
+        rendering.setFocusedSplitPanel(SplitViewPanelId::Right);
+        ASSERT_TRUE(controller.setCameraNavigationMode(InputController::CameraNavigationMode::Walk));
+        const auto primary_before = primary.camera.t;
+        rendering.setFocusedSplitPanel(SplitViewPanelId::Left);
+        controller.update(.016f);
+        EXPECT_EQ(primary.camera.t, primary_before);
+        EXPECT_NEAR(secondary.camera.t.x, 4, 1e-5f);
+        auto settings = controller.walk_settings;
+        settings.height = 1.9f;
+        ASSERT_NO_THROW(controller.setWalkSettings(settings));
+        EXPECT_EQ(primary.camera.t, primary_before);
+        EXPECT_NEAR(secondary.camera.t.y, 1.9f, .02f);
+        services().clear();
+    }
 
     TEST_F(InputControllerFocusTest, NavigationModeChangesRequestGuiRedraw) {
         using Mode = InputController::CameraNavigationMode;
@@ -3024,6 +3080,56 @@ namespace lfs::vis {
                 services().clear();
             }
         }
+    }
+
+    TEST_F(InputControllerFocusTest, JoypadAssignmentSurvivesSidebarFocusAndApplicationFocusLoss) {
+        Viewport primary(200, 200);
+        InputController controller(nullptr, primary);
+        RenderingManager rendering;
+        services().set(&rendering);
+        controller.updateViewportBounds(0, 0, 200, 200);
+        rendering.restoreSplitViewMode(SplitViewMode::IndependentDual, primary);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        const auto click = [&](double x, double y) {
+            router.beginMouseButton(input::ACTION_PRESS, x, y);
+            controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_PRESS, x, y);
+            controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_RELEASE, x, y);
+            router.endMouseButton(input::ACTION_RELEASE, x, y);
+        };
+        click(160, 80);
+        ASSERT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        click(250, 80); // panel outside the viewport
+        EXPECT_FALSE(controller.hasViewportKeyboardFocus());
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        controller.onWindowFocusLost();
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        rendering.setFocusedSplitPanel(SplitViewPanelId::Left);
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        click(40, 80);
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Left);
+        services().clear();
+    }
+
+    TEST_F(InputControllerFocusTest, JoypadSplitAssignmentIsRevokedOnSceneChange) {
+        Viewport primary(200, 200);
+        InputController controller(nullptr, primary);
+        RenderingManager rendering;
+        services().set(&rendering);
+        controller.updateViewportBounds(0, 0, 200, 200);
+        rendering.restoreSplitViewMode(SplitViewMode::IndependentDual, primary);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.beginMouseButton(input::ACTION_PRESS, 160, 80);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_PRESS, 160, 80);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_RELEASE, 160, 80);
+        router.endMouseButton(input::ACTION_RELEASE, 160, 80);
+        ASSERT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        core::events::state::SceneCleared{}.emit();
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Left);
+        services().clear();
     }
 
 } // namespace lfs::vis
