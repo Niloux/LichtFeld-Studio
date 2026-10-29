@@ -583,6 +583,43 @@ namespace lfs::vis {
         }
     }
 
+    void InputController::setVrViewing(const bool enabled) {
+        vr_viewing_ = enabled;
+        clearViewportDragState();
+        clearWasdMomentumViewport();
+        viewport_.camera.clearTransientMotion();
+        onWindowFocusLost();
+        std::fill(std::begin(keys_movement_), std::end(keys_movement_), false);
+    }
+
+    glm::vec3 InputController::vrMovement() const {
+        const auto axis = [this](const int positive, const int negative) {
+            return static_cast<float>(keys_movement_[positive]) - static_cast<float>(keys_movement_[negative]);
+        };
+        return {axis(3, 1), axis(4, 5), axis(2, 0)}; // fwd, left, back, right, up, down
+    }
+
+    void InputController::handleVrKey(const int physical_key, const int logical_key, const int action,
+                                      const int mods, const bool gui_owned) {
+        if (action == input::ACTION_RELEASE) {
+            armPhysicalMovementKey(physical_key, false);
+            return;
+        }
+        if (gui_owned)
+            return;
+        if (action == input::ACTION_PRESS) {
+            switch (bindings_.getActionForKey(input::ToolMode::VR, logical_key, mods)) {
+            case input::Action::EXIT_VR: cmd::SetVrActive{.active = false}.emit(); return;
+            case input::Action::VR_RECENTER: cmd::RecenterVr{}.emit(); return;
+            case input::Action::VR_SNAP_TURN_LEFT: cmd::SnapTurnVr{.direction = -1}.emit(); return;
+            case input::Action::VR_SNAP_TURN_RIGHT: cmd::SnapTurnVr{.direction = 1}.emit(); return;
+            default: break;
+            }
+        }
+        if ((mods & (input::KEYMOD_CTRL | input::KEYMOD_ALT | input::KEYMOD_SUPER)) == 0)
+            armPhysicalMovementKey(physical_key, true);
+    }
+
     void InputController::initialize() {
         instance_ = this;
         try {
@@ -939,6 +976,8 @@ namespace lfs::vis {
 
     // Core handlers
     void InputController::handleMouseButton(int button, int action, double x, double y) {
+        if (vr_viewing_)
+            return;
         if (action == input::ACTION_PRESS) {
             if (input_router_ && input_router_->pointerTarget(x, y) == input::InputTarget::Viewport)
                 pauseGamepadNavigation();
@@ -1621,6 +1660,8 @@ namespace lfs::vis {
     }
 
     void InputController::handleMouseMove(double x, double y, const std::optional<glm::dvec2> motion) {
+        if (vr_viewing_)
+            return;
         if (glm::length(glm::dvec2(x, y) - gamepad_press_pos_) >= 4.0)
             gamepad_click_candidate_ = false;
         decayHeldDragMomentum();
@@ -1883,6 +1924,8 @@ namespace lfs::vis {
     }
 
     void InputController::handleScroll([[maybe_unused]] double xoff, double yoff) {
+        if (vr_viewing_)
+            return;
         // Capture mode (input settings panel) consumes scroll first so the user
         // can rebind scroll-only actions like Camera Zoom or chord-style Roll.
         if (bindings_.isCapturing()) {
@@ -2049,6 +2092,10 @@ namespace lfs::vis {
         // Forward to binding capture before Python panels or modal operators consume keys.
         if (action == input::ACTION_PRESS && bindings_.isCapturing()) {
             bindings_.captureKey(physical_key, logical_key, mods);
+            return;
+        }
+        if (vr_viewing_) {
+            handleVrKey(physical_key, logical_key, action, mods, gui_consumed || wants_text_input);
             return;
         }
 
@@ -2973,6 +3020,8 @@ namespace lfs::vis {
     }
 
     void InputController::update(float delta_time) {
+        if (vr_viewing_)
+            return;
         updateCameraBrowseRepeat();
         decayHeldDragMomentum();
         // Refresh once per input frame; mouse-move events can then query the
@@ -4413,6 +4462,8 @@ namespace lfs::vis {
     }
 
     input::ToolMode InputController::getCurrentToolMode() const {
+        if (vr_viewing_)
+            return input::ToolMode::VR;
         if (UnifiedToolRegistry::instance().getActiveTool() == "builtin.cropbox")
             return input::ToolMode::CROP_BOX;
         if (selection_tool_ && selection_tool_->isEnabled())

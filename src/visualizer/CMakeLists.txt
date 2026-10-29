@@ -25,6 +25,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         core/job_registry.cpp
         core/parameter_manager.cpp
         core/services.cpp
+        vr/openxr_service.cpp
 
         # Project session chapters
         project/session_state.cpp
@@ -235,12 +236,15 @@ target_include_directories(lfs_visualizer
         ${CMAKE_SOURCE_DIR}/external/httplib
 )
 
+find_package(OpenXR CONFIG REQUIRED)
+
 target_link_libraries(lfs_visualizer
         PRIVATE
         lfs_core
         lfs_diagnostics
         lfs_video
         lfs_geometry
+        lfs_preprocessing
         lfs_io
         lfs_rendering_tensor
         lfs_training
@@ -261,6 +265,7 @@ target_link_libraries(lfs_visualizer
         nfd::nfd
         vterm
         fmt::fmt-header-only
+        OpenXR::openxr_loader
 )
 
 set_property(SOURCE

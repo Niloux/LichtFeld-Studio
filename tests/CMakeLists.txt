@@ -185,6 +185,7 @@ if(BUILD_VISUALIZER_TESTS)
         test_gamepad_service.cpp
         test_gamepad_navigation.cpp
         test_gamepad_sequencer.cpp
+        test_sequencer_keyframe_gesture.cpp
         licht_test_support.cpp
         test_json_chapter_dom.cpp
         test_visualizer_post_work.cpp
@@ -943,6 +944,8 @@ set(TEST_FILES
     test_weight_file_paths.cpp
     test_moge2.cpp
     test_lpips.cpp
+    test_sam2.cpp
+    test_video_masking.cpp
     test_ppisp_controller.cpp
     test_ppisp_regularization.cpp
     test_ppisp_sidecar.cpp
@@ -1051,6 +1054,7 @@ list(APPEND TEST_FILES test_vulkan_gpu_census.cpp)
 list(APPEND TEST_FILES test_output_image_pool.cpp)
 # Epic #1568 / #1567: output slot ring (GPU-free host bookkeeping).
 list(APPEND TEST_FILES test_output_slot_ring.cpp)
+list(APPEND TEST_FILES test_vr_math.cpp)
 list(APPEND TEST_FILES test_split_output_lifetime.cpp)
 # Epic #1577 / #1574: readback ticket ring (GPU-free host bookkeeping).
 list(APPEND TEST_FILES test_readback_ticket_ring.cpp)
@@ -1197,6 +1201,7 @@ endif()
 
 # Link libraries
 target_link_libraries(lichtfeld_tests PRIVATE
+    lfs_preprocessing
     ${LFS_TEST_INTERNAL_LINK_LIBS}
 
     # External libraries
@@ -1432,6 +1437,7 @@ string(CONCAT LFS_NIGHTLY_TEST_FILTER
 )
 
 string(CONCAT LFS_SLOW_TEST_FILTER
+    "VideoMaskingPipeline.*:VideoMaskExtraction.*:"
     "*CheckpointResumeTest.TrainSaveLoadResume/tiny_*:"
     "TrainingSetupRegressionTest.*:"
     "EvaluationSplitTest.*:"

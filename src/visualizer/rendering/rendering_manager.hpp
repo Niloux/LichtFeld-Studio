@@ -149,6 +149,13 @@ namespace lfs::vis {
 
         // Main render function
         VulkanFrameResult renderVulkanFrame(const RenderContext& context);
+        // Stereo eyes at the given poses, one output slot per eye.
+        [[nodiscard]] lfs::Result<std::array<VulkanFrameResult, 2>> renderVrEyes(
+            VulkanContext& context, SceneManager& scene,
+            const std::array<lfs::rendering::FrameView, 2>& views);
+        void releaseVrResources();
+        // Turns off the view modes and overlays a headset view cannot show.
+        [[nodiscard]] static RenderSettings vrRenderSettings(RenderSettings settings);
         [[nodiscard]] std::expected<void, std::string> ensureVksplatTrainingSharedScratchReady(
             VulkanContext& context,
             const lfs::core::SplatData& model,

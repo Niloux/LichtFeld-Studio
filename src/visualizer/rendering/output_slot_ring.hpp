@@ -40,11 +40,11 @@ namespace lfs::vis {
         std::uint64_t completion_value = 0;
     };
 
-    // Host bookkeeping for the 3-deep frame ring × 4 logical output slots.
+    // Host bookkeeping for the 3-deep frame ring × 6 logical output slots.
     // GPU-free: timeline complete/wait are injected; no Vulkan/CUDA calls.
     class LFS_VIS_API OutputSlotRing {
     public:
-        static constexpr std::size_t kOutputSlotCount = 4;
+        static constexpr std::size_t kOutputSlotCount = 6;
         static constexpr std::size_t kFrameRingSize = 3;
 
         // Poll whether a timeline value has already retired. May throw.

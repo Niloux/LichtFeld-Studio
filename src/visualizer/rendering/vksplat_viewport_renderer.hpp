@@ -120,7 +120,10 @@ namespace lfs::vis {
             SplitLeft = 1,
             SplitRight = 2,
             Preview = 3,
+            VrLeft = 4,
+            VrRight = 5,
         };
+        static_assert(OutputSlotRing::kOutputSlotCount == static_cast<std::size_t>(OutputSlot::VrRight) + 1);
 
         struct SelectionMaskRequest {
             lfs::rendering::FrameView frame_view;
@@ -294,6 +297,7 @@ namespace lfs::vis {
             bool force_input_upload);
 
         void releasePreviewResources();
+        void releaseVrResources();
         void releaseSplitOutputResources();
         void retainPublishedSplitImages(VkImageView left, VkImageView right);
         void releaseSceneResources();

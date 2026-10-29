@@ -55,6 +55,9 @@ namespace lfs::vis::gui {
 
 namespace lfs::vis {
     class SceneManager;
+    namespace vr {
+        class OpenXrService;
+    } // namespace vr
 } // namespace lfs::vis
 
 namespace lfs::vis {
@@ -564,6 +567,14 @@ namespace lfs::vis {
         bool allowclose();
         void wakeMainLoop() const;
 
+        // VR viewing: enter/exit requests apply at the start of the next update.
+        void updateVrSession();
+        void enterVr();
+        void exitVr();
+        // Submits one headset frame; false when the desktop frame should be skipped.
+        bool renderVrFrame();
+        void publishVrState();
+
         // Frame exception boundary. Contains an OOM or other error escaping a
         // frame so the loop never aborts: OOM triggers one render-safe pressure
         // episode, other errors escalate under a rate limit.
@@ -707,6 +718,12 @@ namespace lfs::vis {
         // Core components
         Viewport viewport_;
         std::unique_ptr<WindowManager> window_manager_;
+        // After the window, so the VR session ends before its Vulkan device.
+        std::unique_ptr<vr::OpenXrService> vr_;
+        bool vr_active_ = false;
+        std::optional<bool> vr_request_;
+        std::uint64_t vr_scene_generation_ = 0;
+        std::optional<RenderSettings> vr_saved_settings_;
         std::unique_ptr<InputController> input_controller_;
         std::unique_ptr<RenderingManager> rendering_manager_;
         DemandToken gui_animation_demand_;

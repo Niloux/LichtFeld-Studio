@@ -748,7 +748,7 @@ namespace lfs::vis {
             (void)gamepads_.select(0);
     }
 
-    bool WindowManager::init() {
+    bool WindowManager::init(const VulkanDeviceHooks* const device_hooks) {
         configureValidationLayerSearchPath();
         // Preserve the initiating press when this same gesture activates us.
         SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
@@ -865,7 +865,15 @@ namespace lfs::vis {
         framebuffer_size_ = glm::ivec2(fb_w, fb_h);
 
         vulkan_context_ = std::make_unique<VulkanContext>();
-        if (!vulkan_context_->init(window_, framebuffer_size_.x, framebuffer_size_.y)) {
+        bool graphics_ready = vulkan_context_->init(window_, framebuffer_size_.x, framebuffer_size_.y,
+                                                    device_hooks ? *device_hooks : VulkanDeviceHooks{});
+        if (!graphics_ready && device_hooks) {
+            device_hooks_error_ = vulkan_context_->lastError();
+            LOG_WARN("Vulkan init through device hooks failed; retrying without them: {}", device_hooks_error_);
+            vulkan_context_ = std::make_unique<VulkanContext>();
+            graphics_ready = vulkan_context_->init(window_, framebuffer_size_.x, framebuffer_size_.y);
+        }
+        if (!graphics_ready) {
             std::cerr << "Failed to initialize Vulkan context: " << vulkan_context_->lastError() << std::endl;
             vulkan_context_.reset();
             SDL_DestroyWindow(window_);

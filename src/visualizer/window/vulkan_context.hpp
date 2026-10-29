@@ -21,6 +21,7 @@
 #include <exception>
 #include <expected>
 #include <format>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -46,6 +47,15 @@ struct SDL_Window;
 
 namespace lfs::vis {
 
+    // Lets another API that must own the Vulkan objects (such as a headset
+    // runtime) create the instance and device. Unset hooks use plain Vulkan.
+    struct VulkanDeviceHooks {
+        std::function<VkResult(const VkInstanceCreateInfo&, VkInstance&)> create_instance;
+        // Init fails when the GPU chosen for rendering is not this device.
+        std::function<VkPhysicalDevice(VkInstance)> required_physical_device;
+        std::function<VkResult(VkPhysicalDevice, const VkDeviceCreateInfo&, VkDevice&)> create_device;
+    };
+
     class VulkanContext {
         friend struct VulkanContextTestAccess;
 
@@ -61,7 +71,15 @@ namespace lfs::vis {
         VulkanContext(const VulkanContext&) = delete;
         VulkanContext& operator=(const VulkanContext&) = delete;
 
-        LFS_VIS_API bool init(SDL_Window* window, int framebuffer_width, int framebuffer_height);
+        LFS_VIS_API bool init(SDL_Window* window, int framebuffer_width, int framebuffer_height,
+                              VulkanDeviceHooks hooks = {});
+        // Runs an external API call that may submit to the shared graphics queue.
+        template <class Operation>
+        decltype(auto) withGraphicsQueue(Operation&& operation) {
+            const std::shared_lock device_lock(device_queue_access_mutex_);
+            const std::lock_guard queue_lock(graphics_queue_mutex_);
+            return std::forward<Operation>(operation)();
+        }
         void setSceneRuntimeOwnership(bool owns) { owns_scene_runtimes_ = owns; }
         LFS_VIS_API void shutdown();
         void notifyFramebufferResized(int width, int height, ResizeIntent intent = ResizeIntent::Exact);
@@ -615,6 +633,7 @@ namespace lfs::vis {
         bool geometry_shader_enabled_ = false;
         std::mutex graphics_queue_mutex_;
         std::shared_mutex device_queue_access_mutex_;
+        VulkanDeviceHooks device_hooks_;
         bool swapchain_maintenance1_enabled_ = false;
         bool swapchain_present_scaling_enabled_ = false;
         bool has_push_descriptor_ = false;

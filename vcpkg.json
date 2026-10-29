@@ -1,5 +1,5 @@
 {
-  "builtin-baseline": "c3867e714dd3a51c272826eea77267876517ed99",
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     "apriltag",
     "args",
@@ -78,6 +78,7 @@
             "vulkan"
           ]
         },
+        "openxr-loader",
         "vulkan",
         {
           "name": "vulkan-loader",
@@ -141,6 +142,10 @@
     {
       "name": "ffmpeg",
       "version": "8.1.2#3"
+    },
+    {
+      "name": "ffnvcodec",
+      "version": "13.0.19.0"
     },
     {
       "name": "freetype",
