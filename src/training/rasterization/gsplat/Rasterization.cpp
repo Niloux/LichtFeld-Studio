@@ -9,9 +9,20 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 namespace gsplat_lfs {
+
+    // The micro-tile forward drops the pairs that blend no pixel of a sub-tile from the
+    // keys the backward walks; LFS_GUT_PRUNE=0 keeps every pair.
+    static bool use_contributor_pruning() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LFS_GUT_PRUNE");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
 
     //=========================================================================
     // Forward rasterization dispatcher
@@ -305,7 +316,9 @@ namespace gsplat_lfs {
         const float* render_backgrounds = (render_mode == 1 || render_mode == 2) ? nullptr : backgrounds;
         const float* render_bg_images = (render_mode == 1 || render_mode == 2) ? nullptr : bg_images;
 
+        // A tile batch is intersected again for its backward, so pruning its keys would be lost.
         auto render = [&](const IntersectTileResult& batch, TileRange tiles) {
+            const bool prune = batch.sub_tile_masks && tiles.end == UINT32_MAX && use_contributor_pruning();
             result.isect_ids = batch.isect_ids;
             result.flatten_ids = batch.flatten_ids;
             result.n_sort = batch.n_sort;
@@ -323,7 +336,8 @@ namespace gsplat_lfs {
                 result.render_colors, result.render_alphas, result.last_ids,
                 stream, tiles, free_space,
                 ScreenFootprint{.means2d = result.means2d, .conics = result.conics, .radii = result.radii,
-                                .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr});
+                                .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr,
+                                .prune_tile_keys = prune ? batch.isect_ids : nullptr});
         };
 
         // Step 3: Tile intersection. The first call retains the existing speculative warm-cache path.

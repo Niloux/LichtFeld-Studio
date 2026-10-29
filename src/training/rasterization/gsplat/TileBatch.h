@@ -26,6 +26,9 @@ namespace gsplat_lfs {
         // Sorted pair keys whose low 32 bits are the sub-tile masks of the pairs,
         // row-major within the tile; null when the keys still carry depths.
         const int64_t* tile_keys = nullptr;
+        // The same keys, writable: the micro-tile forward clears the sub-tile bit of each
+        // pair that blends no pixel of that sub-tile, so the backward never walks it.
+        int64_t* prune_tile_keys = nullptr;
         [[nodiscard]] bool valid() const { return means2d && conics && radii; }
     };
     struct TileBatch {

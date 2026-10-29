@@ -412,7 +412,9 @@ namespace gsplat_lfs {
         __shared__ mat3 s_iscl_rot[kMicroStage];
         __shared__ float s_rgbs[kMicroStage * CDIM];
         __shared__ int32_t s_bin[kMicroStage]; // the survivor's position in the tile's list
+        __shared__ uint8_t s_hit[kMicroStage]; // whether the survivor blended any pixel
         __shared__ uint32_t s_warp_count[kMicroThreads / 32];
+        auto* const prune = reinterpret_cast<unsigned long long*>(footprint.prune_tile_keys);
 
         const int32_t range_end = tile_offsets[tile_id + 1];
         int32_t cursor = tile_offsets[tile_id];
@@ -459,6 +461,7 @@ namespace gsplat_lfs {
                     const uint32_t slot = count + (warp != 0 ? s_warp_count[0] : 0u) +
                                           __popc(ballot & ((1u << lane) - 1u));
                     s_bin[slot] = gi;
+                    s_hit[slot] = 0;
                     const float3 xyz_f = load_float3(reinterpret_cast<const float*>(&means[g]));
                     s_xyz_opacity[slot] = {xyz_f.x, xyz_f.y, xyz_f.z, activated_opacity(opacities[g])};
                     const vec3 scale = activated_scale(scales[g]);
@@ -504,10 +507,22 @@ namespace gsplat_lfs {
                     pix_out[k] += s_rgbs[t * CDIM + k] * vis;
                 }
                 cur_idx = static_cast<uint32_t>(s_bin[t]);
+                s_hit[t] = 1;
                 if (free_limit > 0.0f && s_rgbs[t * CDIM + free_space.depth_channel] < free_limit) {
                     T_front *= 1.0f - alpha;
                 }
                 T = next_T;
+            }
+
+            // A survivor that blended no pixel of the sub-tile adds nothing to its
+            // gradient either, so it loses the sub-tile's bit and the backward skips it.
+            // Clearing it cannot change any render: no pixel here blends that pair.
+            if (prune != nullptr) {
+                __syncthreads();
+                for (uint32_t t = tr; t < count; t += kMicroThreads) {
+                    if (!s_hit[t])
+                        atomicAnd(&prune[s_bin[t]], ~(1ull << sub_bit));
+                }
             }
         }
 

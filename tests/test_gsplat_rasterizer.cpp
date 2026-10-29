@@ -1417,6 +1417,30 @@ TEST_F(GsplatRasterizerTest, GutFromWorldFisheyeGradParity) {
 }
 
 namespace {
+    // A rolling shutter moves the ray origin from one readout line to the next, along
+    // rows or along columns.
+    void run_rolling_shutter_parity(const bool readout_rows, const char* dump_env, const char* ref_env) {
+        constexpr int kW = 96;
+        constexpr int kH = 64;
+        auto camera = make_fisheye_camera(kW, kH);
+        lfs::core::RollingShutterMotion motion;
+        motion.readout_rows = readout_rows;
+        motion.rotation = {0.02f, -0.03f, 0.01f};
+        motion.displacement = {0.08f, -0.05f, 0.04f};
+        camera.set_rolling_shutter(motion);
+        run_gut_from_world_parity(camera, dump_env, ref_env);
+    }
+} // namespace
+
+TEST_F(GsplatRasterizerTest, GutFromWorldRollingRowsGradParity) {
+    run_rolling_shutter_parity(true, "GUT_ROLLING_ROWS_GRAD_DUMP", "GUT_ROLLING_ROWS_GRAD_REF");
+}
+
+TEST_F(GsplatRasterizerTest, GutFromWorldRollingColumnsGradParity) {
+    run_rolling_shutter_parity(false, "GUT_ROLLING_COLUMNS_GRAD_DUMP", "GUT_ROLLING_COLUMNS_GRAD_REF");
+}
+
+namespace {
     Camera make_extra_parity_camera(lfs::core::CameraModelType model, int w = 96, int h = 64) {
         auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);
         auto T = Tensor::from_vector({0.f, 0.f, 3.f}, {3}, Device::CUDA);
