@@ -52,7 +52,9 @@ namespace fast_lfs::optimizer {
         const float beta2,
         const float eps,
         const float bias_correction2_sqrt_rcp,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const float sh_rest_reg_weight,
+        float* sh_rest_reg_loss_out) {
         LFS_VALIDATE_CUDA_DEVICE_POINTER(param, "param");
         LFS_VALIDATE_CUDA_DEVICE_POINTER(packed, "joint_packed");
         LFS_VALIDATE_CUDA_DEVICE_POINTER(bounds, "joint_bounds");
@@ -91,6 +93,8 @@ namespace fast_lfs::optimizer {
         fused.shN.step_size = step_size;
         fused.shN.bias_correction2_sqrt_rcp = bias_correction2_sqrt_rcp;
         fused.shN.enabled = true;
+        fused.sh_rest_reg_weight = sh_rest_reg_weight;
+        fused.sh_rest_reg_loss_out = sh_rest_reg_weight > 0.0f ? sh_rest_reg_loss_out : nullptr;
 
         constexpr int kBS = 256;
         const int n_blocks = (n_prims + kBS - 1) / kBS;

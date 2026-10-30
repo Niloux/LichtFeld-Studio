@@ -131,6 +131,11 @@ namespace lfs::training {
         void set_frozen_mask(lfs::core::Tensor mask);
         [[nodiscard]] const lfs::core::Tensor& frozen_mask() const { return frozen_mask_; }
         void set_frozen_lr_scale(float scale);
+        // SH-rest L2 regularizer applied inside the standalone shN step (the GUT path); FastGS fuses its own.
+        void set_sh_rest_regularization(float weight, float* loss_out = nullptr) {
+            sh_rest_reg_weight_ = weight;
+            sh_rest_reg_loss_out_ = loss_out;
+        }
         void set_crop_damping_mask(lfs::core::Tensor mask);
         // Rows whose refine, sampling and keep scores are scaled by cropbox_lr_scale.
         void set_crop_score_mask(lfs::core::Tensor mask);
@@ -230,6 +235,8 @@ namespace lfs::training {
         std::unordered_map<std::string, AdamParamState> states_;
         lfs::core::Tensor frozen_mask_;
         float frozen_lr_scale_ = 0.0f;
+        float sh_rest_reg_weight_ = 0.0f;
+        float* sh_rest_reg_loss_out_ = nullptr;
         lfs::core::Tensor crop_damping_mask_;
         lfs::core::Tensor crop_score_mask_;
         lfs::core::Tensor crop_roi_rows_;

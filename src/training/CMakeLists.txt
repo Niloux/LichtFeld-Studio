@@ -20,6 +20,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/ssim_reduction.cu
     kernels/regularization.cu
     kernels/effective_rank_regularization.cu
+    kernels/gut_regularization.cu
     kernels/popspa.cu
     kernels/bilateral_grid_forward.cu
     kernels/bilateral_grid_backward.cu

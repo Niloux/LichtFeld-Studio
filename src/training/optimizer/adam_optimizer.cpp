@@ -883,7 +883,9 @@ namespace lfs::training {
                     static_cast<float>(config_.beta2),
                     static_cast<float>(config_.eps),
                     static_cast<float>(bias_correction2_sqrt_rcp),
-                    execution_stream);
+                    execution_stream,
+                    sh_rest_reg_weight_,
+                    sh_rest_reg_loss_out_);
                 param_live.set_stream(execution_stream);
                 state.exp_avg.set_stream(execution_stream);
                 state.joint_bounds.set_stream(execution_stream);

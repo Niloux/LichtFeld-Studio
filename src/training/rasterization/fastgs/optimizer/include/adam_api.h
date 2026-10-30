@@ -109,7 +109,10 @@ namespace fast_lfs::optimizer {
         float beta2,
         float eps,
         float bias_correction2_sqrt_rcp,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr,
+        // L2 pull of the active rest coefficients toward zero, normalized like the fused FastGS term.
+        float sh_rest_reg_weight = 0.0f,
+        float* sh_rest_reg_loss_out = nullptr);
 
     // Joint (u,log_s) densify reset: encode true (m,v)=(0,0). Widens block
     // bounds to include 0 when needed and re-encodes the block.

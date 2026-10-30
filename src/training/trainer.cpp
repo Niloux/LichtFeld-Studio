@@ -46,6 +46,7 @@
 #include "kernels/densification_kernels.hpp"
 #include "kernels/image_kernels.hpp"
 #include "las_prior_sidecar.hpp"
+#include "lfs/kernels/gut_regularization.cuh"
 #include "lfs/kernels/ssim.cuh"
 #include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/live_model_mutation_guard.hpp"
@@ -8520,6 +8521,40 @@ namespace lfs::training {
                         }
                         nvtxRangePop();
                     }
+                    if (!fastgs_path && !in_popspa) {
+                        // GUT's backward leaves plain optimizer gradients: add the per-splat terms FastGS fuses.
+                        auto& model = strategy_->get_model();
+                        const int n = static_cast<int>(model.size());
+                        const float erank_weight = update_gaussians_this_iter ? step_params.erank_reg : 0.0f;
+                        const float dc_weight = update_gaussians_this_iter ? step_params.dc_reg : 0.0f;
+                        if (n > 0 && (erank_weight > 0.0f || dc_weight > 0.0f)) {
+                            const auto device_scalar = [](lfs::core::Tensor& t) -> lfs::core::Tensor {
+                                if (!t.is_valid())
+                                    t = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
+                                t.zero_();
+                                return t;
+                            };
+                            if (erank_weight > 0.0f)
+                                fused_erank_reg_loss_gpu = device_scalar(fused_erank_reg_loss_);
+                            if (dc_weight > 0.0f)
+                                fused_dc_reg_loss_gpu = device_scalar(fused_dc_reg_loss_);
+                            auto& sh0 = model.sh0();
+                            lfs::training::kernels::launch_gut_param_regularization(
+                                model.scaling_raw().ptr<float>(),
+                                gaussian_optimizer.get_grad(ParamType::Scaling).ptr<float>(),
+                                sh0.ptr<float>(),
+                                gaussian_optimizer.get_grad(ParamType::Sh0).ptr<float>(),
+                                static_cast<int>(sh0.numel() / static_cast<size_t>(n)), n,
+                                erank_weight, dc_weight,
+                                erank_weight > 0.0f ? fused_erank_reg_loss_gpu.ptr<float>() : nullptr,
+                                dc_weight > 0.0f ? fused_dc_reg_loss_gpu.ptr<float>() : nullptr);
+                        }
+                    }
+                    // The shN step applies SH-rest regularization on the GUT path; its loss is not reported.
+                    gaussian_optimizer.set_sh_rest_regularization(
+                        !fastgs_path && !in_popspa && strategy_->get_model().get_active_sh_degree() > 0
+                            ? step_params.sh_rest_reg
+                            : 0.0f);
                     if (fused_erank_reg_loss_gpu.is_valid())
                         loss_tensor_gpu = loss_tensor_gpu + fused_erank_reg_loss_gpu;
                     if (fused_dc_reg_loss_gpu.is_valid())

@@ -664,6 +664,7 @@ set(TEST_FILES
     test_rendered_structure.cpp
     test_gradient_residual.cpp
     test_fused_reg_loss.cpp
+    test_gut_regularization.cpp
     test_opacity_gradients.cpp
     test_fused_bg_blend.cpp
     test_photometric_hygiene.cpp
@@ -2190,7 +2191,8 @@ if(COMMAND lfs_enable_fast_cxx_compile)
     lfs_enable_fast_cxx_compile(gsplat_tests)
 endif()
 
-add_executable(opacity_gradient_tests test_main.cpp test_opacity_gradients.cpp test_fused_reg_loss.cpp)
+add_executable(opacity_gradient_tests test_main.cpp test_opacity_gradients.cpp test_fused_reg_loss.cpp
+    test_gut_regularization.cpp)
 target_compile_features(opacity_gradient_tests PRIVATE cxx_std_23)
 target_compile_definitions(opacity_gradient_tests PRIVATE PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}")
 target_include_directories(opacity_gradient_tests PRIVATE
