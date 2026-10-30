@@ -90,6 +90,8 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--no-normal-auto-generate", "normal_auto_generate", Bool, true},
             OptimizationCliBinding{"--normal-loss-weight", "normal_loss_weight", Float},
             OptimizationCliBinding{"--normal-consistency-weight", "normal_consistency_weight", Float},
+            OptimizationCliBinding{"--normal-prior-depth-weight", "normal_prior_depth_weight", Float},
+            OptimizationCliBinding{"--normal-prior-depth-holes-only", "normal_prior_depth_holes_only", Bool},
             OptimizationCliBinding{"--normal-flatten-weight", "normal_flatten_weight", Float},
             OptimizationCliBinding{"--normal-start-fraction", "normal_start_fraction", Float},
             OptimizationCliBinding{"--normal-end-fraction", "normal_end_fraction", Float},
@@ -914,6 +916,8 @@ namespace {
             ::args::Flag no_normal_auto_generate(mask_group, "no_normal_auto_generate", lfs::core::args::optimization_cli_help("--no-normal-auto-generate"), {"no-normal-auto-generate"});
             ::args::ValueFlag<float> normal_loss_weight(mask_group, "normal_loss_weight", lfs::core::args::optimization_cli_help("--normal-loss-weight"), {"normal-loss-weight"});
             ::args::ValueFlag<float> normal_consistency_weight(mask_group, "normal_consistency_weight", lfs::core::args::optimization_cli_help("--normal-consistency-weight"), {"normal-consistency-weight"});
+            ::args::ValueFlag<float> normal_prior_depth_weight(mask_group, "normal_prior_depth_weight", lfs::core::args::optimization_cli_help("--normal-prior-depth-weight"), {"normal-prior-depth-weight"});
+            ::args::Flag normal_prior_depth_holes_only(mask_group, "normal_prior_depth_holes_only", lfs::core::args::optimization_cli_help("--normal-prior-depth-holes-only"), {"normal-prior-depth-holes-only"});
             ::args::ValueFlag<float> normal_flatten_weight(mask_group, "normal_flatten_weight", lfs::core::args::optimization_cli_help("--normal-flatten-weight"), {"normal-flatten-weight"});
             ::args::ValueFlag<float> normal_start_fraction(mask_group, "normal_start_fraction", lfs::core::args::optimization_cli_help("--normal-start-fraction"), {"normal-start-fraction"});
             ::args::ValueFlag<float> normal_end_fraction(mask_group, "normal_end_fraction", lfs::core::args::optimization_cli_help("--normal-end-fraction"), {"normal-end-fraction"});
@@ -1648,6 +1652,7 @@ namespace {
                                         free_space_margin_rel_val = cli_option_present({"--free-space-margin-rel"}) ? std::optional<float>(::args::get(free_space_margin_rel)) : std::optional<float>(),
                                         normal_loss_weight_val = cli_option_present({"--normal-loss-weight"}) ? std::optional<float>(::args::get(normal_loss_weight)) : std::optional<float>(),
                                         normal_consistency_weight_val = cli_option_present({"--normal-consistency-weight"}) ? std::optional<float>(::args::get(normal_consistency_weight)) : std::optional<float>(),
+                                        normal_prior_depth_weight_val = cli_option_present({"--normal-prior-depth-weight"}) ? std::optional<float>(::args::get(normal_prior_depth_weight)) : std::optional<float>(),
                                         normal_flatten_weight_val = cli_option_present({"--normal-flatten-weight"}) ? std::optional<float>(::args::get(normal_flatten_weight)) : std::optional<float>(),
                                         normal_start_fraction_val = cli_option_present({"--normal-start-fraction"}) ? std::optional<float>(::args::get(normal_start_fraction)) : std::optional<float>(),
                                         normal_end_fraction_val = cli_option_present({"--normal-end-fraction"}) ? std::optional<float>(::args::get(normal_end_fraction)) : std::optional<float>(),
@@ -1700,6 +1705,7 @@ namespace {
                                         use_depth_loss_flag = bool(use_depth_loss),
                                         no_depth_auto_generate_flag = bool(no_depth_auto_generate),
                                         use_normal_loss_flag = bool(use_normal_loss),
+                                        normal_prior_depth_holes_only_flag = bool(normal_prior_depth_holes_only),
                                         no_normal_auto_generate_flag = bool(no_normal_auto_generate),
                                         no_error_map_flag = bool(no_error_map),
                                         densify_error_map_val = cli_option_present({"--densify-error-map"})
@@ -1933,6 +1939,8 @@ namespace {
                     opt.normal_auto_generate = false;
                 setVal(normal_loss_weight_val, opt.normal_loss_weight);
                 setVal(normal_consistency_weight_val, opt.normal_consistency_weight);
+                setVal(normal_prior_depth_weight_val, opt.normal_prior_depth_weight);
+                setFlag(normal_prior_depth_holes_only_flag, opt.normal_prior_depth_holes_only);
                 setVal(normal_flatten_weight_val, opt.normal_flatten_weight);
                 setVal(normal_start_fraction_val, opt.normal_start_fraction);
                 setVal(normal_end_fraction_val, opt.normal_end_fraction);
@@ -2035,6 +2043,8 @@ namespace {
                 note_opt("use_normal_loss", use_normal_loss_flag);
                 note_opt("normal_loss_weight", normal_loss_weight_val.has_value());
                 note_opt("normal_consistency_weight", normal_consistency_weight_val.has_value());
+                note_opt("normal_prior_depth_weight", normal_prior_depth_weight_val.has_value());
+                note_opt("normal_prior_depth_holes_only", normal_prior_depth_holes_only_flag);
                 note_opt("normal_flatten_weight", normal_flatten_weight_val.has_value());
                 note_opt("ppisp_holdout_appearance", ppisp_holdout_appearance_val.has_value());
                 note_opt("normal_loss_space", normal_loss_space_val.has_value());

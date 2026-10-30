@@ -7567,6 +7567,8 @@ namespace lfs::training {
                         lfs::core::Tensor mask_tile;
                         // Retain the photometric workspace view through all normal terms.
                         lfs::core::Tensor normal_terms_weight;
+                        // Pixels without a depth prior, for normal_prior_depth_holes_only.
+                        lfs::core::Tensor depth_hole_weight;
                         bool depth_grad_buffers_active = false;
                         const auto roi_weight_ptr_on_stream =
                             [&](const cudaStream_t stream) -> const float* {
@@ -7777,6 +7779,11 @@ namespace lfs::training {
                                     target_depth.shape()[1] == rendered_alpha.shape()[1];
 
                                 if (depth_shape_matches) {
+                                    if (step_params.normal_prior_depth_holes_only) {
+                                        // Invalid depth is 0 or non-finite; Lanczos rings small values into the holes.
+                                        depth_hole_weight =
+                                            target_depth.gt(0.01f).logical_not().to(lfs::core::DataType::Float32);
+                                    }
                                     const size_t num_depth_pixels = rendered_depth.numel();
                                     const size_t depth_partials =
                                         lfs::training::kernels::depth_loss_partial_count(num_depth_pixels);
@@ -8010,6 +8017,21 @@ namespace lfs::training {
                                             const float cy = cam->center_y() * static_cast<float>(render_h) /
                                                              static_cast<float>(cam->camera_height());
 
+                                            const float* prior_depth_pixel_weight = normal_pixel_weight;
+                                            lfs::core::Tensor prior_depth_weight_map;
+                                            if (depth_hole_weight.is_valid() &&
+                                                depth_hole_weight.shape() == rendered_depth.shape()) {
+                                                depth_hole_weight.sync_to_stream(normal_stream);
+                                                prior_depth_weight_map = depth_hole_weight;
+                                                if (normal_pixel_weight) {
+                                                    const lfs::core::Tensor& base_weight =
+                                                        normal_terms_weight.is_valid() ? normal_terms_weight : roi_weight;
+                                                    prior_depth_weight_map =
+                                                        (prior_depth_weight_map * base_weight.reshape(rendered_depth.shape())).contiguous();
+                                                }
+                                                lfs::core::pin_operands({&prior_depth_weight_map});
+                                                prior_depth_pixel_weight = prior_depth_weight_map.ptr<float>();
+                                            }
                                             lfs::core::pin_operands({&target_normal, &rendered_depth, &rendered_alpha});
                                             lfs::training::kernels::launch_normal_prior_depth_loss(
                                                 target_normal.ptr<float>(),
@@ -8025,9 +8047,11 @@ namespace lfs::training {
                                                 fy,
                                                 cx,
                                                 cy,
-                                                step_params.normal_loss_weight,
+                                                step_params.normal_prior_depth_weight >= 0.0f
+                                                    ? step_params.normal_prior_depth_weight
+                                                    : step_params.normal_loss_weight,
                                                 normal_stream,
-                                                normal_pixel_weight,
+                                                prior_depth_pixel_weight,
                                                 gsplat_ctx ? gsplat_ctx->camera_rays.ptr<float>() : nullptr,
                                                 gsplat_ctx && gsplat_ctx->camera_model == ::CameraModelType::EQUIRECTANGULAR);
                                             tile_loss = tile_loss + normal_prior_depth_scalar_;

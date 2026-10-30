@@ -467,6 +467,20 @@ namespace lfs::core::param {
             .precision(3)
             .ui_step(0.01)
             .all_strategies()
+            .float_prop(&OptimizationParameters::normal_prior_depth_weight,
+                        "normal_prior_depth_weight", "Normal Prior Depth Weight", d.normal_prior_depth_weight, -1.0f, 100.0f,
+                        "Weight for the prior normal against the normal of the rendered depth, which moves surfaces; -1 uses the normal loss weight")
+            .locale("training_params.normal_prior_depth_weight")
+            .tooltip("training.tooltip.normal_prior_depth_weight")
+            .precision(3)
+            .ui_step(0.01)
+            .all_strategies()
+            .bool_prop(&OptimizationParameters::normal_prior_depth_holes_only,
+                       "normal_prior_depth_holes_only", "Prior Depth Normals Only In Depth Holes", d.normal_prior_depth_holes_only,
+                       "Apply the prior-depth normal term only on pixels without a depth prior, so it shapes holes and leaves measured depth to the depth loss")
+            .locale("training_params.normal_prior_depth_holes_only")
+            .tooltip("training.tooltip.normal_prior_depth_holes_only")
+            .all_strategies()
             .float_prop(&OptimizationParameters::normal_flatten_weight,
                         "normal_flatten_weight", "Normal Flatten Weight", d.normal_flatten_weight, 0.0f, 1000.0f,
                         "Min-axis scale flattening weight while normal supervision is active")

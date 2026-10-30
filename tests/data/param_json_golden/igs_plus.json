@@ -78,6 +78,8 @@
   "normal_flatten_weight": 0.0,
   "normal_loss_space": "auto",
   "normal_loss_weight": 0.004999999888241291,
+  "normal_prior_depth_holes_only": false,
+  "normal_prior_depth_weight": -1.0,
   "normal_start_fraction": 0.07999999821186066,
   "opacity_decay": 0.004000000189989805,
   "opacity_decay_rendered_only": false,
