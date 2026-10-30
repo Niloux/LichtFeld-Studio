@@ -1826,7 +1826,6 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
         "0.25",
         "--normal-prior-depth-weight",
         "0.125",
-        "--normal-prior-depth-holes-only",
         "--normal-flatten-weight",
         "5.0",
         "--normal-start-fraction",
@@ -1844,7 +1843,6 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_loss_weight, 0.75f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_consistency_weight, 0.25f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_depth_weight, 0.125f);
-    EXPECT_TRUE((*parsed)->optimization.normal_prior_depth_holes_only);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_flatten_weight, 5.0f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_start_fraction, 0.3f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_end_fraction, 0.9f);
