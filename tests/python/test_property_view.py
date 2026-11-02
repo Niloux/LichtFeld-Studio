@@ -544,6 +544,10 @@ EXPECTED_NUMBER_ROWS = {
 
 
 EXPECTED_CHECKBOX_ROWS = {
+    "keep_all_checkpoints": (
+        "training.save.keep_all_checkpoints",
+        "training.tooltip.keep_all_checkpoints",
+    ),
     "use_exposure_correction": (
         "training_params.exposure_correction",
         "training.tooltip.exposure_correction",

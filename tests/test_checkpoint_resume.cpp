@@ -36,6 +36,7 @@
 #include "core/event_bridge/control_boundary.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
@@ -84,10 +85,19 @@ namespace lfs::training {
                    Trainer::RetryDecision::RetryForwardOnce;
         }
 
+        using Phase = Trainer::StepPhase;
+        using Recovery = Trainer::StepOomRecovery;
+
+        static Recovery step_oom(const lfs::Error& error, const Phase phase, const bool committed,
+                                 const bool refine_undone = false) {
+            return Trainer::classify_step_oom(
+                error, Trainer::MutationStamp{.iteration = 7, .epoch = 3, .phase = phase, .persistent_commit = committed, .refine_undone = refine_undone});
+        }
+
         static lfs::Status recover_with_sync_status(
             Trainer& trainer, const lfs::Error& cause, const cudaError_t sync_status) {
             trainer.recovery_sync_for_testing_ = [sync_status] { return sync_status; };
-            auto result = trainer.recover_forward_oom(cause);
+            auto result = trainer.recover_from_oom(cause);
             trainer.recovery_sync_for_testing_ = {};
             return result;
         }
@@ -130,6 +140,27 @@ namespace {
 
         const auto invalid = make_retry_test_error(lfs::ErrorCode::InvalidArgument);
         EXPECT_FALSE(lfs::training::TrainerRetryTestAccess::should_retry(invalid, 1));
+    }
+
+    TEST(TrainerRetrySemantics, StepOomRetriesBeforeCommitAndDropsOnlyWorkAfterIt) {
+        using Access = lfs::training::TrainerRetryTestAccess;
+        using Phase = Access::Phase;
+        using Recovery = Access::Recovery;
+        const auto exhausted = make_retry_test_error(lfs::ErrorCode::ResourceExhausted);
+        for (const auto phase : {Phase::Forward, Phase::Loss, Phase::Backward})
+            EXPECT_EQ(Access::step_oom(exhausted, phase, false), Recovery::RetryIteration);
+        // FastGS refines at the start of a step, so its forward can follow a commit.
+        for (const auto phase : {Phase::Forward, Phase::Backward, Phase::Publish, Phase::TerminalCleanup})
+            EXPECT_EQ(Access::step_oom(exhausted, phase, true), Recovery::SkipRest);
+        EXPECT_EQ(Access::step_oom(exhausted, Phase::OptimizerCommit, true), Recovery::Fail);
+        EXPECT_EQ(Access::step_oom(exhausted, Phase::RefinementCommit, true), Recovery::Fail);
+        EXPECT_EQ(Access::step_oom(exhausted, Phase::RefinementCommit, false), Recovery::Fail);
+        // A refine cut back to the rows it started from leaves the model whole.
+        EXPECT_EQ(Access::step_oom(exhausted, Phase::RefinementCommit, true, true), Recovery::SkipRest);
+        EXPECT_EQ(Access::step_oom(make_retry_test_error(lfs::ErrorCode::Internal), Phase::Backward, false),
+                  Recovery::Fail);
+        EXPECT_EQ(Access::step_oom(make_retry_test_error(lfs::ErrorCode::Internal), Phase::RefinementCommit, true, true),
+                  Recovery::Fail);
     }
 
     TEST(TrainerPOPSpaTest, KeepsRegularStrategyHorizon) {
@@ -216,13 +247,18 @@ namespace {
         auto& manager = lfs::core::GlobalArenaManager::instance();
         manager.reconfigure_for_testing(config);
 
+        // The 4 KiB inputs are never read: the first FastGS allocation, the
+        // visibility buffers, holds at least 4 bytes per primitive and must
+        // already exceed the 64 MiB arena.
+        constexpr int primitives = 40'000'000;
+        static_assert(std::size_t{primitives} * sizeof(std::uint32_t) > 2 * (64ULL << 20));
         const auto attempt = [storage] {
             auto* ptr = static_cast<float*>(storage);
             return fast_lfs::rasterization::forward_raw(
                 ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
                 ptr, ptr, ptr, nullptr,
                 /*bg_color_ptr=*/nullptr, /*bg_image_ptr=*/nullptr,
-                10'000'000, 1, 1, 1, 1,
+                primitives, 1, 1, 1, 1,
                 1.0f, 1.0f, 0.5f, 0.5f, 0.01f, 100.0f, false, nullptr);
         };
 
@@ -1934,6 +1970,8 @@ namespace {
             const size_t stop_refine = static_cast<size_t>(iterations);
             params.optimization.start_refine = std::min<size_t>(500, stop_refine);
             params.optimization.stop_refine = stop_refine;
+            // Phase two resumes from a checkpoint the final save superseded.
+            params.optimization.keep_all_checkpoints = true;
             return params;
         }
 
@@ -3307,6 +3345,7 @@ namespace {
         params.optimization.popspa_sparsify_steps = 1;
         params.optimization.popspa_refine_steps = 0;
         params.optimization.save_steps = {1};
+        params.optimization.keep_all_checkpoints = true;
 
         lfs::core::Scene scene;
         ASSERT_TRUE(lfs::training::loadTrainingDataIntoScene(params, scene));
@@ -3562,6 +3601,68 @@ namespace {
         std::filesystem::remove_all(output_path, ec);
     }
 
+    TEST_F(ProjectCheckpointTrainerInstall, CheckpointRetentionRecreatesUnlinkedProjectAndRejectsConflict) {
+        for (const bool conflict : {false, true}) {
+            SCOPED_TRACE(conflict);
+            lfs::test::licht::TemporaryDirectory temporary;
+            const auto path = temporary.path / "project.licht";
+            auto params = make_tiny_headless_params(temporary.path, 6);
+            params.optimization.save_steps = {1, 3, 5};
+            params.optimization.enable_eval = false;
+            lfs::core::Scene scene;
+            ASSERT_TRUE(lfs::training::loadTrainingDataIntoScene(params, scene));
+            ASSERT_TRUE(lfs::training::initializeTrainingModel(params, scene));
+            lfs::training::Trainer trainer(scene);
+            ASSERT_TRUE(trainer.initialize(params));
+            lfs::training::grant_headless_project_saves(trainer, params);
+            bool removed = false;
+            std::vector<std::byte> foreign_bytes;
+            auto& boundary = lfs::training::ControlBoundary::instance();
+            const auto handle = boundary.register_callback(lfs::training::ControlHook::PostStep,
+                                                           [&](const lfs::training::HookContext& context) {
+                                                               if (context.iteration != 2)
+                                                                   return;
+                                                               if (!waitUntil([&] {
+                                                                       const auto metrics = trainer.get_project_snapshot_metrics();
+                                                                       return metrics.last_path == path && !metrics.writer_in_flight;
+                                                                   },
+                                                                              std::chrono::seconds(30)))
+                                                                   return;
+                                                               removed = lfs::core::native_fs::remove(path);
+                                                               if (conflict && removed) {
+                                                                   auto foreign = lfs::test::licht::require_result(lfs::io::project::ProjectDocument::create(
+                                                                       lfs::core::generate_uuid_v4(), 100));
+                                                                   (void)lfs::test::licht::require_result(foreign.save(path));
+                                                                   foreign_bytes = lfs::test::licht::read_file_bytes(path);
+                                                               }
+                                                           });
+            const auto trained = trainer.train();
+            boundary.unregister_callback(lfs::training::ControlHook::PostStep, handle);
+            trainer.shutdown();
+            ASSERT_TRUE(removed);
+            if (conflict) {
+                EXPECT_FALSE(trainer.get_project_snapshot_metrics().last_writer_error.empty());
+                EXPECT_EQ(lfs::test::licht::read_file_bytes(path), foreign_bytes);
+            } else {
+                ASSERT_TRUE(trained) << lfs::format_for_developer(trained.error());
+                auto document = lfs::test::licht::require_result(lfs::io::project::ProjectDocument::open(path));
+                ASSERT_EQ(document.checkpoint_uuids().size(), 1u);
+                const auto bound = lfs::test::licht::require_result(document.bound_checkpoint_uuid());
+                ASSERT_TRUE(bound);
+                const auto* checkpoint = document.find_checkpoint(*bound);
+                ASSERT_NE(checkpoint, nullptr);
+                lfs::test::licht::require_status(checkpoint->visit_stream([](std::istream& stream, std::uint64_t bytes) -> lfs::Result<void> {
+                    const auto header = lfs::core::load_checkpoint_header(stream, bytes);
+                    EXPECT_TRUE(header);
+                    if (header)
+                        EXPECT_EQ(header->iteration, 6);
+                    return {};
+                }));
+                lfs::test::licht::require_status(document.source_reader()->verify_all());
+            }
+        }
+    }
+
     TEST_F(ProjectCheckpointTrainerInstall,
            ConfiguredStepSavesSurviveAnActiveWriter) {
         const auto output_path =
@@ -3573,6 +3674,7 @@ namespace {
 
         auto params = make_tiny_headless_params(output_path, 40);
         params.optimization.save_steps = {10, 20, 30};
+        params.optimization.keep_all_checkpoints = true;
 
         lfs::core::Scene scene;
         ASSERT_TRUE(lfs::training::loadTrainingDataIntoScene(params, scene));

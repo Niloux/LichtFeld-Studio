@@ -278,7 +278,8 @@ namespace gsplat_lfs {
         vec3* v_scales,
         float* v_colors,
         float* v_opacities,
-        float* densification_info) {
+        float* densification_weight,
+        float* densification_error) {
         float* v_rgb_ptr = v_colors + 3 * g;
         gpuAtomicAdd(v_rgb_ptr, v_rgb[0]);
         gpuAtomicAdd(v_rgb_ptr + 1, v_rgb[1]);
@@ -298,8 +299,9 @@ namespace gsplat_lfs {
         gpuAtomicAdd(v_quat_ptr + 3, v_quat.w);
         gpuAtomicAdd(v_opacities + g, v_opacity * lfs::core::sigmoid_derivative_from_logit(opacity_raw));
         if (do_dens) {
-            gpuAtomicAdd(densification_info + g, dens_w);
-            gpuAtomicAdd(densification_info + N + g, dens_e);
+            if (densification_weight != nullptr)
+                gpuAtomicAdd(densification_weight + g, dens_w);
+            gpuAtomicAdd(densification_error + g, dens_e);
         }
     }
 
@@ -342,7 +344,8 @@ namespace gsplat_lfs {
         vec3* __restrict__ v_scales,
         scalar_t* __restrict__ v_colors,
         scalar_t* __restrict__ v_opacities,
-        float* __restrict__ densification_info,
+        float* __restrict__ densification_weight,
+        float* __restrict__ densification_error,
         const scalar_t* __restrict__ densification_error_map,
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
@@ -384,7 +387,7 @@ namespace gsplat_lfs {
         }
 
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
-        const bool do_dens = densification_info != nullptr && densification_error_map != nullptr;
+        const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
 
         PixelBwd pix0, pix1;
         init_pixel_bwd<kPerfectPinhole>(
@@ -520,7 +523,8 @@ namespace gsplat_lfs {
                             id_batch[t], N, do_dens, v_rgb_local, v_mean_local, v_scale_local,
                             v_quat_local, v_opacity_local, densification_weight_local,
                             densification_error_weighted_local, scale_act, opacities[id_batch[t]],
-                            v_means, v_quats, v_scales, v_colors, v_opacities, densification_info);
+                            v_means, v_quats, v_scales, v_colors, v_opacities, densification_weight,
+                            densification_error);
                     }
                 }
                 if constexpr (kEdgeScoring) {
@@ -586,7 +590,8 @@ namespace gsplat_lfs {
         vec3* __restrict__ v_scales,                          // [N, 3]
         scalar_t* __restrict__ v_colors,                      // [C, N, CDIM] or [nnz, CDIM]
         scalar_t* __restrict__ v_opacities,                   // [C, N] or [nnz]
-        float* __restrict__ densification_info,               // [2, N] flattened or nullptr
+        float* __restrict__ densification_weight,             // [N] or nullptr
+        float* __restrict__ densification_error,              // [N] or nullptr
         const scalar_t* __restrict__ densification_error_map, // [H, W] or nullptr
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
@@ -701,7 +706,7 @@ namespace gsplat_lfs {
                 bg_accum += bg_val * v_render_c[k];
             }
         }
-        const bool do_dens = densification_info != nullptr && densification_error_map != nullptr;
+        const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const float pixel_error = do_dens ? densification_error_map[pix_id] : 0.f;
 
         // T_front = prod(1 - alpha) over the splats in front of the scan limit,
@@ -899,8 +904,9 @@ namespace gsplat_lfs {
                         const float derivative = lfs::core::sigmoid_derivative_from_logit(opacities[g]);
                         gpuAtomicAdd(v_opacities + g, v_opacity_local * derivative);
                         if (do_dens) {
-                            gpuAtomicAdd(densification_info + g, densification_weight_local);
-                            gpuAtomicAdd(densification_info + N + g, densification_error_weighted_local);
+                            if (densification_weight != nullptr)
+                                gpuAtomicAdd(densification_weight + g, densification_weight_local);
+                            gpuAtomicAdd(densification_error + g, densification_error_weighted_local);
                         }
                     }
                 }
@@ -967,7 +973,8 @@ namespace gsplat_lfs {
         vec3* __restrict__ v_scales,
         float* __restrict__ v_colors,
         float* __restrict__ v_opacities,
-        float* __restrict__ densification_info,
+        float* __restrict__ densification_weight,
+        float* __restrict__ densification_error,
         const float* __restrict__ densification_error_map,
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out,
@@ -1007,7 +1014,7 @@ namespace gsplat_lfs {
             edge_score_out += cid * N;
         }
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
-        const bool do_dens = densification_info != nullptr && densification_error_map != nullptr;
+        const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
 
         // The eighth channel of RGB + depth + normal is padding that is always zero.
@@ -1253,8 +1260,9 @@ namespace gsplat_lfs {
                     gpuAtomicAdd(v_quat_ptr + 3, v_quat.w);
                     gpuAtomicAdd(v_opacities + g, v_opacity * lfs::core::sigmoid_derivative_from_logit(opacities[g]));
                     if (do_dens) {
-                        gpuAtomicAdd(densification_info + g, dens_w);
-                        gpuAtomicAdd(densification_info + N + g, dens_e);
+                        if (densification_weight != nullptr)
+                            gpuAtomicAdd(densification_weight + g, dens_w);
+                        gpuAtomicAdd(densification_error + g, dens_e);
                     }
                     if constexpr (kEdgeScoring) {
                         gpuAtomicAdd(edge_score_out + g, edge_score);
@@ -1315,7 +1323,8 @@ namespace gsplat_lfs {
         float* v_scales,
         float* v_colors,
         float* v_opacities,
-        float* densification_info,
+        float* densification_weight,
+        float* densification_error,
         const float* densification_error_map,
         const float* edge_weight_map,
         float* edge_score_out,
@@ -1379,7 +1388,8 @@ namespace gsplat_lfs {
                 reinterpret_cast<vec3*>(v_scales),
                 v_colors,
                 v_opacities,
-                densification_info,
+                densification_weight,
+                densification_error,
                 densification_error_map,
                 edge_weight_map,
                 edge_score_out, tiles, free_space);
@@ -1407,7 +1417,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec3*>(v_means),
                             reinterpret_cast<vec4*>(v_quats),
                             reinterpret_cast<vec3*>(v_scales),
-                            v_colors, v_opacities, densification_info, densification_error_map,
+                            v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
                             edge_weight_map, edge_score_out, tiles, free_space, footprint);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
@@ -1556,7 +1566,8 @@ namespace gsplat_lfs {
         float* v_scales,                                                       \
         float* v_colors,                                                       \
         float* v_opacities,                                                    \
-        float* densification_info,                                             \
+        float* densification_weight,                                           \
+        float* densification_error,                                            \
         const float* densification_error_map,                                  \
         const float* edge_weight_map,                                          \
         float* edge_score_out,                                                 \

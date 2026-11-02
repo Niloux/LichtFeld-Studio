@@ -151,7 +151,8 @@ namespace gsplat_lfs {
         float* v_scales,
         float* v_colors,
         float* v_opacities,
-        float* densification_info,
+        float* densification_weight,
+        float* densification_error,
         const float* densification_error_map,
         const float* edge_weight_map,
         float* edge_score_out,
@@ -187,10 +188,7 @@ namespace gsplat_lfs {
             render_alphas, last_ids,                                 \
             v_render_colors, v_render_alphas,                        \
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
-            densification_info, densification_error_map,             \
-            edge_weight_map, edge_score_out, stream, tiles,          \
-            free_space, footprint);                                  \
-        break;
+            densification_weight, densification_error,                           densification_error_map,                                             edge_weight_map, edge_score_out, stream, tiles,                      free_space, footprint);                                          break;
 
         switch (channels) {
             __LAUNCH_KERNEL__(1)
@@ -442,7 +440,8 @@ namespace gsplat_lfs {
         float* v_opacities,
         float* v_sh0,
         float* v_shN,
-        float* densification_info,
+        float* densification_weight,
+        float* densification_error,
         const float* densification_error_map,
         const float* edge_weight_map,
         float* edge_score_out,
@@ -493,7 +492,7 @@ namespace gsplat_lfs {
                 render_alphas, last_ids,
                 v_render_colors, v_render_alphas,
                 v_means, v_quats, v_scales, v_colors, v_opacities,
-                densification_info, densification_error_map,
+                densification_weight, densification_error, densification_error_map,
                 edge_weight_map, edge_score_out,
                 stream, tiles, free_space,
                 ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys});

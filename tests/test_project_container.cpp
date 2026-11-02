@@ -295,10 +295,11 @@ namespace {
     TEST(ProjectContainerFormat, SupportedCapabilitiesReserveTilesetsAndIncludeCollision) {
         EXPECT_EQ(TILESET_REFERENCES, 10);
         EXPECT_EQ(COLLISION_VOLUMES_V1, 11);
+        EXPECT_EQ(USER_SHADERS_V1, 12);
         const auto reader = supported_reader_capabilities();
         const auto writer = supported_writer_capabilities();
         for (std::uint8_t bit = 0; bit < 128; ++bit) {
-            const bool supported = bit < 10 || bit == 11;
+            const bool supported = bit < 10 || bit == 11 || bit == 12;
             EXPECT_EQ(reader.contains(bit), supported) << "reader bit " << int(bit);
             EXPECT_EQ(writer.contains(bit), supported) << "writer bit " << int(bit);
         }
@@ -1164,6 +1165,81 @@ namespace {
             cursor += records[index].size();
         }
         return framed;
+    }
+
+    // f32-word byte planes: plane0 || plane1 || plane2 || plane3.
+    std::vector<std::byte> byte_planes(const std::span<const std::byte> words) {
+        const std::size_t n_words = words.size() / 4;
+        std::vector<std::byte> planes(words.size());
+        for (std::size_t w = 0; w < n_words; ++w)
+            for (std::size_t plane = 0; plane < 4; ++plane)
+                planes[plane * n_words + w] = words[w * 4 + plane];
+        return planes;
+    }
+
+    // Shuffled records are framed exactly like a ZstdFramed payload of the
+    // transposed bytes, whether a record lies in one plane or spans two.
+    TEST(ProjectContainerWriter, ByteShuffleRecordsMatchFramedPlanes) {
+        for (const std::size_t bytes : {2ull * 64ull * 1024ull * 1024ull + 32ull * 1024ull * 1024ull,
+                                        2ull * 64ull * 1024ull * 1024ull + 4ull * 1024ull * 1024ull + 12ull}) {
+            SCOPED_TRACE(bytes);
+            const auto payload = patterned_payload(bytes);
+            TemporaryDirectory temporary;
+            const fs::path path = temporary.path / "byteshuffle-records.licht";
+            write_framed_fixture(path, FOURCC_CKPT, 840, payload, Compression::ByteShuffleZstdFramed,
+                                 true, true, 840);
+            ProjectReader reader = require_result(ProjectReader::open(path));
+            const ChunkInfo& chunk = reader.chunks().front();
+            ASSERT_EQ(chunk.compression, Compression::ByteShuffleZstdFramed);
+            std::vector<std::byte> stored(chunk.stored_bytes);
+            require_status(reader.read_stored_at(chunk, 0, stored));
+            EXPECT_EQ(stored, reference_framed_zstd(byte_planes(payload)));
+            EXPECT_EQ(require_result(reader.read_chunk(chunk)), payload);
+        }
+    }
+
+    // A segmented payload is consumed while it is compressed. The stored
+    // bytes must match the contiguous path, including records that read
+    // several planes and records that span two.
+    TEST(ProjectContainerWriter, SegmentedPayloadStoresTheSameRecords) {
+        constexpr std::size_t MIB = 1024ull * 1024ull;
+        for (const std::size_t bytes : {160 * MIB, 132 * MIB + 12, 160 * MIB + 3, 40 * MIB}) {
+            SCOPED_TRACE(bytes);
+            const auto payload = patterned_payload(bytes);
+            auto segmented = require_result(SegmentedPayload::allocate(bytes));
+            ASSERT_EQ(segmented.segment_count(), (bytes + SegmentedPayload::SEGMENT_BYTES - 1) /
+                                                     SegmentedPayload::SEGMENT_BYTES);
+            for (std::size_t done = 0; done < bytes;) {
+                const auto window = segmented.window(done);
+                const std::size_t count = std::min(window.size(), bytes - done);
+                std::memcpy(window.data(), payload.data() + done, count);
+                done += count;
+            }
+            const ChunkWriteOptions options{
+                .chunk_version = 1,
+                .compression = Compression::ByteShuffleZstdFramed,
+                .tensor_payload = true,
+                .block_crcs = true,
+            };
+            const auto prepared = require_result(ProjectWriter::prepare_chunk(std::move(segmented), options));
+            EXPECT_EQ(prepared.logical_bytes(), bytes);
+            EXPECT_EQ(require_result(prepared.decode()), payload);
+
+            TemporaryDirectory temporary;
+            const fs::path path = temporary.path / "segmented.licht";
+            ProjectWriter writer = require_result(ProjectWriter::create(path, fixture_create_options(840)));
+            require_status(writer.plan_commit(fixture_commit_options(841, 842, 1)));
+            require_status(writer.preflight(prepared.stored_bytes()));
+            require_status(writer.write_prepared_chunk(
+                ChunkKey{.fourcc = FOURCC_CKPT, .instance_uuid = fixed_uuid(840)}, prepared));
+            require_status(writer.commit());
+            ProjectReader reader = require_result(ProjectReader::open(path));
+            const ChunkInfo& chunk = reader.chunks().front();
+            std::vector<std::byte> stored(chunk.stored_bytes);
+            require_status(reader.read_stored_at(chunk, 0, stored));
+            EXPECT_EQ(stored, reference_framed_zstd(bytes % 4 == 0 ? byte_planes(payload) : payload));
+            EXPECT_EQ(require_result(reader.read_chunk(chunk)), payload);
+        }
     }
 
     TEST(ProjectContainerReader, BoundedStreamMatchesReadChunkForFramedPayloads) {
@@ -4031,46 +4107,49 @@ namespace {
     }
 
 #ifndef _WIN32
-    TEST(ProjectContainerWriter, RenameBackupReplacementCanRollbackAndFinish) {
+    TEST(ProjectContainerWriter, ReplacementWithoutHardLinksPublishesInOneRename) {
         TemporaryDirectory temporary;
         const auto destination = temporary.path / "project.licht";
         const auto replacement = temporary.path / "replacement.licht";
         create_single_chunk_fixture(destination, 1251, 1252, 1253, fixed_key("PROJ", 1254), R"({"version":"original"})");
         create_single_chunk_fixture(replacement, 1261, 1262, 1263, fixed_key("PROJ", 1264), R"({"version":"replacement"})");
-        auto replaced = require_result(detail::replace_with_rename_backup(
-            replacement, destination, detail::make_sibling_temp_path(destination, "replace-backup")));
-        ASSERT_TRUE(replaced.backup_path);
+        auto retained = require_result(ProjectReader::open(destination));
+        auto replaced = require_result(detail::replace_without_backup(replacement, destination));
+        EXPECT_FALSE(replaced.backup_path);
         EXPECT_FALSE(detail::project_fs::exists(replacement));
-        {
-            auto reader = require_result(ProjectReader::open(destination));
-            EXPECT_EQ(reader.commit().commit_uuid, fixed_uuid(1262));
-        }
-        require_status(detail::rollback_atomic_replace(replaced, destination));
-        {
-            auto reader = require_result(ProjectReader::open(destination));
-            EXPECT_EQ(reader.commit().commit_uuid, fixed_uuid(1252));
-            require_status(reader.verify_all());
-        }
-        create_single_chunk_fixture(replacement, 1271, 1272, 1273, fixed_key("PROJ", 1274), R"({"version":"final"})");
-        auto final = require_result(detail::replace_with_rename_backup(
-            replacement, destination, detail::make_sibling_temp_path(destination, "replace-backup")));
-        const auto backup = *final.backup_path;
-        require_status(detail::finish_atomic_replace(final, destination));
-        EXPECT_FALSE(detail::project_fs::exists(backup));
+        require_status(detail::finish_atomic_replace(replaced, destination));
         auto reader = require_result(ProjectReader::open(destination));
-        EXPECT_EQ(reader.commit().commit_uuid, fixed_uuid(1272));
+        EXPECT_EQ(reader.commit().commit_uuid, fixed_uuid(1262));
         require_status(reader.verify_all());
+        EXPECT_EQ(retained.commit().commit_uuid, fixed_uuid(1252));
+        require_status(retained.verify_all());
     }
 
-    // Fails if a rejected publish leaves the prior project only at the backup path.
-    TEST(ProjectContainerWriter, RenameBackupReplacementRestoresPriorProjectWhenPublishFails) {
+    TEST(ProjectContainerWriter, ReplacementWithoutHardLinksSurvivesProcessTermination) {
+        for (const bool publish : {false, true}) {
+            TemporaryDirectory temporary;
+            const auto destination = temporary.path / "project.licht";
+            const auto replacement = temporary.path / "replacement.licht";
+            create_single_chunk_fixture(destination, 1281, 1282, 1283, fixed_key("PROJ", 1284), R"({"version":"original"})");
+            create_single_chunk_fixture(replacement, 1291, 1292, 1293, fixed_key("PROJ", 1294), R"({"version":"replacement"})");
+            const auto status = run_child_process([&] {
+                if (publish)
+                    (void)require_result(detail::replace_without_backup(replacement, destination));
+                ::kill(::getpid(), SIGKILL);
+            });
+            ASSERT_TRUE(WIFSIGNALED(status));
+            EXPECT_EQ(WTERMSIG(status), SIGKILL);
+            auto reader = require_result(ProjectReader::open(destination));
+            EXPECT_EQ(reader.commit().commit_uuid, fixed_uuid(publish ? 1292 : 1282));
+            require_status(reader.verify_all());
+        }
+    }
+
+    TEST(ProjectContainerWriter, ReplacementWithoutHardLinksFailurePreservesDestination) {
         TemporaryDirectory temporary;
         const auto destination = temporary.path / "project.licht";
         create_single_chunk_fixture(destination, 1281, 1282, 1283, fixed_key("PROJ", 1284), R"({"version":"original"})");
-        const auto backup = detail::make_sibling_temp_path(destination, "replace-backup");
-        auto replaced = detail::replace_with_rename_backup(temporary.path / "missing.licht", destination, backup);
-        ASSERT_FALSE(replaced);
-        EXPECT_FALSE(detail::project_fs::exists(backup));
+        ASSERT_FALSE(detail::replace_without_backup(temporary.path / "missing.licht", destination));
         auto reader = require_result(ProjectReader::open(destination));
         EXPECT_EQ(reader.commit().commit_uuid, fixed_uuid(1282));
         require_status(reader.verify_all());

@@ -19,7 +19,6 @@
 #include "kernels/gradient_residual.hpp"
 #include "kernels/thin_structure.hpp"
 #include "lfs/kernels/ssim.cuh"
-#include "lfs/training/refine_scratch.hpp"
 #include "losses/mask_loss.hpp"
 #include "losses/photometric_loss.hpp"
 #include "metrics/metrics.hpp"
@@ -533,6 +532,10 @@ namespace lfs::training {
         };
         enum class RetryDecision : std::uint8_t { DoNotRetry,
                                                   RetryForwardOnce };
+        // What is left of a training step that ran out of memory.
+        enum class StepOomRecovery : std::uint8_t { Fail,
+                                                    RetryIteration,
+                                                    SkipRest };
 
         // epoch here is a trainer-lifetime persistent-commit counter
         // (mutation_epoch_), NOT a dataset/sampler epoch. The main training
@@ -542,6 +545,8 @@ namespace lfs::training {
             std::uint64_t epoch;
             StepPhase phase;
             bool persistent_commit;
+            // A refine that ran out of VRAM was cut back to the rows it started from.
+            bool refine_undone = false;
         };
 
         // Returns the background color to use at a given iteration
@@ -577,7 +582,10 @@ namespace lfs::training {
 
         [[nodiscard]] static RetryDecision classify_forward_retry(
             const lfs::Error& forward_error, MutationStamp stamp, unsigned attempts) noexcept;
-        [[nodiscard]] lfs::Status recover_forward_oom(const lfs::Error& cause);
+        [[nodiscard]] static StepOomRecovery classify_step_oom(
+            const lfs::Error& step_error, MutationStamp failed) noexcept;
+        [[nodiscard]] lfs::Status recover_from_oom(const lfs::Error& cause);
+        void post_backward_or_undo(int iter, RenderOutput& render_output, bool& refine_undone);
 
         void setActiveImageLoader(std::shared_ptr<lfs::io::PipelinedImageLoader> loader);
         int get_regular_iterations() const;
@@ -731,7 +739,7 @@ namespace lfs::training {
         void evaluate_at(int iteration, std::stop_token stop_token = {});
         bool service_evaluation_controls(int iteration, std::stop_token stop_token);
         [[nodiscard]] lfs::core::param::TrainingParameters params_for_project_snapshot() const;
-        [[nodiscard]] std::function<std::uint64_t(std::uint64_t)> release_image_cache_for_snapshot() const;
+        [[nodiscard]] std::function<void(std::uint64_t)> release_image_cache_for_snapshot() const;
         [[nodiscard]] TrainingProgress::Phase get_progress_phase(
             int iter,
             bool in_controller_phase = false) const;
@@ -937,6 +945,7 @@ namespace lfs::training {
             live_project_path_;
         // Used only to seed a fresh headless destination; never a GUI context.
         std::optional<std::filesystem::path> headless_project_source_path_;
+        std::shared_ptr<lfs::io::project::ProjectReader> retained_project_source_;
         TrainerProjectSavePolicy trainer_project_save_policy_{};
         std::function<std::optional<
             ProjectSnapshotDocumentContext>()>
@@ -1096,6 +1105,8 @@ namespace lfs::training {
         // Monotonic, never rolls back. Incremented at the frozen persistent
         // commit boundaries and embedded in terminal MutationStamp context.
         std::uint64_t mutation_epoch_ = 0;
+        // Where the last failed train_step stopped.
+        MutationStamp failed_step_{};
 
         // Async callback system
         std::function<void()> callback_;
