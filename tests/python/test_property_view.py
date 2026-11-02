@@ -252,6 +252,15 @@ EXPECTED_NUMBER_ROWS = {
         100.0,
         False,
     ),
+    "depth_distortion_weight": (
+        "training_params.depth_distortion_weight",
+        "training.tooltip.depth_distortion_weight",
+        3,
+        0.01,
+        0.0,
+        100.0,
+        False,
+    ),
     "normal_prior_depth_weight": (
         "training_params.normal_prior_depth_weight",
         "training.tooltip.normal_prior_depth_weight",
@@ -740,13 +749,13 @@ def test_full_migration_inventory_and_schema_are_exact(lf):
     assert property_view.NUMBER_PROPS == tuple(EXPECTED_NUMBER_ROWS)
     assert property_view.BOOL_PROPS == tuple(EXPECTED_CHECKBOX_ROWS)
     assert property_view.SELECT_PROPS == tuple(EXPECTED_SELECT_ROWS)
-    assert len(property_view.MIGRATED_PROP_IDS) == 83
-    assert len(set(property_view.MIGRATED_PROP_IDS)) == 83
+    assert len(property_view.MIGRATED_PROP_IDS) == 85
+    assert len(set(property_view.MIGRATED_PROP_IDS)) == 85
 
     group_info = lf.ui.property_group_info("optimization")
     resolved_runs = property_view.resolve_runs(group_info)
     rendered = tuple(prop for run in resolved_runs for prop in run.prop_ids)
-    assert len(EXPECTED_RENDERED_PROP_IDS) == 116
+    assert len(EXPECTED_RENDERED_PROP_IDS) == 121
     assert len(rendered) == len(set(rendered)) == len(EXPECTED_RENDERED_PROP_IDS)
     assert set(rendered) == EXPECTED_RENDERED_PROP_IDS
 

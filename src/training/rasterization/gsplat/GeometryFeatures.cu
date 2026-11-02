@@ -55,10 +55,11 @@ namespace gsplat_lfs {
             if constexpr (!Backward) {
                 features[i * channels + d] = depth;
                 if (channels == 8)
-                    features[i * channels + 7] = 0;
+                    features[i * channels + 7] = depth * depth;
             } else {
                 const vec3 dp = radial ? p / fmaxf(depth, 1.e-12f) : vec3(0, 0, 1);
-                const vec3 grad = transpose(V) * dp * gf[i * channels + d];
+                const float gd = gf[i * channels + d] + (channels == 8 ? 2.f * depth * gf[i * channels + 7] : 0.f);
+                const vec3 grad = transpose(V) * dp * gd;
                 for (int c = 0; c < 3; ++c)
                     atomicAdd(gm + 3 * g + c, grad[c]);
             }

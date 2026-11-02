@@ -467,6 +467,14 @@ namespace lfs::core::param {
             .precision(3)
             .ui_step(0.01)
             .all_strategies()
+            .float_prop(&OptimizationParameters::depth_distortion_weight,
+                        "depth_distortion_weight", "Depth Distortion Weight", d.depth_distortion_weight, 0.0f, 100.0f,
+                        "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
+            .locale("training_params.depth_distortion_weight")
+            .tooltip("training.tooltip.depth_distortion_weight")
+            .precision(3)
+            .ui_step(0.01)
+            .all_strategies()
             .float_prop(&OptimizationParameters::normal_prior_depth_weight,
                         "normal_prior_depth_weight", "Normal Prior Depth Weight", d.normal_prior_depth_weight, -1.0f, 100.0f,
                         "Weight for the prior normal against the normal of the rendered depth, which moves surfaces; -1 uses the normal loss weight")

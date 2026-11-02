@@ -1422,6 +1422,11 @@ namespace lfs::python {
                 [](PyOptimizationParams& self, float v) { self.set("normal_consistency_weight", nb::cast(v)); },
                 "Weight for depth-normal consistency supervision")
             .def_prop_rw(
+                "depth_distortion_weight",
+                [](PyOptimizationParams& self) { return self.params().depth_distortion_weight; },
+                [](PyOptimizationParams& self, float v) { self.set("depth_distortion_weight", nb::cast(v)); },
+                "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
+            .def_prop_rw(
                 "normal_flatten_weight",
                 [](PyOptimizationParams& self) { return self.params().normal_flatten_weight; },
                 [](PyOptimizationParams& self, float v) { self.set("normal_flatten_weight", nb::cast(v)); },

@@ -1881,6 +1881,8 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
         "0.75",
         "--normal-consistency-weight",
         "0.25",
+        "--depth-distortion-weight",
+        "0.5",
         "--normal-prior-depth-weight",
         "0.125",
         "--normal-flatten-weight",
@@ -1899,6 +1901,7 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
     EXPECT_TRUE((*parsed)->optimization.normal_auto_generate);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_loss_weight, 0.75f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_consistency_weight, 0.25f);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.depth_distortion_weight, 0.5f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_depth_weight, 0.125f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_flatten_weight, 5.0f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_start_fraction, 0.3f);
@@ -1912,6 +1915,7 @@ TEST(ArgumentParserTest, TrainingRejectsOutOfRangeNumericFlags) {
     const std::vector<std::pair<std::vector<std::string>, std::string>> cases{
         {{"--normal-loss-weight", "-1"}, "normal_loss_weight"},
         {{"--normal-consistency-weight", "-1"}, "normal_consistency_weight"},
+        {{"--depth-distortion-weight", "-1"}, "depth_distortion_weight"},
         {{"--normal-flatten-weight", "-1"}, "normal_flatten_weight"},
         {{"--perf-bench-warmup", "-1"}, "perf_bench_warmup"},
         {{"--max-screen-share", "-1"}, "max_screen_share"},

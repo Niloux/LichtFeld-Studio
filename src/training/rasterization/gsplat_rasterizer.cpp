@@ -633,6 +633,7 @@ namespace lfs::training {
             }
             case GsplatRenderMode::RGB_D_N:
                 render_output.normal = cached_image_chw.slice(0, 4, 7);
+                render_output.depth_sq = cached_image_chw.slice(0, 7, 8);
                 [[fallthrough]];
             case GsplatRenderMode::RGB_D:
                 render_output.image = cached_image_chw.slice(0, 0, 3);
@@ -771,7 +772,8 @@ namespace lfs::training {
         const core::Tensor& grad_depth,
         const core::Tensor& grad_normal,
         float flatten_weight,
-        const core::Tensor& grad_T_front) {
+        const core::Tensor& grad_T_front,
+        const core::Tensor& grad_depth_sq) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -788,7 +790,7 @@ namespace lfs::training {
         try {
             // A caller may produce loss gradients on a different stream from
             // the saved forward context. Order every raw-pointer read explicitly.
-            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal, &grad_T_front}) {
+            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal, &grad_T_front, &grad_depth_sq}) {
                 if (gradient->is_valid() && gradient->numel() > 0) {
                     gradient->sync_to_stream(stream);
                 }
@@ -898,8 +900,10 @@ namespace lfs::training {
                 if (channels > 1)
                     copy_grad(grad_image, 0, 3);
                 copy_grad(grad_depth, channels == 1 ? 0 : 3, 1);
-                if (channels == 8)
+                if (channels == 8) {
                     copy_grad(grad_normal, 4, 3);
+                    copy_grad(grad_depth_sq, 7, 1);
+                }
                 if (expected_depth) {
                     if (grad_alpha.is_valid() && grad_alpha.numel()) {
                         core::pin_operands({&grad_alpha});

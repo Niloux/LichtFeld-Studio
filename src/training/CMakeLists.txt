@@ -35,6 +35,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/depth_loss.cu
     kernels/normal_loss.cu
     kernels/normal_consistency_loss.cu
+    kernels/depth_distortion_loss.cu
     kernels/roi_weight_map.cu
     kernels/image_kernels.cu
     kernels/mask_preprocess.cu

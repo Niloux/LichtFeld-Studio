@@ -332,6 +332,7 @@ namespace lfs::core {
             bool normal_auto_generate = true;         // Generate missing/mismatched maps from images/ with MoGe-2
             float normal_loss_weight = 0.005f;        // Prior normal supervision weight (sweep: free geometry; raise to ~0.1 when geometry is the product)
             float normal_consistency_weight = 0.001f; // Depth-normal consistency weight
+            float depth_distortion_weight = 0.0f;     // Spread of depth along each ray (--gut); 0 = off
             float normal_prior_depth_weight = -1.0f;  // Prior normal vs rendered-depth normal; -1 follows normal_loss_weight
             float normal_flatten_weight = 0.0f;       // L1 on the smallest scale axis; off by default - it suppresses densification under the benchmark refine regime
             float normal_start_fraction = 0.08f;      // Start normal supervision at floor(fraction * total iterations)

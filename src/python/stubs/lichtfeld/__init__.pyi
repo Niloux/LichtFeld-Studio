@@ -2665,6 +2665,13 @@ class OptimizationParams:
     def normal_consistency_weight(self, arg: float, /) -> None: ...
 
     @property
+    def depth_distortion_weight(self) -> float:
+        """Weight for the spread of depth along each ray, which thins layered surfaces (--gut)"""
+
+    @depth_distortion_weight.setter
+    def depth_distortion_weight(self, arg: float, /) -> None: ...
+
+    @property
     def normal_flatten_weight(self) -> float:
         """Min-axis scale flattening weight while normal supervision is active"""
 

@@ -1017,8 +1017,7 @@ namespace gsplat_lfs {
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
 
-        // The eighth channel of RGB + depth + normal is padding that is always zero.
-        constexpr uint32_t kUsed = CDIM == 8 ? 7u : CDIM;
+        constexpr uint32_t kUsed = CDIM;
         __shared__ float s_T[kSplatBwdPixels];
         __shared__ float s_buffer[kSplatBwdPixels * kUsed];
         __shared__ float s_v_c[kSplatBwdPixels * kUsed];

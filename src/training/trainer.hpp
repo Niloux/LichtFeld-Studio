@@ -989,6 +989,7 @@ namespace lfs::training {
         core::Tensor normal_loss_scalar_;
         core::Tensor normal_loss_grad_;
         core::Tensor normal_loss_partials_;
+        core::Tensor depth_distortion_grad_;
         core::Tensor normal_consistency_scalar_;
         core::Tensor normal_consistency_partials_;
         core::Tensor normal_prior_depth_scalar_;

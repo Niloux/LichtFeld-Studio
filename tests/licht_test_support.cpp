@@ -390,6 +390,7 @@ namespace lfs::test::licht {
                 .normal_auto_generate = true,
                 .normal_loss_weight = 0.31f + delta,
                 .normal_consistency_weight = 0.32f + delta,
+                .depth_distortion_weight = 0.325f + delta,
                 .normal_flatten_weight = 0.33f + delta,
                 .normal_start_fraction = 0.34f + delta,
                 .normal_end_fraction = 0.85f + delta,

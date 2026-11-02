@@ -121,6 +121,7 @@ namespace lfs::training {
         opt.use_depth_loss = false;
         opt.normal_loss_weight = 0.0f;
         opt.normal_consistency_weight = 0.0f;
+        opt.depth_distortion_weight = 0.0f;
         opt.normal_flatten_weight = 0.0f;
         opt.ppisp_use_controller = false;
         opt.ppisp_freeze_gaussians_on_distill = false;
