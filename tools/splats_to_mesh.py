@@ -785,7 +785,7 @@ def main():
     parser.add_argument("--depth-cache", help="reuse the depth maps of an earlier run with the same model and views")
     parser.add_argument("--depth-kind", default="center_median", choices=sv.DEPTH_METHODS)
     parser.add_argument("--drop-depth-edges", action="store_true", help="do not fuse pixels on depth steps; costs thin objects")
-    parser.add_argument("--full-weight-range", type=float, default=3.0, help="views beyond this range in meters count less, by 1/r^2")
+    parser.add_argument("--full-weight-range", type=float, default=1.0, help="views beyond this range in meters count less, by 1/r^2")
     parser.add_argument("--voxel", type=float, default=0.02, help="voxel size in meters")
     parser.add_argument("--block", type=int, default=8, help="voxels per block side")
     parser.add_argument("--trunc-voxels", type=float, default=4, help="truncation band in voxels")
