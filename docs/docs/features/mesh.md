@@ -26,11 +26,6 @@ Tools > Mesh from Splats meshes the selected splat from the scene's cameras. It 
 adds an undoable mesh node. Training must be stopped, and the complete model must be loaded,
 not a level-of-detail tree.
 
-Known issue: saving fails with "A geometry scene node has no project payload binding" when the
-mesh was added after stopping training in the same session, because that save goes through the
-training snapshot, which only knows the training model. The PLY is already written by then, so
-nothing is lost but the mesh node. Meshing a reopened project and saving works.
-
 ## Settings
 
 Distances are in scene units, and the defaults are tuned on metric indoor scans; scale them for
