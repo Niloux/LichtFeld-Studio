@@ -416,9 +416,9 @@ namespace lfs::training {
                 channels = 8;
             }
 
-            // The free-space test needs the splat depth channel and the whole image.
+            // The free-space test and the median depth need the splat depth channel and the whole image.
             gsplat_lfs::FreeSpaceRender free_space;
-            if (free_space_in.enabled() && channels != 3 && tile_width == 0 && tile_height == 0) {
+            if ((free_space_in.enabled() || free_space_in.median_depth != nullptr) && channels != 3 && tile_width == 0 && tile_height == 0) {
                 free_space = free_space_in;
                 free_space.depth_channel = channels == 1 ? 0 : 3;
             }

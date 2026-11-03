@@ -81,6 +81,8 @@ namespace gsplat_lfs {
             free_space.T_front != nullptr && free_space.gt_depth != nullptr
                 ? free_space.T_front + cid * image_height * image_width
                 : nullptr;
+        float* const median_out =
+            free_space.median_depth != nullptr ? free_space.median_depth + cid * image_height * image_width : nullptr;
         if (backgrounds != nullptr) {
             backgrounds += cid * CDIM;
         }
@@ -153,6 +155,7 @@ namespace gsplat_lfs {
         uint32_t cur_idx = 0;
         // transmittance of the splats in front of the scan surface
         float T_front = 1.0f;
+        float median = 0.0f;
         const float free_limit = T_front_out != nullptr && inside
                                      ? free_space.limit(cid, j, i, image_width, image_height)
                                      : 0.0f;
@@ -241,6 +244,10 @@ namespace gsplat_lfs {
                     break;
                 }
 
+                if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
+                    median = rgbs_batch[t * CDIM + free_space.depth_channel];
+                }
+
                 const float vis = alpha * T;
                 if constexpr (CDIM == 3) {
                     const float3 c = load_float3(&rgbs_batch[t * 3u]);
@@ -290,6 +297,8 @@ namespace gsplat_lfs {
             last_ids[pix_id] = static_cast<int32_t>(cur_idx);
             if (T_front_out != nullptr)
                 T_front_out[pix_id] = T_front;
+            if (median_out != nullptr)
+                median_out[pix_id] = median;
         }
     }
 
@@ -367,6 +376,8 @@ namespace gsplat_lfs {
             free_space.T_front != nullptr && free_space.gt_depth != nullptr
                 ? free_space.T_front + cid * image_height * image_width
                 : nullptr;
+        float* const median_out =
+            free_space.median_depth != nullptr ? free_space.median_depth + cid * image_height * image_width : nullptr;
         if (backgrounds != nullptr) {
             backgrounds += cid * CDIM;
         }
@@ -425,6 +436,7 @@ namespace gsplat_lfs {
         float T = 1.0f;
         uint32_t cur_idx = 0;
         float T_front = 1.0f;
+        float median = 0.0f;
         const float free_limit = T_front_out != nullptr && inside
                                      ? free_space.limit(cid, j, i, image_width, image_height)
                                      : 0.0f;
@@ -501,6 +513,9 @@ namespace gsplat_lfs {
                     done = true;
                     break;
                 }
+                if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
+                    median = s_rgbs[t * CDIM + free_space.depth_channel];
+                }
                 const float vis = alpha * T;
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
@@ -541,6 +556,8 @@ namespace gsplat_lfs {
             last_ids[pix_id] = static_cast<int32_t>(cur_idx);
             if (T_front_out != nullptr)
                 T_front_out[pix_id] = T_front;
+            if (median_out != nullptr)
+                median_out[pix_id] = median;
         }
     }
 
@@ -626,6 +643,12 @@ namespace gsplat_lfs {
                 cudaMemsetAsync(last_ids, 0,
                                 C * image_height * image_width * sizeof(int32_t), stream),
                 "gsplat empty-forward last-id clear");
+            if (free_space.median_depth != nullptr) {
+                LFS_CUDA_CHECK_MSG(
+                    cudaMemsetAsync(free_space.median_depth, 0,
+                                    C * image_height * image_width * sizeof(float), stream),
+                    "gsplat empty-forward median depth clear");
+            }
             if (free_space.T_front != nullptr) {
                 fill_ones_kernel<<<(C * image_height * image_width + 255) / 256, 256, 0, stream>>>(
                     free_space.T_front, C * image_height * image_width);

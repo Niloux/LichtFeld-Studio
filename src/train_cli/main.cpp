@@ -113,6 +113,8 @@ namespace {
             return "--render-camera-path (video rendering)";
         if (params.evaluate_only)
             return "the eval subcommand";
+        if (params.mesh_settings)
+            return "the mesh subcommand";
         if (params.dataset_project)
             return "a .licht project as --data-path";
         if (params.resume_project || params.resume_checkpoint)

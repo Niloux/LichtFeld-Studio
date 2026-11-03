@@ -726,6 +726,7 @@ namespace {
                 "voxelize -- Generate a .voxel.json/.voxel.bin collision pair\n"
                 "compare -- Score test images against reference images\n"
                 "eval -- Score a finished model or splat file against its images\n"
+                "mesh -- Extract a colored mesh from a finished model\n"
                 "mesh2splat -- Convert a mesh file to Gaussian splats\n"
                 "mask-video -- Generate SAM2 masks for a video or extracted frames\n"
                 "preprocess -- Generate depth and/or normal maps for an image dataset\n"
@@ -2571,6 +2572,123 @@ dataset options work as in training; see the Evaluation page of the docs.
         return lfs::core::args::TrainingMode{std::move(*params)};
     }
 
+    constexpr const char* MESH_HELP = R"(Usage: LichtFeld-Studio mesh <model> -o <mesh.ply> [options]
+
+Extracts a colored mesh from a .licht project, .resume checkpoint or splat file: renders median
+depth from the training cameras, fuses it into a sparse TSDF and colors the surface from the
+photos. A splat file needs -d. Distances are in scene units. Held-out views are not fused unless
+--all-views is given. Dataset options work as in training.
+
+  --voxel-size <v>           Voxel edge (default 0.02)
+  --trunc-voxels <v>         Truncation band in voxels (default 4)
+  --full-weight-range <v>    Views beyond this range count less, by 1/r^2; 0 = equal (default 1)
+  --view-stride <n>          Fuse every Nth view (default 2)
+  --color-stride <n>         Color from every Nth fused view (default 2)
+  --min-views <n>            Views a voxel needs to count as observed (default 3)
+  --min-component-faces <n>  Drop smaller connected pieces (default 100)
+  --render-width <n>         Render and photo width limit (default 1600)
+  --all-views                Also fuse the held-out views
+)";
+
+    std::optional<lfs::core::args::ParsedArgs> parseMeshArgs(const int argc, const char* const argv[], std::string& error) {
+        std::vector<std::string> args(argv + 2, argv + argc);
+        if (args.empty() || args.front() == "-h" || args.front() == "--help") {
+            std::print("{}", MESH_HELP);
+            return lfs::core::args::HelpMode{};
+        }
+        const std::string model = args.front();
+        if (model.starts_with('-')) {
+            error = "Usage: LichtFeld-Studio mesh <model> -o <mesh.ply> [options]";
+            return std::nullopt;
+        }
+
+        lfs::core::SplatMeshSettings settings;
+        std::string output;
+        bool all_views = false;
+        std::vector<std::string> forwarded;
+        for (size_t i = 1; i < args.size(); ++i) {
+            std::string flag = args[i];
+            std::optional<std::string> inline_value;
+            if (const auto equals = flag.find('='); flag.starts_with("--") && equals != std::string::npos) {
+                inline_value = flag.substr(equals + 1);
+                flag.resize(equals);
+            }
+            const auto value = [&]() -> std::string {
+                if (inline_value)
+                    return *inline_value;
+                if (i + 1 >= args.size())
+                    throw std::invalid_argument(flag + " needs a value");
+                return args[++i];
+            };
+            try {
+                if (flag == "--voxel-size") {
+                    settings.voxel_size = std::stof(value());
+                } else if (flag == "--trunc-voxels") {
+                    settings.trunc_voxels = std::stof(value());
+                } else if (flag == "--full-weight-range") {
+                    settings.full_weight_range = std::stof(value());
+                } else if (flag == "--view-stride") {
+                    settings.view_stride = std::stoi(value());
+                } else if (flag == "--color-stride") {
+                    settings.color_stride = std::stoi(value());
+                } else if (flag == "--min-views") {
+                    settings.min_views = std::stoi(value());
+                } else if (flag == "--min-component-faces") {
+                    settings.min_component_faces = std::stoi(value());
+                } else if (flag == "--render-width") {
+                    settings.max_width = std::stoi(value());
+                } else if (flag == "--all-views") {
+                    all_views = true;
+                } else if (flag == "-o" || flag == "--output" || flag == "--output-path") {
+                    output = value();
+                } else {
+                    forwarded.push_back(args[i]);
+                }
+            } catch (const std::exception& e) {
+                error = std::format("mesh: invalid {}: {}", flag, e.what());
+                return std::nullopt;
+            }
+        }
+        const auto output_path = lfs::core::utf8_to_path(output);
+        if (output.empty() || lfs::core::path_to_utf8(output_path.extension()) != ".ply") {
+            error = "mesh needs -o <mesh.ply>";
+            return std::nullopt;
+        }
+
+        const std::string extension = lfs::core::path_to_utf8(lfs::core::utf8_to_path(model).extension());
+        const bool checkpoint = extension == ".licht" || extension == ".resume";
+        const auto given = [&](const std::string_view name) {
+            return std::ranges::any_of(forwarded, [&](const std::string& arg) { return arg == name || arg.starts_with(std::string(name) + "="); });
+        };
+        if (!checkpoint && !given("-d") && !given("--data-path")) {
+            error = "mesh of a splat file needs -d <dataset>";
+            return std::nullopt;
+        }
+
+        const auto absolute = absolute_input_path(output);
+        std::vector<std::string> training_args{argv[0], "--headless", checkpoint ? "--resume" : "--init", model,
+                                               "-o", lfs::core::path_to_utf8(absolute.parent_path())};
+        if (!all_views && !given("--eval") && !given("--eval-all"))
+            training_args.emplace_back("--eval");
+        training_args.insert(training_args.end(), forwarded.begin(), forwarded.end());
+        std::vector<const char*> training_argv;
+        training_argv.reserve(training_args.size());
+        for (const auto& arg : training_args)
+            training_argv.push_back(arg.c_str());
+        auto params = lfs::core::args::parse_args_and_params(static_cast<int>(training_argv.size()), training_argv.data());
+        if (!params) {
+            error = params.error();
+            return std::nullopt;
+        }
+        settings.invert_mask = (*params)->optimization.invert_masks;
+        settings.mask_threshold = (*params)->optimization.mask_threshold;
+        (*params)->mesh_settings = settings;
+        (*params)->mesh_output = absolute;
+        if (!checkpoint)
+            (*params)->optimization.max_cap = 0;
+        return lfs::core::args::TrainingMode{std::move(*params)};
+    }
+
     std::expected<lfs::core::args::ParsedArgs, std::string> parseMesh2SplatArgs(const int argc, const char* const argv[]) {
         namespace core_args = lfs::core::args;
         namespace param = lfs::core::param;
@@ -3369,6 +3487,12 @@ lfs::core::args::parse_args(const int argc, const char* const argv[]) {
         } else if (arg1 == "eval") {
             std::string error;
             if (auto parsed = parseEvalArgs(argc, argv, error)) {
+                return std::move(*parsed);
+            }
+            return std::unexpected(std::move(error));
+        } else if (arg1 == "mesh") {
+            std::string error;
+            if (auto parsed = parseMeshArgs(argc, argv, error)) {
                 return std::move(*parsed);
             }
             return std::unexpected(std::move(error));

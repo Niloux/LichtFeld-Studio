@@ -8,6 +8,8 @@
 #include <cstdint>
 
 #include "core/collision.hpp"
+#include "core/mesh_data.hpp"
+#include "core/splat_mesh_settings.hpp"
 #include "core/events.hpp"
 #include "core/export.hpp"
 #include "core/job_registry.hpp"
@@ -63,6 +65,8 @@ namespace lfs::vis {
             void setupEvents();
             void startCollision(core::CollisionSettings settings);
             void startCollisionExport(core::Uuid uuid, const std::filesystem::path& path);
+            // Meshes the selected splat from the scene's cameras, on the collision job: a new undoable mesh node.
+            void startSplatMesh(core::SplatMeshSettings settings, const std::filesystem::path& path);
             void cancelCollision();
             [[nodiscard]] bool collisionWorkerActive() const;
             void dropSceneReplacement();
@@ -381,6 +385,9 @@ namespace lfs::vis {
             std::stop_source collision_stop_;
             std::move_only_function<void()> collision_replacement_;
             std::shared_ptr<const core::CollisionVolume> collision_result_;
+            std::shared_ptr<core::MeshData> mesh_result_;
+            std::string mesh_name_;
+            glm::mat4 mesh_transform_{1.f};
             uint64_t collision_epoch_ = 0;
             std::optional<core::Scene::CollisionSourceIdentity> collision_source_;
             core::CollisionSettings collision_settings_;

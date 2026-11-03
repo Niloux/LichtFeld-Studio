@@ -8,10 +8,12 @@ into a sparse TSDF, extracts the surface with naive surface nets and colors it f
 Every 8th image (LichtFeld's held-out views) is left out of the fusion so --eval can score the
 mesh on views it never saw. The fisheye projection is shared with tools/splat_vs_las.py.
 
-Needs numpy, scipy, opencv and torch with CUDA. Example:
+The application's mesh subcommand does the same natively; this tool stays as its reference and to
+score meshes, with --mesh. Needs numpy, scipy, opencv and torch with CUDA. Example:
 
     python tools/splats_to_mesh.py --ply splat.ply --dataset work/scene --out mesh_dir \\
         --las scene.las.xyz.npy --eval
+    python tools/splats_to_mesh.py --mesh mesh.ply --dataset work/scene
     python tools/splats_to_mesh.py --selftest
 """
 
@@ -632,6 +634,48 @@ def build_mesh(args):
     print(json.dumps(report, indent=2))
 
 
+def read_mesh(path):
+    with open(path, "rb") as f:
+        counts, fields, current = {}, [], None
+        while True:
+            parts = f.readline().decode("ascii").split()
+            if parts == ["end_header"]:
+                break
+            if parts[0] == "element":
+                current = parts[1]
+                counts[current] = int(parts[2])
+            elif parts[0] == "property" and current == "vertex":
+                fields.append((parts[2], {"float": "<f4", "uchar": "u1"}[parts[1]]))
+        data = np.fromfile(f, dtype=np.dtype(fields), count=counts["vertex"])
+        faces = np.fromfile(f, dtype=np.dtype([("n", "u1"), ("v", "<i4", 3)]), count=counts["face"])
+    return np.stack([data["x"], data["y"], data["z"]], axis=1), faces["v"].astype(np.int64)
+
+
+def score_mesh(args):
+    """Reports on a mesh made elsewhere, such as by the mesh subcommand, on the held-out views."""
+    device = "cuda"
+    root = Path(args.dataset)
+    cameras = sv.read_cameras(root / "sparse/0/cameras.bin")
+    images = sv.read_images(root / "sparse/0/images.bin")
+    for index, image in enumerate(images):
+        image["index"] = index
+    held_out = images[::HELD_OUT_EVERY]
+    v, f = read_mesh(args.mesh)
+    vertices = torch.as_tensor(v, device=device)
+    faces = torch.as_tensor(f, device=device)
+    normals, area = vertex_normals(vertices, faces)
+    report = {"vertices": int(v.shape[0]), "faces": int(f.shape[0]), "area_m2": float(area.sum()),
+              "held_out": view_report(held_out, cameras, root, vertices, faces, {}, device),
+              "roughness": roughness_report(vertices), "floor": floor_report(vertices, normals)}
+    if args.eval:
+        report["eval"] = evaluate(args, held_out, cameras, root, vertices, faces, area, device)
+    print(json.dumps(report, indent=2))
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "mesh_score.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
 def selftest():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     center_radius, voxel = 1.0, 0.02
@@ -779,6 +823,7 @@ def selftest():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ply")
+    parser.add_argument("--mesh", help="score this mesh instead of building one; needs --dataset")
     parser.add_argument("--dataset")
     parser.add_argument("--out")
     parser.add_argument("--las", help="xyz as a float64 .npy of shape [N, 3]; needed by --eval")
@@ -800,6 +845,14 @@ def main():
     if args.selftest:
         with torch.no_grad():
             selftest()
+        return
+    if args.mesh:
+        if not args.dataset:
+            parser.error("--mesh needs --dataset")
+        if args.eval and not (args.las and args.ply):
+            parser.error("--eval needs --las and --ply")
+        with torch.no_grad():
+            score_mesh(args)
         return
     if not (args.ply and args.dataset and args.out):
         parser.error("--ply, --dataset and --out are required")

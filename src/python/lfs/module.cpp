@@ -3383,7 +3383,7 @@ NB_MODULE(lichtfeld, m) {
     auto scene_module = m.def_submodule("scene", "Scene graph API");
     lfs::python::register_splat_data(scene_module);
     lfs::python::register_scene(scene_module);
-    for (const auto* name : {"generate_collision", "export_collision", "cancel_collision", "get_collision_state", "set_walk_settings"})
+    for (const auto* name : {"generate_collision", "generate_mesh", "export_collision", "cancel_collision", "get_collision_state", "set_walk_settings"})
         m.attr(name) = scene_module.attr(name);
     lfs::python::register_cameras(scene_module);
 

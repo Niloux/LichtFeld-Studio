@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/splat_mesh_settings.hpp"
 #include "core/error.hpp"
 #include "core/export.hpp"
 #include "core/image_sharpen.hpp"
@@ -648,6 +649,10 @@ namespace lfs::core {
 
             // eval subcommand: score the model without training, saving or exporting.
             bool evaluate_only = false;
+
+            // mesh subcommand: extract a mesh from the model without training or saving it.
+            std::optional<SplatMeshSettings> mesh_settings = std::nullopt;
+            std::filesystem::path mesh_output;
 
             // Python scripts to execute for custom training callbacks
             std::vector<std::filesystem::path> python_scripts;

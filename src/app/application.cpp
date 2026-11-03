@@ -5,6 +5,7 @@
 #include "app/application.hpp"
 #include "app/headless_recovery_document.hpp"
 #include "app/headless_run_coordinator.hpp"
+#include "app/terminal_progress_bar.hpp"
 #include "control/command_api.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/crash_handler.hpp"
@@ -32,6 +33,7 @@
 #include "io/project_recovery.hpp"
 #include "tcp/include/tcp_publisher.hpp"
 #include "tcp/include/tcp_responder.hpp"
+#include "training/splat_mesh.hpp"
 #include "training/trainer.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/training/training_manager.hpp"
@@ -59,7 +61,9 @@
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <format>
+#include <fstream>
 #include <future>
+#include <nlohmann/json.hpp>
 #include <mutex>
 #include <print>
 #include <rasterization_api.h>
@@ -1207,16 +1211,16 @@ namespace lfs::app {
         }
 
         // eval subcommand: restore the model like a resume (or load a splat file as saved) and score it.
-        int runHeadlessEvaluation(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
+        // Restores the model and dataset without training, for eval and mesh. Null after logging a failure.
+        std::unique_ptr<training::Trainer> loadFinishedModel(const std::unique_ptr<lfs::core::param::TrainingParameters>& params, core::Scene& scene) {
             lfs::event::CommandCenterBridge::instance().set(&lfs::training::CommandCenter::instance());
-            core::Scene scene;
             std::unique_ptr<training::Trainer> trainer;
 
             if (params->resume_project) {
                 auto project = loadTrainingProject(*params, scene);
                 if (!project) {
                     LOG_ERROR("Failed to load the project: {}", lfs::format_for_developer(project.error()));
-                    return 1;
+                    return nullptr;
                 }
                 std::optional<io::project::RecoverySession> recovery_session;
                 if (const auto* session = project->document.recovery_session()) {
@@ -1227,41 +1231,50 @@ namespace lfs::app {
                     core::path_to_utf8(*params->resume_project), project->iteration, recovery_session);
                 if (!installed) {
                     LOG_ERROR("Failed to restore the project model: {}", installed.error());
-                    return 1;
+                    return nullptr;
                 }
                 trainer = std::move(installed->trainer);
             } else if (params->resume_checkpoint) {
                 const auto ckpt_params = loadCheckpointParams(*params, scene);
                 if (!ckpt_params) {
                     LOG_ERROR("Failed to load checkpoint: {}", ckpt_params.error());
-                    return 1;
+                    return nullptr;
                 }
                 trainer = std::make_unique<training::Trainer>(scene);
                 if (const auto result = trainer->initialize(*ckpt_params); !result) {
                     LOG_ERROR("Failed to initialize trainer: {}", result.error());
-                    return 1;
+                    return nullptr;
                 }
                 if (const auto loaded = trainer->load_checkpoint(*params->resume_checkpoint); !loaded) {
                     LOG_ERROR("Failed to restore checkpoint state: {}", loaded.error());
-                    return 1;
+                    return nullptr;
                 }
             } else {
                 if (const auto result = training::loadTrainingDataIntoScene(*params, scene); !result) {
                     LOG_ERROR("Failed to load the dataset: {}", result.error());
-                    return 1;
+                    return nullptr;
                 }
                 if (const auto result = training::initializeTrainingModel(*params, scene); !result) {
                     LOG_ERROR("Failed to load the model: {}", result.error());
-                    return 1;
+                    return nullptr;
                 }
                 trainer = std::make_unique<training::Trainer>(scene);
                 if (const auto result = trainer->initialize(*params); !result) {
                     LOG_ERROR("Failed to initialize trainer: {}", result.error());
-                    return 1;
+                    return nullptr;
                 }
                 auto& model = trainer->get_strategy_mutable().get_model();
                 model.set_active_sh_degree(model.get_max_sh_degree());
             }
+
+            return trainer;
+        }
+
+        int runHeadlessEvaluation(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
+            core::Scene scene;
+            auto trainer = loadFinishedModel(params, scene);
+            if (!trainer)
+                return 1;
 
             trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
             core::Tensor::trim_memory_pool();
@@ -1273,6 +1286,52 @@ namespace lfs::app {
                 return 1;
             }
             LOG_INFO("Evaluation written to {}", core::path_to_utf8(params->dataset.output_path));
+            core::teardown_gpu_before_exit();
+            core::mark_clean_exit();
+            core::flush_and_exit(0);
+        }
+
+        int runHeadlessMesh(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
+            core::Scene scene;
+            auto trainer = loadFinishedModel(params, scene);
+            if (!trainer)
+                return 1;
+            core::Tensor::trim_memory_pool();
+            int result = 0;
+            try {
+                const auto& dataset = trainer->train_dataset();
+                std::vector<core::Camera*> cameras;
+                cameras.reserve(dataset->size());
+                for (size_t i = 0; i < dataset->size(); ++i)
+                    cameras.push_back(dataset->get_camera(i));
+                HeadlessRunCoordinator run;
+                TerminalProgressBar bar("Mesh");
+                const auto mesh = training::extract_splat_mesh(trainer->get_strategy_mutable().get_model(), cameras, *params->mesh_settings,
+                                                               run.stop_token(), std::bind_front(&TerminalProgressBar::report, &bar));
+                core::native_fs::create_directories(params->mesh_output.parent_path());
+                training::write_splat_mesh_ply(mesh, params->mesh_output);
+                bar.complete();
+                const auto& settings = *params->mesh_settings;
+                const nlohmann::json report{{"voxel_size", settings.voxel_size}, {"trunc_voxels", settings.trunc_voxels},
+                                            {"full_weight_range", settings.full_weight_range}, {"views", mesh.views}, {"blocks", mesh.blocks},
+                                            {"band_voxels", mesh.band_voxels}, {"raw_faces", mesh.raw_faces}, {"vertices", mesh.vertices.size()},
+                                            {"faces", mesh.faces.size()}, {"components_kept", mesh.components_kept},
+                                            {"components_total", mesh.components_total}, {"area", mesh.area},
+                                            {"colored_vertex_share", mesh.colored_vertex_share}, {"seconds_render", mesh.seconds_render},
+                                            {"seconds_fusion", mesh.seconds_fusion}, {"seconds_extract", mesh.seconds_extract},
+                                            {"seconds_color", mesh.seconds_color}};
+                auto report_path = params->mesh_output;
+                report_path.replace_extension(".json");
+                std::ofstream(core::native_fs::native_path(report_path)) << report.dump(2);
+                LOG_INFO("Mesh written to {}: {} vertices, {} faces", core::path_to_utf8(params->mesh_output), mesh.vertices.size(), mesh.faces.size());
+            } catch (const std::exception& e) {
+                LOG_ERROR("Mesh extraction failed: {}", e.what());
+                result = 1;
+            }
+            trainer->shutdown();
+            static_cast<void>(trainer.release());
+            if (result != 0)
+                return result;
             core::teardown_gpu_before_exit();
             core::mark_clean_exit();
             core::flush_and_exit(0);
@@ -1816,6 +1875,10 @@ namespace lfs::app {
 
         if (params->evaluate_only) {
             return runHeadlessEvaluation(std::move(params));
+        }
+
+        if (params->mesh_settings) {
+            return runHeadlessMesh(std::move(params));
         }
 
         if (params->dataset_project) {

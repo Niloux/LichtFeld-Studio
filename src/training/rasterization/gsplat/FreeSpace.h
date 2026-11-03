@@ -20,6 +20,9 @@ namespace gsplat_lfs {
         float unit = 1.0f;          // scene units per file unit
         float margin = 0.0f;        // scene units
         float margin_rel = 0.0f;    // fraction of the scan depth
+        // [C, H, W], written by the forward: the depth of the splat that takes transmittance
+        // below 0.5, 0 where none does. Works without a scan.
+        float* median_depth = nullptr;
 
         [[nodiscard]] bool enabled() const { return gt_depth != nullptr && T_front != nullptr; }
 

@@ -2334,6 +2334,14 @@ endif()
 add_test(NAME ColorVarianceContracts COMMAND color_variance_tests)
 set_tests_properties(ColorVarianceContracts PROPERTIES LABELS "fast;gpu" TIMEOUT 120)
 
+add_executable(splat_mesh_tests test_main.cpp test_splat_mesh.cpp)
+target_compile_features(splat_mesh_tests PRIVATE cxx_std_23)
+target_include_directories(splat_mesh_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/training ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(splat_mesh_tests PRIVATE lfs_training lfs_core GTest::gtest CUDA::cudart)
+add_test(NAME SplatMesh COMMAND splat_mesh_tests)
+set_tests_properties(SplatMesh PROPERTIES LABELS "fast;gpu" TIMEOUT 120)
+
 add_executable(gsplat_tests test_main.cpp test_gsplat_rasterizer.cpp)
 target_compile_features(gsplat_tests PRIVATE cxx_std_23)
 target_include_directories(gsplat_tests PRIVATE

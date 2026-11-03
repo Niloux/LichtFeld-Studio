@@ -1072,7 +1072,7 @@ namespace lfs::app {
         const auto& parsed = **val_res;
         if (!parsed.optimization.headless || !parsed.view_paths.empty() || parsed.project_path ||
             parsed.resume_checkpoint || parsed.resume_project || parsed.render_path ||
-            parsed.import_cameras_path || parsed.evaluate_only) {
+            parsed.import_cameras_path || parsed.evaluate_only || parsed.mesh_settings) {
             error = "Batch jobs must select headless training of the job's dataset; viewer, resume and other modes are not supported";
             return false;
         }

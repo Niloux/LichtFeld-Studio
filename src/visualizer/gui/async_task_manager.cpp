@@ -50,6 +50,8 @@
 #include "sequencer/reveal_render_state.hpp"
 #include "sequencer/sequencer_controller.hpp"
 #include "shaders/shader_service.hpp"
+#include "training/rasterization/gsplat_rasterizer.hpp"
+#include "training/splat_mesh.hpp"
 #include "training/training_manager.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
@@ -4038,6 +4040,48 @@ namespace lfs::vis::gui {
         });
     }
 
+    void AsyncTaskManager::startSplatMesh(core::SplatMeshSettings settings, const std::filesystem::path& path) {
+        if (!viewer_->isOnViewerThread())
+            throw core::collisionError("selection.operation_failed_generic", "Mesh capture requires the viewer thread");
+        pollCollision();
+        if (const auto state = collisionJob(); state && state->running())
+            throw core::collisionError("projects.gallery.eligibility.busy", "A collision or mesh job is already running");
+        auto* manager = viewer_->getSceneManager();
+        if (!manager)
+            throw core::collisionError("runtime.no_scene_manager", "No scene manager");
+        if (const auto* trainer = manager->getTrainerManager(); trainer && trainer->isTrainingActive())
+            throw core::collisionError("mesh.training_active", "Stop training before extracting a mesh");
+        const auto selected = manager->getSelectedNodeIds();
+        auto& scene = manager->getScene();
+        const auto* node = selected.size() == 1 ? scene.getNodeById(selected.front()) : nullptr;
+        if (!node || node->type != core::NodeType::SPLAT || !node->model)
+            throw core::collisionError("collision.source_unavailable", "Select exactly one loaded splat node");
+        if (node->model->lod_tree && node->model->lod_tree->has_tree())
+            throw core::collisionError("collision.source_unavailable", "Meshing needs the complete model, not a level-of-detail tree");
+        std::vector<std::shared_ptr<core::Camera>> cameras;
+        for (auto& camera : scene.getAllCameras())
+            if (camera && camera->split() != core::CameraSplit::Eval)
+                cameras.push_back(std::move(camera));
+        if (cameras.empty())
+            throw core::collisionError("mesh.no_cameras", "The mesh needs the cameras of the dataset; load the project or dataset the model was trained on");
+        auto model = std::make_shared<core::SplatData>(node->model->clone());
+        if (model->has_deleted_mask())
+            (void)model->apply_deleted();
+        mesh_name_ = node->name + "_mesh";
+        mesh_transform_ = scene.getWorldTransform(node->id);
+        launchCollision([this, settings, path, model = std::move(model), cameras = std::move(cameras)](std::stop_token stop, const core::ProgressCallback& progress) {
+            std::vector<core::Camera*> views;
+            views.reserve(cameras.size());
+            for (const auto& camera : cameras)
+                views.push_back(camera.get());
+            const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress);
+            training::write_splat_mesh_ply(mesh, path);
+            mesh_result_ = std::make_shared<core::MeshData>(training::splat_mesh_to_mesh_data(mesh));
+            (void)training::release_gsplat_rasterizer_thread_local_caches();
+            return false;
+        });
+    }
+
     void AsyncTaskManager::launchCollision(std::function<bool(std::stop_token, const core::ProgressCallback&)> work) {
         if (collisionWorkerActive() || collision_replacement_)
             throw core::collisionError("projects.gallery.eligibility.busy", "A collision worker or scene replacement is still pending");
@@ -4129,6 +4173,27 @@ namespace lfs::vis::gui {
                 installed = true;
             } catch (const std::exception& e) {
                 LOG_ERROR("Collision completion failed: {}", e.what());
+                jobs_.failed(collision_job_, core::localizedCollisionError(e));
+            }
+        }
+        if (auto mesh = std::move(mesh_result_); mesh && !state->worker_canceled && state->error.empty() && !state->cancel_requested &&
+                                                 viewer_->project_lifecycle_ && collision_epoch_ == viewer_->project_lifecycle_->documentEpoch()) {
+            try {
+                auto* scene_manager = viewer_->getSceneManager();
+                if (!scene_manager)
+                    throw core::collisionError("runtime.no_scene_manager", "No scene manager");
+                auto& scene = scene_manager->getScene();
+                const op::SceneGraphCaptureOptions options{.include_selected_nodes = false, .include_scene_context = false, .scoped_topology = true};
+                auto before = op::SceneGraphPatchEntry::captureStateByIds(*scene_manager, {}, options);
+                const auto id = scene.addMesh(mesh_name_, std::move(mesh));
+                if (id == core::NULL_NODE)
+                    throw core::collisionError("selection.operation_failed_generic", "Cannot add mesh node");
+                scene.getNodeById(id)->local_transform.set(mesh_transform_, false);
+                op::undoHistory().push(std::make_unique<op::SceneGraphPatchEntry>(
+                    *scene_manager, LOC("mesh.title"), std::move(before),
+                    op::SceneGraphPatchEntry::captureStateByIds(*scene_manager, {id}, options)));
+            } catch (const std::exception& e) {
+                LOG_ERROR("Mesh completion failed: {}", e.what());
                 jobs_.failed(collision_job_, core::localizedCollisionError(e));
             }
         }

@@ -294,6 +294,8 @@ namespace lfs::training {
 
         // Mutable access for controlled callbacks (e.g., Python control layer)
         IStrategy& get_strategy_mutable() { return *strategy_; }
+        // The cameras it trains on, without held-out views.
+        [[nodiscard]] const std::shared_ptr<CameraDataset>& train_dataset() const { return train_dataset_; }
 
         // Allow viewer to lock for rendering
         std::shared_mutex& getRenderMutex() const { return render_mutex_; }

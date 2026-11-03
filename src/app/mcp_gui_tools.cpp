@@ -2476,6 +2476,24 @@ namespace lfs::app {
                 });
             });
         registry.register_tool(
+            McpTool{.name = "scene.generate_mesh",
+                    .description = "Mesh exactly one selected loaded splat from the scene's cameras into a PLY and a new undoable mesh node; observe collision.main",
+                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}}, .required = {"path"}},
+                    .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
+            [viewer, viewer_impl](const json& args) -> json {
+                return post_and_wait(viewer, [viewer_impl, args]() -> json {
+                    if (!viewer_impl->getGuiManager())
+                        throw std::runtime_error("GUI manager is not initialized");
+                    core::SplatMeshSettings settings;
+                    settings.voxel_size = args.value("voxel_size", settings.voxel_size);
+                    settings.view_stride = args.value("view_stride", settings.view_stride);
+                    settings.full_weight_range = args.value("full_weight_range", settings.full_weight_range);
+                    settings.min_views = args.value("min_views", settings.min_views);
+                    viewer_impl->getGuiManager()->asyncTasks().startSplatMesh(settings, core::utf8_to_path(args.at("path").get<std::string>()));
+                    return json{{"job_id", "collision.main"}};
+                });
+            });
+        registry.register_tool(
             McpTool{.name = "scene.export_collision",
                     .description = "Export a collision node UUID to a voxel JSON/binary pair; caller approves replacing both files",
                     .input_schema = {.type = "object", .properties = json{{"uuid", {{"type", "string"}}}, {"path", {{"type", "string"}}}}, .required = {"uuid", "path"}},

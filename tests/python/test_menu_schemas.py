@@ -436,8 +436,8 @@ def test_tools_menu_contains_processing_and_python_tools(monkeypatch):
     items = tools_mod.ToolsMenu().menu_items()
     labels = [item.get("label") for item in items]
     assert labels == ["tr:menu.file.mesh_to_splat", "tr:menu.file.extract_video_frames",
-                      "tr:rendering_panel.section_simplify", "tr:collision.title", None, "tr:menu.tools.developer", "tr:menu.tools.plugin_marketplace"]
-    items[5]["items"][0]["callback"]()
+                      "tr:rendering_panel.section_simplify", "tr:collision.title", "tr:mesh.title", None, "tr:menu.tools.developer", "tr:menu.tools.plugin_marketplace"]
+    items[6]["items"][0]["callback"]()
     items[2]["callback"]()
     state["panels"]["lfs.collision"] = SimpleNamespace(show=lambda export=False: state.__setitem__("collision_export", export))
     items[3]["callback"]()

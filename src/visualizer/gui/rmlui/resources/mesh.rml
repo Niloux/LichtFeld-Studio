@@ -1,0 +1,23 @@
+<rml>
+  <head>
+    <link type="text/template" href="floating_window.rml" />
+    <link type="text/rcss" href="rendering.rcss" />
+    <link type="text/rcss" href="export_panel.rcss" />
+  </head>
+  <body template="floating-window" data-model="mesh">
+    <div data-if="mesh_source == ''" class="text-muted">@tr:rendering_panel.simplify_select_source</div>
+    <div data-if="mesh_source != ''"><span>@tr:rendering_panel.simplify_source</span>: {{mesh_source}}</div>
+    <div class="text-muted">@tr:mesh.hint</div>
+    <div id="mesh-fields"></div>
+    <div data-if="mesh_active">
+      <progress max="1" data-attr-value="mesh_progress" />
+      <span>{{mesh_status}}</span>
+    </div>
+    <div data-if="mesh_error != ''" class="text-error"><span>@tr:status.error</span>: {{mesh_error}}</div>
+    <div class="ep-buttons">
+      <button class="btn btn--primary" data-attrif-disabled="mesh_source == '' || mesh_active" data-event-click="mesh_generate">@tr:new_project.create</button>
+      <button data-if="!mesh_active" class="btn btn--secondary ep-action-btn" data-event-click="mesh_close">@tr:common.cancel</button>
+      <button data-if="mesh_active" class="btn btn--secondary ep-action-btn" data-event-click="mesh_cancel">@tr:common.cancel</button>
+    </div>
+  </body>
+</rml>
