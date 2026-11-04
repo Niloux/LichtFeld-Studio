@@ -38,7 +38,8 @@ other scenes.
 | Full-weight range | 1 | Views beyond it count less, by 1/r², so close views win. 0 weighs all equally |
 | Minimum views | 3 | Views a voxel needs. Higher removes floaters and opens holes |
 | Simplify tolerance | 0.005 | Surface deviation allowed when reducing faces, spending more faces where colors change. 0 keeps every face |
-| Truncation (CLI) | 4 voxels | Smaller bands open holes on weakly observed surfaces |
+| Fill holes (CLI) | 0.3 | Closes holes with a shorter rim using an interpolated patch, not an observed surface. 0 leaves them open |
+| Truncation (CLI) | 0.08 | Band around the surface. Narrower bands open holes where views disagree on depth |
 | Minimum component (CLI) | 100 faces | Thin objects can split into small pieces, so keep it low |
 
 GPU memory holds the TSDF, 10 bytes per voxel of each touched block. RAM holds one depth map per

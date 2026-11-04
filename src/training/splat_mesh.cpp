@@ -61,13 +61,14 @@ namespace lfs::training {
 
         void validate(const core::SplatMeshSettings& s) {
             const bool ok = std::isfinite(s.voxel_size) && s.voxel_size > 0 && s.block_voxels >= 2 && s.block_voxels <= 32 &&
-                            std::isfinite(s.trunc_voxels) && s.trunc_voxels > 0 && std::isfinite(s.full_weight_range) &&
+                            std::isfinite(s.truncation) && s.truncation > 0 && std::isfinite(s.fill_hole_perimeter) &&
+                            s.fill_hole_perimeter >= 0 && std::isfinite(s.full_weight_range) &&
                             s.full_weight_range >= 0 && s.view_stride >= 1 && s.color_stride >= 1 && s.min_views >= 1 &&
                             s.min_views <= 65535 && s.min_component_faces >= 0 && s.max_width >= 16 &&
                             std::isfinite(s.simplify_error) && s.simplify_error >= 0;
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
-                                     std::format("{}; {}", s.voxel_size, s.trunc_voxels));
+                                     std::format("{}; {}", s.voxel_size, s.truncation));
         }
 
         void device_buffer_preflight(const size_t bytes, const char* operation) {
@@ -402,6 +403,77 @@ namespace lfs::training {
         mesh.faces = std::move(faces);
     }
 
+    size_t fill_small_mesh_holes(SplatMesh& mesh, const float max_perimeter) {
+        if (max_perimeter <= 0.f)
+            return 0;
+        const auto key = [](const int32_t from, const int32_t to) { return (uint64_t(uint32_t(from)) << 32) | uint32_t(to); };
+        std::vector<uint64_t> directed;
+        directed.reserve(mesh.faces.size() * 3);
+        for (const auto& f : mesh.faces)
+            for (int i = 0; i < 3; ++i)
+                directed.push_back(key(f[i], f[(i + 1) % 3]));
+        std::ranges::sort(directed);
+        // A rim edge has no triangle on its other side. Sorted by start vertex, so a walk can find what follows.
+        std::vector<uint64_t> rim;
+        for (const auto edge : directed)
+            if (!std::ranges::binary_search(directed, (edge << 32) | (edge >> 32)))
+                rim.push_back(edge);
+        directed = {};
+        const auto rim_start = [&](const int32_t vertex) { return std::ranges::lower_bound(rim, key(vertex, 0)) - rim.begin(); };
+        std::vector<char> used(rim.size(), 0);
+        const auto edge_length = [&](const int32_t a, const int32_t b) {
+            const auto& p = mesh.vertices[a];
+            const auto& q = mesh.vertices[b];
+            return std::hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+        };
+        size_t filled = 0;
+        std::vector<int32_t> loop;
+        for (size_t first = 0; first < rim.size(); ++first) {
+            if (used[first])
+                continue;
+            used[first] = 1;
+            const auto start = static_cast<int32_t>(rim[first] >> 32);
+            auto current = static_cast<int32_t>(rim[first] & 0xffffffffu);
+            float perimeter = edge_length(start, current);
+            loop.assign({start});
+            bool closed = false;
+            while (perimeter <= max_perimeter) {
+                if (current == start) {
+                    closed = true;
+                    break;
+                }
+                loop.push_back(current);
+                size_t next = rim_start(current);
+                while (next < rim.size() && static_cast<int32_t>(rim[next] >> 32) == current && used[next])
+                    ++next;
+                if (next == rim.size() || static_cast<int32_t>(rim[next] >> 32) != current)
+                    break;
+                used[next] = 1;
+                const auto following = static_cast<int32_t>(rim[next] & 0xffffffffu);
+                perimeter += edge_length(current, following);
+                current = following;
+            }
+            if (!closed || loop.size() < 3)
+                continue;
+            // The rim runs along existing triangles, so the new ones run against it.
+            if (loop.size() == 3) {
+                mesh.faces.push_back({loop[2], loop[1], loop[0]});
+            } else {
+                std::array<double, 3> center{0., 0., 0.};
+                for (const auto vertex : loop)
+                    for (int i = 0; i < 3; ++i)
+                        center[i] += mesh.vertices[vertex][i];
+                const auto middle = static_cast<int32_t>(mesh.vertices.size());
+                const double count = static_cast<double>(loop.size());
+                mesh.vertices.push_back({float(center[0] / count), float(center[1] / count), float(center[2] / count)});
+                for (size_t i = 0; i < loop.size(); ++i)
+                    mesh.faces.push_back({loop[(i + 1) % loop.size()], loop[i], middle});
+            }
+            ++filled;
+        }
+        return filled;
+    }
+
     void compute_splat_mesh_normals(SplatMesh& mesh) {
         std::vector<std::array<double, 3>> sum(mesh.vertices.size(), {0., 0., 0.});
         double area = 0.;
@@ -491,7 +563,7 @@ namespace lfs::training {
         mesh.views = views.size();
         Tsdf tsdf;
         tsdf.grid = {.voxel = settings.voxel_size, .block = static_cast<uint32_t>(settings.block_voxels),
-                     .trunc = settings.voxel_size * settings.trunc_voxels, .full_weight_range = settings.full_weight_range};
+                     .trunc = settings.truncation, .full_weight_range = settings.full_weight_range};
 
         CameraSizes sizes;
         for (auto* camera : views)
@@ -558,6 +630,7 @@ namespace lfs::training {
         remove_small_mesh_components(mesh, settings.min_component_faces);
         if (mesh.faces.empty())
             throw collisionError("mesh.empty", "No surface survived; lower the view count or use a larger voxel size");
+        mesh.holes_filled = fill_small_mesh_holes(mesh, settings.fill_hole_perimeter);
         compute_splat_mesh_normals(mesh);
         mesh.seconds_extract = seconds_since(step);
 

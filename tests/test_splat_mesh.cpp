@@ -84,6 +84,60 @@ TEST(SplatMesh, SmallComponentsGoAndLargeOnesStay) {
     EXPECT_EQ(mesh.components_total, 2u);
 }
 
+namespace {
+    // A flat grid of 2 cm cells facing +z, with the listed cells left out.
+    SplatMesh grid_without(const std::vector<std::pair<int, int>>& missing) {
+        constexpr int n = 41;
+        SplatMesh mesh;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x)
+                mesh.vertices.push_back({x * .02f, y * .02f, 0.f});
+        for (int y = 0; y + 1 < n; ++y)
+            for (int x = 0; x + 1 < n; ++x) {
+                if (std::ranges::find(missing, std::pair{x, y}) != missing.end())
+                    continue;
+                const int a = y * n + x;
+                mesh.faces.push_back({a, a + 1, a + n + 1});
+                mesh.faces.push_back({a, a + n + 1, a + n});
+            }
+        return mesh;
+    }
+
+    size_t rim_edges(const SplatMesh& mesh) {
+        std::vector<std::pair<int32_t, int32_t>> edges;
+        for (const auto& f : mesh.faces)
+            for (int i = 0; i < 3; ++i)
+                edges.emplace_back(f[i], f[(i + 1) % 3]);
+        std::ranges::sort(edges);
+        return std::ranges::count_if(edges, [&](const auto& e) { return !std::ranges::binary_search(edges, std::pair{e.second, e.first}); });
+    }
+} // namespace
+
+TEST(SplatMesh, FillClosesSmallHolesFacingTheSameWay) {
+    auto mesh = grid_without({{10, 10}, {11, 10}, {30, 30}});
+    const auto outer_rim = rim_edges(grid_without({}));
+    const auto before = mesh.faces.size();
+    EXPECT_EQ(lfs::training::fill_small_mesh_holes(mesh, .3f), 2u);
+    EXPECT_GT(mesh.faces.size(), before);
+    EXPECT_EQ(rim_edges(mesh), outer_rim);
+    lfs::training::compute_splat_mesh_normals(mesh);
+    EXPECT_NEAR(mesh.area, .8 * .8, 1e-4);
+    for (const auto& n : mesh.normals)
+        EXPECT_GT(n[2], .99f);
+}
+
+TEST(SplatMesh, FillLeavesLargeHolesAndTheOuterRimOpen) {
+    std::vector<std::pair<int, int>> missing;
+    for (int y = 10; y < 20; ++y)
+        for (int x = 10; x < 20; ++x)
+            missing.emplace_back(x, y);
+    auto mesh = grid_without(missing);
+    const auto faces = mesh.faces.size();
+    EXPECT_EQ(lfs::training::fill_small_mesh_holes(mesh, .3f), 0u);
+    EXPECT_EQ(mesh.faces.size(), faces);
+    EXPECT_EQ(lfs::training::fill_small_mesh_holes(mesh, 0.f), 0u);
+}
+
 TEST(SplatMesh, SimplifyStaysOnTheSurfaceWithFewerFaces) {
     constexpr float voxel = .04f, tolerance = .01f;
     auto mesh = sphere_mesh(voxel);

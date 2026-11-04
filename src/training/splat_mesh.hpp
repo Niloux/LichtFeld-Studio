@@ -30,6 +30,7 @@ namespace lfs::training {
         size_t blocks = 0;
         uint64_t band_voxels = 0;
         size_t raw_faces = 0;
+        size_t holes_filled = 0;
         size_t faces_before_simplify = 0;
         float simplify_result_error = 0.f;
         size_t components_kept = 0;
@@ -57,6 +58,9 @@ namespace lfs::training {
                       float max_step = 1.5f);
     // Removes connected components with fewer faces and the vertices they leave unused.
     void remove_small_mesh_components(SplatMesh& mesh, int min_faces);
+    // Closes open boundaries with a rim shorter than max_perimeter scene units, by a fan around a
+    // new center vertex. Runs before normals and colors exist. Returns how many it closed.
+    size_t fill_small_mesh_holes(SplatMesh& mesh, float max_perimeter);
     // Area-weighted vertex normals and the mesh area.
     void compute_splat_mesh_normals(SplatMesh& mesh);
     // Reduces faces while the surface stays within about max_error scene units, moving the kept
