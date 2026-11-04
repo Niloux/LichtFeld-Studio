@@ -84,6 +84,66 @@ TEST(SplatMesh, SmallComponentsGoAndLargeOnesStay) {
     EXPECT_EQ(mesh.components_total, 2u);
 }
 
+TEST(SplatMesh, SimplifyStaysOnTheSurfaceWithFewerFaces) {
+    constexpr float voxel = .04f, tolerance = .01f;
+    auto mesh = sphere_mesh(voxel);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    const size_t before = mesh.faces.size();
+    lfs::training::simplify_splat_mesh(mesh, tolerance, 1.f);
+    EXPECT_LT(mesh.faces.size(), before / 2);
+    EXPECT_EQ(mesh.faces_before_simplify, before);
+    ASSERT_EQ(mesh.normals.size(), mesh.vertices.size());
+    ASSERT_EQ(mesh.colors.size(), mesh.vertices.size());
+    EXPECT_NEAR(mesh.area / (4. * std::numbers::pi), 1., .1);
+    std::vector<char> used(mesh.vertices.size(), 0);
+    for (const auto& face : mesh.faces)
+        for (const auto vertex : face) {
+            ASSERT_GE(vertex, 0);
+            ASSERT_LT(size_t(vertex), mesh.vertices.size());
+            used[vertex] = 1;
+        }
+    EXPECT_EQ(std::ranges::count(used, char{0}), 0);
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const auto& p = mesh.vertices[i];
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, voxel / 2 + 2 * tolerance);
+        EXPECT_EQ(mesh.colors[i], (std::array<uint8_t, 3>{10, 20, 30}));
+    }
+}
+
+TEST(SplatMesh, SimplifyWithoutToleranceKeepsEveryFace) {
+    auto mesh = sphere_mesh(.04f);
+    const auto faces = mesh.faces;
+    const auto vertices = mesh.vertices;
+    lfs::training::simplify_splat_mesh(mesh, 0.f, 1.f);
+    EXPECT_EQ(mesh.faces, faces);
+    EXPECT_EQ(mesh.vertices, vertices);
+}
+
+TEST(SplatMesh, SimplifyKeepsMoreFacesWhereTheColorChanges) {
+    // A flat grid has no shape to keep, so only the color stripes can hold faces back.
+    const auto stripes = [] {
+        constexpr int n = 101;
+        SplatMesh mesh;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                mesh.vertices.push_back({x * .02f, y * .02f, 0.f});
+                const auto level = static_cast<uint8_t>((x / 5) % 2 ? 255 : 0);
+                mesh.colors.push_back({level, level, level});
+            }
+        for (int y = 0; y + 1 < n; ++y)
+            for (int x = 0; x + 1 < n; ++x) {
+                const int a = y * n + x;
+                mesh.faces.push_back({a, a + 1, a + n + 1});
+                mesh.faces.push_back({a, a + n + 1, a + n});
+            }
+        return mesh;
+    };
+    auto plain = stripes(), colored = stripes();
+    lfs::training::simplify_splat_mesh(plain, .01f, 0.f);
+    lfs::training::simplify_splat_mesh(colored, .01f, 20.f);
+    EXPECT_LT(plain.faces.size() * 4, colored.faces.size());
+}
+
 TEST(SplatMesh, PlyHasTheHeaderCountsAndRecordSizes) {
     SplatMesh mesh;
     mesh.vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};

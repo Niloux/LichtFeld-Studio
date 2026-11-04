@@ -25,6 +25,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <meshoptimizer.h>
 #include <numeric>
 
 namespace lfs::training {
@@ -37,6 +38,9 @@ namespace lfs::training {
         constexpr uint64_t kAxisStep[3] = {uint64_t{1}, uint64_t{1} << gsplat_lfs::kTsdfKeyBits,
                                            uint64_t{1} << (2 * gsplat_lfs::kTsdfKeyBits)};
         constexpr uint64_t kAxisMask = (uint64_t{1} << gsplat_lfs::kTsdfKeyBits) - 1;
+        // Measured on a 30k indoor scene at 2 cm voxels and 1 cm tolerance: a weight of 20 loses 0.16 dB
+        // of color against the photos, and a weight 400 times smaller loses 1 dB.
+        constexpr float kSimplifyColorWeightPerVoxel = 1000.f;
 
         template <class T>
         struct DeviceArray {
@@ -59,7 +63,8 @@ namespace lfs::training {
             const bool ok = std::isfinite(s.voxel_size) && s.voxel_size > 0 && s.block_voxels >= 2 && s.block_voxels <= 32 &&
                             std::isfinite(s.trunc_voxels) && s.trunc_voxels > 0 && std::isfinite(s.full_weight_range) &&
                             s.full_weight_range >= 0 && s.view_stride >= 1 && s.color_stride >= 1 && s.min_views >= 1 &&
-                            s.min_views <= 65535 && s.min_component_faces >= 0 && s.max_width >= 16;
+                            s.min_views <= 65535 && s.min_component_faces >= 0 && s.max_width >= 16 &&
+                            std::isfinite(s.simplify_error) && s.simplify_error >= 0;
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.trunc_voxels));
@@ -421,6 +426,53 @@ namespace lfs::training {
         }
     }
 
+    void simplify_splat_mesh(SplatMesh& mesh, const float max_error, const float color_weight) {
+        mesh.faces_before_simplify = mesh.faces.size();
+        if (max_error <= 0.f || mesh.faces.empty())
+            return;
+        const bool has_colors = mesh.colors.size() == mesh.vertices.size();
+        std::vector<float> attributes;
+        // The simplifier measures positions in units of the mesh extent.
+        const float weight = color_weight / std::max(meshopt_simplifyScale(mesh.vertices.front().data(), mesh.vertices.size(), sizeof(float) * 3), 1e-12f);
+        const float weights[3] = {weight, weight, weight};
+        // Always carried, so the colors of the vertices that move follow them.
+        if (has_colors) {
+            attributes.resize(mesh.vertices.size() * 3);
+            for (size_t v = 0; v < mesh.vertices.size(); ++v)
+                for (int c = 0; c < 3; ++c)
+                    attributes[3 * v + c] = float(mesh.colors[v][c]) / 255.f;
+        }
+        static_assert(sizeof(std::array<int32_t, 3>) == 3 * sizeof(unsigned int));
+        auto* indices = reinterpret_cast<unsigned int*>(mesh.faces.data());
+        float* positions = mesh.vertices.front().data();
+        const size_t index_count = meshopt_simplifyWithUpdate(
+            indices, mesh.faces.size() * 3, positions, mesh.vertices.size(), sizeof(float) * 3,
+            has_colors ? attributes.data() : nullptr, sizeof(float) * 3, weights, has_colors ? 3 : 0, nullptr,
+            0, max_error, meshopt_SimplifyErrorAbsolute | meshopt_SimplifyPrune, &mesh.simplify_result_error);
+        mesh.faces.resize(index_count / 3);
+
+        std::vector<int32_t> remap(mesh.vertices.size(), -1);
+        std::vector<std::array<float, 3>> vertices;
+        std::vector<std::array<uint8_t, 3>> colors;
+        for (auto& face : mesh.faces)
+            for (auto& vertex : face) {
+                auto& target = remap[vertex];
+                if (target < 0) {
+                    target = static_cast<int32_t>(vertices.size());
+                    vertices.push_back(mesh.vertices[vertex]);
+                    if (has_colors) {
+                        auto& color = colors.emplace_back();
+                        for (int c = 0; c < 3; ++c)
+                            color[c] = static_cast<uint8_t>(std::clamp(std::lround(255.f * attributes[3 * size_t(vertex) + c]), 0l, 255l));
+                    }
+                }
+                vertex = target;
+            }
+        mesh.vertices = std::move(vertices);
+        mesh.colors = std::move(colors);
+        compute_splat_mesh_normals(mesh);
+    }
+
     SplatMesh extract_splat_mesh(core::SplatData& model, const std::span<core::Camera* const> cameras,
                                  const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress) {
         validate(settings);
@@ -517,7 +569,7 @@ namespace lfs::training {
         DeviceArray<uint32_t> color_count(vertex_count, stream, true);
         const float tolerance = 2.5f * settings.voxel_size;
         for (size_t i = 0; i < views.size(); i += settings.color_stride) {
-            core::reportProgress(stop, progress, .85f + .15f * float(i) / views.size(), stage("mesh.stage_color", "Coloring"));
+            core::reportProgress(stop, progress, .85f + .1f * float(i) / views.size(), stage("mesh.stage_color", "Coloring"));
             auto& camera = *views[i];
             if (!camera.has_image())
                 continue;
@@ -552,7 +604,11 @@ namespace lfs::training {
         }
         mesh.colored_vertex_share = float(colored) / float(vertex_count);
         mesh.seconds_color = seconds_since(step);
-        core::reportProgress(stop, progress, 1.f, stage("mesh.stage_color", "Coloring"));
+        core::reportProgress(stop, progress, .95f, stage("mesh.stage_simplify", "Reducing faces"));
+        step = Clock::now();
+        simplify_splat_mesh(mesh, settings.simplify_error, kSimplifyColorWeightPerVoxel * settings.voxel_size);
+        mesh.seconds_simplify = seconds_since(step);
+        core::reportProgress(stop, progress, 1.f, stage("mesh.stage_simplify", "Reducing faces"));
         return mesh;
     }
 

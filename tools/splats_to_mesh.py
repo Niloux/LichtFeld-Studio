@@ -651,8 +651,58 @@ def read_mesh(path):
     return np.stack([data["x"], data["y"], data["z"]], axis=1), faces["v"].astype(np.int64)
 
 
+def resample_triangles(vertices, faces, spacing=0.02):
+    """Splits triangles into barycentric grids with edges of about spacing, on the same surface."""
+    device = vertices.device
+    a, b, c = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+    longest = torch.stack([(a - b).norm(dim=1), (b - c).norm(dim=1), (c - a).norm(dim=1)]).max(dim=0).values
+    level = torch.ceil(longest / spacing).long().clamp(1, 256)
+    out_vertices, out_faces = [], []
+    base = 0
+    for k in level.unique().tolist():
+        selected = faces[level == k]
+        grid = [(i, j) for i in range(k + 1) for j in range(k + 1 - i)]
+        ids = {g: n for n, g in enumerate(grid)}
+        weights = torch.tensor([[k - i - j, i, j] for i, j in grid], dtype=torch.float32, device=device) / k
+        triangles = []
+        for i in range(k):
+            for j in range(k - i):
+                triangles.append((ids[(i, j)], ids[(i + 1, j)], ids[(i, j + 1)]))
+                if i + j < k - 1:
+                    triangles.append((ids[(i + 1, j)], ids[(i + 1, j + 1)], ids[(i, j + 1)]))
+        triangles = torch.tensor(triangles, dtype=torch.int64, device=device)
+        for start in range(0, selected.shape[0], 500_000):
+            part = selected[start : start + 500_000]
+            out_vertices.append(torch.einsum("nkd,gk->ngd", vertices[part], weights).reshape(-1, 3))
+            offsets = base + torch.arange(part.shape[0], device=device)[:, None, None] * len(grid)
+            out_faces.append((triangles[None] + offsets).reshape(-1, 3))
+            base += part.shape[0] * len(grid)
+    return torch.cat(out_vertices), torch.cat(out_faces)
+
+
+def surface_points(vertices, faces, spacing=0.02):
+    """Area-uniform points and their triangle normals, so finely meshed regions do not count extra."""
+    a, b, c = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+    cross = torch.cross(b - a, c - a, dim=1)
+    area = 0.5 * cross.norm(dim=1)
+    generator = torch.Generator(device=vertices.device).manual_seed(0)
+    cumulative = torch.cumsum(area.double(), dim=0)
+    count = int(area.sum().item() / spacing**2)
+    picks = torch.rand(count, device=vertices.device, dtype=torch.float64, generator=generator) * cumulative[-1]
+    chosen = torch.searchsorted(cumulative, picks).clamp_max(faces.shape[0] - 1)
+    r = torch.rand((count, 2), device=vertices.device, generator=generator)
+    s = torch.sqrt(r[:, 0])
+    points = (1 - s)[:, None] * a[chosen] + (s * (1 - r[:, 1]))[:, None] * b[chosen] + (s * r[:, 1])[:, None] * c[chosen]
+    return points, F.normalize(cross[chosen], dim=1)
+
+
 def score_mesh(args):
-    """Reports on a mesh made elsewhere, such as by the mesh subcommand, on the held-out views."""
+    """Reports on a mesh made elsewhere, such as by the mesh subcommand, on the held-out views.
+
+    A simplified mesh has large triangles, which the rasterizer drops and the vertex-based metrics
+    undersample, so everything is measured on a resampled surface. Roughness and floor numbers from
+    before this are vertex-based and not comparable.
+    """
     device = "cuda"
     root = Path(args.dataset)
     cameras = sv.read_cameras(root / "sparse/0/cameras.bin")
@@ -661,12 +711,12 @@ def score_mesh(args):
         image["index"] = index
     held_out = images[::HELD_OUT_EVERY]
     v, f = read_mesh(args.mesh)
-    vertices = torch.as_tensor(v, device=device)
-    faces = torch.as_tensor(f, device=device)
-    normals, area = vertex_normals(vertices, faces)
+    vertices, faces = resample_triangles(torch.as_tensor(v, device=device), torch.as_tensor(f, device=device))
+    _, area = vertex_normals(vertices, faces)
+    points, normals = surface_points(vertices, faces)
     report = {"vertices": int(v.shape[0]), "faces": int(f.shape[0]), "area_m2": float(area.sum()),
               "held_out": view_report(held_out, cameras, root, vertices, faces, {}, device),
-              "roughness": roughness_report(vertices), "floor": floor_report(vertices, normals)}
+              "roughness": roughness_report(points), "floor": floor_report(points, normals)}
     if args.eval:
         report["eval"] = evaluate(args, held_out, cameras, root, vertices, faces, area, device)
     print(json.dumps(report, indent=2))

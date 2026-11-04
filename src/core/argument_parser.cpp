@@ -2586,6 +2586,7 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --color-stride <n>         Color from every Nth fused view (default 2)
   --min-views <n>            Views a voxel needs to count as observed (default 3)
   --min-component-faces <n>  Drop smaller connected pieces (default 100)
+  --simplify-error <v>       Reduce faces within this surface deviation; 0 keeps all (default 0.005)
   --render-width <n>         Render and photo width limit (default 1600)
   --all-views                Also fuse the held-out views
 )";
@@ -2635,6 +2636,8 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.min_views = std::stoi(value());
                 } else if (flag == "--min-component-faces") {
                     settings.min_component_faces = std::stoi(value());
+                } else if (flag == "--simplify-error") {
+                    settings.simplify_error = std::stof(value());
                 } else if (flag == "--render-width") {
                     settings.max_width = std::stoi(value());
                 } else if (flag == "--all-views") {

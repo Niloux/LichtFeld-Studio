@@ -160,6 +160,8 @@ target_include_directories(lfs_training SYSTEM PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external>
 )
 
+find_package(meshoptimizer CONFIG REQUIRED)
+
 # Link dependencies
 target_link_libraries(lfs_training
     PUBLIC
@@ -172,6 +174,7 @@ target_link_libraries(lfs_training
         gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
+        meshoptimizer::meshoptimizer
 )
 
 if(LFS_TRAINER_ONLY)

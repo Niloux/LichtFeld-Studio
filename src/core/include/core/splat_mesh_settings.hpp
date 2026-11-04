@@ -14,6 +14,7 @@ namespace lfs::core {
         int color_stride = 2;          // color from every Nth fused view
         int min_views = 3;             // views a voxel needs to count as observed
         int min_component_faces = 100;
+        float simplify_error = .005f;  // surface deviation allowed when reducing faces; 0 keeps every face
         int max_width = 1600;          // render and photo width limit
         bool invert_mask = false;
         float mask_threshold = .5f;

@@ -30,6 +30,8 @@ namespace lfs::training {
         size_t blocks = 0;
         uint64_t band_voxels = 0;
         size_t raw_faces = 0;
+        size_t faces_before_simplify = 0;
+        float simplify_result_error = 0.f;
         size_t components_kept = 0;
         size_t components_total = 0;
         double area = 0.;
@@ -38,6 +40,7 @@ namespace lfs::training {
         double seconds_fusion = 0.;
         double seconds_extract = 0.;
         double seconds_color = 0.;
+        double seconds_simplify = 0.;
     };
 
     // Renders transmittance median depth from the cameras, fuses it into a sparse TSDF, extracts
@@ -56,6 +59,11 @@ namespace lfs::training {
     void remove_small_mesh_components(SplatMesh& mesh, int min_faces);
     // Area-weighted vertex normals and the mesh area.
     void compute_splat_mesh_normals(SplatMesh& mesh);
+    // Reduces faces while the surface stays within about max_error scene units, moving the kept
+    // vertices to fit and blending their colors. Larger color_weight keeps more faces where the
+    // color changes; it scales with scene size but is not a distance, and 0 ignores color and
+    // leaves kept vertices with their own colors. Refreshes normals and area.
+    void simplify_splat_mesh(SplatMesh& mesh, float max_error, float color_weight);
 
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path);
     [[nodiscard]] core::MeshData splat_mesh_to_mesh_data(const SplatMesh& mesh);

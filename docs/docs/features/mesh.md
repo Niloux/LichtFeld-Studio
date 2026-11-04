@@ -37,6 +37,7 @@ other scenes.
 | View stride | 2 | Fuse every Nth view. More views fill holes and roughen surfaces |
 | Full-weight range | 1 | Views beyond it count less, by 1/r², so close views win. 0 weighs all equally |
 | Minimum views | 3 | Views a voxel needs. Higher removes floaters and opens holes |
+| Simplify tolerance | 0.005 | Surface deviation allowed when reducing faces, spending more faces where colors change. 0 keeps every face |
 | Truncation (CLI) | 4 voxels | Smaller bands open holes on weakly observed surfaces |
 | Minimum component (CLI) | 100 faces | Thin objects can split into small pieces, so keep it low |
 

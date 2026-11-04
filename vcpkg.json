@@ -24,6 +24,7 @@
     "libjpeg-turbo",
     "libpng",
     "libwebp",
+    "meshoptimizer",
     "nlohmann-json",
     "openssl",
     "spdlog",
