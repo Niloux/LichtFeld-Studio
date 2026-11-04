@@ -81,9 +81,10 @@ namespace gsplat_lfs {
                                                const float* carve, uint32_t min_views,
                                                uint64_t* keys, float* tsdf, uint64_t* counter, cudaStream_t stream);
 
-    // Adds the photo [3, H, W] to the vertices this view sees as its surface.
-    void mesh_color_accumulate(const float* vertices, uint32_t vertex_count, const TsdfView& view,
-                               const float* depth, const float* photo, float tolerance,
-                               float* color_sum, uint32_t* color_count, cudaStream_t stream);
+    // Adds the photo [3, H, W] to the vertices this view sees as its surface, weighted by 1 / distance.
+    // No weight by angle: on a flat floor seen at a low angle, the noise in the normals makes such a
+    // weight vary from vertex to vertex, and the colors mottle.
+    void mesh_color_accumulate(const float* vertices, uint32_t vertex_count, const TsdfView& view, const float* depth, const float* photo,
+                               float tolerance, float* color_sum, float* color_weight, cudaStream_t stream);
 
 } // namespace gsplat_lfs

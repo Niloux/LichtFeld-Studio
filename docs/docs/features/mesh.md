@@ -2,8 +2,11 @@
 
 Extracts a vertex-colored triangle mesh from a trained model. It renders transmittance median
 depth from the training cameras, fuses it into a sparse TSDF, extracts the surface with naive
-surface nets and colors the vertices from the photos. Pixels outside the dataset's masks are not
-fused. Fisheye, thin-prism, panoramic and rolling-shutter cameras are handled by the same camera
+surface nets and colors the vertices from the photos. Each photo counts by 1 / distance, so close
+views count more. A model trained with exposure correction or PPISP has each
+photo's exposure, vignetting and color taken back out first, so the colors match the model's render
+and not any one photo, and photos of different exposure do not leave visible patches. The per-photo
+residual grid of exposure correction is not undone. Pixels outside the dataset's masks are not fused. Fisheye, thin-prism, panoramic and rolling-shutter cameras are handled by the same camera
 models as training.
 
 Models trained with `--depth-distortion-weight` and `--normal-consistency-weight` give flatter
@@ -46,7 +49,10 @@ other scenes.
 GPU memory holds the TSDF, 10 bytes per voxel of each touched block. When it does not fit, fusion
 runs in slices of the scene, one at a time. RAM holds one depth map per fused view at the render
 width, 1600 pixels by default, and the mesh, so RAM is what limits fine voxels: halving the voxel
-size makes about four times the faces. Above 20 million faces, faces are reduced in pieces, in less
-RAM and in parallel, and the vertices shared between pieces are kept.
+size makes about four times the faces. After fusion the job estimates what the rest will take, about
+65 bytes per surface voxel, and stops with an error if that exceeds the free RAM. Faces are reduced in
+parallel pieces of at most 3 million faces and 4000 tolerances across, 20 m at the default: the
+simplifier's single-precision error measure cannot resolve the tolerance over a larger piece and then
+keeps most faces. The vertices shared between pieces are kept, a few percent of the output faces.
 
 `tools/splats_to_mesh.py --mesh mesh.ply` scores a mesh against held-out views and a LAS scan.

@@ -21,6 +21,11 @@ namespace lfs::training::kernels {
                                          int num_cameras, int num_frames, int camera_idx, int frame_idx,
                                          cudaStream_t stream = nullptr);
 
+    // Takes a photo back to what the forward pass was given.
+    void launch_ppisp_inverse_chw(const float* exposure_params, const float* vignetting_params, const float* color_params,
+                                  const float* crf_params, const float* rgb_in, float* rgb_out, int height, int width,
+                                  int camera_idx, int frame_idx, cudaStream_t stream = nullptr);
+
     // Backward pass (CHW layout)
     void launch_ppisp_backward_chw(const float* exposure_params, const float* vignetting_params,
                                    const float* color_params, const float* crf_params, const float* rgb_in,

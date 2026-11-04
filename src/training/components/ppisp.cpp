@@ -371,6 +371,17 @@ namespace lfs::training {
                              num_frames_, region);
     }
 
+    lfs::core::Tensor PPISP::invert(const lfs::core::Tensor& photo, const int camera_id, const int uid, const cudaStream_t stream) const {
+        assert(finalized_ && "Must call finalize() before invert()");
+        const auto& shape = photo.shape();
+        assert(shape.rank() == 3 && shape[0] == 3 && "Expected CHW layout with 3 channels");
+        auto output = lfs::core::Tensor::empty({3, shape[1], shape[2]}, lfs::core::Device::CUDA);
+        kernels::launch_ppisp_inverse_chw(exposure_params_.ptr<float>(), vignetting_params_.ptr<float>(), color_params_.ptr<float>(),
+                                          crf_params_.ptr<float>(), photo.ptr<float>(), output.ptr<float>(), static_cast<int>(shape[1]),
+                                          static_cast<int>(shape[2]), translate_camera(camera_id), translate_frame(uid), stream);
+        return output;
+    }
+
     lfs::core::Tensor PPISP::apply_interpolated_frames(const lfs::core::Tensor& rgb, int camera_id,
                                                        int left_uid, int right_uid, float fraction) {
         assert(finalized_ && fraction >= 0.0f && fraction <= 1.0f);

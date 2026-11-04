@@ -71,6 +71,27 @@ namespace lfs::training::kernels {
         rgb_out[2 * num_pixels + idx] = rgb.z;
     }
 
+    __global__ void ppisp_inverse_chw_kernel(int height, int width, const float* __restrict__ exposure_params,
+                                             const VignettingChannelParams* __restrict__ vignetting_params,
+                                             const ColorPPISPParams* __restrict__ color_params,
+                                             const CRFPPISPChannelParams* __restrict__ crf_params,
+                                             const float* __restrict__ rgb_in, float* __restrict__ rgb_out,
+                                             int camera_idx, int frame_idx) {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int num_pixels = height * width;
+        if (idx >= num_pixels)
+            return;
+        float3 rgb = make_float3(rgb_in[idx], rgb_in[num_pixels + idx], rgb_in[2 * num_pixels + idx]);
+        rgb = ppisp_invert_crf(rgb, &crf_params[camera_idx * 3]);
+        rgb = ppisp_invert_color(rgb, &color_params[frame_idx]);
+        rgb = ppisp_invert_vignetting(rgb, &vignetting_params[camera_idx * 3], make_float2(idx % width + 0.5f, idx / width + 0.5f),
+                                      static_cast<float>(width), static_cast<float>(height));
+        rgb = rgb * exp2f(-ppisp_exposure_value(exposure_params[frame_idx]));
+        rgb_out[idx] = rgb.x;
+        rgb_out[num_pixels + idx] = rgb.y;
+        rgb_out[2 * num_pixels + idx] = rgb.z;
+    }
+
     // Backward kernel (CHW layout)
     template <int BLOCK_SIZE>
     __global__ void ppisp_backward_chw_kernel(int height, int width, int num_cameras, int num_frames,
@@ -506,6 +527,17 @@ namespace lfs::training::kernels {
             reinterpret_cast<const CRFPPISPChannelParams*>(crf_params), rgb_in, rgb_out, camera_idx, frame_idx);
 
         LFS_CUDA_CHECK_MSG(cudaGetLastError(), "PPISP forward kernel launch failed");
+    }
+
+    void launch_ppisp_inverse_chw(const float* exposure_params, const float* vignetting_params, const float* color_params,
+                                  const float* crf_params, const float* rgb_in, float* rgb_out, int height, int width,
+                                  int camera_idx, int frame_idx, cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        ppisp_inverse_chw_kernel<<<divUp(height * width, PPISP_BLOCK_SIZE), PPISP_BLOCK_SIZE, 0, stream>>>(
+            height, width, exposure_params, reinterpret_cast<const VignettingChannelParams*>(vignetting_params),
+            reinterpret_cast<const ColorPPISPParams*>(color_params), reinterpret_cast<const CRFPPISPChannelParams*>(crf_params),
+            rgb_in, rgb_out, camera_idx, frame_idx);
+        LFS_CUDA_CHECK_MSG(cudaGetLastError(), "PPISP inverse kernel launch failed");
     }
 
     void launch_ppisp_forward_chw(const float* exposure_params, const float* vignetting_params,

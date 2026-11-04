@@ -16,6 +16,9 @@ namespace gsplat_lfs {
         // the frame at either end can still land inside it.
         constexpr float kReadoutMargin = 0.1f;
         constexpr uint32_t kNoBlock = ~uint32_t{0};
+        // Keep a view that sees a vertex at all from dropping to nothing, and depth noise on a
+        // very close view from taking over.
+        constexpr float kColorMinDistance = 0.5f;
 
         // Calls body once with this view's camera model.
         template <class Body>
@@ -322,24 +325,30 @@ namespace gsplat_lfs {
         }
 
         __global__ void color_kernel(const float* vertices, const uint32_t vertex_count, const TsdfView view, const float* depth,
-                                     const float* photo, const float tolerance, float* color_sum, uint32_t* color_count) {
+                                     const float* photo, const float tolerance, float* color_sum, float* color_weight) {
             const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
             if (first >= vertex_count)
                 return;
             const uint32_t pixels = view.width * view.height;
             const RollingShutterParameters readout = readout_of(view);
+            const float* m = view.viewmat;
+            // Center = -R^T t. The middle of the readout is close enough for a weight.
+            const glm::fvec3 center(-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]), -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
+                                    -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11]));
             with_model(view, [&](const auto& model) {
                 for (uint32_t v = first; v < min(first + kVerticesPerThread, vertex_count); ++v) {
-                    const Pixel pixel = project(model, view, readout, glm::fvec3(vertices[3 * v], vertices[3 * v + 1], vertices[3 * v + 2]));
+                    const glm::fvec3 point(vertices[3 * v], vertices[3 * v + 1], vertices[3 * v + 2]);
+                    const Pixel pixel = project(model, view, readout, point);
                     if (!pixel.valid)
                         continue;
                     const uint32_t at = pixel.y * view.width + pixel.x;
                     const float measured = depth[at];
                     if (!(measured > 0.f) || !(fabsf(measured - pixel.range) < tolerance))
                         continue;
+                    const float w = 1.f / fmaxf(glm::length(center - point), kColorMinDistance);
                     for (uint32_t c = 0; c < 3; ++c)
-                        color_sum[3 * v + c] += photo[c * pixels + at];
-                    color_count[v] += 1;
+                        color_sum[3 * v + c] += w * photo[c * pixels + at];
+                    color_weight[v] += w;
                 }
             });
         }
@@ -419,11 +428,10 @@ namespace gsplat_lfs {
         return count;
     }
 
-    void mesh_color_accumulate(const float* vertices, const uint32_t vertex_count, const TsdfView& view,
-                               const float* depth, const float* photo, const float tolerance,
-                               float* color_sum, uint32_t* color_count, cudaStream_t stream) {
+    void mesh_color_accumulate(const float* vertices, const uint32_t vertex_count, const TsdfView& view, const float* depth, const float* photo,
+                               const float tolerance, float* color_sum, float* color_weight, cudaStream_t stream) {
         const uint64_t threads = (static_cast<uint64_t>(vertex_count) + kVerticesPerThread - 1) / kVerticesPerThread;
-        color_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, vertex_count, view, depth, photo, tolerance, color_sum, color_count);
+        color_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, vertex_count, view, depth, photo, tolerance, color_sum, color_weight);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.color");
     }
 

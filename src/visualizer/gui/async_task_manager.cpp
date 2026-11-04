@@ -50,6 +50,7 @@
 #include "sequencer/reveal_render_state.hpp"
 #include "sequencer/sequencer_controller.hpp"
 #include "shaders/shader_service.hpp"
+#include "training/components/ppisp.hpp"
 #include "training/rasterization/gsplat_rasterizer.hpp"
 #include "training/splat_mesh.hpp"
 #include "training/training_manager.hpp"
@@ -77,6 +78,7 @@
 #include <string_view>
 #include <type_traits>
 #include <typeinfo>
+#include <sstream>
 
 namespace lfs::vis::gui {
 
@@ -4067,14 +4069,26 @@ namespace lfs::vis::gui {
         auto model = std::make_shared<core::SplatData>(node->model->clone());
         if (model->has_deleted_mask())
             (void)model->apply_deleted();
+        // The job gets its own copy: the scene can drop its appearance model while the job runs.
+        std::shared_ptr<training::PPISP> appearance;
+        const auto* trainer_manager = manager->getTrainerManager();
+        const auto* trainer = trainer_manager ? trainer_manager->getTrainer() : nullptr;
+        const training::PPISP* source = trainer && trainer->hasPPISP() ? trainer->getPPISP() : manager->getAppearancePPISP();
+        if (source && source->isFinalized()) {
+            std::stringstream bytes(std::ios::in | std::ios::out | std::ios::binary);
+            source->serialize(bytes);
+            appearance = std::make_shared<training::PPISP>(1);
+            appearance->deserialize(bytes);
+            LFS_CUDA_CHECK(cudaDeviceSynchronize());
+        }
         mesh_name_ = node->name + "_mesh";
         mesh_transform_ = scene.getWorldTransform(node->id);
-        launchCollision([this, settings, path, model = std::move(model), cameras = std::move(cameras)](std::stop_token stop, const core::ProgressCallback& progress) {
+        launchCollision([this, settings, path, model = std::move(model), cameras = std::move(cameras), appearance = std::move(appearance)](std::stop_token stop, const core::ProgressCallback& progress) {
             std::vector<core::Camera*> views;
             views.reserve(cameras.size());
             for (const auto& camera : cameras)
                 views.push_back(camera.get());
-            const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress);
+            const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress, appearance.get());
             training::write_splat_mesh_ply(mesh, path);
             mesh_result_ = std::make_shared<core::MeshData>(training::splat_mesh_to_mesh_data(mesh));
             (void)training::release_gsplat_rasterizer_thread_local_caches();

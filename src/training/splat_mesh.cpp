@@ -2,11 +2,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "splat_mesh.hpp"
 
+#include "components/ppisp.hpp"
 #include "components/rolling_shutter.hpp"
 #include "core/camera.hpp"
 #include "core/checked_arithmetic.hpp"
 #include "core/collision_volume.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/host_metrics.hpp"
 #include "core/logger.hpp"
 #include "core/memory_pressure.hpp"
 #include "core/mesh_data.hpp"
@@ -44,11 +46,21 @@ namespace lfs::training {
         constexpr uint64_t kAxisStep[3] = {uint64_t{1}, uint64_t{1} << gsplat_lfs::kTsdfKeyBits,
                                            uint64_t{1} << (2 * gsplat_lfs::kTsdfKeyBits)};
         constexpr uint64_t kAxisMask = (uint64_t{1} << gsplat_lfs::kTsdfKeyBits) - 1;
-        // Measured on a 30k indoor scene at 2 cm voxels and 1 cm tolerance: a weight of 20 loses 0.16 dB
-        // of color against the photos, and a weight 400 times smaller loses 1 dB.
-        constexpr float kSimplifyColorWeightPerVoxel = 1000.f;
+        // Against whole-mesh reduction on a 2 cm indoor scene at 5 mm: 17% fewer faces, 0.02 dB more color
+        // against the photos and a p99 deviation of 6.0 instead of 6.9 mm. At half this, 38% fewer faces and 0.02 dB less.
+        constexpr float kSimplifyColorWeight = 0.9f;
+        // The simplifier's single-precision quadrics lose a tolerance once a plane lies this many
+        // tolerances from the corner of its piece: at 5 mm, 25 m beyond a 6 m crop keeps 39% of the
+        // faces instead of 13%, and 100 m keeps 63%. Smaller pieces gain nothing and grow the seams.
+        constexpr float kPieceExtentPerTolerance = 4000.f;
         constexpr double kTsdfShareOfFreeMemory = 0.8;
+        // Sharper weights rest each vertex on fewer views and lost color on both test scenes.
         constexpr int kSimplifyThreads = 8;
+        // What RAM use rises by from the end of fusion to its peak, as measured on an outdoor scene at
+        // 4 cm, 2 cm and 1 cm with a range limit and an indoor one at 2 cm (5.6M to 105M voxels): within
+        // 0.2 GB of 0.3 GB + 65 bytes per voxel. Faces per voxel stay within 1.5 to 1.8.
+        constexpr double kRamBaseBytes = 0.3 * (1ull << 30);
+        constexpr double kRamBytesPerVoxel = 65.;
 
         template <class T>
         struct DeviceArray {
@@ -77,6 +89,19 @@ namespace lfs::training {
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.truncation));
+        }
+
+        // Fails now, rather than after minutes of extraction or in the page file.
+        void ram_preflight(const uint64_t voxels) {
+            const auto host = core::host_metrics::sample();
+            if (!host.ram_valid)
+                return;
+            const double needed = kRamBaseBytes + kRamBytesPerVoxel * double(voxels);
+            const double available = double(host.system_total_bytes - host.system_used_bytes);
+            LOG_INFO("Mesh: {} voxels need about {:.1f} GB of RAM, {:.1f} GB available", voxels, needed / (1ull << 30), available / (1ull << 30));
+            if (needed > available)
+                throw collisionError("mesh.ram", "Not enough RAM for the mesh; use a larger voxel size or a maximum range", ErrorCode::ResourceExhausted,
+                                     std::format("{:.1f} GB needed, {:.1f} GB available", needed / (1ull << 30), available / (1ull << 30)));
         }
 
         void device_buffer_preflight(const size_t bytes, const char* operation) {
@@ -559,14 +584,9 @@ namespace lfs::training {
     }
 
     namespace {
-        // Orders mesh.faces so that each returned range of up to max_faces is a compact piece of space.
-        void split_faces(SplatMesh& mesh, const size_t first, const size_t last, const size_t max_faces, const int threads_left,
+        // Orders mesh.faces so that each returned range of up to max_faces and max_extent is a compact piece of space.
+        void split_faces(SplatMesh& mesh, const size_t first, const size_t last, const size_t max_faces, const float max_extent, const int threads_left,
                          std::vector<std::pair<size_t, size_t>>& ranges, std::mutex& ranges_mutex) {
-            if (last - first <= max_faces) {
-                std::lock_guard lock(ranges_mutex);
-                ranges.emplace_back(first, last);
-                return;
-            }
             std::array<float, 3> low{FLT_MAX, FLT_MAX, FLT_MAX}, high{-FLT_MAX, -FLT_MAX, -FLT_MAX};
             for (size_t f = first; f < last; ++f) {
                 const auto& p = mesh.vertices[mesh.faces[f][0]];
@@ -579,6 +599,11 @@ namespace lfs::training {
             for (int i = 1; i < 3; ++i)
                 if (high[i] - low[i] > high[axis] - low[axis])
                     axis = i;
+            if (last - first <= 1 || (last - first <= max_faces && high[axis] - low[axis] <= max_extent)) {
+                std::lock_guard lock(ranges_mutex);
+                ranges.emplace_back(first, last);
+                return;
+            }
             const size_t middle = first + (last - first) / 2;
             std::nth_element(mesh.faces.begin() + std::ptrdiff_t(first), mesh.faces.begin() + std::ptrdiff_t(middle), mesh.faces.begin() + std::ptrdiff_t(last),
                              [&](const auto& a, const auto& b) { return mesh.vertices[a[0]][axis] < mesh.vertices[b[0]][axis]; });
@@ -586,13 +611,13 @@ namespace lfs::training {
                 std::exception_ptr failure;
                 std::thread other([&] {
                     try {
-                        split_faces(mesh, first, middle, max_faces, threads_left / 2, ranges, ranges_mutex);
+                        split_faces(mesh, first, middle, max_faces, max_extent, threads_left / 2, ranges, ranges_mutex);
                     } catch (...) {
                         failure = std::current_exception();
                     }
                 });
                 try {
-                    split_faces(mesh, middle, last, max_faces, threads_left - threads_left / 2, ranges, ranges_mutex);
+                    split_faces(mesh, middle, last, max_faces, max_extent, threads_left - threads_left / 2, ranges, ranges_mutex);
                 } catch (...) {
                     other.join();
                     throw;
@@ -601,8 +626,8 @@ namespace lfs::training {
                 if (failure)
                     std::rethrow_exception(failure);
             } else {
-                split_faces(mesh, first, middle, max_faces, 1, ranges, ranges_mutex);
-                split_faces(mesh, middle, last, max_faces, 1, ranges, ranges_mutex);
+                split_faces(mesh, first, middle, max_faces, max_extent, 1, ranges, ranges_mutex);
+                split_faces(mesh, middle, last, max_faces, max_extent, 1, ranges, ranges_mutex);
             }
         }
 
@@ -612,7 +637,7 @@ namespace lfs::training {
             const int threads = std::clamp(int(std::thread::hardware_concurrency()), 1, kSimplifyThreads);
             std::vector<std::pair<size_t, size_t>> ranges;
             std::mutex ranges_mutex;
-            split_faces(mesh, 0, mesh.faces.size(), piece_faces, threads, ranges, ranges_mutex);
+            split_faces(mesh, 0, mesh.faces.size(), piece_faces, kPieceExtentPerTolerance * max_error, threads, ranges, ranges_mutex);
             std::ranges::sort(ranges);
 
             std::vector<int32_t> owner(mesh.vertices.size(), -1);
@@ -656,8 +681,7 @@ namespace lfs::training {
                                 for (int c = 0; c < 3; ++c)
                                     attributes[3 * v + c] = float(mesh.colors[used[v]][c]) / 255.f;
                         }
-                        const float weight = color_weight / std::max(meshopt_simplifyScale(positions.data(), used.size(), 12), 1e-12f);
-                        const float weights[3] = {weight, weight, weight};
+                        const float weights[3] = {color_weight, color_weight, color_weight};
                         const size_t index_count = meshopt_simplifyWithUpdate(
                             indices.data(), indices.size(), positions.data(), used.size(), 12, has_colors ? attributes.data() : nullptr, 12, weights,
                             has_colors ? 3 : 0, lock.data(), 0, max_error, meshopt_SimplifyErrorAbsolute | meshopt_SimplifyPrune, &errors[r]);
@@ -700,34 +724,12 @@ namespace lfs::training {
         }
     } // namespace
 
-    void simplify_splat_mesh(SplatMesh& mesh, const float max_error, const float color_weight, const size_t max_whole_faces, const size_t piece_faces) {
+    void simplify_splat_mesh(SplatMesh& mesh, const float max_error, const float color_weight, const size_t piece_faces) {
         mesh.faces_before_simplify = mesh.faces.size();
         if (max_error <= 0.f || mesh.faces.empty())
             return;
         const bool has_colors = mesh.colors.size() == mesh.vertices.size();
-        std::vector<float> attributes;
-        if (mesh.faces.size() > max_whole_faces) {
-            simplify_in_pieces(mesh, max_error, color_weight, piece_faces);
-        } else {
-            // The simplifier measures positions in units of the mesh extent.
-            const float weight = color_weight / std::max(meshopt_simplifyScale(mesh.vertices.front().data(), mesh.vertices.size(), sizeof(float) * 3), 1e-12f);
-            const float weights[3] = {weight, weight, weight};
-            // Always carried, so the colors of the vertices that move follow them.
-            if (has_colors) {
-                attributes.resize(mesh.vertices.size() * 3);
-                for (size_t v = 0; v < mesh.vertices.size(); ++v)
-                    for (int c = 0; c < 3; ++c)
-                        attributes[3 * v + c] = float(mesh.colors[v][c]) / 255.f;
-            }
-            static_assert(sizeof(std::array<int32_t, 3>) == 3 * sizeof(unsigned int));
-            auto* indices = reinterpret_cast<unsigned int*>(mesh.faces.data());
-            float* positions = mesh.vertices.front().data();
-            const size_t index_count = meshopt_simplifyWithUpdate(
-                indices, mesh.faces.size() * 3, positions, mesh.vertices.size(), sizeof(float) * 3,
-                has_colors ? attributes.data() : nullptr, sizeof(float) * 3, weights, has_colors ? 3 : 0, nullptr,
-                0, max_error, meshopt_SimplifyErrorAbsolute | meshopt_SimplifyPrune, &mesh.simplify_result_error);
-            mesh.faces.resize(index_count / 3);
-        }
+        simplify_in_pieces(mesh, max_error, color_weight, piece_faces);
 
         std::vector<int32_t> remap(mesh.vertices.size(), -1);
         std::vector<std::array<float, 3>> vertices;
@@ -738,15 +740,8 @@ namespace lfs::training {
                 if (target < 0) {
                     target = static_cast<int32_t>(vertices.size());
                     vertices.push_back(mesh.vertices[vertex]);
-                    if (has_colors) {
-                        auto& color = colors.emplace_back();
-                        if (attributes.empty()) {
-                            color = mesh.colors[vertex];
-                        } else {
-                            for (int c = 0; c < 3; ++c)
-                                color[c] = static_cast<uint8_t>(std::clamp(std::lround(255.f * attributes[3 * size_t(vertex) + c]), 0l, 255l));
-                        }
-                    }
+                    if (has_colors)
+                        colors.push_back(mesh.colors[vertex]);
                 }
                 vertex = target;
             }
@@ -756,7 +751,8 @@ namespace lfs::training {
     }
 
     SplatMesh extract_splat_mesh(core::SplatData& model, const std::span<core::Camera* const> cameras,
-                                 const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress) try {
+                                 const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress,
+                                 const PPISP* appearance) try {
         validate(settings);
         const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
         std::vector<core::Camera*> views;
@@ -861,6 +857,7 @@ namespace lfs::training {
         tsdf = {};
         core::Tensor::trim_memory_pool();
         mesh.seconds_fusion = seconds_since(step);
+        ram_preflight(voxels.keys.size());
 
         step = Clock::now();
         core::reportProgress(stop, progress, .8f, stage("mesh.stage_extract", "Extracting surface"));
@@ -879,7 +876,7 @@ namespace lfs::training {
         DeviceArray<float> vertices_device(size_t(vertex_count) * 3, stream);
         LFS_CUDA_CHECK(cudaMemcpyAsync(vertices_device.data(), mesh.vertices.data(), size_t(vertex_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
         DeviceArray<float> color_sum(size_t(vertex_count) * 3, stream, true);
-        DeviceArray<uint32_t> color_count(vertex_count, stream, true);
+        DeviceArray<float> color_weight(vertex_count, stream, true);
         const float tolerance = 2.5f * settings.voxel_size;
         for (size_t i = 0; i < views.size(); i += settings.color_stride) {
             core::reportProgress(stop, progress, .85f + .1f * float(i) / views.size(), stage("mesh.stage_color", "Coloring"));
@@ -894,42 +891,46 @@ namespace lfs::training {
                 continue;
             }
             photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
+            if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid())) {
+                photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
+                ++mesh.views_color_corrected;
+            }
             auto depth = Tensor::empty({size_t(view.height), size_t(view.width)}, Device::CUDA);
             depth.set_stream(stream);
             LFS_CUDA_CHECK(cudaMemcpyAsync(depth.ptr<float>(), depths[i].data(), depths[i].size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-            gsplat_lfs::mesh_color_accumulate(vertices_device.data(), vertex_count, view, depth.ptr<float>(), photo.ptr<float>(), tolerance,
-                                              color_sum.data(), color_count.data(), stream);
+            gsplat_lfs::mesh_color_accumulate(vertices_device.data(), vertex_count, view, depth.ptr<float>(), photo.ptr<float>(), tolerance, color_sum.data(), color_weight.data(), stream);
             LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color");
         }
         std::vector<float> sums(size_t(vertex_count) * 3);
-        std::vector<uint32_t> counts(vertex_count);
+        std::vector<float> weights(vertex_count);
         LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), color_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        LFS_CUDA_CHECK(cudaMemcpyAsync(counts.data(), color_count.data(), counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        LFS_CUDA_CHECK(cudaMemcpyAsync(weights.data(), color_weight.data(), weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
         LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh color download");
         mesh.colors.resize(vertex_count);
         size_t colored = 0;
         for (size_t v = 0; v < vertex_count; ++v) {
-            colored += counts[v] > 0;
+            colored += weights[v] > 0.f;
             for (int c = 0; c < 3; ++c) {
-                const float value = counts[v] > 0 ? 255.f * sums[3 * v + c] / float(counts[v]) : 128.f;
+                const float value = weights[v] > 0.f ? 255.f * sums[3 * v + c] / weights[v] : 128.f;
                 mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
             }
         }
         mesh.colored_vertex_share = float(colored) / float(vertex_count);
         mesh.seconds_color = seconds_since(step);
+        LOG_INFO("Mesh: colored with the trained appearance taken out of {} views", mesh.views_color_corrected);
         // Reducing faces is the peak of RAM use; it needs none of these, and recomputes the normals.
         depths = {};
         sums = {};
-        counts = {};
+        weights = {};
         if (settings.simplify_error > 0.f)
             mesh.normals = {};
         vertices_device = {};
         color_sum = {};
-        color_count = {};
+        color_weight = {};
         core::Tensor::trim_memory_pool();
         core::reportProgress(stop, progress, .95f, stage("mesh.stage_simplify", "Reducing faces"));
         step = Clock::now();
-        simplify_splat_mesh(mesh, settings.simplify_error, kSimplifyColorWeightPerVoxel * settings.voxel_size);
+        simplify_splat_mesh(mesh, settings.simplify_error, kSimplifyColorWeight);
         mesh.seconds_simplify = seconds_since(step);
         core::reportProgress(stop, progress, 1.f, stage("mesh.stage_simplify", "Reducing faces"));
         return mesh;

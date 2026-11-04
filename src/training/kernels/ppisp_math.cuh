@@ -365,3 +365,66 @@ __device__ __forceinline__ void ppisp_apply_crf(const float3& rgb_in, const CRFP
 
     rgb_out = make_float3(out_arr[0], out_arr[1], out_arr[2]);
 }
+
+// The inverses take a photo back to what the model renders, in reverse order of the pipeline.
+__device__ __forceinline__ float3 ppisp_invert_crf(const float3& rgb_in, const CRFPPISPChannelParams* crf_params) {
+    const float3 rgb = ppisp_clamp(rgb_in, 0.0f, 1.0f);
+    float out_arr[3];
+
+#pragma unroll
+    for (int i = 0; i < 3; i++) {
+        const float value = (i == 0) ? rgb.x : (i == 1) ? rgb.y
+                                                        : rgb.z;
+        const CRFPPISPChannelParams& params = crf_params[i];
+        const float toe = ppisp_bounded_positive_forward(params.toe, 0.3f);
+        const float shoulder = ppisp_bounded_positive_forward(params.shoulder, 0.3f);
+        const float gamma = ppisp_bounded_positive_forward(params.gamma, 0.1f);
+        const float center = ppisp_clamped_forward(params.center);
+        const float a = __fdividef(shoulder * center, __fmaf_rn(shoulder - toe, center, toe));
+        const float y = __powf(value, __fdividef(1.0f, gamma));
+        out_arr[i] = y <= a ? center * __powf(__fdividef(y, a), __fdividef(1.0f, toe))
+                            : 1.0f - (1.0f - center) * __powf(fmaxf(__fdividef(1.0f - y, 1.0f - a), 0.0f), __fdividef(1.0f, shoulder));
+    }
+    return make_float3(out_arr[0], out_arr[1], out_arr[2]);
+}
+
+__device__ __forceinline__ float3 ppisp_invert_color(const float3& rgb_in, const ColorPPISPParams* color_params) {
+    const float3x3 H = ppisp_compute_homography(color_params);
+    const float3 c0 = make_float3(H(0, 0), H(1, 0), H(2, 0));
+    const float3 c1 = make_float3(H(0, 1), H(1, 1), H(2, 1));
+    const float3 c2 = make_float3(H(0, 2), H(1, 2), H(2, 2));
+    // The adjugate: the determinant's size drops out because the pipeline renormalizes intensity.
+    const float3 r0 = ppisp_cross(c1, c2), r1 = ppisp_cross(c2, c0), r2 = ppisp_cross(c0, c1);
+    const float3 rgb = make_float3(fmaxf(rgb_in.x, 0.0f), fmaxf(rgb_in.y, 0.0f), fmaxf(rgb_in.z, 0.0f));
+    const float intensity = rgb.x + rgb.y + rgb.z;
+    const float3 rgi_out = make_float3(rgb.x, rgb.y, intensity);
+    const float sign = ppisp_dot(c0, r0) < 0.0f ? -1.0f : 1.0f;
+    const float3 rgi = make_float3(ppisp_dot(r0, rgi_out), ppisp_dot(r1, rgi_out), ppisp_dot(r2, rgi_out)) * sign;
+    const float scale = __fdividef(intensity, fmaxf(rgi.z, 0.0f) + 1.0e-5f);
+    return make_float3(rgi.x * scale, rgi.y * scale, (rgi.z - rgi.x - rgi.y) * scale);
+}
+
+// Falloff near the rim is a fit to few pixels; limits how much those pixels are lifted.
+constexpr float PPISP_MIN_INVERSE_FALLOFF = 0.25f;
+
+__device__ __forceinline__ float3 ppisp_invert_vignetting(const float3& rgb, const VignettingChannelParams* vignetting_params,
+                                                          const float2& pixel_coords, float resolution_x, float resolution_y) {
+    const float max_res = fmaxf(resolution_x, resolution_y);
+    const float2 uv = make_float2(__fdividef(pixel_coords.x - resolution_x * 0.5f, max_res),
+                                  __fdividef(pixel_coords.y - resolution_y * 0.5f, max_res));
+    float out_arr[3] = {rgb.x, rgb.y, rgb.z};
+
+#pragma unroll
+    for (int i = 0; i < 3; i++) {
+        const VignettingChannelParams& params = vignetting_params[i];
+        const float dx = uv.x - ppisp_finite_or_zero(params.cx);
+        const float dy = uv.y - ppisp_finite_or_zero(params.cy);
+        const float r2 = __fmaf_rn(dx, dx, dy * dy);
+        const float r4 = r2 * r2;
+        const float falloff = __fmaf_rn(ppisp_finite_or_zero(params.alpha2), r4 * r2,
+                                        __fmaf_rn(ppisp_finite_or_zero(params.alpha1), r4,
+                                                  __fmaf_rn(ppisp_finite_or_zero(params.alpha0), r2, 1.0f)));
+        out_arr[i] = __fdividef(out_arr[i], fmaxf(PPISP_MIN_INVERSE_FALLOFF, fminf(1.0f, falloff)));
+    }
+    return make_float3(out_arr[0], out_arr[1], out_arr[2]);
+}

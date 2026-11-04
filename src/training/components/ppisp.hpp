@@ -120,6 +120,10 @@ namespace lfs::training {
         lfs::core::Tensor apply(const lfs::core::Tensor& rgb, int camera_id, int uid,
                                 const PPISPRegion& region = {});
 
+        /// Takes a photo [C,H,W] back to what the model renders for that frame. Inverts apply() except
+        /// where it clipped; the falloff of vignetting is limited near the rim.
+        lfs::core::Tensor invert(const lfs::core::Tensor& photo, int camera_id, int uid, cudaStream_t stream = nullptr) const;
+
         lfs::core::Tensor apply_interpolated_frames(const lfs::core::Tensor& rgb, int camera_id,
                                                     int left_uid, int right_uid, float fraction);
 
