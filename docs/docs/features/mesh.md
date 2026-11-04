@@ -39,10 +39,14 @@ other scenes.
 | Minimum views | 3 | Views a voxel needs. Higher removes floaters and opens holes |
 | Simplify tolerance | 0.005 | Surface deviation allowed when reducing faces, spending more faces where colors change. 0 keeps every face |
 | Fill holes (CLI) | 0.3 | Closes holes with a shorter rim using an interpolated patch, not an observed surface. 0 leaves them open |
-| Truncation (CLI) | 0.08 | Band around the surface. Narrower bands open holes where views disagree on depth |
+| Maximum range | 0 | Meshes only surfaces a view saw from closer than this. 0 has no limit. Far surfaces take most of the faces of an outdoor scene at fine voxels, and a pixel there is wider than a voxel |
+| Truncation (CLI) | 0.08 or 4 voxels, the larger | Band around the surface. Narrower bands open holes on surfaces seen at grazing angles and where views disagree on depth |
 | Minimum component (CLI) | 100 faces | Thin objects can split into small pieces, so keep it low |
 
-GPU memory holds the TSDF, 10 bytes per voxel of each touched block. RAM holds one depth map per
-fused view at the render width, 1600 pixels by default.
+GPU memory holds the TSDF, 10 bytes per voxel of each touched block. When it does not fit, fusion
+runs in slices of the scene, one at a time. RAM holds one depth map per fused view at the render
+width, 1600 pixels by default, and the mesh, so RAM is what limits fine voxels: halving the voxel
+size makes about four times the faces. Above 20 million faces, faces are reduced in pieces, in less
+RAM and in parallel, and the vertices shared between pieces are kept.
 
 `tools/splats_to_mesh.py --mesh mesh.ply` scores a mesh against held-out views and a LAS scan.

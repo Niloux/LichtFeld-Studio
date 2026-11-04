@@ -66,8 +66,10 @@ namespace lfs::training {
     // Reduces faces while the surface stays within about max_error scene units, moving the kept
     // vertices to fit and blending their colors. Larger color_weight keeps more faces where the
     // color changes; it scales with scene size but is not a distance, and 0 ignores color and
-    // leaves kept vertices with their own colors. Refreshes normals and area.
-    void simplify_splat_mesh(SplatMesh& mesh, float max_error, float color_weight);
+    // leaves kept vertices with their own colors. Refreshes normals and area. Above max_whole_faces
+    // it works in pieces of piece_faces, in less RAM and in parallel, keeping the seams' vertices.
+    void simplify_splat_mesh(SplatMesh& mesh, float max_error, float color_weight, size_t max_whole_faces = 20'000'000,
+                             size_t piece_faces = 3'000'000);
 
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path);
     [[nodiscard]] core::MeshData splat_mesh_to_mesh_data(const SplatMesh& mesh);

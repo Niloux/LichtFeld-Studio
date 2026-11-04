@@ -17,17 +17,18 @@ SPECS = {
     "full_weight_range": ScrubFieldSpec(0, 1000, .1, "%.3g"),
     "min_views": ScrubFieldSpec(1, 64, 1, "%.0f"),
     "simplify_error": ScrubFieldSpec(0, .05, .001, "%.3g"),
+    "max_range": ScrubFieldSpec(0, 1000, 1, "%.3g"),
 }
 LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_stride",
           "full_weight_range": "mesh.full_weight_range", "min_views": "mesh.min_views",
-          "simplify_error": "mesh.simplify_error"}
+          "simplify_error": "mesh.simplify_error", "max_range": "mesh.max_range"}
 
 
 @panel_class("mesh")
 class MeshPanel(Panel):
     def __init__(self):
         self.handle = None
-        self.values = dict(voxel_size=.02, view_stride=2, full_weight_range=1., min_views=3, simplify_error=.005, error="")
+        self.values = dict(voxel_size=.02, view_stride=2, full_weight_range=1., min_views=3, simplify_error=.005, max_range=0., error="")
         self.state = {}
         self.close_when_done = False
         self.scrubs = ScrubFieldController(
@@ -47,7 +48,7 @@ class MeshPanel(Panel):
         try:
             lf.generate_mesh(path, self.values["voxel_size"], int(self.values["view_stride"]),
                              self.values["full_weight_range"], int(self.values["min_views"]),
-                             self.values["simplify_error"])
+                             self.values["simplify_error"], self.values["max_range"])
             self.close_when_done = True
         except (RuntimeError, ValueError) as exc:
             key = getattr(exc, "message_key", "")

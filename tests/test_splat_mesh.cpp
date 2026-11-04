@@ -173,6 +173,24 @@ TEST(SplatMesh, SimplifyWithoutToleranceKeepsEveryFace) {
     EXPECT_EQ(mesh.vertices, vertices);
 }
 
+TEST(SplatMesh, SimplifyInPiecesLeavesNoCracksAndStaysOnTheSurface) {
+    constexpr float voxel = .04f, tolerance = .01f;
+    auto mesh = sphere_mesh(voxel);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    ASSERT_EQ(rim_edges(mesh), 0u);
+    const size_t before = mesh.faces.size();
+    lfs::training::simplify_splat_mesh(mesh, tolerance, 1.f, 0, before / 16);
+    EXPECT_LT(mesh.faces.size(), before * 3 / 4);
+    EXPECT_EQ(rim_edges(mesh), 0u);
+    ASSERT_EQ(mesh.normals.size(), mesh.vertices.size());
+    ASSERT_EQ(mesh.colors.size(), mesh.vertices.size());
+    EXPECT_NEAR(mesh.area / (4. * std::numbers::pi), 1., .1);
+    for (const auto& p : mesh.vertices)
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, 2.f * tolerance + voxel);
+    for (const auto& c : mesh.colors)
+        EXPECT_EQ(c, (std::array<uint8_t, 3>{10, 20, 30}));
+}
+
 TEST(SplatMesh, SimplifyKeepsMoreFacesWhereTheColorChanges) {
     // A flat grid has no shape to keep, so only the color stripes can hold faces back.
     const auto stripes = [] {
@@ -297,12 +315,12 @@ namespace {
             gsplat_lfs::tsdf_integrate(keys.data, near_blocks.data, near_found, view, grid, depth_d.data, sum.data, weight.data, views.data, nullptr);
             ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         }
-        const uint64_t count = gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
+        const uint64_t count = gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), 0, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
                                                                min_views, nullptr, nullptr, counter.data, nullptr);
         ASSERT_GT(count, 0u);
         Device<uint64_t> found_keys(count);
         Device<float> found_tsdf(count);
-        (void)gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
+        (void)gsplat_lfs::tsdf_collect_voxels(keys.data, uint32_t(blocks), 0, uint32_t(blocks), grid, sum.data, weight.data, views.data, carve.data,
                                               min_views, found_keys.data, found_tsdf.data, counter.data, nullptr);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         std::vector<uint64_t> host_keys(count);
