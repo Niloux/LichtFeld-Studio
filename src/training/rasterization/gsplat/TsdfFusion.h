@@ -103,8 +103,9 @@ namespace gsplat_lfs {
 
     // Adds this view to the texels at world positions texels [3 * count]; a texel needs all four pixels it
     // samples to lie on its surface. low_sum / low_weight is the mean of the blurred photo over views, each
-    // counting by 1 / distance, so levels agree across views. high keeps photo - low_photo of the view that
-    // labels [count] chose for the texel; where that view has no clean sample, of the closest view that does.
+    // counting by 1 / distance. high keeps the photo of the view that labels [count] chose for the texel, and
+    // best_weight is then infinite; where that view has no clean sample, photo - low_photo of the closest view
+    // that does, to add to the mean.
     void mesh_texture_accumulate(const float* texels, uint32_t count, const TsdfView& view, int32_t view_label, const int32_t* labels,
                                  const float* depth, const float* photo, const float* low_photo, const float* tolerances, float* low_sum,
                                  float* low_weight, float* high, float* best_weight, cudaStream_t stream);

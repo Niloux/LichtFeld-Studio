@@ -475,11 +475,13 @@ namespace gsplat_lfs {
                     for (uint32_t c = 0; c < 3; ++c)
                         low_sum[3 * static_cast<uint64_t>(t) + c] += w * low[c];
                     low_weight[t] += w;
-                    const float rank = labels[t] == view_label ? INFINITY : w;
+                    // The chosen view keeps its whole color, and another view only its detail, over the levels of all.
+                    const bool chosen = labels[t] == view_label;
+                    const float rank = chosen ? INFINITY : w;
                     if (rank > best_weight[t]) {
                         best_weight[t] = rank;
                         for (uint32_t c = 0; c < 3; ++c)
-                            high[3 * static_cast<uint64_t>(t) + c] = color[c] - low[c];
+                            high[3 * static_cast<uint64_t>(t) + c] = chosen ? color[c] : color[c] - low[c];
                     }
                 }
             });

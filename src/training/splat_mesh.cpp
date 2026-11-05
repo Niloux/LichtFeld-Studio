@@ -888,6 +888,20 @@ namespace lfs::training {
                 used.erase(std::unique(used.begin(), used.end()), used.end());
                 LOG_INFO("Mesh: {} views set the detail of {} of {} faces", used.size(), chosen, face_views.size());
             }
+            auto leveling = plan_color_leveling(mesh, face_views);
+            const auto sample_count = static_cast<uint32_t>(leveling.sample_labels.size());
+            DeviceArray<float> sample_positions(size_t(sample_count) * 3, stream), sample_sum(size_t(sample_count) * 3, stream, true), sample_weight(sample_count, stream, true);
+            DeviceArray<float> sample_high(size_t(sample_count) * 3, stream, true), sample_best(sample_count, stream, true), sample_tolerances(sample_count, stream);
+            DeviceArray<int32_t> sample_labels(sample_count, stream);
+            if (sample_count > 0) {
+                std::vector<float> host_tolerances(sample_count);
+                for (size_t s = 0; s < sample_count; ++s)
+                    host_tolerances[s] = tolerance_of(leveling.sample_faces[s]);
+                LFS_CUDA_CHECK(cudaMemcpyAsync(sample_positions.data(), leveling.sample_positions.data(), size_t(sample_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(sample_labels.data(), leveling.sample_labels.data(), size_t(sample_count) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(sample_tolerances.data(), host_tolerances.data(), size_t(sample_count) * sizeof(float), cudaMemcpyHostToDevice, stream));
+                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples upload");
+            }
             while (first_page < page_count) {
                 size_t last_page = first_page, count = 0;
                 while (last_page < page_count && (last_page == first_page || count + texels[last_page].pixels.size() <= max_texels))
@@ -944,12 +958,45 @@ namespace lfs::training {
                                                     scratch.data(), weights.data(), low.data(), stream);
                     gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerances.data(),
                                                         low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
+                    // The first group of pages also reads the seams, with one pass over the photos less.
+                    // Blurred, so that misregistration and grain do not read as a step.
+                    if (first_page == 0 && sample_count > 0)
+                        gsplat_lfs::mesh_texture_accumulate(sample_positions.data(), sample_count, view, static_cast<int32_t>(i), sample_labels.data(), depth.ptr<float>(), low.data(), low.data(), sample_tolerances.data(),
+                                                            sample_sum.data(), sample_weight.data(), sample_high.data(), sample_best.data(), stream);
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture");
                 }
-                std::vector<float> sums(count * 3), sum_weights(count), highs(count * 3);
+                if (first_page == 0) {
+                    std::vector<float> host_colors(size_t(sample_count) * 3, -1.f);
+                    if (sample_count > 0) {
+                        std::vector<float> means(size_t(sample_count) * 3), mean_weights(sample_count), direct(size_t(sample_count) * 3), bests(sample_count);
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(means.data(), sample_sum.data(), means.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(mean_weights.data(), sample_weight.data(), mean_weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(direct.data(), sample_high.data(), direct.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), sample_best.data(), bests.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                        LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples");
+                        for (size_t s = 0; s < sample_count; ++s)
+                            for (size_t c = 0; c < 3; ++c) {
+                                if (std::isinf(bests[s]))
+                                    host_colors[3 * s + c] = direct[3 * s + c];
+                                // Where no view sets the detail, the texels hold the mean of all views.
+                                else if (leveling.sample_labels[s] < 0 && mean_weights[s] > 0.f)
+                                    host_colors[3 * s + c] = means[3 * s + c] / mean_weights[s];
+                            }
+                    }
+                    solve_color_leveling(leveling, mesh, host_colors);
+                    sample_positions = {};
+                    sample_labels = {};
+                    sample_tolerances = {};
+                    sample_sum = {};
+                    sample_weight = {};
+                    sample_high = {};
+                    sample_best = {};
+                }
+                std::vector<float> sums(count * 3), sum_weights(count), highs(count * 3), bests(count);
                 LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), low_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_CUDA_CHECK(cudaMemcpyAsync(sum_weights.data(), low_weight.data(), sum_weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_CUDA_CHECK(cudaMemcpyAsync(highs.data(), high.data(), highs.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), best_weight.data(), bests.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture download");
                 offset = 0;
                 std::vector<float> colors;
@@ -960,8 +1007,15 @@ namespace lfs::training {
                         const size_t at = offset + t;
                         const bool seen = sum_weights[at] > 0.f;
                         observed += seen;
+                        if (!seen) {
+                            colors[3 * t] = colors[3 * t + 1] = colors[3 * t + 2] = -1.f;
+                            continue;
+                        }
+                        float level[3];
+                        leveling.offset_at(mesh, texels[p].faces[t], &texels[p].positions[3 * t], level);
+                        const bool direct = std::isinf(bests[at]);
                         for (size_t c = 0; c < 3; ++c)
-                            colors[3 * t + c] = seen ? std::max(sums[3 * at + c] / sum_weights[at] + highs[3 * at + c], 0.f) : -1.f;
+                            colors[3 * t + c] = std::max((direct ? 0.f : sums[3 * at + c] / sum_weights[at]) + highs[3 * at + c] + level[c], 0.f);
                     }
                     mesh.pages[p] = compose_mesh_page(texels[p], colors, mesh.page_side(p));
                     texels[p] = {};

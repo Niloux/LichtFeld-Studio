@@ -426,6 +426,220 @@ namespace lfs::training {
         return labels;
     }
 
+    ColorLeveling plan_color_leveling(const SplatMesh& mesh, const std::span<const int32_t> face_views) {
+        // Points of the surface by position: levels of detail and tiles repeat them, and leveling them together keeps
+        // tile borders closed.
+        std::vector<uint32_t> order(mesh.vertices.size());
+        std::iota(order.begin(), order.end(), 0u);
+        std::ranges::sort(order, {}, [&](const uint32_t v) { return mesh.vertices[v]; });
+        std::vector<uint32_t> point_of(mesh.vertices.size());
+        uint32_t points = 0;
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (i > 0 && mesh.vertices[order[i]] != mesh.vertices[order[i - 1]])
+                ++points;
+            point_of[order[i]] = points;
+        }
+        order = {};
+
+        struct Corner {
+            uint64_t key; // point, then label
+            uint32_t corner;
+        };
+        std::vector<Corner> corners(mesh.faces.size() * 3);
+        for (size_t f = 0; f < mesh.faces.size(); ++f)
+            for (size_t c = 0; c < 3; ++c)
+                corners[3 * f + c] = {(uint64_t(point_of[size_t(mesh.faces[f][c])]) << 32) | uint32_t(face_views[f] + 1), static_cast<uint32_t>(3 * f + c)};
+        std::ranges::sort(corners, {}, &Corner::key);
+
+        ColorLeveling leveling;
+        leveling.corner_unknowns.resize(corners.size());
+        uint32_t unknown = 0;
+        for (size_t i = 0; i < corners.size();) {
+            const uint32_t point = uint32_t(corners[i].key >> 32);
+            size_t next_point = i;
+            uint32_t labels_here = 0;
+            for (size_t j = i; j < corners.size() && uint32_t(corners[j].key >> 32) == point; ++j, ++next_point)
+                labels_here += j == i || corners[j].key != corners[j - 1].key;
+            for (size_t j = i; j < next_point; ++j) {
+                const bool first = j == i || corners[j].key != corners[j - 1].key;
+                if (first && j != i)
+                    ++unknown;
+                leveling.corner_unknowns[corners[j].corner] = unknown;
+                if (first && labels_here > 1) {
+                    const uint32_t face = corners[j].corner / 3;
+                    const auto& position = mesh.vertices[size_t(mesh.faces[face][corners[j].corner % 3])];
+                    leveling.sample_labels.push_back(face_views[face]);
+                    leveling.sample_positions.insert(leveling.sample_positions.end(), position.begin(), position.end());
+                    leveling.sample_faces.push_back(face);
+                    leveling.sample_unknowns.push_back(unknown);
+                    leveling.sample_points.push_back(point);
+                }
+            }
+            ++unknown;
+            i = next_point;
+        }
+        leveling.offsets.assign(size_t(unknown) * 3, 0.f);
+        return leveling;
+    }
+
+    void solve_color_leveling(ColorLeveling& leveling, const SplatMesh& mesh, const std::span<const float> colors) {
+        // Texrecon's weights: a step across a seam counts ten times a difference along the surface.
+        constexpr float kSmooth = .1f;
+        // Keeps a photo as it is far from any seam; a step spreads over about sqrt(kSmooth / kPull) = 100 vertices.
+        constexpr float kPull = 1e-5f;
+        constexpr int kMaxIterations = 2000;
+        constexpr double kTolerance = 1e-3;
+        const size_t unknowns = leveling.offsets.size() / 3;
+        struct Entry {
+            uint64_t key;
+            float value;
+        };
+        std::vector<Entry> entries;
+        entries.reserve(mesh.faces.size() * 6);
+        std::vector<float> diagonal(unknowns, kPull), right(unknowns * 3, 0.f);
+        const auto couple = [&](const uint32_t a, const uint32_t b, const float weight) {
+            if (a == b)
+                return;
+            diagonal[a] += weight;
+            diagonal[b] += weight;
+            entries.push_back({(uint64_t(a) << 32) | b, -weight});
+            entries.push_back({(uint64_t(b) << 32) | a, -weight});
+        };
+        // Each edge inside a region comes twice, once from each face.
+        for (size_t f = 0; f < mesh.faces.size(); ++f)
+            for (size_t c = 0; c < 3; ++c)
+                couple(leveling.corner_unknowns[3 * f + c], leveling.corner_unknowns[3 * f + (c + 1) % 3], .5f * kSmooth);
+        size_t steps = 0;
+        double step_sum = 0.;
+        for (size_t first = 0; first < leveling.sample_points.size();) {
+            size_t last = first;
+            while (last < leveling.sample_points.size() && leveling.sample_points[last] == leveling.sample_points[first])
+                ++last;
+            for (size_t a = first; a < last; ++a)
+                for (size_t b = a + 1; b < last; ++b) {
+                    if (colors[3 * a] < 0.f || colors[3 * b] < 0.f)
+                        continue;
+                    const uint32_t ua = leveling.sample_unknowns[a], ub = leveling.sample_unknowns[b];
+                    couple(ua, ub, 1.f);
+                    ++steps;
+                    for (size_t c = 0; c < 3; ++c) {
+                        const float step = colors[3 * a + c] - colors[3 * b + c];
+                        step_sum += std::abs(step);
+                        right[3 * size_t(ua) + c] -= step;
+                        right[3 * size_t(ub) + c] += step;
+                    }
+                }
+            first = last;
+        }
+        std::ranges::sort(entries, {}, &Entry::key);
+        std::vector<size_t> row_first(unknowns + 1, 0);
+        std::vector<uint32_t> columns;
+        std::vector<float> values;
+        columns.reserve(entries.size());
+        values.reserve(entries.size());
+        for (size_t e = 0; e < entries.size(); ++e) {
+            if (e > 0 && entries[e].key == entries[e - 1].key) {
+                values.back() += entries[e].value;
+                continue;
+            }
+            columns.push_back(uint32_t(entries[e].key));
+            values.push_back(entries[e].value);
+            ++row_first[size_t(entries[e].key >> 32) + 1];
+        }
+        entries = {};
+        std::partial_sum(row_first.begin(), row_first.end(), row_first.begin());
+
+        // Conjugate gradients with the diagonal as preconditioner, on the three channels at once.
+        constexpr size_t kChunk = size_t{1} << 15;
+        const size_t chunks = (unknowns + kChunk - 1) / kChunk;
+        const auto over_unknowns = [&](auto&& body) {
+            parallel_for(chunks, kUnwrapThreads, [&](const size_t chunk) {
+                for (size_t i = chunk * kChunk; i < std::min((chunk + 1) * kChunk, unknowns); ++i)
+                    body(i);
+            });
+        };
+        auto& x = leveling.offsets;
+        std::vector<float> residual = right, direction(unknowns * 3), product(unknowns * 3);
+        const auto dot = [&](const std::vector<float>& a, const std::vector<float>& b, const bool scaled) {
+            std::array<double, 3> total{0., 0., 0.};
+            for (size_t i = 0; i < unknowns; ++i) {
+                const double scale = scaled ? 1. / double(diagonal[i]) : 1.;
+                for (size_t c = 0; c < 3; ++c)
+                    total[c] += scale * double(a[3 * i + c]) * double(b[3 * i + c]);
+            }
+            return total;
+        };
+        over_unknowns([&](const size_t i) {
+            for (size_t c = 0; c < 3; ++c)
+                direction[3 * i + c] = residual[3 * i + c] / diagonal[i];
+        });
+        auto rho = dot(residual, residual, true);
+        const auto start = dot(right, right, false);
+        int iteration = 0;
+        for (; iteration < kMaxIterations; ++iteration) {
+            const auto norm = dot(residual, residual, false);
+            bool done = true;
+            for (size_t c = 0; c < 3; ++c)
+                done = done && norm[c] <= kTolerance * kTolerance * start[c];
+            if (done)
+                break;
+            over_unknowns([&](const size_t i) {
+                float sum[3];
+                for (size_t c = 0; c < 3; ++c)
+                    sum[c] = diagonal[i] * direction[3 * i + c];
+                for (size_t e = row_first[i]; e < row_first[i + 1]; ++e)
+                    for (size_t c = 0; c < 3; ++c)
+                        sum[c] += values[e] * direction[3 * size_t(columns[e]) + c];
+                for (size_t c = 0; c < 3; ++c)
+                    product[3 * i + c] = sum[c];
+            });
+            const auto curvature = dot(direction, product, false);
+            std::array<float, 3> alpha;
+            for (size_t c = 0; c < 3; ++c)
+                alpha[c] = curvature[c] > 0. ? float(rho[c] / curvature[c]) : 0.f;
+            over_unknowns([&](const size_t i) {
+                for (size_t c = 0; c < 3; ++c) {
+                    x[3 * i + c] += alpha[c] * direction[3 * i + c];
+                    residual[3 * i + c] -= alpha[c] * product[3 * i + c];
+                }
+            });
+            const auto next_rho = dot(residual, residual, true);
+            std::array<float, 3> beta;
+            for (size_t c = 0; c < 3; ++c)
+                beta[c] = rho[c] > 0. ? float(next_rho[c] / rho[c]) : 0.f;
+            over_unknowns([&](const size_t i) {
+                for (size_t c = 0; c < 3; ++c)
+                    direction[3 * i + c] = residual[3 * i + c] / diagonal[i] + beta[c] * direction[3 * i + c];
+            });
+            rho = next_rho;
+        }
+        leveling.iterations = size_t(iteration);
+        double offset_sum = 0.;
+        for (const float value : x)
+            offset_sum += std::abs(value);
+        LOG_INFO("Mesh: leveling {} unknowns, {} steps of {:.1f} / 255 on average, {} iterations, mean offset {:.1f} / 255", unknowns, steps,
+                 255. * step_sum / double(std::max<size_t>(3 * steps, 1)), iteration, 255. * offset_sum / double(std::max<size_t>(x.size(), 1)));
+    }
+
+    void ColorLeveling::offset_at(const SplatMesh& mesh, const uint32_t face, const float* position, float* offset) const {
+        const auto& corner = mesh.faces[face];
+        const auto& a = mesh.vertices[size_t(corner[0])];
+        const auto& b = mesh.vertices[size_t(corner[1])];
+        const auto& c = mesh.vertices[size_t(corner[2])];
+        const float u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        const float v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const float p[3] = {position[0] - a[0], position[1] - a[1], position[2] - a[2]};
+        const auto dot = [](const float* x, const float* y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+        const float uu = dot(u, u), uv = dot(u, v), vv = dot(v, v), pu = dot(p, u), pv = dot(p, v);
+        const float area = uu * vv - uv * uv;
+        const float wb = area > 0.f ? std::clamp((vv * pu - uv * pv) / area, 0.f, 1.f) : 0.f;
+        const float wc = area > 0.f ? std::clamp((uu * pv - uv * pu) / area, 0.f, 1.f - wb) : 0.f;
+        const float wa = 1.f - wb - wc;
+        const uint32_t* unknown = &corner_unknowns[3 * size_t(face)];
+        for (size_t k = 0; k < 3; ++k)
+            offset[k] = wa * offsets[3 * size_t(unknown[0]) + k] + wb * offsets[3 * size_t(unknown[1]) + k] + wc * offsets[3 * size_t(unknown[2]) + k];
+    }
+
     std::vector<uint8_t> compose_mesh_page(const MeshTexels& texels, const std::vector<float>& colors, const int page_size) {
         const auto side = size_t(page_size);
         std::vector<uint8_t> image(side * side * 3, 0), state(side * side, 0);

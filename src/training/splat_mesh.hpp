@@ -126,6 +126,25 @@ namespace lfs::training {
     // best view. Faces mostly surrounded by another view that sees them well enough then join it.
     [[nodiscard]] std::vector<int32_t> choose_face_views(const SplatMesh& mesh, const FaceViewCandidates& candidates);
 
+    // Takes the steps between views out of a texture and leaves the photos otherwise as they are: a smooth offset per
+    // view on the vertices of its region, as small as closes the seams (Waechter et al. 2014, global seam leveling).
+    // Where a point of the surface borders n views, there is one sample per view to read from them.
+    struct ColorLeveling {
+        std::vector<uint32_t> corner_unknowns;   // 3 per face
+        std::vector<int32_t> sample_labels;      // per sample, the view to read, or -1 for the mean of all
+        std::vector<float> sample_positions;     // 3 per sample
+        std::vector<uint32_t> sample_faces;      // per sample, a face at that point
+        std::vector<uint32_t> sample_unknowns;   // per sample
+        std::vector<uint32_t> sample_points;     // per sample, in rising order: samples of one point are neighbors
+        std::vector<float> offsets;              // 3 per unknown, once solved
+        size_t iterations = 0;
+        // The offset at a point of a face.
+        void offset_at(const SplatMesh& mesh, uint32_t face, const float* position, float* offset) const;
+    };
+    [[nodiscard]] ColorLeveling plan_color_leveling(const SplatMesh& mesh, std::span<const int32_t> face_views);
+    // colors: 3 per sample, 0 to 1, negative where the sample's view does not see it.
+    void solve_color_leveling(ColorLeveling& leveling, const SplatMesh& mesh, std::span<const float> colors);
+
     // The page image from colors (3 per texel, 0 to 1, negative where unobserved), with the rest
     // of the page filled outward from the charts, so that filtering and compression reach no background.
     [[nodiscard]] std::vector<uint8_t> compose_mesh_page(const MeshTexels& texels, const std::vector<float>& colors, int page_size);

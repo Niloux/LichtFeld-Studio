@@ -50,6 +50,58 @@ namespace {
     }
 } // namespace
 
+TEST(SplatMesh, LevelingClosesTheStepBetweenViewsAndKeepsThemElsewhere) {
+    // A row of squares, one view on each half, meeting along a line at x = 10.
+    SplatMesh mesh;
+    constexpr int kColumns = 21;
+    for (int x = 0; x < kColumns; ++x)
+        for (int y = 0; y < 2; ++y)
+            mesh.vertices.push_back({float(x), float(y), 0.f});
+    std::vector<int32_t> labels;
+    for (int x = 0; x + 1 < kColumns; ++x) {
+        mesh.faces.push_back({2 * x, 2 * x + 2, 2 * x + 1});
+        mesh.faces.push_back({2 * x + 1, 2 * x + 2, 2 * x + 3});
+        labels.insert(labels.end(), 2, x < 10 ? 3 : 7);
+    }
+    auto leveling = lfs::training::plan_color_leveling(mesh, labels);
+    // Two points on the line, each read from both views.
+    ASSERT_EQ(leveling.sample_labels.size(), 4u);
+    std::vector<float> colors;
+    for (const auto label : leveling.sample_labels)
+        colors.insert(colors.end(), 3, label == 3 ? .3f : .5f);
+    lfs::training::solve_color_leveling(leveling, mesh, colors);
+
+    const auto color_at = [&](const size_t face, const std::array<float, 3> position, const float base) {
+        float offset[3];
+        leveling.offset_at(mesh, static_cast<uint32_t>(face), position.data(), offset);
+        return base + offset[0];
+    };
+    // Both sides of the line now agree, each moved by half the step.
+    const float left = color_at(19, {10.f, 1.f, 0.f}, .3f), right = color_at(20, {10.f, 1.f, 0.f}, .5f);
+    EXPECT_NEAR(left, right, .01f);
+    EXPECT_NEAR(left, .4f, .01f);
+    // A step dies away with distance, and never overshoots.
+    const float far_left = color_at(0, {0.f, 0.f, 0.f}, .3f);
+    EXPECT_GT(far_left, .3f);
+    EXPECT_LE(far_left, left + .001f);
+}
+
+TEST(SplatMesh, LevelingIgnoresViewsThatDoNotSeeTheSeam) {
+    SplatMesh mesh;
+    mesh.vertices = {{0.f, 0.f, 0.f}, {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {1.f, 1.f, 0.f}};
+    mesh.faces = {{0, 1, 2}, {2, 1, 3}};
+    const std::vector<int32_t> labels{0, 1};
+    auto leveling = lfs::training::plan_color_leveling(mesh, labels);
+    std::vector<float> colors(leveling.sample_labels.size() * 3, -1.f);
+    for (size_t s = 0; s < leveling.sample_labels.size(); ++s)
+        if (leveling.sample_labels[s] == 0)
+            for (size_t c = 0; c < 3; ++c)
+                colors[3 * s + c] = .9f;
+    lfs::training::solve_color_leveling(leveling, mesh, colors);
+    for (const float offset : leveling.offsets)
+        EXPECT_EQ(offset, 0.f);
+}
+
 TEST(SplatMesh, SurfaceNetsSitsOnTheSphereFacingOutward) {
     constexpr float voxel = .04f;
     auto mesh = sphere_mesh(voxel);
@@ -703,7 +755,7 @@ TEST_F(SplatMeshGpu, TextureSamplesPhotosBetweenPixelsAndSkipsOccludingEdges) {
     EXPECT_EQ(w[1], 0.f);
 }
 
-TEST_F(SplatMeshGpu, TextureDetailComesFromTheChosenViewAndLevelsFromAll) {
+TEST_F(SplatMeshGpu, TextureColorComesFromTheChosenViewAndLevelsFromAll) {
     constexpr size_t pixels = size_t(kSize) * kSize;
     const std::vector<float> position{0.f, 0.f, 0.f};
     Device<float> texels(3), depth(pixels), photo(pixels * 3), low_photo(pixels * 3), sum(3), weight(1), high(3), best(1);
@@ -730,8 +782,8 @@ TEST_F(SplatMeshGpu, TextureDetailComesFromTheChosenViewAndLevelsFromAll) {
     ASSERT_EQ(cudaMemcpy(&w, weight.data, 4, cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(h, high.data, 12, cudaMemcpyDeviceToHost), cudaSuccess);
     EXPECT_NEAR(s[0] / w, (.25f * .8f + 1.f * .4f + .5f * .6f) / 1.75f, 1e-4f);
-    // The chosen view is the farthest, and closer ones do not take over.
-    EXPECT_NEAR(h[0], .2f, 1e-4f);
+    // The chosen view is the farthest, closer ones do not take over, and it keeps its whole color.
+    EXPECT_NEAR(h[0], 1.f, 1e-4f);
 }
 
 TEST_F(SplatMeshGpu, TextureLowPassLeavesInvalidPixelsOut) {
