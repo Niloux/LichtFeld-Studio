@@ -57,6 +57,9 @@ namespace lfs::training {
         constexpr double kTsdfShareOfFreeMemory = 0.8;
         // The rest holds a depth map, a photo and its blurs at the bake width.
         constexpr double kTextureShareOfFreeMemory = 0.7;
+        // A batch of pages holds 52 bytes per covered texel on the GPU, whatever the size of the scene. Half this reads the
+        // photos twice as often: 920 s against 766 s on an outdoor scene, at the same peak of GPU memory.
+        constexpr size_t kBakeBatchTexels = 128'000'000;
         // Detail below this share of the image comes from the view chosen for the face, and only broader colors are leveled
         // across views. Smaller lets the mean of misregistered views blur lettering, which spans about 1/100 of the image on
         // an indoor scene; larger shows the seams between views on white walls at 1/50 and bands colored lights at 1/20.
@@ -116,10 +119,9 @@ namespace lfs::training {
                                      std::format("{:.1f} GB needed, {:.1f} GB available", needed / (1ull << 30), available / (1ull << 30)));
         }
 
-        // Rasterizing the pages holds 16 bytes per page texel in up to kSimplifyThreads threads, and baking
-        // keeps 19 per covered texel and 3 per page texel. Covered texels run about 1.3 times the area.
-        // Unwrapping and choosing views add about 100 bytes per face: 10.8 GB in all at 288M texels and 23M faces of levels
-        // of detail, and 3.5 GB at 66M and 1.7M.
+        // Pages stay in RAM at 3 bytes per page texel, of which covered texels fill most. A batch of them holds 16 bytes per
+        // page texel while rasterizing and 23 per covered texel to bake. Unwrapping, choosing views and leveling add
+        // about 100 bytes per face.
         void texture_ram_preflight(const SplatMesh& mesh, const core::SplatMeshSettings& s) {
             const auto host = core::host_metrics::sample();
             if (!host.ram_valid)
@@ -128,7 +130,7 @@ namespace lfs::training {
             // Levels of detail add a quarter of the texels at each step, and about half the faces in all.
             const double covered = (s.write_osgb ? 4. / 3. : 1.) * 1.3 * mesh.area / (double(s.texel_size) * s.texel_size);
             const double faces = (s.write_osgb ? 1.5 : 1.) * double(mesh.faces.size());
-            const double needed = kSimplifyThreads * 16. * page_texels + 22. * covered + 100. * faces;
+            const double needed = kSimplifyThreads * 16. * page_texels + 23. * std::min(covered, double(kBakeBatchTexels)) + 5. * covered + 100. * faces;
             const double available = double(host.system_total_bytes - host.system_used_bytes);
             LOG_INFO("Mesh: {:.0f}M texels need about {:.1f} GB of RAM, {:.1f} GB available", covered / 1e6, needed / (1ull << 30), available / (1ull << 30));
             if (needed > available)
@@ -803,46 +805,47 @@ namespace lfs::training {
         // Takes each page's colors from the photos, through the same appearance inverse as the vertex colors. Uses every
         // photo: a surface's best view is one or two photos out of hundreds, and a stride leaves it out by chance, which
         // took lettering from 7 m instead of 2.5 m.
-        // Pages share the GPU, and a group of them that fits goes through all views at once.
+        // Views and the leveling between them are settled over the whole mesh first, so that nothing steps where one batch
+        // meets the next. Then pages go through in batches of neighbors, each held in memory only while it bakes and
+        // read only from the photos that can see it. page_groups are runs of pages that stay in one batch.
         void bake_texture(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings,
-                          cudaStream_t stream, const auto& report, const PPISP* appearance) {
+                          cudaStream_t stream, const auto& report, const PPISP* appearance, const std::span<const std::pair<size_t, size_t>> page_groups) {
             const size_t page_count = mesh.page_first_face.size() - 1;
-            std::vector<MeshTexels> texels(page_count);
-            {
-                std::atomic<size_t> next{0};
-                std::vector<std::thread> pool;
-                std::vector<std::exception_ptr> failures(kSimplifyThreads);
-                for (int t = 0; t < kSimplifyThreads; ++t)
-                    pool.emplace_back([&, t] {
-                        try {
-                            for (size_t p = next++; p < page_count; p = next++)
-                                texels[p] = rasterize_mesh_texels(mesh, p);
-                        } catch (...) {
-                            failures[size_t(t)] = std::current_exception();
-                            next = page_count;
-                        }
-                    });
-                for (auto& thread : pool)
-                    thread.join();
-                for (const auto& failure : failures)
-                    if (failure)
-                        std::rethrow_exception(failure);
-            }
             mesh.pages.assign(page_count, {});
             core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
             core::Tensor::trim_memory_pool();
             constexpr size_t bytes_per_texel = 52;
             const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh texture"});
             const size_t available = room.effective_free_bytes > room.required_peak_bytes ? room.effective_free_bytes - room.required_peak_bytes : 0;
-            const size_t max_texels = size_t(double(available) * kTextureShareOfFreeMemory) / bytes_per_texel;
+            const size_t max_texels = std::min(size_t(double(available) * kTextureShareOfFreeMemory) / bytes_per_texel, kBakeBatchTexels);
 
             auto bake_settings = settings;
             bake_settings.max_width = settings.texture_width;
             // A coarse level lies as far from the surface as its faces were allowed to move.
             const float base_tolerance = 2.5f * settings.voxel_size;
             const auto tolerance_of = [&](const size_t face) { return mesh.face_error.empty() ? base_tolerance : std::max(base_tolerance, kFaceErrorToTolerance * mesh.face_error[face]); };
-            size_t observed = 0, total = 0;
-            size_t first_page = 0;
+
+            // Batches of whole groups, counted in page texels, which bound the covered ones.
+            struct Batch {
+                size_t first_page = 0, last_page = 0;
+                std::vector<uint8_t> uses_view;
+            };
+            std::vector<Batch> batches;
+            size_t held = 0;
+            for (const auto& [first, last] : page_groups) {
+                size_t texels = 0;
+                for (size_t p = first; p < last; ++p)
+                    texels += size_t(mesh.page_side(p)) * mesh.page_side(p);
+                if (batches.empty() || held + texels > max_texels) {
+                    batches.push_back({.first_page = first, .last_page = last, .uses_view = std::vector<uint8_t>(views.size(), 0)});
+                    held = 0;
+                } else {
+                    batches.back().last_page = last;
+                }
+                held += texels;
+            }
+            // Choosing views and reading seams take a pass over the photos each; the batches about one more in all.
+            const float pass_share = 1.f / 3.f;
 
             // Which view sets the detail of each face.
             const auto face_count = static_cast<uint32_t>(mesh.faces.size());
@@ -862,7 +865,7 @@ namespace lfs::training {
                 LFS_CUDA_CHECK(cudaMemcpyAsync(faces.data(), mesh.faces.data(), size_t(face_count) * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
                 std::vector<float> host(face_count);
                 for (size_t i = 0; i < views.size(); ++i) {
-                    report(.4f * float(i) / float(views.size()));
+                    report(pass_share * float(i) / float(views.size()));
                     auto& camera = *views[i];
                     if (!camera.has_image())
                         continue;
@@ -877,7 +880,6 @@ namespace lfs::training {
             }
             LOG_INFO("Mesh: {} of {} views carry rolling shutter motion", std::ranges::count_if(views, [](const core::Camera* camera) { return camera->rolling_shutter().has_value(); }), views.size());
             const auto face_views = choose_face_views(mesh, candidates);
-            candidates = FaceViewCandidates(0);
             {
                 std::vector<int32_t> used;
                 for (const auto label : face_views)
@@ -888,109 +890,161 @@ namespace lfs::training {
                 used.erase(std::unique(used.begin(), used.end()), used.end());
                 LOG_INFO("Mesh: {} views set the detail of {} of {} faces", used.size(), chosen, face_views.size());
             }
-            auto leveling = plan_color_leveling(mesh, face_views);
-            const auto sample_count = static_cast<uint32_t>(leveling.sample_labels.size());
-            DeviceArray<float> sample_positions(size_t(sample_count) * 3, stream), sample_sum(size_t(sample_count) * 3, stream, true), sample_weight(sample_count, stream, true);
-            DeviceArray<float> sample_high(size_t(sample_count) * 3, stream, true), sample_best(sample_count, stream, true), sample_tolerances(sample_count, stream);
-            DeviceArray<int32_t> sample_labels(sample_count, stream);
-            if (sample_count > 0) {
-                std::vector<float> host_tolerances(sample_count);
-                for (size_t s = 0; s < sample_count; ++s)
-                    host_tolerances[s] = tolerance_of(leveling.sample_faces[s]);
-                LFS_CUDA_CHECK(cudaMemcpyAsync(sample_positions.data(), leveling.sample_positions.data(), size_t(sample_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
-                LFS_CUDA_CHECK(cudaMemcpyAsync(sample_labels.data(), leveling.sample_labels.data(), size_t(sample_count) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                LFS_CUDA_CHECK(cudaMemcpyAsync(sample_tolerances.data(), host_tolerances.data(), size_t(sample_count) * sizeof(float), cudaMemcpyHostToDevice, stream));
-                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples upload");
+            // A batch needs the views chosen for its faces, and those nearly as good, which fill in what a chosen view cannot
+            // see. A fisheye sees most of a room, so leaving out the rest saves most of the reads.
+            constexpr size_t kCandidates = FaceViewCandidates::kPerFace;
+            constexpr float kFillsIn = .5f;
+            size_t batch_views_total = 0;
+            for (auto& batch : batches) {
+                for (size_t f = mesh.page_first_face[batch.first_page]; f < mesh.page_first_face[batch.last_page]; ++f) {
+                    if (face_views[f] >= 0)
+                        batch.uses_view[size_t(face_views[f])] = 1;
+                    for (size_t slot = 0; slot < kCandidates; ++slot)
+                        if (const float score = candidates.scores[f * kCandidates + slot]; score > 0.f && score >= kFillsIn * candidates.scores[f * kCandidates])
+                            batch.uses_view[size_t(candidates.views[f * kCandidates + slot])] = 1;
+                }
+                batch_views_total += size_t(std::ranges::count(batch.uses_view, uint8_t{1}));
             }
-            while (first_page < page_count) {
-                size_t last_page = first_page, count = 0;
-                while (last_page < page_count && (last_page == first_page || count + texels[last_page].pixels.size() <= max_texels))
-                    count += texels[last_page++].pixels.size();
-                if (count > max_texels)
-                    throw collisionError("mesh.memory", "Not enough GPU memory for the mesh texture; free memory or use a smaller texture size",
-                                         ErrorCode::ResourceExhausted, std::format("{} texels, room for {}", count, max_texels));
+            candidates = FaceViewCandidates(0);
+            LOG_INFO("Mesh: {} batches of at most {} M page texels read {:.1f} times the photos in all", batches.size(), max_texels / 1000000, double(batch_views_total) / double(std::max<size_t>(views.size(), 1)));
+
+            // A photo and its blur, through the appearance inverse; false if it has no use here.
+            DeviceArray<float> scratch, weights, low;
+            const auto read_view = [&](core::Camera& camera, const gsplat_lfs::TsdfView& view, Tensor& depth, Tensor& photo) {
+                depth = render_median_depth(camera, model, bake_settings, stream);
+                photo = load_photo(camera, settings.texture_width);
+                const size_t pixels = size_t(view.width) * view.height;
+                if (photo.numel() != pixels * 3) {
+                    LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
+                    return false;
+                }
+                photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
+                if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid()))
+                    photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
+                if (low.count != pixels * 3) {
+                    scratch = DeviceArray<float>(pixels * 3, stream);
+                    low = DeviceArray<float>(pixels * 3, stream);
+                    weights = DeviceArray<float>(pixels * 2, stream);
+                }
+                gsplat_lfs::mesh_photo_low_pass(photo.ptr<float>(), depth.ptr<float>(), view.width, view.height, std::max(int(view.width) / kBlendWidthPerRadius, 1),
+                                                scratch.data(), weights.data(), low.data(), stream);
+                return true;
+            };
+
+            auto leveling = plan_color_leveling(mesh, face_views);
+            {
+                const auto sample_count = static_cast<uint32_t>(leveling.sample_labels.size());
+                std::vector<float> host_colors(size_t(sample_count) * 3, -1.f);
+                if (sample_count > 0) {
+                    DeviceArray<float> positions(size_t(sample_count) * 3, stream), sum(size_t(sample_count) * 3, stream, true), weight(sample_count, stream, true);
+                    DeviceArray<float> high(size_t(sample_count) * 3, stream, true), best(sample_count, stream, true), tolerances(sample_count, stream);
+                    DeviceArray<int32_t> labels(sample_count, stream);
+                    std::vector<float> host_tolerances(sample_count);
+                    for (size_t s = 0; s < sample_count; ++s)
+                        host_tolerances[s] = tolerance_of(leveling.sample_faces[s]);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(positions.data(), leveling.sample_positions.data(), size_t(sample_count) * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(labels.data(), leveling.sample_labels.data(), size_t(sample_count) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), size_t(sample_count) * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples upload");
+                    for (size_t i = 0; i < views.size(); ++i) {
+                        report(pass_share * (1.f + float(i) / float(views.size())));
+                        auto& camera = *views[i];
+                        if (!camera.has_image())
+                            continue;
+                        camera.load_image_size(1, settings.texture_width);
+                        const auto view = make_view(camera);
+                        Tensor depth, photo;
+                        if (!read_view(camera, view, depth, photo))
+                            continue;
+                        // Blurred, so that misregistration and grain do not read as a step.
+                        gsplat_lfs::mesh_texture_accumulate(positions.data(), sample_count, view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), low.data(), low.data(), tolerances.data(),
+                                                            sum.data(), weight.data(), high.data(), best.data(), stream);
+                        LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples");
+                    }
+                    std::vector<float> means(size_t(sample_count) * 3), mean_weights(sample_count), direct(size_t(sample_count) * 3), bests(sample_count);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(means.data(), sum.data(), means.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(mean_weights.data(), weight.data(), mean_weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(direct.data(), high.data(), direct.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), best.data(), bests.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples download");
+                    for (size_t s = 0; s < sample_count; ++s)
+                        for (size_t c = 0; c < 3; ++c) {
+                            if (std::isinf(bests[s]))
+                                host_colors[3 * s + c] = direct[3 * s + c];
+                            // Where no view sets the detail, the texels hold the mean of all views.
+                            else if (leveling.sample_labels[s] < 0 && mean_weights[s] > 0.f)
+                                host_colors[3 * s + c] = means[3 * s + c] / mean_weights[s];
+                        }
+                }
+                solve_color_leveling(leveling, mesh, host_colors);
+                leveling.release_samples();
+            }
+
+            size_t observed = 0, total = 0, batch_views_done = 0;
+            for (const auto& batch : batches) {
+                const size_t pages_here = batch.last_page - batch.first_page;
+                std::vector<MeshTexels> texels(pages_here);
+                {
+                    std::atomic<size_t> next{0};
+                    std::vector<std::thread> pool;
+                    std::vector<std::exception_ptr> failures(kSimplifyThreads);
+                    for (int t = 0; t < kSimplifyThreads; ++t)
+                        pool.emplace_back([&, t] {
+                            try {
+                                for (size_t p = next++; p < pages_here; p = next++)
+                                    texels[p] = rasterize_mesh_texels(mesh, batch.first_page + p);
+                            } catch (...) {
+                                failures[size_t(t)] = std::current_exception();
+                                next = pages_here;
+                            }
+                        });
+                    for (auto& thread : pool)
+                        thread.join();
+                    for (const auto& failure : failures)
+                        if (failure)
+                            std::rethrow_exception(failure);
+                }
+                size_t count = 0;
+                for (const auto& page : texels)
+                    count += page.pixels.size();
                 DeviceArray<float> positions(count * 3, stream), low_sum(count * 3, stream, true), low_weight(count, stream, true);
                 DeviceArray<float> high(count * 3, stream, true), best_weight(count, stream, true);
                 DeviceArray<int32_t> labels(count, stream);
                 DeviceArray<float> tolerances(count, stream);
-                std::vector<int32_t> host_labels;
-                std::vector<float> host_tolerances;
-                host_labels.reserve(count);
-                host_tolerances.reserve(count);
-                for (size_t p = first_page; p < last_page; ++p)
-                    for (const auto face : texels[p].faces) {
-                        host_labels.push_back(face_views[face]);
-                        host_tolerances.push_back(tolerance_of(face));
+                {
+                    std::vector<int32_t> host_labels;
+                    std::vector<float> host_tolerances;
+                    host_labels.reserve(count);
+                    host_tolerances.reserve(count);
+                    for (const auto& page : texels)
+                        for (const auto face : page.faces) {
+                            host_labels.push_back(face_views[face]);
+                            host_tolerances.push_back(tolerance_of(face));
+                        }
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(labels.data(), host_labels.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), count * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    size_t offset = 0;
+                    for (const auto& page : texels) {
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(positions.data() + 3 * offset, page.positions.data(), page.positions.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                        offset += page.pixels.size();
                     }
-                LFS_CUDA_CHECK(cudaMemcpyAsync(labels.data(), host_labels.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), count * sizeof(float), cudaMemcpyHostToDevice, stream));
-                size_t offset = 0;
-                for (size_t p = first_page; p < last_page; ++p) {
-                    LFS_CUDA_CHECK(cudaMemcpyAsync(positions.data() + 3 * offset, texels[p].positions.data(), texels[p].positions.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-                    offset += texels[p].pixels.size();
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture upload");
                 }
-                LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture upload");
-                DeviceArray<float> scratch, weights, low;
                 for (size_t i = 0; i < views.size(); ++i) {
-                    const float done = (float(first_page) + float(last_page - first_page) * float(i) / float(views.size())) / float(page_count);
-                    report(.4f + .6f * done);
+                    if (!batch.uses_view[i])
+                        continue;
+                    report(pass_share * (2.f + float(batch_views_done++) / float(std::max<size_t>(batch_views_total, 1))));
                     auto& camera = *views[i];
                     if (!camera.has_image())
                         continue;
                     camera.load_image_size(1, settings.texture_width);
                     const auto view = make_view(camera);
-                    auto depth = render_median_depth(camera, model, bake_settings, stream);
-                    auto photo = load_photo(camera, settings.texture_width);
-                    const size_t pixels = size_t(view.width) * view.height;
-                    if (photo.numel() != pixels * 3) {
-                        LOG_WARN("Mesh: photo size of {} does not match the render; skipping its colors", camera.image_name());
+                    Tensor depth, photo;
+                    if (!read_view(camera, view, depth, photo))
                         continue;
-                    }
-                    photo = photo.to(Device::CUDA, stream).to(core::DataType::Float32).contiguous();
-                    if (appearance && appearance->is_known_camera(camera.camera_id()) && appearance->is_known_frame(camera.uid()))
-                        photo = appearance->invert(photo, camera.camera_id(), camera.uid(), stream);
-                    if (low.count != pixels * 3) {
-                        scratch = DeviceArray<float>(pixels * 3, stream);
-                        low = DeviceArray<float>(pixels * 3, stream);
-                        weights = DeviceArray<float>(pixels * 2, stream);
-                    }
-                    gsplat_lfs::mesh_photo_low_pass(photo.ptr<float>(), depth.ptr<float>(), view.width, view.height, std::max(int(view.width) / kBlendWidthPerRadius, 1),
-                                                    scratch.data(), weights.data(), low.data(), stream);
                     gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerances.data(),
                                                         low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
-                    // The first group of pages also reads the seams, with one pass over the photos less.
-                    // Blurred, so that misregistration and grain do not read as a step.
-                    if (first_page == 0 && sample_count > 0)
-                        gsplat_lfs::mesh_texture_accumulate(sample_positions.data(), sample_count, view, static_cast<int32_t>(i), sample_labels.data(), depth.ptr<float>(), low.data(), low.data(), sample_tolerances.data(),
-                                                            sample_sum.data(), sample_weight.data(), sample_high.data(), sample_best.data(), stream);
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture");
-                }
-                if (first_page == 0) {
-                    std::vector<float> host_colors(size_t(sample_count) * 3, -1.f);
-                    if (sample_count > 0) {
-                        std::vector<float> means(size_t(sample_count) * 3), mean_weights(sample_count), direct(size_t(sample_count) * 3), bests(sample_count);
-                        LFS_CUDA_CHECK(cudaMemcpyAsync(means.data(), sample_sum.data(), means.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                        LFS_CUDA_CHECK(cudaMemcpyAsync(mean_weights.data(), sample_weight.data(), mean_weights.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                        LFS_CUDA_CHECK(cudaMemcpyAsync(direct.data(), sample_high.data(), direct.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                        LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), sample_best.data(), bests.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                        LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh seam samples");
-                        for (size_t s = 0; s < sample_count; ++s)
-                            for (size_t c = 0; c < 3; ++c) {
-                                if (std::isinf(bests[s]))
-                                    host_colors[3 * s + c] = direct[3 * s + c];
-                                // Where no view sets the detail, the texels hold the mean of all views.
-                                else if (leveling.sample_labels[s] < 0 && mean_weights[s] > 0.f)
-                                    host_colors[3 * s + c] = means[3 * s + c] / mean_weights[s];
-                            }
-                    }
-                    solve_color_leveling(leveling, mesh, host_colors);
-                    sample_positions = {};
-                    sample_labels = {};
-                    sample_tolerances = {};
-                    sample_sum = {};
-                    sample_weight = {};
-                    sample_high = {};
-                    sample_best = {};
                 }
                 std::vector<float> sums(count * 3), sum_weights(count), highs(count * 3), bests(count);
                 LFS_CUDA_CHECK(cudaMemcpyAsync(sums.data(), low_sum.data(), sums.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
@@ -998,9 +1052,9 @@ namespace lfs::training {
                 LFS_CUDA_CHECK(cudaMemcpyAsync(highs.data(), high.data(), highs.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_CUDA_CHECK(cudaMemcpyAsync(bests.data(), best_weight.data(), bests.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture download");
-                offset = 0;
+                size_t offset = 0;
                 std::vector<float> colors;
-                for (size_t p = first_page; p < last_page; ++p) {
+                for (size_t p = 0; p < pages_here; ++p) {
                     const size_t page_texels = texels[p].pixels.size();
                     colors.resize(page_texels * 3);
                     for (size_t t = 0; t < page_texels; ++t) {
@@ -1017,12 +1071,11 @@ namespace lfs::training {
                         for (size_t c = 0; c < 3; ++c)
                             colors[3 * t + c] = std::max((direct ? 0.f : sums[3 * at + c] / sum_weights[at]) + highs[3 * at + c] + level[c], 0.f);
                     }
-                    mesh.pages[p] = compose_mesh_page(texels[p], colors, mesh.page_side(p));
+                    mesh.pages[batch.first_page + p] = compose_mesh_page(texels[p], colors, mesh.page_side(batch.first_page + p));
                     texels[p] = {};
                     offset += page_texels;
                 }
                 total += count;
-                first_page = last_page;
             }
             mesh.texels = total;
             mesh.observed_texel_share = total > 0 ? float(observed) / float(total) : 0.f;
@@ -1230,9 +1283,23 @@ namespace lfs::training {
             for (auto* camera : cameras)
                 if (camera)
                     all_views.push_back(camera);
+            // The levels of a tile stay together, and tiles come in the order of the splits: neighbors in the list are neighbors in space.
+            std::vector<std::pair<size_t, size_t>> page_groups;
+            if (mesh.tiled) {
+                for (const auto& level : mesh.tiled->levels) {
+                    const size_t last = level.first_page + level.page_count;
+                    if (level.level == 0 || page_groups.empty())
+                        page_groups.push_back({level.first_page, last});
+                    else
+                        page_groups.back().second = last;
+                }
+            } else {
+                for (size_t p = 0; p + 1 < mesh.page_first_face.size(); ++p)
+                    page_groups.push_back({p, p + 1});
+            }
             bake_texture(mesh.tiled ? mesh.tiled->combined : mesh, model, all_views, settings, stream, [&](const float value) {
                 core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture"));
-            }, appearance);
+            }, appearance, page_groups);
             mesh.seconds_bake = seconds_since(step);
             if (mesh.tiled) {
                 mesh.pages = {};

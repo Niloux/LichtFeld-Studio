@@ -127,11 +127,24 @@ namespace lfs::training {
         parallel_for(ranges.size(), [&](const size_t r) {
             auto& tile = tiles[r];
             SplatMesh finest;
-            finest.vertices = base.vertices;
-            finest.colors = base.colors;
-            finest.faces.assign(base.faces.begin() + std::ptrdiff_t(ranges[r].first), base.faces.begin() + std::ptrdiff_t(ranges[r].second));
-            auto locks = shared;
-            compact(finest, &locks);
+            std::vector<uint8_t> locks;
+            // Only the tile's own vertices, in the order its faces reach them: a copy of the whole mesh per tile costs gigabytes.
+            {
+                std::vector<int32_t> remap(base.vertices.size(), -1);
+                finest.faces.assign(base.faces.begin() + std::ptrdiff_t(ranges[r].first), base.faces.begin() + std::ptrdiff_t(ranges[r].second));
+                for (auto& face : finest.faces)
+                    for (auto& vertex : face) {
+                        auto& target = remap[size_t(vertex)];
+                        if (target < 0) {
+                            target = static_cast<int32_t>(finest.vertices.size());
+                            finest.vertices.push_back(base.vertices[size_t(vertex)]);
+                            if (!base.colors.empty())
+                                finest.colors.push_back(base.colors[size_t(vertex)]);
+                            locks.push_back(shared[size_t(vertex)]);
+                        }
+                        vertex = target;
+                    }
+            }
             std::array<double, 3> low{DBL_MAX, DBL_MAX, DBL_MAX}, high{-DBL_MAX, -DBL_MAX, -DBL_MAX};
             for (const auto& p : finest.vertices)
                 for (int c = 0; c < 3; ++c) {

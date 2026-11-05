@@ -138,6 +138,7 @@ namespace lfs::training {
         std::vector<uint32_t> sample_points;     // per sample, in rising order: samples of one point are neighbors
         std::vector<float> offsets;              // 3 per unknown, once solved
         size_t iterations = 0;
+        void release_samples();
         // The offset at a point of a face.
         void offset_at(const SplatMesh& mesh, uint32_t face, const float* position, float* offset) const;
     };

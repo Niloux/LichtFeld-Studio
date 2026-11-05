@@ -621,6 +621,14 @@ namespace lfs::training {
                  255. * step_sum / double(std::max<size_t>(3 * steps, 1)), iteration, 255. * offset_sum / double(std::max<size_t>(x.size(), 1)));
     }
 
+    void ColorLeveling::release_samples() {
+        sample_labels = {};
+        sample_positions = {};
+        sample_faces = {};
+        sample_unknowns = {};
+        sample_points = {};
+    }
+
     void ColorLeveling::offset_at(const SplatMesh& mesh, const uint32_t face, const float* position, float* offset) const {
         const auto& corner = mesh.faces[face];
         const auto& a = mesh.vertices[size_t(corner[0])];
