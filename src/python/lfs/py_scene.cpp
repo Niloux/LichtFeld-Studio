@@ -1484,16 +1484,17 @@ namespace lfs::python {
             const core::CollisionSettings settings{.voxel_size = size, .opacity = opacity, .max_gaussian_area = max_area,
                                                     .auto_resolution = automatic, .cleanup = cleanup};
             collision_access([&](auto& tasks, auto*) { tasks.startCollision(settings); }); }, nb::arg("voxel_size") = .05f, nb::arg("opacity") = .1f, nb::arg("auto_resolution") = false, nb::arg("cleanup") = true, nb::arg("max_gaussian_area") = 0.f);
-        m.def("generate_mesh", [collision_access](const std::string& path, float voxel_size, int view_stride, float full_weight_range, int min_views, float simplify_error, float max_range) {
+        m.def("generate_mesh", [collision_access](const std::string& path, float voxel_size, int view_stride, float full_weight_range, int min_views, float simplify_error, float max_range, float texel_size) {
             core::SplatMeshSettings settings;
+            settings.texel_size = texel_size;
             settings.simplify_error = simplify_error;
             settings.max_range = max_range;
             settings.voxel_size = voxel_size;
             settings.view_stride = view_stride;
             settings.full_weight_range = full_weight_range;
             settings.min_views = min_views;
-            collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .02f, nb::arg("view_stride") = 2, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 3, nb::arg("simplify_error") = .005f, nb::arg("max_range") = 0.f,
-              "Mesh the selected splat from the scene's cameras into a PLY and a new mesh node; progress is in get_collision_state, cancel with cancel_collision");
+            collision_access([&](auto& tasks, auto*) { tasks.startSplatMesh(settings, core::utf8_to_path(path)); }); }, nb::arg("path"), nb::arg("voxel_size") = .02f, nb::arg("view_stride") = 2, nb::arg("full_weight_range") = 1.f, nb::arg("min_views") = 3, nb::arg("simplify_error") = .005f, nb::arg("max_range") = 0.f, nb::arg("texel_size") = 0.f,
+              "Mesh the selected splat from the scene's cameras into a PLY and a new mesh node, and with texel_size also a textured OBJ beside it; progress is in get_collision_state, cancel with cancel_collision");
         m.def("export_collision", [collision_access](const std::string& uuid, const std::string& path) {
             const auto parsed = core::Uuid::from_string(uuid);
             if (!parsed)

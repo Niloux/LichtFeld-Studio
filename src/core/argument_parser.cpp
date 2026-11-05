@@ -2590,6 +2590,9 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --simplify-error <v>       Reduce faces within this surface deviation; 0 keeps all (default 0.005)
   --max-range <v>            Mesh only surfaces a view saw from closer than this; 0 = no limit (default 0)
   --render-width <n>         Render and photo width limit (default 1600)
+  --texel-size <v>           Bake a texture with texels of this size, and write an OBJ beside the PLY; 0 = none (default 0)
+  --texture-size <n>         Side of a texture page (default 4096)
+  --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
   --all-views                Also fuse the held-out views
 )";
 
@@ -2646,6 +2649,12 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.max_range = std::stof(value());
                 } else if (flag == "--render-width") {
                     settings.max_width = std::stoi(value());
+                } else if (flag == "--texel-size") {
+                    settings.texel_size = std::stof(value());
+                } else if (flag == "--texture-size") {
+                    settings.texture_size = std::stoi(value());
+                } else if (flag == "--texture-width") {
+                    settings.texture_width = std::stoi(value());
                 } else if (flag == "--all-views") {
                     all_views = true;
                 } else if (flag == "-o" || flag == "--output" || flag == "--output-path") {

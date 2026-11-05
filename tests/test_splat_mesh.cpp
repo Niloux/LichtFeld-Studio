@@ -248,6 +248,232 @@ TEST(SplatMesh, PlyHasTheHeaderCountsAndRecordSizes) {
     EXPECT_EQ(text.size() - (end + 11), 3u * 27u + 13u);
 }
 
+TEST(SplatMesh, UnwrapKeepsTheFacesAndGivesThemAreaOnThePage) {
+    constexpr float voxel = .04f, texel = .005f;
+    constexpr int side = 2048;
+    auto mesh = sphere_mesh(voxel);
+    lfs::training::compute_splat_mesh_normals(mesh);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    const size_t faces = mesh.faces.size();
+    const double area = mesh.area;
+    lfs::training::unwrap_splat_mesh(mesh, texel, side, {}, 4000);
+    // Surface nets makes a few faces without area on the symmetry planes; only those go.
+    EXPECT_GT(mesh.faces.size(), faces * 99 / 100);
+    auto copy = mesh;
+    lfs::training::compute_splat_mesh_normals(copy);
+    EXPECT_NEAR(copy.area / area, 1., 1e-4);
+    ASSERT_EQ(mesh.uvs.size(), mesh.vertices.size());
+    EXPECT_EQ(mesh.normals.size(), mesh.vertices.size());
+    EXPECT_EQ(mesh.colors.size(), mesh.vertices.size());
+    EXPECT_GT(mesh.charts, 1u);
+    ASSERT_GE(mesh.page_first_face.size(), 2u);
+    EXPECT_EQ(mesh.page_first_face.back(), mesh.faces.size());
+    for (const auto& uv : mesh.uvs) {
+        EXPECT_GE(uv[0], 0.f);
+        EXPECT_LE(uv[0], 1.f);
+        EXPECT_GE(uv[1], 0.f);
+        EXPECT_LE(uv[1], 1.f);
+    }
+    for (const auto& p : mesh.vertices)
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, voxel / 2);
+
+    size_t texels = 0;
+    for (size_t page = 0; page + 1 < mesh.page_first_face.size(); ++page) {
+        const auto found = lfs::training::rasterize_mesh_texels(mesh, page);
+        texels += found.pixels.size();
+        ASSERT_EQ(found.positions.size(), 3 * found.pixels.size());
+        // Every texel lies on a face, which lies within a voxel of the sphere.
+        for (size_t t = 0; t < found.pixels.size(); t += 97)
+            ASSERT_NEAR(std::hypot(found.positions[3 * t], found.positions[3 * t + 1], found.positions[3 * t + 2]), 1.f, voxel);
+        EXPECT_EQ(found.fallback[0], 10);
+        EXPECT_EQ(found.fallback[2], 30);
+    }
+    // At least what the surface takes at this density, and not much more for the margins.
+    const double expected = area / (texel * texel);
+    EXPECT_GT(double(texels), .95 * expected);
+    EXPECT_LT(double(texels), 1.5 * expected);
+}
+
+TEST(SplatMesh, UnwrapGroupsKeepTheirOwnPagesAndEveryFace) {
+    constexpr float voxel = .04f, texel = .005f;
+    auto single = sphere_mesh(voxel), grouped = single;
+    lfs::training::compute_splat_mesh_normals(single);
+    lfs::training::compute_splat_mesh_normals(grouped);
+    const double area = single.area;
+    lfs::training::unwrap_splat_mesh(single, texel, 2048, {}, 2000);
+    lfs::training::unwrap_splat_mesh(grouped, texel, 2048, {}, 2000, 6000);
+    EXPECT_GT(grouped.page_first_face.size(), single.page_first_face.size());
+    EXPECT_EQ(grouped.faces.size(), single.faces.size());
+    EXPECT_EQ(grouped.page_first_face.back(), grouped.faces.size());
+    lfs::training::compute_splat_mesh_normals(grouped);
+    EXPECT_NEAR(grouped.area / area, 1., 1e-4);
+    // A vertex keeps its position in the group's output, and each page stays on the page.
+    for (const auto& p : grouped.vertices)
+        EXPECT_NEAR(std::hypot(p[0], p[1], p[2]), 1.f, voxel / 2);
+    for (const auto& uv : grouped.uvs) {
+        EXPECT_GE(uv[0], 0.f);
+        EXPECT_LE(uv[1], 1.f);
+    }
+}
+
+namespace {
+    // A strip of n quads along x, with the faces of quad i at indices 2i and 2i + 1.
+    SplatMesh strip_mesh(const int n) {
+        SplatMesh mesh;
+        for (int i = 0; i <= n; ++i) {
+            mesh.vertices.push_back({float(i), 0.f, 0.f});
+            mesh.vertices.push_back({float(i), 1.f, 0.f});
+        }
+        for (int i = 0; i < n; ++i) {
+            mesh.faces.push_back({2 * i, 2 * i + 2, 2 * i + 1});
+            mesh.faces.push_back({2 * i + 1, 2 * i + 2, 2 * i + 3});
+        }
+        return mesh;
+    }
+} // namespace
+
+TEST(SplatMesh, CandidatesKeepTheBestViewsInOrder) {
+    lfs::training::FaceViewCandidates candidates(1);
+    for (int view = 0; view < 20; ++view) {
+        const float score = float(view % 7) + 1.f + float(view) * .01f;
+        candidates.add(view, std::span(&score, 1));
+    }
+    for (size_t slot = 0; slot + 1 < lfs::training::FaceViewCandidates::kPerFace; ++slot)
+        EXPECT_GE(candidates.scores[slot], candidates.scores[slot + 1]);
+    EXPECT_EQ(candidates.views[0], 13);
+}
+
+TEST(SplatMesh, OneViewTakesEveryFaceItSeesWellEnough) {
+    // Each view is the very best on its own half, and sees the other half at 60%: one must take all, or the middle is a seam.
+    const auto mesh = strip_mesh(50);
+    lfs::training::FaceViewCandidates candidates(mesh.faces.size());
+    std::vector<float> first(mesh.faces.size()), second(mesh.faces.size());
+    for (size_t f = 0; f < mesh.faces.size(); ++f) {
+        first[f] = f < mesh.faces.size() / 2 ? 1.f : .6f;
+        second[f] = f < mesh.faces.size() / 2 ? .6f : 1.f;
+    }
+    candidates.add(3, first);
+    candidates.add(5, second);
+    const auto labels = lfs::training::choose_face_views(mesh, candidates);
+    EXPECT_TRUE(std::ranges::all_of(labels, [&](const int32_t label) { return label == labels[0]; }));
+    EXPECT_TRUE(labels[0] == 3 || labels[0] == 5);
+}
+
+TEST(SplatMesh, ViewsSplitOnlyWhereOneCannotServeAndUnseenFacesStayUnset) {
+    const auto mesh = strip_mesh(50);
+    const size_t faces = mesh.faces.size();
+    lfs::training::FaceViewCandidates candidates(faces);
+    std::vector<float> first(faces, 0.f), second(faces, 0.f);
+    for (size_t f = 0; f + 2 < faces; ++f)
+        (f < faces / 2 ? first : second)[f] = 1.f;
+    candidates.add(3, first);
+    candidates.add(5, second);
+    const auto labels = lfs::training::choose_face_views(mesh, candidates);
+    EXPECT_EQ(labels[0], 3);
+    EXPECT_EQ(labels[faces - 3], 5);
+    EXPECT_EQ(labels[faces - 1], -1);
+}
+
+TEST(SplatMesh, ASpeckJoinsTheViewAroundIt) {
+    // A face whose own best view differs, but which the surrounding view sees at 40%.
+    const auto mesh = strip_mesh(50);
+    const size_t faces = mesh.faces.size();
+    lfs::training::FaceViewCandidates candidates(faces);
+    std::vector<float> around(faces, 1.f), own(faces, 0.f);
+    around[40] = .4f;
+    own[40] = 1.f;
+    candidates.add(3, around);
+    candidates.add(5, own);
+    const auto labels = lfs::training::choose_face_views(mesh, candidates);
+    EXPECT_EQ(labels[40], 3);
+}
+
+TEST(SplatMesh, ComposingAPageFillsOutwardFromTheCharts) {
+    lfs::training::MeshTexels texels;
+    constexpr int side = 64;
+    texels.pixels = {uint32_t(20 * side + 20), uint32_t(20 * side + 21)};
+    texels.positions.assign(6, 0.f);
+    texels.fallback = {0, 0, 0, 200, 100, 50};
+    const std::vector<float> colors{1.f, .5f, 0.f, -1.f, -1.f, -1.f};
+    const auto image = lfs::training::compose_mesh_page(texels, colors, side);
+    const auto at = [&](const int x, const int y, const int c) { return int(image[3 * (size_t(y) * side + x) + c]); };
+    EXPECT_EQ(at(20, 20, 0), 255);
+    EXPECT_EQ(at(20, 20, 1), 128);
+    // Unobserved texels use the vertex colors.
+    EXPECT_EQ(at(21, 20, 0), 200);
+    // The gutter continues the chart, and the far page holds its mean.
+    EXPECT_EQ(at(19, 20, 0), 255);
+    EXPECT_EQ(at(60, 60, 1), (128 + 100) / 2);
+}
+
+TEST(SplatMesh, FilesStayConnectedAcrossChartSeams) {
+    // Two charts sharing an edge: its two points are repeated in the output, with different texture coordinates.
+    SplatMesh mesh;
+    mesh.vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}};
+    mesh.normals.assign(6, {0.f, 0.f, 1.f});
+    mesh.colors.assign(6, {1, 2, 3});
+    mesh.faces = {{0, 1, 2}, {3, 5, 4}};
+    mesh.uvs = {{0.f, 0.f}, {.1f, 0.f}, {0.f, .1f}, {.5f, .5f}, {.5f, .6f}, {.6f, .6f}};
+    mesh.uv_source = {10, 20, 30, 20, 30, 40};
+    mesh.page_first_face = {0, 2};
+    mesh.page_size = 8;
+    mesh.pages = {std::vector<uint8_t>(3 * 64, 128)};
+    const auto welded = lfs::training::weld_chart_seams(mesh);
+    EXPECT_EQ(welded.originals.size(), 4u);
+    EXPECT_EQ(welded.index[1], welded.index[3]);
+    EXPECT_EQ(welded.index[2], welded.index[4]);
+
+    const auto folder = std::filesystem::temp_directory_path() / "lfs_splat_mesh_weld_test";
+    std::filesystem::create_directories(folder);
+    lfs::training::write_splat_mesh_obj(mesh, folder / "scene.obj");
+    lfs::training::write_splat_mesh_ply(mesh, folder / "scene.ply");
+    std::ifstream obj_in(folder / "scene.obj", std::ios::binary), ply_in(folder / "scene.ply", std::ios::binary);
+    const std::string obj((std::istreambuf_iterator<char>(obj_in)), {}), ply((std::istreambuf_iterator<char>(ply_in)), {});
+    obj_in.close();
+    ply_in.close();
+    std::filesystem::remove_all(folder);
+    const auto count = [&](const std::string_view prefix) {
+        size_t found = 0;
+        for (size_t at = 0; (at = obj.find(prefix, at)) != std::string::npos; at += prefix.size())
+            ++found;
+        return found;
+    };
+    EXPECT_EQ(count("\nv "), 4u);
+    EXPECT_EQ(count("\nvn "), 4u);
+    EXPECT_EQ(count("\nvt "), 6u);
+    // The second face shares the points of the first, through its own texture coordinates.
+    EXPECT_NE(obj.find("f 1/1/1 2/2/2 3/3/3\nf 2/4/2 4/6/4 3/5/3\n"), std::string::npos);
+    EXPECT_NE(ply.find("element vertex 4\n"), std::string::npos);
+    EXPECT_NE(ply.find("element face 2\n"), std::string::npos);
+}
+
+TEST(SplatMesh, ObjNamesItsTexturesAndFlipsV) {
+    SplatMesh mesh;
+    mesh.vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+    mesh.normals = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
+    mesh.faces = {{0, 1, 2}};
+    mesh.uvs = {{0.f, .25f}, {1.f, .25f}, {0.f, 1.f}};
+    mesh.page_first_face = {0, 1};
+    mesh.page_size = 8;
+    mesh.pages = {std::vector<uint8_t>(3 * 64, 128)};
+    const auto folder = std::filesystem::temp_directory_path() / "lfs_splat_mesh_obj_test";
+    std::filesystem::create_directories(folder);
+    lfs::training::write_splat_mesh_obj(mesh, folder / "scene.obj");
+    std::ifstream in(folder / "scene.obj", std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), {});
+    in.close();
+    std::ifstream material(folder / "scene.mtl", std::ios::binary);
+    const std::string mtl((std::istreambuf_iterator<char>(material)), {});
+    material.close();
+    const bool image_written = std::filesystem::file_size(folder / "scene_0.jpg") > 0;
+    std::filesystem::remove_all(folder);
+    EXPECT_TRUE(image_written);
+    EXPECT_NE(text.find("mtllib scene.mtl\n"), std::string::npos);
+    EXPECT_NE(text.find("vt 0 0.75\n"), std::string::npos);
+    EXPECT_NE(text.find("usemtl page_0\nf 1/1/1 2/2/2 3/3/3\n"), std::string::npos);
+    EXPECT_NE(mtl.find("map_Kd scene_0.jpg\n"), std::string::npos);
+}
+
 namespace {
     class SplatMeshGpu : public ::testing::Test {
         void SetUp() override {
@@ -383,6 +609,81 @@ TEST_F(SplatMeshGpu, ColorsLeanOnCloseViews) {
     ASSERT_EQ(cudaMemcpy(&w, weight.data, 4, cudaMemcpyDeviceToHost), cudaSuccess);
     // Weights 1 and 1/4.
     EXPECT_NEAR(s / w, .8f, .001f);
+}
+
+TEST_F(SplatMeshGpu, TextureSamplesPhotosBetweenPixelsAndSkipsOccludingEdges) {
+    constexpr size_t pixels = size_t(kSize) * kSize;
+    const auto view = pinhole_at(-1.f);
+    // A texel at world x = .5025 lands on image x = 200 * .5025 + 100 = 200.5, past the last pixel; these land inside.
+    const std::vector<float> position{0.f, 0.f, 0.f, .1025f, 0.f, 0.f};
+    Device<float> texels(6), depth(pixels), photo(pixels * 3), sum(6), weight(2), high(6), best(2);
+    Device<int32_t> labels(2);
+    ASSERT_EQ(cudaMemcpy(texels.data, position.data(), 24, cudaMemcpyHostToDevice), cudaSuccess);
+    std::vector<float> d(pixels, 1.f), c(pixels * 3, 0.f);
+    for (size_t i = 0; i < pixels; ++i)
+        c[i] = float(i % kSize) / float(kSize); // red rises along x by 1 / kSize per pixel
+    // The first texel samples pixels 99 and 100; the second 120 and 121. Occlude 121 in one row.
+    const size_t row = 100;
+    d[row * kSize + 121] = .5f;
+    ASSERT_EQ(cudaMemcpy(depth.data, d.data(), pixels * 4, cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(photo.data, c.data(), c.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
+    gsplat_lfs::mesh_texture_accumulate(texels.data, 2, view, 0, labels.data, depth.data, photo.data, photo.data, .1f, sum.data, weight.data, high.data, best.data, nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    float s[6], w[2];
+    ASSERT_EQ(cudaMemcpy(s, sum.data, 24, cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(w, weight.data, 8, cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_GT(w[0], 0.f);
+    // Image x = 100 lies between the centers of pixels 99 and 100.
+    EXPECT_NEAR(s[0] / w[0], 99.5f / float(kSize), 1e-4f);
+    EXPECT_EQ(w[1], 0.f);
+}
+
+TEST_F(SplatMeshGpu, TextureDetailComesFromTheChosenViewAndLevelsFromAll) {
+    constexpr size_t pixels = size_t(kSize) * kSize;
+    const std::vector<float> position{0.f, 0.f, 0.f};
+    Device<float> texels(3), depth(pixels), photo(pixels * 3), low_photo(pixels * 3), sum(3), weight(1), high(3), best(1);
+    Device<int32_t> labels(1);
+    const int32_t chosen = 7;
+    ASSERT_EQ(cudaMemcpy(labels.data, &chosen, 4, cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(texels.data, position.data(), 12, cudaMemcpyHostToDevice), cudaSuccess);
+    const auto add = [&](const int32_t label, const float camera_z, const float low_level, const float detail) {
+        std::vector<float> d(pixels, -camera_z), low(pixels * 3, low_level), c(pixels * 3, low_level + detail);
+        ASSERT_EQ(cudaMemcpy(depth.data, d.data(), pixels * 4, cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(photo.data, c.data(), c.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(low_photo.data, low.data(), low.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
+        gsplat_lfs::mesh_texture_accumulate(texels.data, 1, pinhole_at(camera_z), label, labels.data, depth.data, photo.data, low_photo.data, .1f, sum.data, weight.data, high.data, best.data, nullptr);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    };
+    add(7, -4.f, .8f, .2f);
+    add(8, -1.f, .4f, -.1f);
+    add(9, -2.f, .6f, .3f);
+    float s[3], w = 0.f, h[3];
+    ASSERT_EQ(cudaMemcpy(s, sum.data, 12, cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&w, weight.data, 4, cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(h, high.data, 12, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_NEAR(s[0] / w, (.25f * .8f + 1.f * .4f + .5f * .6f) / 1.75f, 1e-4f);
+    // The chosen view is the farthest, and closer ones do not take over.
+    EXPECT_NEAR(h[0], .2f, 1e-4f);
+}
+
+TEST_F(SplatMeshGpu, TextureLowPassLeavesInvalidPixelsOut) {
+    constexpr size_t pixels = size_t(kSize) * kSize;
+    Device<float> depth(pixels), photo(pixels * 3), scratch(pixels * 3), weights(pixels * 2), low(pixels * 3);
+    std::vector<float> d(pixels, 1.f), c(pixels * 3, .5f);
+    // A bright person, masked out of the depth.
+    for (size_t y = 90; y < 110; ++y)
+        for (size_t x = 90; x < 110; ++x) {
+            d[y * kSize + x] = 0.f;
+            c[y * kSize + x] = 1.f;
+        }
+    ASSERT_EQ(cudaMemcpy(depth.data, d.data(), pixels * 4, cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(photo.data, c.data(), c.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
+    gsplat_lfs::mesh_photo_low_pass(photo.data, depth.data, kSize, kSize, 8, scratch.data, weights.data, low.data, nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    std::vector<float> out(pixels * 3);
+    ASSERT_EQ(cudaMemcpy(out.data(), low.data, out.size() * 4, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_NEAR(out[88 * kSize + 100], .5f, 1e-4f);
+    EXPECT_NEAR(out[100 * kSize + 111], .5f, 1e-4f);
 }
 
 TEST_F(SplatMeshGpu, TrainedAppearanceInvertsBackToTheRender) {

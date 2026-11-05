@@ -20,6 +20,9 @@ namespace lfs::core {
         float simplify_error = .005f;  // surface deviation allowed when reducing faces; 0 keeps every face
         float max_range = 0.f;         // surfaces no view saw from closer are not meshed; 0 = no limit
         int max_width = 1600;          // render and photo width limit
+        float texel_size = 0.f;        // size of a texel on the surface; 0 = vertex colors only
+        int texture_size = 4096;       // side of a texture page
+        int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
         bool invert_mask = false;
         float mask_threshold = .5f;
 

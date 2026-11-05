@@ -73,6 +73,8 @@ namespace gsplat_lfs {
         struct Pixel {
             uint32_t x = 0;
             uint32_t y = 0;
+            float u = 0.f; // where in the image, with pixel x spanning [x, x + 1)
+            float v = 0.f;
             float range = 0.f;
             bool valid = false;
         };
@@ -95,6 +97,8 @@ namespace gsplat_lfs {
             const float u = floorf(image.imagePoint.x), w = floorf(image.imagePoint.y);
             if (u < 0.f || w < 0.f || u >= static_cast<float>(v.width) || w >= static_cast<float>(v.height))
                 return out;
+            out.u = image.imagePoint.x;
+            out.v = image.imagePoint.y;
             out.x = static_cast<uint32_t>(u);
             out.y = static_cast<uint32_t>(w);
             out.valid = true;
@@ -353,6 +357,134 @@ namespace gsplat_lfs {
             });
         }
 
+        // Averages valid pixels of each channel along one axis, weighted by a triangle of the given radius.
+        __global__ void blur_pass_kernel(const float* source, const float* source_weight, const uint32_t width, const uint32_t height,
+                                         const int radius, const bool along_x, float* target, float* target_weight) {
+            const uint32_t pixels = width * height;
+            const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= pixels)
+                return;
+            const int x = static_cast<int>(i % width), y = static_cast<int>(i / width);
+            float sum[3] = {0.f, 0.f, 0.f}, total = 0.f;
+            for (int k = -radius; k <= radius; ++k) {
+                const int sx = along_x ? x + k : x, sy = along_x ? y : y + k;
+                if (sx < 0 || sy < 0 || sx >= static_cast<int>(width) || sy >= static_cast<int>(height))
+                    continue;
+                const uint32_t at = static_cast<uint32_t>(sy) * width + static_cast<uint32_t>(sx);
+                const float w = static_cast<float>(radius + 1 - abs(k)) * source_weight[at];
+                total += w;
+                for (uint32_t c = 0; c < 3; ++c)
+                    sum[c] += w * source[c * pixels + at];
+            }
+            for (uint32_t c = 0; c < 3; ++c)
+                target[c * pixels + i] = total > 0.f ? sum[c] / total : 0.f;
+            target_weight[i] = total > 0.f ? total / static_cast<float>((radius + 1) * (radius + 1)) : 0.f;
+        }
+
+        __global__ void valid_pixels_kernel(const float* depth, const uint32_t pixels, float* weight) {
+            const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i < pixels)
+                weight[i] = depth[i] > 0.f ? 1.f : 0.f;
+        }
+
+        // The bilinear sample of an image [3, H, W] around pixel at.
+        __device__ __forceinline__ void sample_bilinear(const float* image, const uint32_t pixels, const uint32_t at, const uint32_t width, const float fx, const float fy, float* value) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                const float* p = image + c * pixels + at;
+                value[c] = (1.f - fy) * ((1.f - fx) * p[0] + fx * p[1]) + fy * ((1.f - fx) * p[width] + fx * p[width + 1]);
+            }
+        }
+
+        __global__ void face_score_kernel(const float* vertices, const int32_t* faces, const uint32_t face_count, const TsdfView view, const float* depth,
+                                          const float tolerance, float* score) {
+            const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
+            if (first >= face_count)
+                return;
+            const RollingShutterParameters readout = readout_of(view);
+            const float* m = view.viewmat;
+            const glm::fvec3 center(-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]), -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
+                                    -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11]));
+            with_model(view, [&](const auto& model) {
+                for (uint32_t f = first; f < min(first + kVerticesPerThread, face_count); ++f) {
+                    const auto vertex = [&](const int c) {
+                        const int32_t v = faces[3 * static_cast<uint64_t>(f) + c];
+                        return glm::fvec3(vertices[3 * v], vertices[3 * v + 1], vertices[3 * v + 2]);
+                    };
+                    const glm::fvec3 a = vertex(0), b = vertex(1), c = vertex(2);
+                    const glm::fvec3 cross = glm::cross(b - a, c - a);
+                    const glm::fvec3 middle = (a + b + c) / 3.f;
+                    const glm::fvec3 to_camera = center - middle;
+                    const float distance = glm::length(to_camera), area = glm::length(cross);
+                    const float cosine = area > 0.f && distance > 0.f ? glm::dot(cross, to_camera) / (area * distance) : 0.f;
+                    float result = 0.f;
+                    if (cosine > 0.f) {
+                        const glm::fvec3 points[7] = {a, b, c, .5f * (a + b), .5f * (b + c), .5f * (c + a), middle};
+                        int seen = 0;
+                        for (const auto& point : points) {
+                            const Pixel pixel = project(model, view, readout, point);
+                            if (!pixel.valid)
+                                continue;
+                            const float measured = depth[pixel.y * view.width + pixel.x];
+                            seen += measured > 0.f && fabsf(measured - pixel.range) < tolerance;
+                        }
+                        if (2 * seen >= 7) {
+                            const float share = static_cast<float>(seen) / 7.f;
+                            const float d = fmaxf(distance, kColorMinDistance);
+                            const float square = cosine * cosine;
+                            result = share * share * square * square * square / (d * d);
+                        }
+                    }
+                    score[f] = result;
+                }
+            });
+        }
+
+        __global__ void texture_kernel(const float* texels, const uint32_t count, const TsdfView view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
+                                       const float* low_photo, const float tolerance,
+                                       float* low_sum, float* low_weight, float* high, float* best_weight) {
+            const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
+            if (first >= count)
+                return;
+            const uint32_t width = view.width, pixels = view.width * view.height;
+            const RollingShutterParameters readout = readout_of(view);
+            const float* m = view.viewmat;
+            const glm::fvec3 center(-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]), -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
+                                    -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11]));
+            with_model(view, [&](const auto& model) {
+                for (uint32_t t = first; t < min(first + kVerticesPerThread, count); ++t) {
+                    const glm::fvec3 point(texels[3 * t], texels[3 * t + 1], texels[3 * t + 2]);
+                    const Pixel pixel = project(model, view, readout, point);
+                    if (!pixel.valid)
+                        continue;
+                    const float sx = pixel.u - .5f, sy = pixel.v - .5f;
+                    const float fx0 = floorf(sx), fy0 = floorf(sy);
+                    if (fx0 < 0.f || fy0 < 0.f || fx0 + 1.f >= static_cast<float>(view.width) || fy0 + 1.f >= static_cast<float>(view.height))
+                        continue;
+                    const uint32_t at = static_cast<uint32_t>(fy0) * width + static_cast<uint32_t>(fx0);
+                    // A texel next to an occluding edge or a mask has no clean color in this view.
+                    const float corners[4] = {depth[at], depth[at + 1], depth[at + width], depth[at + width + 1]};
+                    bool clean = true;
+                    for (const float measured : corners)
+                        clean = clean && measured > 0.f && fabsf(measured - pixel.range) < tolerance;
+                    if (!clean)
+                        continue;
+                    const float w = 1.f / fmaxf(glm::length(center - point), kColorMinDistance);
+                    float color[3], low[3];
+                    sample_bilinear(photo, pixels, at, width, sx - fx0, sy - fy0, color);
+                    sample_bilinear(low_photo, pixels, at, width, sx - fx0, sy - fy0, low);
+                    for (uint32_t c = 0; c < 3; ++c)
+                        low_sum[3 * static_cast<uint64_t>(t) + c] += w * low[c];
+                    low_weight[t] += w;
+                    const float rank = labels[t] == view_label ? INFINITY : w;
+                    if (rank > best_weight[t]) {
+                        best_weight[t] = rank;
+                        for (uint32_t c = 0; c < 3; ++c)
+                            high[3 * static_cast<uint64_t>(t) + c] = color[c] - low[c];
+                    }
+                }
+            });
+        }
+
         [[nodiscard]] uint32_t launch_blocks(const uint64_t count) {
             return static_cast<uint32_t>((count + kThreads - 1) / kThreads);
         }
@@ -433,6 +565,32 @@ namespace gsplat_lfs {
         const uint64_t threads = (static_cast<uint64_t>(vertex_count) + kVerticesPerThread - 1) / kVerticesPerThread;
         color_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, vertex_count, view, depth, photo, tolerance, color_sum, color_weight);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.color");
+    }
+
+    void mesh_photo_low_pass(const float* photo, const float* depth, const uint32_t width, const uint32_t height, const int radius,
+                             float* scratch, float* weights, float* low, cudaStream_t stream) {
+        const uint64_t pixels = uint64_t{width} * height;
+        valid_pixels_kernel<<<launch_blocks(pixels), kThreads, 0, stream>>>(depth, static_cast<uint32_t>(pixels), weights);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.valid_pixels");
+        blur_pass_kernel<<<launch_blocks(pixels), kThreads, 0, stream>>>(photo, weights, width, height, radius, true, scratch, weights + pixels);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.blur_x");
+        blur_pass_kernel<<<launch_blocks(pixels), kThreads, 0, stream>>>(scratch, weights + pixels, width, height, radius, false, low, weights);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.blur_y");
+    }
+
+    void mesh_face_view_score(const float* vertices, const int32_t* faces, const uint32_t face_count, const TsdfView& view, const float* depth,
+                              const float tolerance, float* score, cudaStream_t stream) {
+        const uint64_t threads = (static_cast<uint64_t>(face_count) + kVerticesPerThread - 1) / kVerticesPerThread;
+        face_score_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, faces, face_count, view, depth, tolerance, score);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.face_score");
+    }
+
+    void mesh_texture_accumulate(const float* texels, const uint32_t count, const TsdfView& view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
+                                 const float* low_photo, const float tolerance, float* low_sum, float* low_weight,
+                                 float* high, float* best_weight, cudaStream_t stream) {
+        const uint64_t threads = (static_cast<uint64_t>(count) + kVerticesPerThread - 1) / kVerticesPerThread;
+        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerance, low_sum, low_weight, high, best_weight);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.texture");
     }
 
 } // namespace gsplat_lfs

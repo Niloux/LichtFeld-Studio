@@ -52,6 +52,7 @@
 #include "shaders/shader_service.hpp"
 #include "training/components/ppisp.hpp"
 #include "training/rasterization/gsplat_rasterizer.hpp"
+#include "training/components/rolling_shutter.hpp"
 #include "training/splat_mesh.hpp"
 #include "training/training_manager.hpp"
 #include "training/training_setup.hpp"
@@ -4083,13 +4084,57 @@ namespace lfs::vis::gui {
         }
         mesh_name_ = node->name + "_mesh";
         mesh_transform_ = scene.getWorldTransform(node->id);
-        launchCollision([this, settings, path, model = std::move(model), cameras = std::move(cameras), appearance = std::move(appearance)](std::stop_token stop, const core::ProgressCallback& progress) {
+        // Only a trainer attaches the photos' readout motion, and without it they land sheared on the surface.
+        std::optional<training::RollingShutterTable> rolling_shutter;
+        auto dataset_path = manager->getDatasetPath();
+        if (dataset_path.empty() && trainer)
+            dataset_path = trainer->getParams().dataset.data_path;
+        if (dataset_path.empty())
+            if (const auto* loader = viewer_->getDataLoader())
+                dataset_path = loader->getParameters().dataset.data_path;
+        // An opened project knows no dataset path, but its photos lie in the dataset. attach_rolling_shutter
+        // then checks every image against what it finds.
+        if (dataset_path.empty()) {
+            std::error_code ec;
+            auto folder = cameras.front()->image_path().parent_path();
+            while (folder.has_relative_path() && !core::native_fs::is_regular_file(folder / training::ROLLING_SHUTTER_SIDECAR, ec))
+                folder = folder.parent_path();
+            if (folder.has_relative_path())
+                dataset_path = folder;
+        }
+        if (auto table = training::read_rolling_shutter(dataset_path); !table) {
+            LOG_WARN("Mesh: treating the photos as global shutter: {}", table.error());
+        } else {
+            rolling_shutter = std::move(*table);
+            LOG_INFO("Mesh: dataset '{}' {} rolling shutter motion", core::path_to_utf8(dataset_path), rolling_shutter ? "has" : "has no");
+        }
+        launchCollision([this, settings, path, model = std::move(model), cameras = std::move(cameras), appearance = std::move(appearance), rolling_shutter = std::move(rolling_shutter)](std::stop_token stop, const core::ProgressCallback& progress) {
+            // The cameras are the scene's: leave them as they were found.
+            struct RestoreMotion {
+                const std::vector<std::shared_ptr<core::Camera>>& cameras;
+                std::vector<std::optional<core::RollingShutterMotion>> saved;
+                ~RestoreMotion() {
+                    for (size_t i = 0; i < saved.size(); ++i)
+                        cameras[i]->set_rolling_shutter(saved[i]);
+                }
+            } restore{cameras, {}};
+            restore.saved.reserve(cameras.size());
+            for (const auto& camera : cameras)
+                restore.saved.push_back(camera->rolling_shutter());
+            if (rolling_shutter) {
+                if (const auto attached = training::attach_rolling_shutter(*rolling_shutter, cameras); !attached) {
+                    training::clear_rolling_shutter(cameras);
+                    LOG_WARN("Mesh: treating the photos as global shutter: {}", attached.error());
+                }
+            }
             std::vector<core::Camera*> views;
             views.reserve(cameras.size());
             for (const auto& camera : cameras)
                 views.push_back(camera.get());
             const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress, appearance.get());
             training::write_splat_mesh_ply(mesh, path);
+            if (!mesh.pages.empty())
+                training::write_splat_mesh_obj(mesh, std::filesystem::path(path).replace_extension(".obj"));
             mesh_result_ = std::make_shared<core::MeshData>(training::splat_mesh_to_mesh_data(mesh));
             (void)training::release_gsplat_rasterizer_thread_local_caches();
             return false;

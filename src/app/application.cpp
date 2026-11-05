@@ -1313,6 +1313,8 @@ namespace lfs::app {
                                                                trained && trainer->hasPPISP() ? trainer->getPPISP() : nullptr);
                 core::native_fs::create_directories(params->mesh_output.parent_path());
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
+                if (!mesh.pages.empty())
+                    training::write_splat_mesh_obj(mesh, std::filesystem::path(params->mesh_output).replace_extension(".obj"));
                 bar.complete();
                 const auto& settings = *params->mesh_settings;
                 const nlohmann::json report{{"voxel_size", settings.voxel_size}, {"truncation", settings.band()},
@@ -1326,7 +1328,9 @@ namespace lfs::app {
                                             {"components_total", mesh.components_total}, {"area", mesh.area},
                                             {"colored_vertex_share", mesh.colored_vertex_share}, {"views_color_corrected", mesh.views_color_corrected}, {"seconds_render", mesh.seconds_render},
                                             {"seconds_fusion", mesh.seconds_fusion}, {"seconds_extract", mesh.seconds_extract},
-                                            {"seconds_color", mesh.seconds_color}};
+                                            {"seconds_color", mesh.seconds_color}, {"texel_size", settings.texel_size}, {"texture_size", settings.texture_size},
+                                            {"texture_width", settings.texture_width}, {"pages", mesh.pages.size()}, {"charts", mesh.charts}, {"texels", mesh.texels},
+                                            {"observed_texel_share", mesh.observed_texel_share}, {"seconds_unwrap", mesh.seconds_unwrap}, {"seconds_bake", mesh.seconds_bake}};
                 auto report_path = params->mesh_output;
                 report_path.replace_extension(".json");
                 std::ofstream(core::native_fs::native_path(report_path)) << report.dump(2);

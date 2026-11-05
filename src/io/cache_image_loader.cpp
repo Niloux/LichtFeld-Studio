@@ -697,7 +697,7 @@ namespace lfs::io {
         std::vector<uint8_t> jpeg_bytes;
         bool from_cache = false;
 
-        {
+        if (!params.skip_blob_cache) {
             std::lock_guard lock(jpeg_blob_mutex_);
             if (auto it = jpeg_blob_cache_.find(cache_key); it != jpeg_blob_cache_.end()) {
                 it->second.last_access = std::chrono::steady_clock::now();
