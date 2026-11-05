@@ -928,17 +928,6 @@ if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
         )
     endif()
 
-    # OSG finds its writers at run time, in this folder beside the executable.
-    file(GLOB _lfs_osg_plugin_dirs LIST_DIRECTORIES true "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/plugins/osgPlugins-*")
-    foreach(_lfs_osg_plugin_dir IN LISTS _lfs_osg_plugin_dirs)
-        cmake_path(GET _lfs_osg_plugin_dir FILENAME _lfs_osg_plugin_name)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory "${_lfs_osg_plugin_dir}" "$<TARGET_FILE_DIR:${PROJECT_NAME}>/${_lfs_osg_plugin_name}"
-            COMMENT "Copying OSG plugins"
-        )
-        install(DIRECTORY "${_lfs_osg_plugin_dir}" DESTINATION ${CMAKE_INSTALL_BINDIR})
-    endforeach()
-
     # Only copy debug DLLs for Debug builds (they link to debug CRT which breaks Release)
     # For single-config generators (Ninja, Makefiles): check CMAKE_BUILD_TYPE
     # For multi-config generators (VS, Xcode): use generator expression

@@ -164,7 +164,7 @@ target_include_directories(lfs_training SYSTEM PRIVATE
 )
 
 find_package(meshoptimizer CONFIG REQUIRED)
-find_package(unofficial-osg CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # Link dependencies
 target_link_libraries(lfs_training
@@ -179,8 +179,7 @@ target_link_libraries(lfs_training
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
         meshoptimizer::meshoptimizer
-        unofficial::osg::osg
-        unofficial::osg::osgDB
+        ZLIB::ZLIB
 )
 
 if(LFS_TRAINER_ONLY)

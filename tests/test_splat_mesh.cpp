@@ -7,11 +7,15 @@
 #include "splat_mesh.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
 #include <numbers>
+#include <string>
 #include <vector>
+#include <zlib.h>
 
 using lfs::training::SplatMesh;
 
@@ -49,6 +53,71 @@ namespace {
         return mesh;
     }
 } // namespace
+
+TEST(SplatMesh, OsgbFilesHoldOneSceneWhoseBracketsAddUp) {
+    lfs::training::TiledMesh tiled;
+    auto& mesh = tiled.combined;
+    mesh.vertices = {{0.f, 0.f, 0.f}, {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 0.f}, {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}};
+    mesh.normals.assign(6, {0.f, 0.f, 1.f});
+    mesh.uvs = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}};
+    mesh.faces = {{0, 1, 2}, {3, 4, 5}};
+    mesh.page_first_face = {0, 1, 2};
+    mesh.page_size = 8;
+    mesh.pages.assign(2, std::vector<uint8_t>(8 * 8 * 3, 128));
+    lfs::training::TileLevel fine;
+    fine.page_count = 1;
+    fine.vertex_count = 3;
+    fine.texel = .01f;
+    fine.radius = 1.f;
+    auto coarse = fine;
+    coarse.level = 1;
+    coarse.first_page = 1;
+    coarse.first_vertex = 3;
+    coarse.texel = .02f;
+    tiled.levels = {fine, coarse};
+
+    const auto folder = std::filesystem::temp_directory_path() / "lfs_test_osgb";
+    std::filesystem::remove_all(folder);
+    lfs::training::write_splat_mesh_osgb(tiled, folder);
+    const auto unpack = [](const std::filesystem::path& path) {
+        std::ifstream file(path, std::ios::binary);
+        std::string data((std::istreambuf_iterator<char>(file)), {});
+        EXPECT_GT(data.size(), 28u);
+        EXPECT_EQ(data.substr(0, 8), std::string("\xa1\x0e\x91\x6c\x45\x45\xfb\x1a", 8));
+        EXPECT_EQ(data.substr(24, 4), "zlib");
+        std::string scene(size_t{1} << 20, '\0');
+        z_stream stream{};
+        EXPECT_EQ(inflateInit2(&stream, 15 + 16), Z_OK);
+        stream.next_in = reinterpret_cast<Bytef*>(data.data() + 28);
+        stream.avail_in = static_cast<uInt>(data.size() - 28);
+        stream.next_out = reinterpret_cast<Bytef*>(scene.data());
+        stream.avail_out = static_cast<uInt>(scene.size());
+        EXPECT_EQ(inflate(&stream, Z_FINISH), Z_STREAM_END);
+        scene.resize(stream.total_out);
+        inflateEnd(&stream);
+        return scene;
+    };
+    // The outermost bracket spans the file: its size counts itself and all that follows it.
+    const auto outer_bracket_fits = [](const std::string& scene) {
+        uint32_t name = 0;
+        std::memcpy(&name, scene.data(), 4);
+        uint64_t size = 0;
+        std::memcpy(&size, scene.data() + 4 + name, 8);
+        return size == scene.size() - 4 - name;
+    };
+    const auto opening = unpack(folder / "Data" / "Tile_+000_+000" / "Tile_+000_+000.osgb");
+    EXPECT_EQ(opening.substr(4, 13), "osg::PagedLOD");
+    EXPECT_NE(opening.find("Tile_+000_+000_L1.osgb"), std::string::npos);
+    EXPECT_NE(opening.find("Tile_+000_+000_0.jpg"), std::string::npos);
+    EXPECT_NE(opening.find("\xff\xd8\xff"), std::string::npos);
+    EXPECT_TRUE(outer_bracket_fits(opening));
+    const auto finest = unpack(folder / "Data" / "Tile_+000_+000" / "Tile_+000_+000_L1.osgb");
+    EXPECT_EQ(finest.substr(4, 10), "osg::Geode");
+    EXPECT_EQ(finest.find("PagedLOD"), std::string::npos);
+    EXPECT_TRUE(outer_bracket_fits(finest));
+    EXPECT_TRUE(std::filesystem::exists(folder / "metadata.xml"));
+    std::filesystem::remove_all(folder);
+}
 
 TEST(SplatMesh, LevelingClosesTheStepBetweenViewsAndKeepsThemElsewhere) {
     // A row of squares, one view on each half, meeting along a line at x = 10.

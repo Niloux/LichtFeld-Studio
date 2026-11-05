@@ -2338,7 +2338,8 @@ add_executable(splat_mesh_tests test_main.cpp test_splat_mesh.cpp)
 target_compile_features(splat_mesh_tests PRIVATE cxx_std_23)
 target_include_directories(splat_mesh_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/training ${CUDAToolkit_INCLUDE_DIRS})
-target_link_libraries(splat_mesh_tests PRIVATE lfs_training lfs_core GTest::gtest CUDA::cudart)
+find_package(ZLIB REQUIRED)
+target_link_libraries(splat_mesh_tests PRIVATE lfs_training lfs_core GTest::gtest CUDA::cudart ZLIB::ZLIB)
 add_test(NAME SplatMesh COMMAND splat_mesh_tests)
 set_tests_properties(SplatMesh PROPERTIES LABELS "fast;gpu" TIMEOUT 120)
 
