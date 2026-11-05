@@ -54,6 +54,50 @@ namespace {
     }
 } // namespace
 
+TEST(SplatMesh, ReadsBackTheMeshItWrites) {
+    SplatMesh mesh;
+    mesh.vertices = {{0.f, 0.f, 0.f}, {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}};
+    mesh.colors = {{10, 20, 30}, {40, 50, 60}, {70, 80, 90}};
+    mesh.faces = {{0, 1, 2}};
+    lfs::training::compute_splat_mesh_normals(mesh);
+    const auto path = std::filesystem::temp_directory_path() / "lfs_test_read.ply";
+    lfs::training::write_splat_mesh_ply(mesh, path);
+    const auto read = lfs::training::read_splat_mesh_ply(path);
+    std::filesystem::remove(path);
+    EXPECT_EQ(read.vertices, mesh.vertices);
+    EXPECT_EQ(read.colors, mesh.colors);
+    EXPECT_EQ(read.faces, mesh.faces);
+    EXPECT_EQ(read.normals, mesh.normals);
+    EXPECT_FLOAT_EQ(float(read.area), .5f);
+}
+
+TEST(SplatMesh, ReadsTextPlyOfPolygonsWithoutColors) {
+    const auto path = std::filesystem::temp_directory_path() / "lfs_test_read_text.ply";
+    {
+        std::ofstream out(path);
+        out << "ply\nformat ascii 1.0\ncomment by hand\nelement vertex 4\nproperty double x\nproperty float y\nproperty float z\n"
+               "element face 1\nproperty list uchar uint vertex_index\nelement extra 1\nproperty int value\nend_header\n"
+               "0 0 0\n1 0 0\n1 1 0\n0 1 0\n4 0 1 2 3\n7\n";
+    }
+    const auto read = lfs::training::read_splat_mesh_ply(path);
+    std::filesystem::remove(path);
+    ASSERT_EQ(read.vertices.size(), 4u);
+    ASSERT_EQ(read.faces.size(), 2u);
+    EXPECT_EQ(read.faces[1], (std::array<int32_t, 3>{0, 2, 3}));
+    EXPECT_EQ(read.colors[0], (std::array<uint8_t, 3>{128, 128, 128}));
+}
+
+TEST(SplatMesh, RefusesPlyWithFacesBeyondItsVertices) {
+    const auto path = std::filesystem::temp_directory_path() / "lfs_test_read_bad.ply";
+    {
+        std::ofstream out(path);
+        out << "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\n"
+               "element face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n3 0 1 2\n";
+    }
+    EXPECT_ANY_THROW((void)lfs::training::read_splat_mesh_ply(path));
+    std::filesystem::remove(path);
+}
+
 TEST(SplatMesh, OsgbFilesHoldOneSceneWhoseBracketsAddUp) {
     lfs::training::TiledMesh tiled;
     auto& mesh = tiled.combined;

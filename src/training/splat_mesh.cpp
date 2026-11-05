@@ -1081,35 +1081,13 @@ namespace lfs::training {
             mesh.observed_texel_share = total > 0 ? float(observed) / float(total) : 0.f;
             LOG_INFO("Mesh: {} pages, {} texels, {:.1f}% seen by a view", page_count, total, 100.f * mesh.observed_texel_share);
         }
-    } // namespace
-
-    SplatMesh extract_splat_mesh(core::SplatData& model, const std::span<core::Camera* const> cameras,
-                                 const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress,
-                                 const PPISP* appearance) try {
-        validate(settings);
-        const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
-        // Baking takes about as long as all the rest.
-        const float geometry_share = settings.texel_size > 0.f ? .5f : 1.f;
-        std::vector<core::Camera*> views;
-        for (size_t i = 0; i < cameras.size(); i += settings.view_stride)
-            if (cameras[i])
-                views.push_back(cameras[i]);
-        if (views.empty())
-            throw collisionError("mesh.no_cameras", "The mesh needs the cameras of the dataset; load the project or dataset the model was trained on");
-        if (model.size() == 0)
-            throw collisionError("collision.geometry_invalid", "The model has no splats", ErrorCode::InvalidArgument);
-
-        const auto stream = core::getCurrentCUDAStream();
-        SplatMesh mesh;
-        mesh.views = views.size();
+        // The surface from the depth of the views: fused, cleaned up, colored at its vertices and reduced.
+        void extract_surface(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings, cudaStream_t stream,
+                             const std::stop_token stop, const core::ProgressCallback& progress, const PPISP* appearance, const float geometry_share) {
+            const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
         Tsdf tsdf;
         tsdf.grid = {.voxel = settings.voxel_size, .block = static_cast<uint32_t>(settings.block_voxels),
                      .trunc = settings.band(), .full_weight_range = settings.full_weight_range, .max_range = settings.max_range};
-
-        CameraSizes sizes;
-        for (auto* camera : cameras)
-            if (camera)
-                sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
 
         // Depth stays in RAM between the touch and the integrate passes, which need the block set first.
         auto step = Clock::now();
@@ -1269,6 +1247,43 @@ namespace lfs::training {
         simplify_splat_mesh(mesh, settings.simplify_error, kSimplifyColorWeight);
         mesh.seconds_simplify = seconds_since(step);
         core::reportProgress(stop, progress, geometry_share, stage("mesh.stage_simplify", "Reducing faces"));
+        }
+    } // namespace
+
+    SplatMesh extract_splat_mesh(core::SplatData& model, const std::span<core::Camera* const> cameras,
+                                 const core::SplatMeshSettings& settings, const std::stop_token stop, const core::ProgressCallback& progress,
+                                 const PPISP* appearance) try {
+        validate(settings);
+        const auto stage = [](const std::string_view key, const char* diagnostic) { return std::string(core::collisionStage(key, diagnostic)); };
+        // Baking takes about as long as all the rest.
+        const float geometry_share = settings.texel_size > 0.f ? .5f : 1.f;
+        std::vector<core::Camera*> views;
+        for (size_t i = 0; i < cameras.size(); i += settings.view_stride)
+            if (cameras[i])
+                views.push_back(cameras[i]);
+        if (views.empty())
+            throw collisionError("mesh.no_cameras", "The mesh needs the cameras of the dataset; load the project or dataset the model was trained on");
+        if (model.size() == 0)
+            throw collisionError("collision.geometry_invalid", "The model has no splats", ErrorCode::InvalidArgument);
+
+        const auto stream = core::getCurrentCUDAStream();
+        SplatMesh mesh;
+        mesh.views = views.size();
+        CameraSizes sizes;
+        for (auto* camera : cameras)
+            if (camera)
+                sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
+
+        if (settings.from_mesh.empty()) {
+            extract_surface(mesh, model, views, settings, stream, stop, progress, appearance, geometry_share);
+        } else {
+            core::reportProgress(stop, progress, 0.f, stage("mesh.stage_read", "Reading mesh"));
+            auto read = read_splat_mesh_ply(core::utf8_to_path(settings.from_mesh));
+            read.views = mesh.views;
+            mesh = std::move(read);
+            LOG_INFO("Mesh: {} vertices and {} faces from {}", mesh.vertices.size(), mesh.faces.size(), settings.from_mesh);
+        }
+        auto step = Clock::now();
         if (settings.texel_size > 0.f) {
             texture_ram_preflight(mesh, settings);
             step = Clock::now();
@@ -1311,6 +1326,163 @@ namespace lfs::training {
         return mesh;
     } catch (const std::bad_alloc&) {
         throw collisionError("mesh.ram", "Not enough RAM for the mesh; use a larger voxel size or a maximum range", ErrorCode::ResourceExhausted);
+    }
+
+    SplatMesh read_splat_mesh_ply(const std::filesystem::path& path) {
+        const auto bad = [&](const std::string_view why) { return collisionError("mesh.read_failed", "Could not read the mesh; it must be a PLY of triangles or polygons", ErrorCode::InvalidArgument, std::format("{}: {}", core::path_to_utf8(path), why)); };
+        std::ifstream in(core::native_fs::native_path(path), std::ios::binary);
+        if (!in)
+            throw collisionError("mesh.read_failed", "Could not open the mesh", ErrorCode::NotFound, core::path_to_utf8(path));
+        struct Property {
+            std::string name, type, count_type; // count_type is set for a list
+        };
+        struct Element {
+            std::string name;
+            size_t count = 0;
+            std::vector<Property> properties;
+        };
+        std::vector<Element> elements;
+        bool ascii = false, started = false, ended = false;
+        for (std::string line; !ended && std::getline(in, line);) {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            std::istringstream words(line);
+            std::string word;
+            words >> word;
+            if (!started) {
+                if (word != "ply")
+                    throw bad("no ply header");
+                started = true;
+            } else if (word == "format") {
+                words >> word;
+                ascii = word == "ascii";
+                if (!ascii && word != "binary_little_endian")
+                    throw bad(word);
+            } else if (word == "element") {
+                Element element;
+                words >> element.name >> element.count;
+                elements.push_back(std::move(element));
+            } else if (word == "property") {
+                if (elements.empty())
+                    throw bad("a property before any element");
+                Property property;
+                words >> property.type;
+                if (property.type == "list")
+                    words >> property.count_type >> property.type;
+                words >> property.name;
+                elements.back().properties.push_back(std::move(property));
+            } else if (word == "end_header") {
+                ended = true;
+            }
+        }
+        if (!ended)
+            throw bad("no end of header");
+
+        const auto type_size = [&](const std::string_view type) -> size_t {
+            if (type == "char" || type == "uchar" || type == "int8" || type == "uint8")
+                return 1;
+            if (type == "short" || type == "ushort" || type == "int16" || type == "uint16")
+                return 2;
+            if (type == "int" || type == "uint" || type == "int32" || type == "uint32" || type == "float" || type == "float32")
+                return 4;
+            if (type == "double" || type == "float64")
+                return 8;
+            throw bad(type);
+        };
+        const auto read_number = [&](const std::string_view type) -> double {
+            if (ascii) {
+                double value = 0.;
+                if (!(in >> value))
+                    throw bad("the file ends early");
+                return value;
+            }
+            char raw[8];
+            if (!in.read(raw, std::streamsize(type_size(type))))
+                throw bad("the file ends early");
+            const auto as = [&]<typename T>(T value) {
+                std::memcpy(&value, raw, sizeof(T));
+                return double(value);
+            };
+            if (type == "char" || type == "int8")
+                return as(int8_t{});
+            if (type == "uchar" || type == "uint8")
+                return as(uint8_t{});
+            if (type == "short" || type == "int16")
+                return as(int16_t{});
+            if (type == "ushort" || type == "uint16")
+                return as(uint16_t{});
+            if (type == "int" || type == "int32")
+                return as(int32_t{});
+            if (type == "uint" || type == "uint32")
+                return as(uint32_t{});
+            if (type == "float" || type == "float32")
+                return as(float{});
+            return as(double{});
+        };
+
+        SplatMesh mesh;
+        for (const auto& element : elements) {
+            if (element.name == "vertex") {
+                const auto find = [&](const std::string_view name) {
+                    for (size_t p = 0; p < element.properties.size(); ++p)
+                        if (element.properties[p].name == name)
+                            return int(p);
+                    return -1;
+                };
+                const int position[3] = {find("x"), find("y"), find("z")};
+                const int color[3] = {find("red"), find("green"), find("blue")};
+                if (position[0] < 0 || position[1] < 0 || position[2] < 0)
+                    throw bad("vertices without x, y, z");
+                const bool has_color = color[0] >= 0 && color[1] >= 0 && color[2] >= 0;
+                mesh.vertices.resize(element.count);
+                mesh.colors.assign(element.count, {128, 128, 128});
+                std::vector<double> values(element.properties.size());
+                for (size_t v = 0; v < element.count; ++v) {
+                    for (size_t p = 0; p < values.size(); ++p) {
+                        if (!element.properties[p].count_type.empty())
+                            throw bad("a list property on vertices");
+                        values[p] = read_number(element.properties[p].type);
+                    }
+                    for (int c = 0; c < 3; ++c) {
+                        mesh.vertices[v][c] = float(values[size_t(position[c])]);
+                        if (has_color)
+                            mesh.colors[v][c] = static_cast<uint8_t>(std::clamp(values[size_t(color[c])], 0., 255.));
+                    }
+                }
+            } else {
+                const bool faces = element.name == "face";
+                if (faces)
+                    mesh.faces.reserve(element.count);
+                std::vector<int32_t> corners;
+                for (size_t e = 0; e < element.count; ++e)
+                    for (const auto& property : element.properties) {
+                        if (property.count_type.empty()) {
+                            read_number(property.type);
+                            continue;
+                        }
+                        const auto count = size_t(read_number(property.count_type));
+                        const bool indices = faces && (property.name == "vertex_indices" || property.name == "vertex_index");
+                        corners.resize(count);
+                        for (size_t c = 0; c < count; ++c) {
+                            const double value = read_number(property.type);
+                            corners[c] = int32_t(value);
+                        }
+                        if (!indices)
+                            continue;
+                        // A polygon as a fan.
+                        for (size_t c = 2; c < count; ++c)
+                            mesh.faces.push_back({corners[0], corners[c - 1], corners[c]});
+                    }
+            }
+        }
+        for (const auto& face : mesh.faces)
+            for (const auto vertex : face)
+                if (vertex < 0 || size_t(vertex) >= mesh.vertices.size())
+                    throw bad("a face refers to a vertex that does not exist");
+        if (mesh.faces.empty())
+            throw bad("no faces");
+        compute_splat_mesh_normals(mesh);
+        return mesh;
     }
 
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path) {

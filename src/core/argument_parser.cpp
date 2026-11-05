@@ -2595,6 +2595,8 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
   --osgb                     With a texel size: write <output>_osgb, tiles with levels of detail, instead of an OBJ
   --all-views                Also fuse the held-out views
+  --from-mesh <mesh.ply>     Bake this mesh, made earlier or edited since, instead of extracting one; needs a texel size.
+                             Voxel size still sets how near the depth a surface must lie
 )";
 
     std::optional<lfs::core::args::ParsedArgs> parseMeshArgs(const int argc, const char* const argv[], std::string& error) {
@@ -2660,6 +2662,8 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.write_osgb = true;
                 } else if (flag == "--all-views") {
                     all_views = true;
+                } else if (flag == "--from-mesh") {
+                    settings.from_mesh = value();
                 } else if (flag == "-o" || flag == "--output" || flag == "--output-path") {
                     output = value();
                 } else {
@@ -2673,6 +2677,11 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
         const auto output_path = lfs::core::utf8_to_path(output);
         if (output.empty() || lfs::core::path_to_utf8(output_path.extension()) != ".ply") {
             error = "mesh needs -o <mesh.ply>";
+            return std::nullopt;
+        }
+
+        if (!settings.from_mesh.empty() && settings.texel_size <= 0.f) {
+            error = "--from-mesh needs --texel-size";
             return std::nullopt;
         }
 

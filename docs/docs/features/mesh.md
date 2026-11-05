@@ -97,4 +97,8 @@ texel and has its own charts and texture. Vertices that tiles share stay put on 
 The viewer pages in a finer level as a tile comes to fill the screen. The model is in the dataset's coordinates, and the
 position in `metadata.xml` is a placeholder. The mesh node in the scene shows vertex colors.
 
+`--from-mesh mesh.ply` bakes a mesh made earlier, or edited since in another program, without extracting the surface again: a
+different texel size or model takes only the unwrapping and baking. The mesh must stay in the dataset's coordinates and near the
+surfaces the views saw, within 2.5 voxels. The file is a PLY, binary or text.
+
 `tools/splats_to_mesh.py --mesh mesh.ply` scores a mesh against held-out views and a LAS scan.

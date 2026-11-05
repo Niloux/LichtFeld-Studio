@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <string>
 
 namespace lfs::core {
 
@@ -24,6 +25,7 @@ namespace lfs::core {
         int texture_size = 4096;       // side of a texture page
         int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
         bool write_osgb = false;       // bake tiles with levels of detail for an OSGB model instead of one OBJ
+        std::string from_mesh;         // a PLY to bake instead of extracting the surface, UTF-8
         bool invert_mask = false;
         float mask_threshold = .5f;
 

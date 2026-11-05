@@ -182,6 +182,8 @@ namespace lfs::training {
     [[nodiscard]] TiledMesh build_tiled_mesh(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000);
     // Writes a model DasViewer opens: folder/metadata.xml and folder/Data/<tile>/<tile>.osgb, the coarsest level of a tile, with
     // the next finer one paged in as the tile fills the screen.
+    // A mesh from a PLY file, binary or text; polygons become fans. To bake a mesh made earlier or edited elsewhere.
+    [[nodiscard]] SplatMesh read_splat_mesh_ply(const std::filesystem::path& path);
     void write_splat_mesh_osgb(const TiledMesh& tiled, const std::filesystem::path& folder, const core::ProgressCallback& progress = {}, std::stop_token stop = {});
 
     // Writes path (.obj), the .mtl beside it and one <stem>_<page>.jpg per page. Positions and normals stay connected
