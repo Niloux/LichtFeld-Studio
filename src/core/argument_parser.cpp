@@ -2583,7 +2583,7 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --truncation <v>           Band around the surface (default: 0.08 or 4 voxels, the larger)
   --full-weight-range <v>    Views beyond this range count less, by 1/r^2; 0 = equal (default 1)
   --view-stride <n>          Fuse every Nth view (default 2)
-  --color-stride <n>         Color from every Nth fused view (default 2)
+  --color-stride <n>         Vertex colors from every Nth fused view; a texture uses every photo (default 2)
   --min-views <n>            Views a voxel needs to count as observed (default 3)
   --min-component-faces <n>  Drop smaller connected pieces (default 100)
   --fill-holes <v>           Close holes with a shorter rim; 0 leaves them open (default 0.3)

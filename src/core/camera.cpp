@@ -612,7 +612,7 @@ namespace lfs::core {
         _mask_loaded = false;
     }
 
-    Tensor Camera::read_mask_image(const std::filesystem::path& path, const int resize_factor, const int max_width,
+    Tensor Camera::read_mask_image(const std::filesystem::path& path, const bool keep_cached, const int resize_factor, const int max_width,
                                    const bool apply_undistortion) const {
         Tensor mask;
         const bool warp_full_resolution = _undistort_prepared && apply_undistortion;
@@ -621,6 +621,7 @@ namespace lfs::core {
             .resize_factor = warp_full_resolution ? 1 : resize_factor,
             .max_width = warp_full_resolution ? 0 : max_width,
             .stream = _stream,
+            .skip_blob_cache = !keep_cached,
             .mask_grayscale = true};
 
         mask = load_image_cached(params);
@@ -687,9 +688,9 @@ namespace lfs::core {
 
     Tensor Camera::load_mask_file(const std::filesystem::path& path, const int resize_factor, const int max_width,
                                   const bool invert_mask, const float mask_threshold, const bool binarize,
-                                  const bool apply_undistortion) const {
+                                  const bool apply_undistortion, const bool keep_cached) const {
         const CUDAStreamGuard stream_guard(_stream);
-        return finish_mask(read_mask_image(path, resize_factor, max_width, apply_undistortion), resize_factor,
+        return finish_mask(read_mask_image(path, keep_cached, resize_factor, max_width, apply_undistortion), resize_factor,
                            max_width, invert_mask, mask_threshold, binarize, false);
     }
 
@@ -762,7 +763,7 @@ namespace lfs::core {
                 }
             }
         } else if (!_mask_path.empty() && lfs::core::native_fs::exists(_mask_path)) {
-            mask = read_mask_image(_mask_path, resize_factor, max_width, apply_undistortion);
+            mask = read_mask_image(_mask_path, true, resize_factor, max_width, apply_undistortion);
         } else {
             return Tensor();
         }

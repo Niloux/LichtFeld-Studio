@@ -13,7 +13,7 @@ namespace lfs::core {
         float truncation = 0.f;        // band around the surface; narrower than the depth spread opens holes. 0 = automatic
         float full_weight_range = 1.f; // views beyond this range count less, by 1/r^2; 0 = equal weights
         int view_stride = 2;           // fuse every Nth view
-        int color_stride = 2;          // color from every Nth fused view
+        int color_stride = 2;          // vertex colors from every Nth fused view; a texture uses every photo
         int min_views = 3;             // views a voxel needs to count as observed
         int min_component_faces = 100;
         float fill_hole_perimeter = .3f; // closes holes with a shorter rim; 0 leaves them open

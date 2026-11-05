@@ -237,7 +237,7 @@ namespace lfs::training {
             LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(render_stream), "Mesh render");
             if (camera.has_mask()) {
                 auto mask = camera.load_mask_file(camera.mask_path(), 1, settings.max_width, settings.invert_mask,
-                                                  settings.mask_threshold, true, false)
+                                                  settings.mask_threshold, true, false, false)
                                 .to(Device::CUDA, stream);
                 if (mask.numel() == width * height) {
                     depth = depth.mul(mask.reshape({int(height), int(width)}).to(core::DataType::Float32));
@@ -793,7 +793,9 @@ namespace lfs::training {
     }
 
     namespace {
-        // Takes each page's colors from the photos, through the same appearance inverse as the vertex colors.
+        // Takes each page's colors from the photos, through the same appearance inverse as the vertex colors. Uses every
+        // photo: a surface's best view is one or two photos out of hundreds, and a stride leaves it out by chance, which
+        // took lettering from 7 m instead of 2.5 m.
         // Pages share the GPU, and a group of them that fits goes through all views at once.
         void bake_texture(SplatMesh& mesh, core::SplatData& model, const std::span<core::Camera* const> views, const core::SplatMeshSettings& settings,
                           cudaStream_t stream, const auto& report, const PPISP* appearance) {
@@ -842,7 +844,7 @@ namespace lfs::training {
                 LFS_CUDA_CHECK(cudaMemcpyAsync(vertices.data(), mesh.vertices.data(), mesh.vertices.size() * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
                 LFS_CUDA_CHECK(cudaMemcpyAsync(faces.data(), mesh.faces.data(), size_t(face_count) * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
                 std::vector<float> host(face_count);
-                for (size_t i = 0; i < views.size(); i += settings.color_stride) {
+                for (size_t i = 0; i < views.size(); ++i) {
                     report(.4f * float(i) / float(views.size()));
                     auto& camera = *views[i];
                     if (!camera.has_image())
@@ -892,7 +894,7 @@ namespace lfs::training {
                 }
                 LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture upload");
                 DeviceArray<float> scratch, weights, low;
-                for (size_t i = 0; i < views.size(); i += settings.color_stride) {
+                for (size_t i = 0; i < views.size(); ++i) {
                     const float done = (float(first_page) + float(last_page - first_page) * float(i) / float(views.size())) / float(page_count);
                     report(.4f + .6f * done);
                     auto& camera = *views[i];
@@ -975,8 +977,9 @@ namespace lfs::training {
                      .trunc = settings.band(), .full_weight_range = settings.full_weight_range, .max_range = settings.max_range};
 
         CameraSizes sizes;
-        for (auto* camera : views)
-            sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
+        for (auto* camera : cameras)
+            if (camera)
+                sizes.saved.push_back({camera, camera->image_width(), camera->image_height(), camera->image_size_loaded()});
 
         // Depth stays in RAM between the touch and the integrate passes, which need the block set first.
         auto step = Clock::now();
@@ -1143,7 +1146,11 @@ namespace lfs::training {
             unwrap_splat_mesh(mesh, settings.texel_size, settings.texture_size, stop);
             mesh.seconds_unwrap = seconds_since(step);
             step = Clock::now();
-            bake_texture(mesh, model, views, settings, stream, [&](const float value) {
+            std::vector<core::Camera*> all_views;
+            for (auto* camera : cameras)
+                if (camera)
+                    all_views.push_back(camera);
+            bake_texture(mesh, model, all_views, settings, stream, [&](const float value) {
                 core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture"));
             }, appearance);
             mesh.seconds_bake = seconds_since(step);

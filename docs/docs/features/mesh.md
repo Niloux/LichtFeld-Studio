@@ -81,7 +81,8 @@ everything finer than 1/100 of the image. Broader colors are a mean over all vie
 show where regions meet.
 
 Texels no view saw take the vertex colors, and the rest of each page continues the charts outward, so that filtering and
-image compression reach no background. Baking loads each photo at full size and renders its depth twice.
+image compression reach no background. Baking uses every photo, whatever the view stride: a surface's best view is one or
+two photos out of hundreds. It loads each at full size and renders its depth twice, so its time grows with the photos.
 
 RAM holds about 22 bytes per texel and 364 per face, plus about 2 GB while rasterizing 4096 pages, and the job stops with an
 error before unwrapping if that exceeds the free RAM. The surface area in `mesh.json` tells how many texels a size takes:
