@@ -4135,6 +4135,12 @@ namespace lfs::vis::gui {
             training::write_splat_mesh_ply(mesh, path);
             if (!mesh.pages.empty())
                 training::write_splat_mesh_obj(mesh, std::filesystem::path(path).replace_extension(".obj"));
+            if (mesh.tiled) {
+                auto folder = path;
+                folder.replace_extension();
+                folder += "_osgb";
+                training::write_splat_mesh_osgb(*mesh.tiled, folder, progress, stop);
+            }
             mesh_result_ = std::make_shared<core::MeshData>(training::splat_mesh_to_mesh_data(mesh));
             (void)training::release_gsplat_rasterizer_thread_local_caches();
             return false;

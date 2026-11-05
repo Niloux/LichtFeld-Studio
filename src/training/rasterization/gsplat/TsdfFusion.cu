@@ -396,7 +396,7 @@ namespace gsplat_lfs {
         }
 
         __global__ void face_score_kernel(const float* vertices, const int32_t* faces, const uint32_t face_count, const TsdfView view, const float* depth,
-                                          const float tolerance, float* score) {
+                                          const float* tolerances, float* score) {
             const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
             if (first >= face_count)
                 return;
@@ -425,7 +425,7 @@ namespace gsplat_lfs {
                             if (!pixel.valid)
                                 continue;
                             const float measured = depth[pixel.y * view.width + pixel.x];
-                            seen += measured > 0.f && fabsf(measured - pixel.range) < tolerance;
+                            seen += measured > 0.f && fabsf(measured - pixel.range) < tolerances[f];
                         }
                         if (2 * seen >= 7) {
                             const float share = static_cast<float>(seen) / 7.f;
@@ -440,7 +440,7 @@ namespace gsplat_lfs {
         }
 
         __global__ void texture_kernel(const float* texels, const uint32_t count, const TsdfView view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
-                                       const float* low_photo, const float tolerance,
+                                       const float* low_photo, const float* tolerances,
                                        float* low_sum, float* low_weight, float* high, float* best_weight) {
             const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) * kVerticesPerThread;
             if (first >= count)
@@ -465,7 +465,7 @@ namespace gsplat_lfs {
                     const float corners[4] = {depth[at], depth[at + 1], depth[at + width], depth[at + width + 1]};
                     bool clean = true;
                     for (const float measured : corners)
-                        clean = clean && measured > 0.f && fabsf(measured - pixel.range) < tolerance;
+                        clean = clean && measured > 0.f && fabsf(measured - pixel.range) < tolerances[t];
                     if (!clean)
                         continue;
                     const float w = 1.f / fmaxf(glm::length(center - point), kColorMinDistance);
@@ -579,17 +579,17 @@ namespace gsplat_lfs {
     }
 
     void mesh_face_view_score(const float* vertices, const int32_t* faces, const uint32_t face_count, const TsdfView& view, const float* depth,
-                              const float tolerance, float* score, cudaStream_t stream) {
+                              const float* tolerances, float* score, cudaStream_t stream) {
         const uint64_t threads = (static_cast<uint64_t>(face_count) + kVerticesPerThread - 1) / kVerticesPerThread;
-        face_score_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, faces, face_count, view, depth, tolerance, score);
+        face_score_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(vertices, faces, face_count, view, depth, tolerances, score);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.face_score");
     }
 
     void mesh_texture_accumulate(const float* texels, const uint32_t count, const TsdfView& view, const int32_t view_label, const int32_t* labels, const float* depth, const float* photo,
-                                 const float* low_photo, const float tolerance, float* low_sum, float* low_weight,
+                                 const float* low_photo, const float* tolerances, float* low_sum, float* low_weight,
                                  float* high, float* best_weight, cudaStream_t stream) {
         const uint64_t threads = (static_cast<uint64_t>(count) + kVerticesPerThread - 1) / kVerticesPerThread;
-        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerance, low_sum, low_weight, high, best_weight);
+        texture_kernel<<<launch_blocks(threads), kThreads, 0, stream>>>(texels, count, view, view_label, labels, depth, photo, low_photo, tolerances, low_sum, low_weight, high, best_weight);
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.texture");
     }
 

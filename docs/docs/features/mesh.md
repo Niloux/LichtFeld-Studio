@@ -84,8 +84,17 @@ Texels no view saw take the vertex colors, and the rest of each page continues t
 image compression reach no background. Baking uses every photo, whatever the view stride: a surface's best view is one or
 two photos out of hundreds. It loads each at full size and renders its depth twice, so its time grows with the photos.
 
-RAM holds about 22 bytes per texel and 364 per face, plus about 2 GB while rasterizing 4096 pages, and the job stops with an
+RAM holds about 22 bytes per texel and 100 per face, plus about 2 GB while rasterizing 4096 pages, and the job stops with an
 error before unwrapping if that exceeds the free RAM. The surface area in `mesh.json` tells how many texels a size takes:
 area / size².
+
+## OSGB model
+
+With a texel size, `--osgb` on the command line, or the OSGB box in the panel, writes a model DasViewer opens, in a folder beside the
+PLY: `mesh_osgb/metadata.xml` and `mesh_osgb/Data/<tile>/`, in place of the OBJ. The mesh is split into tiles of at most 150 000
+faces, and each tile gets up to 4 levels of detail: every level allows 4 times the surface deviation of the last, doubles the
+texel and has its own charts and texture. Vertices that tiles share stay put on every level, so no cracks open between tiles.
+The viewer pages in a finer level as a tile comes to fill the screen. The model is in the dataset's coordinates, and the
+position in `metadata.xml` is a placeholder. The mesh node in the scene shows vertex colors.
 
 `tools/splats_to_mesh.py --mesh mesh.ply` scores a mesh against held-out views and a LAS scan.

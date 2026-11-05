@@ -27,6 +27,10 @@
     "meshoptimizer",
     "nlohmann-json",
     "openssl",
+    {
+      "name": "osg",
+      "default-features": false
+    },
     "spdlog",
     "tbb",
     "tiff",

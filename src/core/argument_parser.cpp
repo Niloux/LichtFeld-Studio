@@ -2593,6 +2593,7 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --texel-size <v>           Bake a texture with texels of this size, and write an OBJ beside the PLY; 0 = none (default 0)
   --texture-size <n>         Side of a texture page (default 4096)
   --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
+  --osgb                     With a texel size: write <output>_osgb, tiles with levels of detail, instead of an OBJ
   --all-views                Also fuse the held-out views
 )";
 
@@ -2655,6 +2656,8 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                     settings.texture_size = std::stoi(value());
                 } else if (flag == "--texture-width") {
                     settings.texture_width = std::stoi(value());
+                } else if (flag == "--osgb") {
+                    settings.write_osgb = true;
                 } else if (flag == "--all-views") {
                     all_views = true;
                 } else if (flag == "-o" || flag == "--output" || flag == "--output-path") {

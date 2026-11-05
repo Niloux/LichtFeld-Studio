@@ -9,6 +9,10 @@
     <div data-if="mesh_source != ''"><span>@tr:rendering_panel.simplify_source</span>: {{mesh_source}}</div>
     <div class="text-muted">@tr:mesh.hint</div>
     <div id="mesh-fields"></div>
+    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.write_osgb">
+      <span class="setting-row__label-col">@tr:mesh.write_osgb</span>
+      <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_write_osgb" /></label>
+    </div>
     <div data-if="mesh_active">
       <progress max="1" data-attr-value="mesh_progress" />
       <span>{{mesh_status}}</span>

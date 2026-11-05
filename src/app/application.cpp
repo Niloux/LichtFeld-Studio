@@ -1315,6 +1315,12 @@ namespace lfs::app {
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
                 if (!mesh.pages.empty())
                     training::write_splat_mesh_obj(mesh, std::filesystem::path(params->mesh_output).replace_extension(".obj"));
+                if (mesh.tiled) {
+                    auto folder = params->mesh_output;
+                    folder.replace_extension();
+                    folder += "_osgb";
+                    training::write_splat_mesh_osgb(*mesh.tiled, folder);
+                }
                 bar.complete();
                 const auto& settings = *params->mesh_settings;
                 const nlohmann::json report{{"voxel_size", settings.voxel_size}, {"truncation", settings.band()},
@@ -1329,7 +1335,7 @@ namespace lfs::app {
                                             {"colored_vertex_share", mesh.colored_vertex_share}, {"views_color_corrected", mesh.views_color_corrected}, {"seconds_render", mesh.seconds_render},
                                             {"seconds_fusion", mesh.seconds_fusion}, {"seconds_extract", mesh.seconds_extract},
                                             {"seconds_color", mesh.seconds_color}, {"texel_size", settings.texel_size}, {"texture_size", settings.texture_size},
-                                            {"texture_width", settings.texture_width}, {"pages", mesh.pages.size()}, {"charts", mesh.charts}, {"texels", mesh.texels},
+                                            {"texture_width", settings.texture_width}, {"pages", mesh.tiled ? mesh.tiled->combined.page_first_face.size() - 1 : mesh.pages.size()}, {"tile_levels", mesh.tiled ? mesh.tiled->levels.size() : size_t{0}}, {"charts", mesh.charts}, {"texels", mesh.texels},
                                             {"observed_texel_share", mesh.observed_texel_share}, {"seconds_unwrap", mesh.seconds_unwrap}, {"seconds_bake", mesh.seconds_bake}};
                 auto report_path = params->mesh_output;
                 report_path.replace_extension(".json");

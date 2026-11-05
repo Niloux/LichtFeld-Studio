@@ -229,7 +229,7 @@ namespace lfs::training {
     }
 
     MeshTexels rasterize_mesh_texels(const SplatMesh& mesh, const size_t page) {
-        const auto side = size_t(mesh.page_size);
+        const auto side = size_t(mesh.page_side(page));
         const bool has_colors = mesh.colors.size() == mesh.vertices.size();
         std::vector<float> positions(side * side * 3);
         std::vector<uint8_t> fallback(side * side * 3), state(side * side, 0);

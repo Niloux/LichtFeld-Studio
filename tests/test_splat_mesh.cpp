@@ -9,6 +9,7 @@
 #include <cmath>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
 #include <numbers>
 #include <vector>
 
@@ -332,6 +333,67 @@ namespace {
     }
 } // namespace
 
+TEST(SplatMesh, TilesKeepTheirBordersOnEveryLevelAndEveryFaceOfTheFinest) {
+    constexpr float voxel = .04f, texel = .005f;
+    auto mesh = sphere_mesh(voxel);
+    lfs::training::compute_splat_mesh_normals(mesh);
+    mesh.colors.assign(mesh.vertices.size(), {10, 20, 30});
+    const size_t faces = mesh.faces.size();
+    const auto tiled = lfs::training::build_tiled_mesh(mesh, texel, 2048, 4, .005f, {}, 5000);
+    const auto& all = tiled.combined;
+    size_t tiles = 0, finest = 0, reduced = 0;
+    for (const auto& level : tiled.levels) {
+        tiles = std::max(tiles, level.tile + 1);
+        const size_t count = all.page_first_face[level.first_page + level.page_count] - all.page_first_face[level.first_page];
+        (level.level == 0 ? finest : reduced) += count;
+        EXPECT_GT(level.radius, 0.f);
+    }
+    EXPECT_GT(tiles, 1u);
+    EXPECT_GT(reduced, 0u);
+    // Unwrapping drops only faces without area.
+    EXPECT_GT(finest, faces * 99 / 100);
+    EXPECT_LE(finest, faces);
+    EXPECT_EQ(all.page_sizes.size() + 1, all.page_first_face.size());
+    EXPECT_EQ(all.face_error.size(), all.faces.size());
+    // A tile's outer rim is the same set of points on every level: edges used by one face only, against the finest.
+    const auto rim_of = [&](const lfs::training::TileLevel& level) {
+        std::vector<std::array<int64_t, 6>> edges;
+        const auto key = [](const std::array<float, 3>& p) { return std::array<int64_t, 3>{std::llround(p[0] * 1e5), std::llround(p[1] * 1e5), std::llround(p[2] * 1e5)}; };
+        for (size_t f = all.page_first_face[level.first_page]; f < all.page_first_face[level.first_page + level.page_count]; ++f)
+            for (int c = 0; c < 3; ++c) {
+                auto a = key(all.vertices[size_t(all.faces[f][size_t(c)])]), b = key(all.vertices[size_t(all.faces[f][size_t((c + 1) % 3)])]);
+                if (b < a)
+                    std::swap(a, b);
+                edges.push_back({a[0], a[1], a[2], b[0], b[1], b[2]});
+            }
+        std::ranges::sort(edges);
+        std::vector<std::array<int64_t, 3>> rim;
+        for (size_t e = 0; e < edges.size();) {
+            size_t end = e;
+            while (end < edges.size() && edges[end] == edges[e])
+                ++end;
+            if (end - e == 1) {
+                rim.push_back({edges[e][0], edges[e][1], edges[e][2]});
+                rim.push_back({edges[e][3], edges[e][4], edges[e][5]});
+            }
+            e = end;
+        }
+        std::ranges::sort(rim);
+        rim.erase(std::unique(rim.begin(), rim.end()), rim.end());
+        return rim;
+    };
+    for (const auto& level : tiled.levels) {
+        if (level.level == 0)
+            continue;
+        const auto finest_level = std::ranges::find_if(tiled.levels, [&](const auto& other) { return other.tile == level.tile && other.level == 0; });
+        ASSERT_NE(finest_level, tiled.levels.end());
+        const auto outer = rim_of(*finest_level), coarse = rim_of(level);
+        std::vector<std::array<int64_t, 3>> missing;
+        std::ranges::set_difference(outer, coarse, std::back_inserter(missing));
+        EXPECT_TRUE(missing.empty()) << missing.size() << " rim points lost on level " << level.level;
+    }
+}
+
 TEST(SplatMesh, CandidatesKeepTheBestViewsInOrder) {
     lfs::training::FaceViewCandidates candidates(1);
     for (int view = 0; view < 20; ++view) {
@@ -618,6 +680,9 @@ TEST_F(SplatMeshGpu, TextureSamplesPhotosBetweenPixelsAndSkipsOccludingEdges) {
     const std::vector<float> position{0.f, 0.f, 0.f, .1025f, 0.f, 0.f};
     Device<float> texels(6), depth(pixels), photo(pixels * 3), sum(6), weight(2), high(6), best(2);
     Device<int32_t> labels(2);
+    Device<float> tolerances(2);
+    const float tolerance_values[2] = {.1f, .1f};
+    ASSERT_EQ(cudaMemcpy(tolerances.data, tolerance_values, 8, cudaMemcpyHostToDevice), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(texels.data, position.data(), 24, cudaMemcpyHostToDevice), cudaSuccess);
     std::vector<float> d(pixels, 1.f), c(pixels * 3, 0.f);
     for (size_t i = 0; i < pixels; ++i)
@@ -627,7 +692,7 @@ TEST_F(SplatMeshGpu, TextureSamplesPhotosBetweenPixelsAndSkipsOccludingEdges) {
     d[row * kSize + 121] = .5f;
     ASSERT_EQ(cudaMemcpy(depth.data, d.data(), pixels * 4, cudaMemcpyHostToDevice), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(photo.data, c.data(), c.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
-    gsplat_lfs::mesh_texture_accumulate(texels.data, 2, view, 0, labels.data, depth.data, photo.data, photo.data, .1f, sum.data, weight.data, high.data, best.data, nullptr);
+    gsplat_lfs::mesh_texture_accumulate(texels.data, 2, view, 0, labels.data, depth.data, photo.data, photo.data, tolerances.data, sum.data, weight.data, high.data, best.data, nullptr);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     float s[6], w[2];
     ASSERT_EQ(cudaMemcpy(s, sum.data, 24, cudaMemcpyDeviceToHost), cudaSuccess);
@@ -643,6 +708,9 @@ TEST_F(SplatMeshGpu, TextureDetailComesFromTheChosenViewAndLevelsFromAll) {
     const std::vector<float> position{0.f, 0.f, 0.f};
     Device<float> texels(3), depth(pixels), photo(pixels * 3), low_photo(pixels * 3), sum(3), weight(1), high(3), best(1);
     Device<int32_t> labels(1);
+    Device<float> tolerances(1);
+    const float tolerance_value = .1f;
+    ASSERT_EQ(cudaMemcpy(tolerances.data, &tolerance_value, 4, cudaMemcpyHostToDevice), cudaSuccess);
     const int32_t chosen = 7;
     ASSERT_EQ(cudaMemcpy(labels.data, &chosen, 4, cudaMemcpyHostToDevice), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(texels.data, position.data(), 12, cudaMemcpyHostToDevice), cudaSuccess);
@@ -651,7 +719,7 @@ TEST_F(SplatMeshGpu, TextureDetailComesFromTheChosenViewAndLevelsFromAll) {
         ASSERT_EQ(cudaMemcpy(depth.data, d.data(), pixels * 4, cudaMemcpyHostToDevice), cudaSuccess);
         ASSERT_EQ(cudaMemcpy(photo.data, c.data(), c.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
         ASSERT_EQ(cudaMemcpy(low_photo.data, low.data(), low.size() * 4, cudaMemcpyHostToDevice), cudaSuccess);
-        gsplat_lfs::mesh_texture_accumulate(texels.data, 1, pinhole_at(camera_z), label, labels.data, depth.data, photo.data, low_photo.data, .1f, sum.data, weight.data, high.data, best.data, nullptr);
+        gsplat_lfs::mesh_texture_accumulate(texels.data, 1, pinhole_at(camera_z), label, labels.data, depth.data, photo.data, low_photo.data, tolerances.data, sum.data, weight.data, high.data, best.data, nullptr);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     };
     add(7, -4.f, .8f, .2f);

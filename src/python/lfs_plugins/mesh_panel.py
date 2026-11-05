@@ -29,7 +29,7 @@ LABELS = {"voxel_size": "main_panel.voxel_size", "view_stride": "mesh.view_strid
 class MeshPanel(Panel):
     def __init__(self):
         self.handle = None
-        self.values = dict(voxel_size=.02, view_stride=2, full_weight_range=1., min_views=3, simplify_error=.005, max_range=0., texel_size=0., error="")
+        self.values = dict(voxel_size=.02, view_stride=2, full_weight_range=1., min_views=3, simplify_error=.005, max_range=0., texel_size=0., write_osgb=False, error="")
         self.state = {}
         self.close_when_done = False
         self.scrubs = ScrubFieldController(
@@ -49,7 +49,7 @@ class MeshPanel(Panel):
         try:
             lf.generate_mesh(path, self.values["voxel_size"], int(self.values["view_stride"]),
                              self.values["full_weight_range"], int(self.values["min_views"]),
-                             self.values["simplify_error"], self.values["max_range"], self.values["texel_size"])
+                             self.values["simplify_error"], self.values["max_range"], self.values["texel_size"], self.values["write_osgb"])
             self.close_when_done = True
         except (RuntimeError, ValueError) as exc:
             key = getattr(exc, "message_key", "")
@@ -81,6 +81,7 @@ class MeshPanel(Panel):
         model.bind_func("mesh_progress", lambda: self.state.get("progress", 0))
         model.bind_func("mesh_error", lambda: self.values["error"] or self.state.get("error", ""))
         model.bind_func("mesh_status", lambda: f'{self.state.get("stage") or lf.ui.tr("training_panel.running")} {self.state.get("progress", 0):.0%}')
+        model.bind("mesh_write_osgb", lambda: self.values["write_osgb"], lambda value: self.set_value("write_osgb", bool(value)))
         model.bind_event("mesh_generate", self.generate)
         model.bind_event("mesh_cancel", self.cancel)
         model.bind_event("mesh_close", lambda *_: lf.ui.set_panel_enabled("lfs.mesh", False))

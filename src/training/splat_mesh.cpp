@@ -61,6 +61,10 @@ namespace lfs::training {
         // across views. Smaller lets the mean of misregistered views blur lettering, which spans about 1/100 of the image on
         // an indoor scene; larger shows the seams between views on white walls at 1/50 and bands colored lights at 1/20.
         constexpr int kBlendWidthPerRadius = 100;
+        // The surface of a reduced level is within about 1.4 times its allowed error, and depth maps have their own.
+        constexpr float kFaceErrorToTolerance = 2.f;
+        constexpr int kOsgbMaxLevels = 4;
+        constexpr int kOsgbMaxPage = 4096;
         // Sharper weights rest each vertex on fewer views and lost color on both test scenes.
         constexpr int kSimplifyThreads = 8;
         // What RAM use rises by from the end of fusion to its peak, as measured on an outdoor scene at
@@ -93,7 +97,7 @@ namespace lfs::training {
                             s.full_weight_range >= 0 && s.view_stride >= 1 && s.color_stride >= 1 && s.min_views >= 1 &&
                             s.min_views <= 65535 && s.min_component_faces >= 0 && s.max_width >= 16 &&
                             std::isfinite(s.simplify_error) && s.simplify_error >= 0 && std::isfinite(s.max_range) && s.max_range >= 0 &&
-                            std::isfinite(s.texel_size) && s.texel_size >= 0 && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
+                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (!s.write_osgb || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.truncation));
@@ -114,14 +118,17 @@ namespace lfs::training {
 
         // Rasterizing the pages holds 16 bytes per page texel in up to kSimplifyThreads threads, and baking
         // keeps 19 per covered texel and 3 per page texel. Covered texels run about 1.3 times the area.
-        // Unwrapping adds about 300 bytes per face, as measured on an outdoor scene of 12M faces, and choosing views 64.
+        // Unwrapping and choosing views add about 100 bytes per face: 10.8 GB in all at 288M texels and 23M faces of levels
+        // of detail, and 3.5 GB at 66M and 1.7M.
         void texture_ram_preflight(const SplatMesh& mesh, const core::SplatMeshSettings& s) {
             const auto host = core::host_metrics::sample();
             if (!host.ram_valid)
                 return;
             const double page_texels = double(s.texture_size) * s.texture_size;
-            const double covered = 1.3 * mesh.area / (double(s.texel_size) * s.texel_size);
-            const double needed = kSimplifyThreads * 16. * page_texels + 22. * covered + 364. * double(mesh.faces.size());
+            // Levels of detail add a quarter of the texels at each step, and about half the faces in all.
+            const double covered = (s.write_osgb ? 4. / 3. : 1.) * 1.3 * mesh.area / (double(s.texel_size) * s.texel_size);
+            const double faces = (s.write_osgb ? 1.5 : 1.) * double(mesh.faces.size());
+            const double needed = kSimplifyThreads * 16. * page_texels + 22. * covered + 100. * faces;
             const double available = double(host.system_total_bytes - host.system_used_bytes);
             LOG_INFO("Mesh: {:.0f}M texels need about {:.1f} GB of RAM, {:.1f} GB available", covered / 1e6, needed / (1ull << 30), available / (1ull << 30));
             if (needed > available)
@@ -824,14 +831,16 @@ namespace lfs::training {
             mesh.pages.assign(page_count, {});
             core::GlobalArenaManager::instance().get_arena().release_idle_for_pressure();
             core::Tensor::trim_memory_pool();
-            constexpr size_t bytes_per_texel = 48;
+            constexpr size_t bytes_per_texel = 52;
             const auto room = core::MemoryPressureCoordinator::instance().preflight({.operation = "Mesh texture"});
             const size_t available = room.effective_free_bytes > room.required_peak_bytes ? room.effective_free_bytes - room.required_peak_bytes : 0;
             const size_t max_texels = size_t(double(available) * kTextureShareOfFreeMemory) / bytes_per_texel;
 
             auto bake_settings = settings;
             bake_settings.max_width = settings.texture_width;
-            const float tolerance = 2.5f * settings.voxel_size;
+            // A coarse level lies as far from the surface as its faces were allowed to move.
+            const float base_tolerance = 2.5f * settings.voxel_size;
+            const auto tolerance_of = [&](const size_t face) { return mesh.face_error.empty() ? base_tolerance : std::max(base_tolerance, kFaceErrorToTolerance * mesh.face_error[face]); };
             size_t observed = 0, total = 0;
             size_t first_page = 0;
 
@@ -841,6 +850,14 @@ namespace lfs::training {
             {
                 DeviceArray<float> vertices(mesh.vertices.size() * 3, stream), scores(face_count, stream);
                 DeviceArray<int32_t> faces(size_t(face_count) * 3, stream);
+                DeviceArray<float> tolerances(face_count, stream);
+                {
+                    std::vector<float> host_tolerances(face_count);
+                    for (size_t f = 0; f < face_count; ++f)
+                        host_tolerances[f] = tolerance_of(f);
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), face_count * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh tolerances");
+                }
                 LFS_CUDA_CHECK(cudaMemcpyAsync(vertices.data(), mesh.vertices.data(), mesh.vertices.size() * 3 * sizeof(float), cudaMemcpyHostToDevice, stream));
                 LFS_CUDA_CHECK(cudaMemcpyAsync(faces.data(), mesh.faces.data(), size_t(face_count) * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
                 std::vector<float> host(face_count);
@@ -852,7 +869,7 @@ namespace lfs::training {
                     camera.load_image_size(1, settings.texture_width);
                     const auto view = make_view(camera);
                     auto depth = render_median_depth(camera, model, bake_settings, stream);
-                    gsplat_lfs::mesh_face_view_score(vertices.data(), faces.data(), face_count, view, depth.ptr<float>(), tolerance, scores.data(), stream);
+                    gsplat_lfs::mesh_face_view_score(vertices.data(), faces.data(), face_count, view, depth.ptr<float>(), tolerances.data(), scores.data(), stream);
                     LFS_CUDA_CHECK(cudaMemcpyAsync(host.data(), scores.data(), host.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh face views");
                     candidates.add(static_cast<int32_t>(i), host);
@@ -881,12 +898,18 @@ namespace lfs::training {
                 DeviceArray<float> positions(count * 3, stream), low_sum(count * 3, stream, true), low_weight(count, stream, true);
                 DeviceArray<float> high(count * 3, stream, true), best_weight(count, stream, true);
                 DeviceArray<int32_t> labels(count, stream);
+                DeviceArray<float> tolerances(count, stream);
                 std::vector<int32_t> host_labels;
+                std::vector<float> host_tolerances;
                 host_labels.reserve(count);
+                host_tolerances.reserve(count);
                 for (size_t p = first_page; p < last_page; ++p)
-                    for (const auto face : texels[p].faces)
+                    for (const auto face : texels[p].faces) {
                         host_labels.push_back(face_views[face]);
+                        host_tolerances.push_back(tolerance_of(face));
+                    }
                 LFS_CUDA_CHECK(cudaMemcpyAsync(labels.data(), host_labels.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                LFS_CUDA_CHECK(cudaMemcpyAsync(tolerances.data(), host_tolerances.data(), count * sizeof(float), cudaMemcpyHostToDevice, stream));
                 size_t offset = 0;
                 for (size_t p = first_page; p < last_page; ++p) {
                     LFS_CUDA_CHECK(cudaMemcpyAsync(positions.data() + 3 * offset, texels[p].positions.data(), texels[p].positions.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
@@ -919,7 +942,7 @@ namespace lfs::training {
                     }
                     gsplat_lfs::mesh_photo_low_pass(photo.ptr<float>(), depth.ptr<float>(), view.width, view.height, std::max(int(view.width) / kBlendWidthPerRadius, 1),
                                                     scratch.data(), weights.data(), low.data(), stream);
-                    gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerance,
+                    gsplat_lfs::mesh_texture_accumulate(positions.data(), static_cast<uint32_t>(count), view, static_cast<int32_t>(i), labels.data(), depth.ptr<float>(), photo.ptr<float>(), low.data(), tolerances.data(),
                                                         low_sum.data(), low_weight.data(), high.data(), best_weight.data(), stream);
                     LFS_ENSURE_CUDA_SUCCESS(cudaStreamSynchronize(stream), "Mesh texture");
                 }
@@ -940,7 +963,7 @@ namespace lfs::training {
                         for (size_t c = 0; c < 3; ++c)
                             colors[3 * t + c] = seen ? std::max(sums[3 * at + c] / sum_weights[at] + highs[3 * at + c], 0.f) : -1.f;
                     }
-                    mesh.pages[p] = compose_mesh_page(texels[p], colors, mesh.page_size);
+                    mesh.pages[p] = compose_mesh_page(texels[p], colors, mesh.page_side(p));
                     texels[p] = {};
                     offset += page_texels;
                 }
@@ -1143,17 +1166,26 @@ namespace lfs::training {
             texture_ram_preflight(mesh, settings);
             step = Clock::now();
             core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
-            unwrap_splat_mesh(mesh, settings.texel_size, settings.texture_size, stop);
+            if (settings.write_osgb)
+                mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, settings.texel_size, std::min(settings.texture_size, kOsgbMaxPage), kOsgbMaxLevels, settings.simplify_error, stop));
+            else
+                unwrap_splat_mesh(mesh, settings.texel_size, settings.texture_size, stop);
             mesh.seconds_unwrap = seconds_since(step);
             step = Clock::now();
             std::vector<core::Camera*> all_views;
             for (auto* camera : cameras)
                 if (camera)
                     all_views.push_back(camera);
-            bake_texture(mesh, model, all_views, settings, stream, [&](const float value) {
+            bake_texture(mesh.tiled ? mesh.tiled->combined : mesh, model, all_views, settings, stream, [&](const float value) {
                 core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture"));
             }, appearance);
             mesh.seconds_bake = seconds_since(step);
+            if (mesh.tiled) {
+                mesh.pages = {};
+                mesh.charts = mesh.tiled->combined.charts;
+                mesh.texels = mesh.tiled->combined.texels;
+                mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
+            }
         }
         return mesh;
     } catch (const std::bad_alloc&) {

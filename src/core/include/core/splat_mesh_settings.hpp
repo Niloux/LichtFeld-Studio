@@ -23,6 +23,7 @@ namespace lfs::core {
         float texel_size = 0.f;        // size of a texel on the surface; 0 = vertex colors only
         int texture_size = 4096;       // side of a texture page
         int texture_width = 0;         // render and photo width limit when baking; 0 = the photos' own
+        bool write_osgb = false;       // bake tiles with levels of detail for an OSGB model instead of one OBJ
         bool invert_mask = false;
         float mask_threshold = .5f;
 

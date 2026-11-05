@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <stop_token>
 #include <utility>
@@ -32,8 +33,12 @@ namespace lfs::training {
         std::vector<std::array<float, 2>> uvs;
         std::vector<int32_t> uv_source; // per vertex, one number per point of the surface, whichever charts repeat it
         std::vector<size_t> page_first_face;
+        std::vector<int> page_sizes; // per page, when pages differ; else every page is page_size
+        std::vector<float> face_error; // how far each face may lie from the surface, when faces differ
         std::vector<std::vector<uint8_t>> pages; // RGB, sRGB as in the photos
         int page_size = 0;
+        [[nodiscard]] int page_side(const size_t page) const { return page_sizes.empty() ? page_size : page_sizes[page]; }
+        std::shared_ptr<struct TiledMesh> tiled; // with write_osgb: the model to write, baked
 
         // What each stage found, for reports.
         size_t views = 0;
@@ -135,6 +140,30 @@ namespace lfs::training {
 
     // The surface alone, connected across chart seams: the same geometry with a texture as without.
     void write_splat_mesh_ply(const SplatMesh& mesh, const std::filesystem::path& path);
+
+    // One level of detail of one tile: a span of the vertices and pages of TiledMesh::combined.
+    struct TileLevel {
+        size_t tile = 0;
+        size_t level = 0; // 0 is the finest
+        size_t first_page = 0, page_count = 0;
+        size_t first_vertex = 0, vertex_count = 0;
+        float texel = 0.f;
+        std::array<float, 3> center{0.f, 0.f, 0.f}; // of the tile, the same on every level
+        float radius = 0.f;
+    };
+    // Every level of every tile as one mesh, so that one pass over the photos bakes them all.
+    struct TiledMesh {
+        SplatMesh combined;
+        std::vector<TileLevel> levels;
+    };
+    // Splits the mesh into tiles of at most tile_faces, whose charts fit a page of max_page, and reduces each to up to
+    // max_levels of detail: each allows 4 times the surface deviation of the last and doubles the texel. Vertices that tiles
+    // share stay put on every level, so no cracks open between tiles. Reorders base.faces. Unwraps every level; baking remains.
+    [[nodiscard]] TiledMesh build_tiled_mesh(SplatMesh& base, float texel_size, int max_page, int max_levels, float finest_error, std::stop_token stop = {}, size_t tile_faces = 150'000);
+    // Writes a model DasViewer opens: folder/metadata.xml and folder/Data/<tile>/<tile>.osgb, the coarsest level of a tile, with
+    // the next finer one paged in as the tile fills the screen.
+    void write_splat_mesh_osgb(const TiledMesh& tiled, const std::filesystem::path& folder, const core::ProgressCallback& progress = {}, std::stop_token stop = {});
+
     // Writes path (.obj), the .mtl beside it and one <stem>_<page>.jpg per page. Positions and normals stay connected
     // across chart seams, and only the texture coordinates are repeated there.
     void write_splat_mesh_obj(const SplatMesh& mesh, const std::filesystem::path& path);
