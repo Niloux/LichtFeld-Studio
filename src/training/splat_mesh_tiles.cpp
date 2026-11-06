@@ -15,6 +15,8 @@
 namespace lfs::training {
     namespace {
         constexpr int kTileThreads = 8;
+        // Unwrapping the tiles is most of the work here: 16 against 8 took 228 s against 268 s on an outdoor scene, and 24 no less.
+        constexpr int kTileWorkThreads = 16;
         constexpr float kPieceShareOfPage = .7f;
         // Each level allows this much more surface deviation than the one below it, and doubles its texel.
         constexpr float kLevelErrorGrowth = 4.f;
@@ -26,7 +28,7 @@ namespace lfs::training {
         constexpr size_t kMinLevelFaces = 1000;
 
         void parallel_for(const size_t count, auto&& body) {
-            const int threads = std::clamp(int(std::thread::hardware_concurrency()), 1, kTileThreads);
+            const int threads = std::clamp(int(std::thread::hardware_concurrency()), 1, kTileWorkThreads);
             std::atomic<size_t> next{0};
             std::vector<std::exception_ptr> failures(static_cast<size_t>(threads));
             const auto work = [&](const int thread) {

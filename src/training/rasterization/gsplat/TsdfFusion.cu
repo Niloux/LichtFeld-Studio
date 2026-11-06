@@ -569,6 +569,39 @@ namespace gsplat_lfs {
         LFS_CUDA_LAUNCH_CHECK(stream, "mesh.color");
     }
 
+    namespace {
+        __global__ void pack_mask_kernel(const float* mask, const uint32_t pixels, uint32_t* bits) {
+            const uint32_t word = blockIdx.x * blockDim.x + threadIdx.x;
+            if (uint64_t{word} * 32 >= pixels)
+                return;
+            uint32_t value = 0;
+            for (uint32_t b = 0; b < 32; ++b) {
+                const uint64_t p = uint64_t{word} * 32 + b;
+                if (p < pixels && mask[p] != 0.f)
+                    value |= 1u << b;
+            }
+            bits[word] = value;
+        }
+
+        __global__ void apply_mask_kernel(float* depth, const uint32_t pixels, const uint32_t* bits) {
+            const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+            if (p >= pixels)
+                return;
+            depth[p] *= (bits[p >> 5] >> (p & 31)) & 1u ? 1.f : 0.f;
+        }
+    } // namespace
+
+    void mesh_pack_mask(const float* mask, const uint32_t pixels, uint32_t* bits, cudaStream_t stream) {
+        const uint64_t words = (uint64_t{pixels} + 31) / 32;
+        pack_mask_kernel<<<launch_blocks(words), kThreads, 0, stream>>>(mask, pixels, bits);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.pack_mask");
+    }
+
+    void mesh_apply_mask(float* depth, const uint32_t pixels, const uint32_t* bits, cudaStream_t stream) {
+        apply_mask_kernel<<<launch_blocks(pixels), kThreads, 0, stream>>>(depth, pixels, bits);
+        LFS_CUDA_LAUNCH_CHECK(stream, "mesh.apply_mask");
+    }
+
     void mesh_photo_low_pass(const float* photo, const float* depth, const uint32_t width, const uint32_t height, const int radius,
                              float* scratch, float* weights, float* low, cudaStream_t stream) {
         const uint64_t pixels = uint64_t{width} * height;

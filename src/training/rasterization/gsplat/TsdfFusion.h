@@ -87,6 +87,10 @@ namespace gsplat_lfs {
     void mesh_color_accumulate(const float* vertices, uint32_t vertex_count, const TsdfView& view, const float* depth, const float* photo,
                                float tolerance, float* color_sum, float* color_weight, cudaStream_t stream);
 
+    // A mask of 0 and 1 as one bit per pixel, (pixels + 31) / 32 words, and depth multiplied by it again.
+    void mesh_pack_mask(const float* mask, uint32_t pixels, uint32_t* bits, cudaStream_t stream);
+    void mesh_apply_mask(float* depth, uint32_t pixels, const uint32_t* bits, cudaStream_t stream);
+
     // Blurs the photo [3, H, W] over pixels of positive depth, for mesh_texture_accumulate.
     // scratch holds a photo and weights two channels of H * W.
     void mesh_photo_low_pass(const float* photo, const float* depth, uint32_t width, uint32_t height, int radius,
