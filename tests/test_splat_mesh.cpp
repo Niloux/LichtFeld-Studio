@@ -633,8 +633,8 @@ TEST(SplatMesh, ComposingAPageFillsOutwardFromTheCharts) {
     EXPECT_EQ(at(60, 60, 1), (128 + 100) / 2);
 }
 
-TEST(SplatMesh, FilesStayConnectedAcrossChartSeams) {
-    // Two charts sharing an edge: its two points are repeated in the output, with different texture coordinates.
+TEST(SplatMesh, PlyStaysConnectedAcrossChartSeams) {
+    // Two charts sharing an edge: its two points are repeated in the mesh, with different texture coordinates.
     SplatMesh mesh;
     mesh.vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}};
     mesh.normals.assign(6, {0.f, 0.f, 1.f});
@@ -652,53 +652,13 @@ TEST(SplatMesh, FilesStayConnectedAcrossChartSeams) {
 
     const auto folder = std::filesystem::temp_directory_path() / "lfs_splat_mesh_weld_test";
     std::filesystem::create_directories(folder);
-    lfs::training::write_splat_mesh_obj(mesh, folder / "scene.obj");
     lfs::training::write_splat_mesh_ply(mesh, folder / "scene.ply");
-    std::ifstream obj_in(folder / "scene.obj", std::ios::binary), ply_in(folder / "scene.ply", std::ios::binary);
-    const std::string obj((std::istreambuf_iterator<char>(obj_in)), {}), ply((std::istreambuf_iterator<char>(ply_in)), {});
-    obj_in.close();
+    std::ifstream ply_in(folder / "scene.ply", std::ios::binary);
+    const std::string ply((std::istreambuf_iterator<char>(ply_in)), {});
     ply_in.close();
     std::filesystem::remove_all(folder);
-    const auto count = [&](const std::string_view prefix) {
-        size_t found = 0;
-        for (size_t at = 0; (at = obj.find(prefix, at)) != std::string::npos; at += prefix.size())
-            ++found;
-        return found;
-    };
-    EXPECT_EQ(count("\nv "), 4u);
-    EXPECT_EQ(count("\nvn "), 4u);
-    EXPECT_EQ(count("\nvt "), 6u);
-    // The second face shares the points of the first, through its own texture coordinates.
-    EXPECT_NE(obj.find("f 1/1/1 2/2/2 3/3/3\nf 2/4/2 4/6/4 3/5/3\n"), std::string::npos);
     EXPECT_NE(ply.find("element vertex 4\n"), std::string::npos);
     EXPECT_NE(ply.find("element face 2\n"), std::string::npos);
-}
-
-TEST(SplatMesh, ObjNamesItsTexturesAndFlipsV) {
-    SplatMesh mesh;
-    mesh.vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
-    mesh.normals = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
-    mesh.faces = {{0, 1, 2}};
-    mesh.uvs = {{0.f, .25f}, {1.f, .25f}, {0.f, 1.f}};
-    mesh.page_first_face = {0, 1};
-    mesh.page_size = 8;
-    mesh.pages = {std::vector<uint8_t>(3 * 64, 128)};
-    const auto folder = std::filesystem::temp_directory_path() / "lfs_splat_mesh_obj_test";
-    std::filesystem::create_directories(folder);
-    lfs::training::write_splat_mesh_obj(mesh, folder / "scene.obj");
-    std::ifstream in(folder / "scene.obj", std::ios::binary);
-    const std::string text((std::istreambuf_iterator<char>(in)), {});
-    in.close();
-    std::ifstream material(folder / "scene.mtl", std::ios::binary);
-    const std::string mtl((std::istreambuf_iterator<char>(material)), {});
-    material.close();
-    const bool image_written = std::filesystem::file_size(folder / "scene_0.jpg") > 0;
-    std::filesystem::remove_all(folder);
-    EXPECT_TRUE(image_written);
-    EXPECT_NE(text.find("mtllib scene.mtl\n"), std::string::npos);
-    EXPECT_NE(text.find("vt 0 0.75\n"), std::string::npos);
-    EXPECT_NE(text.find("usemtl page_0\nf 1/1/1 2/2/2 3/3/3\n"), std::string::npos);
-    EXPECT_NE(mtl.find("map_Kd scene_0.jpg\n"), std::string::npos);
 }
 
 namespace {

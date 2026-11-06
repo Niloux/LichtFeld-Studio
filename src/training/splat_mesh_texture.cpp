@@ -2,21 +2,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "core/collision_volume.hpp"
 #include "core/logger.hpp"
-#include "core/native_fs.hpp"
-#include "core/path_utils.hpp"
 #include "splat_mesh.hpp"
 #include "splat_mesh_parallel.hpp"
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <numeric>
 #include <span>
-#include <stb_image_write.h>
 #include <xatlas/xatlas.h>
 
 namespace lfs::training {
@@ -27,7 +22,6 @@ namespace lfs::training {
         // A chart in a piece this share of a page across fits a page along its diagonal.
         constexpr float kPieceShareOfPage = .7f;
         constexpr int kUnwrapThreads = 8;
-        constexpr int kTextureJpegQuality = 95;
         // Reaches what bilinear sampling reads from the edge of a chart.
         constexpr double kCoverageMarginTexels = .75;
         constexpr int kFillRings = 8;
@@ -683,44 +677,6 @@ namespace lfs::training {
         return image;
     }
 
-    namespace {
-        void write_or_throw(std::ofstream& out, const std::filesystem::path& path) {
-            out.close();
-            if (!out)
-                throw collisionError("mesh.write_failed", "Could not write the mesh; check disk space and permissions", ErrorCode::Unavailable, core::path_to_utf8(path));
-        }
-
-        void write_jpeg(const std::vector<uint8_t>& rgb, const int side, const std::filesystem::path& path) {
-            std::ofstream out(core::native_fs::native_path(path), std::ios::binary | std::ios::trunc);
-            const auto append = [](void* context, void* data, const int size) { static_cast<std::ofstream*>(context)->write(static_cast<const char*>(data), size); };
-            if (!stbi_write_jpg_to_func(append, &out, side, side, 3, rgb.data(), kTextureJpegQuality))
-                throw collisionError("mesh.write_failed", "Could not write the mesh texture", ErrorCode::Unavailable, core::path_to_utf8(path));
-            write_or_throw(out, path);
-        }
-
-        struct LineBuffer {
-            std::ofstream& out;
-            std::vector<char> data = std::vector<char>(size_t{1} << 24);
-            size_t used = 0;
-            void reserve(const size_t bytes) {
-                if (used + bytes > data.size()) {
-                    out.write(data.data(), std::streamsize(used));
-                    used = 0;
-                }
-            }
-            void flush() { reserve(data.size()); }
-            void text(const std::string_view value) {
-                reserve(value.size());
-                std::memcpy(data.data() + used, value.data(), value.size());
-                used += value.size();
-            }
-            void number(const auto value) {
-                reserve(64);
-                used = size_t(std::to_chars(data.data() + used, data.data() + data.size(), value).ptr - data.data());
-            }
-        };
-    } // namespace
-
     WeldedVertices weld_chart_seams(const SplatMesh& mesh) {
         WeldedVertices welded;
         const size_t count = mesh.vertices.size();
@@ -742,81 +698,6 @@ namespace lfs::training {
                 welded.originals[size_t(merged)] = static_cast<int32_t>(v);
         }
         return welded;
-    }
-
-    void write_splat_mesh_obj(const SplatMesh& mesh, const std::filesystem::path& path) {
-        if (mesh.uvs.size() != mesh.vertices.size() || mesh.page_first_face.size() != mesh.pages.size() + 1)
-            throw collisionError("mesh.write_failed", "The mesh has no texture to write", ErrorCode::InvalidArgument);
-        const auto stem = core::path_to_utf8(path.stem());
-        const auto folder = path.parent_path();
-        const auto mtl_name = stem + ".mtl";
-        {
-            std::ofstream out(core::native_fs::native_path(folder / core::utf8_to_path(mtl_name)), std::ios::binary | std::ios::trunc);
-            for (size_t p = 0; p < mesh.pages.size(); ++p)
-                out << std::format("newmtl page_{}\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd {}_{}.jpg\n\n", p, stem, p);
-            write_or_throw(out, folder / core::utf8_to_path(mtl_name));
-        }
-        detail::parallel_for(mesh.pages.size(), kUnwrapThreads, [&](const size_t p) {
-            write_jpeg(mesh.pages[p], mesh.page_size, folder / core::utf8_to_path(std::format("{}_{}.jpg", stem, p)));
-        });
-
-        const auto welded = weld_chart_seams(mesh);
-        const auto temporary = std::filesystem::path(path).concat(".tmp");
-        {
-            std::ofstream out(core::native_fs::native_path(temporary), std::ios::binary | std::ios::trunc);
-            LineBuffer lines{out};
-            lines.text(std::format("mtllib {}\n", mtl_name));
-            for (const auto original : welded.originals) {
-                const auto& p = mesh.vertices[size_t(original)];
-                lines.text("v ");
-                lines.number(p[0]);
-                lines.text(" ");
-                lines.number(p[1]);
-                lines.text(" ");
-                lines.number(p[2]);
-                lines.text("\n");
-            }
-            // OBJ counts v up from the bottom of the image.
-            for (const auto& uv : mesh.uvs) {
-                lines.text("vt ");
-                lines.number(uv[0]);
-                lines.text(" ");
-                lines.number(1.f - uv[1]);
-                lines.text("\n");
-            }
-            for (const auto original : welded.originals) {
-                const auto& n = mesh.normals[size_t(original)];
-                lines.text("vn ");
-                lines.number(n[0]);
-                lines.text(" ");
-                lines.number(n[1]);
-                lines.text(" ");
-                lines.number(n[2]);
-                lines.text("\n");
-            }
-            for (size_t p = 0; p < mesh.pages.size(); ++p) {
-                lines.text(std::format("usemtl page_{}\n", p));
-                for (size_t f = mesh.page_first_face[p]; f < mesh.page_first_face[p + 1]; ++f) {
-                    lines.text("f");
-                    for (const auto vertex : mesh.faces[f]) {
-                        const int32_t position = welded.index[size_t(vertex)] + 1;
-                        lines.text(" ");
-                        lines.number(position);
-                        lines.text("/");
-                        lines.number(vertex + 1);
-                        lines.text("/");
-                        lines.number(position);
-                    }
-                    lines.text("\n");
-                }
-            }
-            lines.flush();
-            write_or_throw(out, path);
-        }
-        std::error_code error;
-        core::native_fs::rename(temporary, path, error);
-        if (error)
-            throw collisionError("mesh.write_failed", error.message(), ErrorCode::Unavailable, core::path_to_utf8(path));
     }
 
 } // namespace lfs::training

@@ -35,7 +35,7 @@ class MeshPanel(Panel):
     def __init__(self):
         self.handle = None
         self.values = dict(voxel_size=.02, view_stride=2, full_weight_range=1., min_views=3, simplify_error=.005, max_range=0., texel_size=0.,
-                           write_osgb=False, use_file=False, file="", error="")
+                           use_file=False, file="", error="")
         self.state = {}
         self.close_when_done = False
         self.scrubs = ScrubFieldController(
@@ -50,10 +50,6 @@ class MeshPanel(Panel):
     def textured(self):
         return self.values["texel_size"] > 0
 
-    def osgb(self):
-        # Kept as asked when the texel size goes back to 0, but only written with a texture.
-        return self.values["write_osgb"] and self.textured()
-
     def notice(self):
         """Why the settings cannot run as they are, or empty. A missing file shows on its own row."""
         if self.values["use_file"] and not self.textured():
@@ -61,9 +57,7 @@ class MeshPanel(Panel):
         return ""
 
     def output(self):
-        if self.osgb():
-            return lf.ui.tr("mesh.output_osgb")
-        return lf.ui.tr("mesh.output_obj" if self.textured() else "mesh.output_ply")
+        return lf.ui.tr("mesh.output_osgb" if self.textured() else "mesh.output_ply")
 
     def ready(self):
         if self.values["use_file"] and not self.values["file"]:
@@ -93,7 +87,7 @@ class MeshPanel(Panel):
         try:
             lf.generate_mesh(path, self.values["voxel_size"], int(self.values["view_stride"]),
                              self.values["full_weight_range"], int(self.values["min_views"]),
-                             self.values["simplify_error"], self.values["max_range"], self.values["texel_size"], self.osgb(),
+                             self.values["simplify_error"], self.values["max_range"], self.values["texel_size"],
                              self.values["file"] if self.values["use_file"] else "")
             self.close_when_done = True
         except (RuntimeError, ValueError) as exc:
@@ -126,13 +120,11 @@ class MeshPanel(Panel):
         model.bind_func("mesh_progress", lambda: self.state.get("progress", 0))
         model.bind_func("mesh_error", lambda: self.values["error"] or self.state.get("error", ""))
         model.bind_func("mesh_status", lambda: f'{self.state.get("stage") or lf.ui.tr("training_panel.running")} {self.state.get("progress", 0):.0%}')
-        model.bind_func("mesh_textured", self.textured)
         model.bind_func("mesh_file", lambda: self.values["file"])
         model.bind_func("mesh_file_name", lambda: Path(self.values["file"]).name if self.values["file"] else lf.ui.tr("mesh.no_file"))
         model.bind_func("mesh_output", self.output)
         model.bind_func("mesh_notice", self.notice)
         model.bind_func("mesh_ready", self.ready)
-        model.bind("mesh_write_osgb", lambda: self.osgb(), lambda value: self.set_value("write_osgb", bool(value)))
         model.bind("mesh_use_file", lambda: self.values["use_file"], lambda value: self.set_value("use_file", bool(value)))
         model.bind_event("mesh_choose_file", self.choose_file)
         model.bind_event("mesh_generate", self.generate)

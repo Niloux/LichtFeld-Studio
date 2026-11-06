@@ -38,7 +38,7 @@ namespace lfs::training {
         std::vector<std::vector<uint8_t>> pages; // RGB, sRGB as in the photos
         int page_size = 0;
         [[nodiscard]] int page_side(const size_t page) const { return page_sizes.empty() ? page_size : page_sizes[page]; }
-        std::shared_ptr<struct TiledMesh> tiled; // with write_osgb: the model to write, baked
+        std::shared_ptr<struct TiledMesh> tiled; // with a texel size: the OSGB model to write, baked
 
         // What each stage found, for reports.
         size_t views = 0;
@@ -186,9 +186,6 @@ namespace lfs::training {
     [[nodiscard]] SplatMesh read_splat_mesh_ply(const std::filesystem::path& path);
     void write_splat_mesh_osgb(const TiledMesh& tiled, const std::filesystem::path& folder, const core::ProgressCallback& progress = {}, std::stop_token stop = {});
 
-    // Writes path (.obj), the .mtl beside it and one <stem>_<page>.jpg per page. Positions and normals stay connected
-    // across chart seams, and only the texture coordinates are repeated there.
-    void write_splat_mesh_obj(const SplatMesh& mesh, const std::filesystem::path& path);
     [[nodiscard]] core::MeshData splat_mesh_to_mesh_data(const SplatMesh& mesh);
 
 } // namespace lfs::training

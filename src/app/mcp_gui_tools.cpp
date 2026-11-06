@@ -2477,8 +2477,8 @@ namespace lfs::app {
             });
         registry.register_tool(
             McpTool{.name = "scene.generate_mesh",
-                    .description = "Mesh exactly one selected loaded splat from the scene's cameras into a PLY and a new undoable mesh node, and with texel_size also a textured OBJ beside it, or with write_osgb an OSGB model folder; from_mesh bakes that PLY instead of extracting a surface and needs texel_size; observe collision.main",
-                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}, {"simplify_error", {{"type", "number"}}}, {"max_range", {{"type", "number"}}}, {"texel_size", {{"type", "number"}}}, {"write_osgb", {{"type", "boolean"}}}, {"from_mesh", {{"type", "string"}}}}, .required = {"path"}},
+                    .description = "Mesh exactly one selected loaded splat from the scene's cameras into a PLY and a new undoable mesh node, and with texel_size also an OSGB model folder beside it; from_mesh bakes that PLY instead of extracting a surface and needs texel_size; observe collision.main",
+                    .input_schema = {.type = "object", .properties = json{{"path", {{"type", "string"}}}, {"voxel_size", {{"type", "number"}}}, {"view_stride", {{"type", "integer"}}}, {"full_weight_range", {{"type", "number"}}}, {"min_views", {{"type", "integer"}}}, {"simplify_error", {{"type", "number"}}}, {"max_range", {{"type", "number"}}}, {"texel_size", {{"type", "number"}}}, {"from_mesh", {{"type", "string"}}}}, .required = {"path"}},
                     .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
             [viewer, viewer_impl](const json& args) -> json {
                 return post_and_wait(viewer, [viewer_impl, args]() -> json {
@@ -2486,7 +2486,6 @@ namespace lfs::app {
                         throw std::runtime_error("GUI manager is not initialized");
                     core::SplatMeshSettings settings;
                     settings.texel_size = args.value("texel_size", settings.texel_size);
-                    settings.write_osgb = args.value("write_osgb", settings.write_osgb);
                     settings.from_mesh = args.value("from_mesh", settings.from_mesh);
                     settings.simplify_error = args.value("simplify_error", settings.simplify_error);
                     settings.max_range = args.value("max_range", settings.max_range);

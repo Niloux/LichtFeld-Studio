@@ -2590,10 +2590,10 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
   --simplify-error <v>       Reduce faces within this surface deviation; 0 keeps all (default 0.005)
   --max-range <v>            Mesh only surfaces a view saw from closer than this; 0 = no limit (default 0)
   --render-width <n>         Render and photo width limit (default 1600)
-  --texel-size <v>           Bake a texture with texels of this size, and write an OBJ beside the PLY; 0 = none (default 0)
+  --texel-size <v>           Bake a texture with texels of this size, and write <output>_osgb beside the PLY: an OSGB
+                             model of tiles with levels of detail; 0 = vertex colors only (default 0)
   --texture-size <n>         Side of a texture page (default 4096)
   --texture-width <n>        Render and photo width limit when baking; 0 = the photos' own (default 0)
-  --osgb                     With a texel size: write <output>_osgb, tiles with levels of detail, instead of an OBJ
   --all-views                Also fuse the held-out views
   --from-mesh <mesh.ply>     Bake this mesh, made earlier or edited since, instead of extracting one; needs a texel size.
                              Voxel size still sets how near the depth a surface must lie
@@ -2659,7 +2659,8 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
                 } else if (flag == "--texture-width") {
                     settings.texture_width = std::stoi(value());
                 } else if (flag == "--osgb") {
-                    settings.write_osgb = true;
+                    error = "mesh: --osgb is no longer needed: a texel size always writes the OSGB model";
+                    return std::nullopt;
                 } else if (flag == "--all-views") {
                     all_views = true;
                 } else if (flag == "--from-mesh") {

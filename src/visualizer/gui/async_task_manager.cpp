@@ -4133,8 +4133,6 @@ namespace lfs::vis::gui {
                 views.push_back(camera.get());
             const auto mesh = training::extract_splat_mesh(*model, views, settings, stop, progress, appearance.get());
             training::write_splat_mesh_ply(mesh, path);
-            if (!mesh.pages.empty())
-                training::write_splat_mesh_obj(mesh, std::filesystem::path(path).replace_extension(".obj"));
             if (mesh.tiled) {
                 auto folder = path;
                 folder.replace_extension();

@@ -19,16 +19,15 @@ LichtFeld-Studio mesh project.licht -o mesh.ply
 LichtFeld-Studio mesh splat.ply -d dataset -o mesh.ply --voxel-size 0.02
 ```
 
-With `--texel-size 0.005` it also writes `mesh.obj`, `mesh.mtl` and one `mesh_<page>.jpg` per texture
-page, see [Texture](#texture). Writes `mesh.ply` and `mesh.json` with counts and timings. The output folder also receives the
+With `--texel-size 0.005` it also writes the OSGB model `mesh_osgb/`, see [Texture](#texture) and
+[OSGB model](#osgb-model). Writes `mesh.ply` and `mesh.json` with counts and timings. The output folder also receives the
 run's `training_config.json` and `metrics.csv`. Held-out views are left out unless `--all-views`
 is given. See `LichtFeld-Studio mesh --help`.
 
 ## Application
 
 Tools > Mesh from Splats meshes the selected splat from the scene's cameras. It writes a PLY, with
-a texel size also a textured OBJ beside it, or an OSGB model, and adds an undoable mesh node; the panel says which before it
-runs. Training must be stopped, and the complete model must be loaded, not a level-of-detail tree. Bake an existing mesh takes the
+a texel size also an OSGB model beside it, and adds an undoable mesh node; the panel says which before it runs. Training must be stopped, and the complete model must be loaded, not a level-of-detail tree. Bake an existing mesh takes the
 surface from a PLY instead, see [OSGB model](#osgb-model).
 
 ## Settings
@@ -64,9 +63,8 @@ keeps most faces. The vertices shared between pieces are kept, a few percent of 
 
 A texel size bakes a texture after faces are reduced, and changes no geometry: the PLY is the same surface with or
 without one. Photos of a dataset with `rolling_shutter.json` are placed with their readout motion, on the command line and in
-the application alike. xatlas unwraps the mesh into charts on square pages, in groups of about a million neighboring faces with
-pages of their own, since packing charts slows sharply with their number. The OBJ repeats only texture coordinates along
-chart seams, so its surface stays connected, also in viewers that compute their own normals.
+the application alike. xatlas unwraps each level of each tile into charts on square pages of its own, since packing charts
+slows sharply with their number. The PLY stays connected across chart seams.
 
 Every texel then takes its color from the photos. Exposure, vignetting and color come out of each photo as they do for
 vertex colors. A view counts for a texel only where the four pixels it samples all lie on the surface, so occluding edges
@@ -94,8 +92,7 @@ area / size².
 
 ## OSGB model
 
-With a texel size, `--osgb` on the command line, or the OSGB box in the panel, writes a model DasViewer opens, in a folder beside the
-PLY: `mesh_osgb/metadata.xml` and `mesh_osgb/Data/<tile>/`, in place of the OBJ. The mesh is split into tiles of at most 150 000
+A texel size writes a model DasViewer opens, in a folder beside the PLY: `mesh_osgb/metadata.xml` and `mesh_osgb/Data/<tile>/`. The mesh is split into tiles of at most 150 000
 faces, and each tile gets up to 4 levels of detail: every level allows 4 times the surface deviation of the last, doubles the
 texel and has its own charts and texture. Vertices that tiles share stay put on every level, so no cracks open between tiles.
 The viewer pages in a finer level as a tile comes to fill the screen. The model is in the dataset's coordinates, and the

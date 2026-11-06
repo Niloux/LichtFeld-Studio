@@ -104,7 +104,7 @@ namespace lfs::training {
                             s.full_weight_range >= 0 && s.view_stride >= 1 && s.color_stride >= 1 && s.min_views >= 1 &&
                             s.min_views <= 65535 && s.min_component_faces >= 0 && s.max_width >= 16 &&
                             std::isfinite(s.simplify_error) && s.simplify_error >= 0 && std::isfinite(s.max_range) && s.max_range >= 0 &&
-                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (!s.write_osgb || s.texel_size > 0) && (s.from_mesh.empty() || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
+                            std::isfinite(s.texel_size) && s.texel_size >= 0 && (s.from_mesh.empty() || s.texel_size > 0) && s.texture_size >= 64 && s.texture_size <= 16384 && s.texture_width >= 0 && (s.texture_width == 0 || s.texture_width >= 16);
             if (!ok)
                 throw collisionError("mesh.settings_invalid", "Invalid mesh settings", ErrorCode::InvalidArgument,
                                      std::format("{}; {}", s.voxel_size, s.truncation));
@@ -132,8 +132,8 @@ namespace lfs::training {
                 return;
             const double page_texels = double(s.texture_size) * s.texture_size;
             // Levels of detail add a quarter of the texels at each step, and about half the faces in all.
-            const double covered = (s.write_osgb ? 4. / 3. : 1.) * 1.3 * mesh.area / (double(s.texel_size) * s.texel_size);
-            const double faces = (s.write_osgb ? 1.5 : 1.) * double(mesh.faces.size());
+            const double covered = 4. / 3. * 1.3 * mesh.area / (double(s.texel_size) * s.texel_size);
+            const double faces = 1.5 * double(mesh.faces.size());
             const double needed = kSimplifyThreads * 16. * page_texels + 23. * std::min(covered, double(kBakeBatchTexels)) + 5. * covered + 100. * faces;
             const double available = double(host.system_total_bytes - host.system_used_bytes);
             LOG_INFO("Mesh: {:.0f}M texels need about {:.1f} GB of RAM, {:.1f} GB available", covered / 1e6, needed / (1ull << 30), available / (1ull << 30));
@@ -1351,10 +1351,7 @@ namespace lfs::training {
             texture_ram_preflight(mesh, settings);
             step = Clock::now();
             core::reportProgress(stop, progress, .5f, stage("mesh.stage_unwrap", "Unwrapping"));
-            if (settings.write_osgb)
-                mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, settings.texel_size, std::min(settings.texture_size, kOsgbMaxPage), kOsgbMaxLevels, settings.simplify_error, stop));
-            else
-                unwrap_splat_mesh(mesh, settings.texel_size, settings.texture_size, stop);
+            mesh.tiled = std::make_shared<TiledMesh>(build_tiled_mesh(mesh, settings.texel_size, std::min(settings.texture_size, kOsgbMaxPage), kOsgbMaxLevels, settings.simplify_error, stop));
             mesh.seconds_unwrap = seconds_since(step);
             step = Clock::now();
             std::vector<core::Camera*> all_views;
@@ -1363,26 +1360,18 @@ namespace lfs::training {
                     all_views.push_back(camera);
             // The levels of a tile stay together, and tiles come in the order of the splits: neighbors in the list are neighbors in space.
             std::vector<std::pair<size_t, size_t>> page_groups;
-            if (mesh.tiled) {
-                for (const auto& level : mesh.tiled->levels) {
-                    const size_t last = level.first_page + level.page_count;
-                    if (level.level == 0 || page_groups.empty())
-                        page_groups.push_back({level.first_page, last});
-                    else
-                        page_groups.back().second = last;
-                }
-            } else {
-                for (size_t p = 0; p + 1 < mesh.page_first_face.size(); ++p)
-                    page_groups.push_back({p, p + 1});
+            for (const auto& level : mesh.tiled->levels) {
+                const size_t last = level.first_page + level.page_count;
+                if (level.level == 0 || page_groups.empty())
+                    page_groups.push_back({level.first_page, last});
+                else
+                    page_groups.back().second = last;
             }
-            bake_texture(mesh.tiled ? mesh.tiled->combined : mesh, model, all_views, settings, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
+            bake_texture(mesh.tiled->combined, model, all_views, settings, stream, [&](const float value) { core::reportProgress(stop, progress, .6f + .4f * value, stage("mesh.stage_bake", "Baking texture")); }, appearance, page_groups);
             mesh.seconds_bake = seconds_since(step);
-            if (mesh.tiled) {
-                mesh.pages = {};
-                mesh.charts = mesh.tiled->combined.charts;
-                mesh.texels = mesh.tiled->combined.texels;
-                mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
-            }
+            mesh.charts = mesh.tiled->combined.charts;
+            mesh.texels = mesh.tiled->combined.texels;
+            mesh.observed_texel_share = mesh.tiled->combined.observed_texel_share;
         }
         return mesh;
     } catch (const std::bad_alloc&) {

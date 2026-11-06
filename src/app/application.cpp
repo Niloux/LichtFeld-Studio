@@ -1313,8 +1313,6 @@ namespace lfs::app {
                                                                trained && trainer->hasPPISP() ? trainer->getPPISP() : nullptr);
                 core::native_fs::create_directories(params->mesh_output.parent_path());
                 training::write_splat_mesh_ply(mesh, params->mesh_output);
-                if (!mesh.pages.empty())
-                    training::write_splat_mesh_obj(mesh, std::filesystem::path(params->mesh_output).replace_extension(".obj"));
                 if (mesh.tiled) {
                     auto folder = params->mesh_output;
                     folder.replace_extension();

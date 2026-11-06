@@ -116,9 +116,9 @@ def generate_collision(voxel_size: float = 0.05000000074505806, opacity: float =
 
 def export_collision(uuid: str, path: str) -> None: ...
 
-def generate_mesh(path: str, voxel_size: float = 0.019999999552965164, view_stride: int = 2, full_weight_range: float = 1.0, min_views: int = 3, simplify_error: float = 0.004999999888241291, max_range: float = 0.0, texel_size: float = 0.0, write_osgb: bool = False, from_mesh: str = '') -> None:
+def generate_mesh(path: str, voxel_size: float = 0.019999999552965164, view_stride: int = 2, full_weight_range: float = 1.0, min_views: int = 3, simplify_error: float = 0.004999999888241291, max_range: float = 0.0, texel_size: float = 0.0, from_mesh: str = '') -> None:
     """
-    Mesh the selected splat from the scene's cameras into a PLY and a new mesh node, and with texel_size also a textured OBJ beside it, or with write_osgb an OSGB model folder. With from_mesh, bakes that PLY instead of extracting a surface, which needs texel_size. Progress is in get_collision_state, cancel with cancel_collision
+    Mesh the selected splat from the scene's cameras into a PLY and a new mesh node, and with texel_size also an OSGB model folder beside it, named after the PLY with _osgb. With from_mesh, bakes that PLY instead of extracting a surface, which needs texel_size. Progress is in get_collision_state, cancel with cancel_collision
     """
 
 def cancel_collision() -> None: ...

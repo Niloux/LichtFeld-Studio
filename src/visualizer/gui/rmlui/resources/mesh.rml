@@ -30,10 +30,6 @@
     <div class="ep-section">
       <span class="ep-section-title text-accent">@tr:mesh.section_texture</span>
       <div id="mesh-texture-fields"></div>
-      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.write_osgb">
-        <span class="setting-row__label-col" data-class-text-muted="!mesh_textured">@tr:mesh.write_osgb</span>
-        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_write_osgb" data-attrif-disabled="!mesh_textured" /></label>
-      </div>
     </div>
     <div class="separator"></div>
 
