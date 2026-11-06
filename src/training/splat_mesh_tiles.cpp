@@ -2,15 +2,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "core/logger.hpp"
 #include "splat_mesh.hpp"
+#include "splat_mesh_parallel.hpp"
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
-#include <exception>
 #include <meshoptimizer.h>
-#include <thread>
 
 namespace lfs::training {
     namespace {
@@ -26,30 +24,6 @@ namespace lfs::training {
         // A coarser level is not worth a file unless it is this much smaller, or below this size at all.
         constexpr double kMinLevelReduction = .85;
         constexpr size_t kMinLevelFaces = 1000;
-
-        void parallel_for(const size_t count, auto&& body) {
-            const int threads = std::clamp(int(std::thread::hardware_concurrency()), 1, kTileWorkThreads);
-            std::atomic<size_t> next{0};
-            std::vector<std::exception_ptr> failures(static_cast<size_t>(threads));
-            const auto work = [&](const int thread) {
-                try {
-                    for (size_t i = next++; i < count; i = next++)
-                        body(i);
-                } catch (...) {
-                    failures[size_t(thread)] = std::current_exception();
-                    next = count;
-                }
-            };
-            std::vector<std::thread> pool;
-            for (int t = 1; t < threads; ++t)
-                pool.emplace_back(work, t);
-            work(0);
-            for (auto& thread : pool)
-                thread.join();
-            for (const auto& failure : failures)
-                if (failure)
-                    std::rethrow_exception(failure);
-        }
 
         struct TileChunk {
             std::vector<SplatMesh> levels; // finest first
@@ -126,7 +100,7 @@ namespace lfs::training {
         owner = {};
 
         std::vector<TileChunk> tiles(ranges.size());
-        parallel_for(ranges.size(), [&](const size_t r) {
+        detail::parallel_for(ranges.size(), kTileWorkThreads, [&](const size_t r) {
             auto& tile = tiles[r];
             SplatMesh finest;
             std::vector<uint8_t> locks;

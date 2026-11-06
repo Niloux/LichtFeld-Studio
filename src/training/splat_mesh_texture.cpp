@@ -5,20 +5,18 @@
 #include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "splat_mesh.hpp"
+#include "splat_mesh_parallel.hpp"
 #include <algorithm>
-#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <exception>
 #include <format>
 #include <fstream>
 #include <memory>
 #include <numeric>
 #include <span>
 #include <stb_image_write.h>
-#include <thread>
 #include <xatlas/xatlas.h>
 
 namespace lfs::training {
@@ -41,37 +39,13 @@ namespace lfs::training {
         bool keep_going(xatlas::ProgressCategory, int, void* user) {
             return !static_cast<const std::stop_token*>(user)->stop_requested();
         }
-
-        void parallel_for(const size_t count, const int thread_limit, auto&& body) {
-            const int threads = std::clamp(int(std::thread::hardware_concurrency()), 1, thread_limit);
-            std::atomic<size_t> next{0};
-            std::vector<std::exception_ptr> failures(static_cast<size_t>(threads));
-            const auto work = [&](const int thread) {
-                try {
-                    for (size_t i = next++; i < count; i = next++)
-                        body(i);
-                } catch (...) {
-                    failures[size_t(thread)] = std::current_exception();
-                    next = count;
-                }
-            };
-            std::vector<std::thread> pool;
-            for (int t = 1; t < threads; ++t)
-                pool.emplace_back(work, t);
-            work(0);
-            for (auto& thread : pool)
-                thread.join();
-            for (const auto& failure : failures)
-                if (failure)
-                    std::rethrow_exception(failure);
-        }
     } // namespace
 
     namespace {
         // The charts of a group of pieces, packed onto pages of their own.
         struct UnwrappedGroup {
-            std::vector<int32_t> sources;              // per output vertex, the mesh vertex it repeats
-            std::vector<std::array<float, 2>> uvs;     // per output vertex
+            std::vector<int32_t> sources;                                // per output vertex, the mesh vertex it repeats
+            std::vector<std::array<float, 2>> uvs;                       // per output vertex
             std::vector<std::vector<std::array<int32_t, 3>>> page_faces; // into the output vertices
             size_t charts = 0;
             double seconds_charts = 0., seconds_packing = 0.;
@@ -171,7 +145,7 @@ namespace lfs::training {
             first = last;
         }
         std::vector<UnwrappedGroup> groups(group_ranges.size());
-        parallel_for(groups.size(), kUnwrapThreads, [&](const size_t g) { groups[g] = unwrap_group(mesh, group_ranges[g], texel_size, page_size, stop); });
+        detail::parallel_for(groups.size(), kUnwrapThreads, [&](const size_t g) { groups[g] = unwrap_group(mesh, group_ranges[g], texel_size, page_size, stop); });
 
         size_t vertex_count = 0, face_count = 0, charts = 0;
         double seconds_charts = 0., seconds_packing = 0.;
@@ -553,7 +527,7 @@ namespace lfs::training {
         constexpr size_t kChunk = size_t{1} << 15;
         const size_t chunks = (unknowns + kChunk - 1) / kChunk;
         const auto over_unknowns = [&](auto&& body) {
-            parallel_for(chunks, kUnwrapThreads, [&](const size_t chunk) {
+            detail::parallel_for(chunks, kUnwrapThreads, [&](const size_t chunk) {
                 for (size_t i = chunk * kChunk; i < std::min((chunk + 1) * kChunk, unknowns); ++i)
                     body(i);
             });
@@ -782,7 +756,7 @@ namespace lfs::training {
                 out << std::format("newmtl page_{}\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd {}_{}.jpg\n\n", p, stem, p);
             write_or_throw(out, folder / core::utf8_to_path(mtl_name));
         }
-        parallel_for(mesh.pages.size(), kUnwrapThreads, [&](const size_t p) {
+        detail::parallel_for(mesh.pages.size(), kUnwrapThreads, [&](const size_t p) {
             write_jpeg(mesh.pages[p], mesh.page_size, folder / core::utf8_to_path(std::format("{}_{}.jpg", stem, p)));
         });
 

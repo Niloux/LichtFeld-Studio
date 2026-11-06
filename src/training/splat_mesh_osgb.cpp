@@ -78,16 +78,16 @@ namespace lfs::training {
 
         // osg::Object
         void write_object_fields(OsgbStream& out, const uint32_t variance = kUnspecifiedVariance) {
-            out.text("");           // name
-            out.u32(variance);      // data variance
-            out.flag(false);        // user data
+            out.text("");      // name
+            out.u32(variance); // data variance
+            out.flag(false);   // user data
         }
 
         // osg::Node, up to its state set
         void write_node_fields(OsgbStream& out) {
-            out.zeros(5);           // initial bound, compute bound, update, event and cull callbacks
-            out.flag(true);         // culling active
-            out.u32(0xffffffffu);   // node mask
+            out.zeros(5);         // initial bound, compute bound, update, event and cull callbacks
+            out.flag(true);       // culling active
+            out.u32(0xffffffffu); // node mask
         }
 
         // Numbers each object; a reference to one already written is its name and number alone.
@@ -152,12 +152,12 @@ namespace lfs::training {
             out.zeros(1);       // shadow comparison
             out.u32(kGlLequal); // shadow compare function
             out.u32(kGlLuminance);
-            out.f32(0.f);       // shadow ambient
+            out.f32(0.f); // shadow ambient
             out.flag(true);
-            out.text("RGBA");   // swizzle
-            out.f32(0.f);       // min LOD
-            out.f32(-1.f);      // max LOD
-            out.f32(0.f);       // LOD bias
+            out.text("RGBA"); // swizzle
+            out.f32(0.f);     // min LOD
+            out.f32(-1.f);    // max LOD
+            out.f32(0.f);     // LOD bias
         }
 
         [[nodiscard]] std::vector<char> encode_jpeg(const std::vector<uint8_t>& rgb, const int side, const std::string& name) {
@@ -254,12 +254,12 @@ namespace lfs::training {
                 out.close();
 
                 // osg::Drawable
-                out.zeros(3);          // initial bound, compute bound callback, shape
-                out.flag(true);        // supports display list
-                out.flag(false);       // use display list
-                out.flag(true);        // use vertex buffer objects
-                out.u32(0xffffffffu);  // node mask
-                out.flag(true);        // culling active
+                out.zeros(3);         // initial bound, compute bound callback, shape
+                out.flag(true);       // supports display list
+                out.flag(false);      // use display list
+                out.flag(true);       // use vertex buffer objects
+                out.u32(0xffffffffu); // node mask
+                out.flag(true);       // culling active
 
                 // osg::Geometry
                 out.u32(1); // primitive sets

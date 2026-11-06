@@ -33,8 +33,8 @@ namespace lfs::training {
         std::vector<std::array<float, 2>> uvs;
         std::vector<int32_t> uv_source; // per vertex, one number per point of the surface, whichever charts repeat it
         std::vector<size_t> page_first_face;
-        std::vector<int> page_sizes; // per page, when pages differ; else every page is page_size
-        std::vector<float> face_error; // how far each face may lie from the surface, when faces differ
+        std::vector<int> page_sizes;             // per page, when pages differ; else every page is page_size
+        std::vector<float> face_error;           // how far each face may lie from the surface, when faces differ
         std::vector<std::vector<uint8_t>> pages; // RGB, sRGB as in the photos
         int page_size = 0;
         [[nodiscard]] int page_side(const size_t page) const { return page_sizes.empty() ? page_size : page_sizes[page]; }
@@ -106,16 +106,16 @@ namespace lfs::training {
 
     // The texels of a page that faces cover, and those within reach of a bilinear sample of them.
     struct MeshTexels {
-        std::vector<uint32_t> pixels;   // row * page_size + column
-        std::vector<float> positions;   // 3 per texel, on the surface
-        std::vector<uint8_t> fallback;  // 3 per texel, from the vertex colors, for texels no view saw
-        std::vector<uint32_t> faces;    // per texel, the face it lies on
+        std::vector<uint32_t> pixels;  // row * page_size + column
+        std::vector<float> positions;  // 3 per texel, on the surface
+        std::vector<uint8_t> fallback; // 3 per texel, from the vertex colors, for texels no view saw
+        std::vector<uint32_t> faces;   // per texel, the face it lies on
     };
     [[nodiscard]] MeshTexels rasterize_mesh_texels(const SplatMesh& mesh, size_t page);
     // The best views of each face, as mesh_face_view_score rates them.
     struct FaceViewCandidates {
         static constexpr size_t kPerFace = 8;
-        std::vector<float> scores;   // kPerFace per face, best first, 0 where unused
+        std::vector<float> scores; // kPerFace per face, best first, 0 where unused
         std::vector<int32_t> views;
         explicit FaceViewCandidates(const size_t faces) : scores(faces * kPerFace, 0.f), views(faces * kPerFace, -1) {}
         void add(int32_t view, std::span<const float> face_scores);
@@ -130,13 +130,13 @@ namespace lfs::training {
     // view on the vertices of its region, as small as closes the seams (Waechter et al. 2014, global seam leveling).
     // Where a point of the surface borders n views, there is one sample per view to read from them.
     struct ColorLeveling {
-        std::vector<uint32_t> corner_unknowns;   // 3 per face
-        std::vector<int32_t> sample_labels;      // per sample, the view to read, or -1 for the mean of all
-        std::vector<float> sample_positions;     // 3 per sample
-        std::vector<uint32_t> sample_faces;      // per sample, a face at that point
-        std::vector<uint32_t> sample_unknowns;   // per sample
-        std::vector<uint32_t> sample_points;     // per sample, in rising order: samples of one point are neighbors
-        std::vector<float> offsets;              // 3 per unknown, once solved
+        std::vector<uint32_t> corner_unknowns; // 3 per face
+        std::vector<int32_t> sample_labels;    // per sample, the view to read, or -1 for the mean of all
+        std::vector<float> sample_positions;   // 3 per sample
+        std::vector<uint32_t> sample_faces;    // per sample, a face at that point
+        std::vector<uint32_t> sample_unknowns; // per sample
+        std::vector<uint32_t> sample_points;   // per sample, in rising order: samples of one point are neighbors
+        std::vector<float> offsets;            // 3 per unknown, once solved
         size_t iterations = 0;
         void release_samples();
         // The offset at a point of a face.
