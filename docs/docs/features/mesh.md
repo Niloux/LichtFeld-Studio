@@ -27,8 +27,9 @@ is given. See `LichtFeld-Studio mesh --help`.
 ## Application
 
 Tools > Mesh from Splats meshes the selected splat from the scene's cameras. It writes a PLY, with
-a texel size also a textured OBJ beside it, and adds an undoable mesh node. Training must be stopped, and the complete model must be loaded,
-not a level-of-detail tree.
+a texel size also a textured OBJ beside it, or an OSGB model, and adds an undoable mesh node; the panel says which before it
+runs. Training must be stopped, and the complete model must be loaded, not a level-of-detail tree. Bake an existing mesh takes the
+surface from a PLY instead, see [OSGB model](#osgb-model).
 
 ## Settings
 
@@ -82,10 +83,13 @@ show where regions meet.
 
 Texels no view saw take the vertex colors, and the rest of each page continues the charts outward, so that filtering and
 image compression reach no background. Baking uses every photo, whatever the view stride: a surface's best view is one or
-two photos out of hundreds. It loads each at full size and renders its depth twice, so its time grows with the photos.
+two photos out of hundreds. It loads each at full size, so its time grows with the photos. Each photo's depth is rendered once
+to choose views and once more for each batch of pages that it sees; the masks are decoded only once.
 
-RAM holds about 22 bytes per texel and 100 per face, plus about 2 GB while rasterizing 4096 pages, and the job stops with an
-error before unwrapping if that exceeds the free RAM. The surface area in `mesh.json` tells how many texels a size takes:
+Pages bake in batches of neighbors of at most 80 million covered texels, each holding 52 bytes per texel on the GPU, about
+4 GB. A larger scene takes more batches, and more reads of the photos, rather than more memory. RAM holds about 23 bytes per
+texel of a batch, 5 per texel of all pages and 100 per face, plus about 2 GB while rasterizing 4096 pages, and the job stops
+with an error before unwrapping if that exceeds the free RAM. The surface area in `mesh.json` tells how many texels a size takes:
 area / size².
 
 ## OSGB model
@@ -97,8 +101,9 @@ texel and has its own charts and texture. Vertices that tiles share stay put on 
 The viewer pages in a finer level as a tile comes to fill the screen. The model is in the dataset's coordinates, and the
 position in `metadata.xml` is a placeholder. The mesh node in the scene shows vertex colors.
 
-`--from-mesh mesh.ply` bakes a mesh made earlier, or edited since in another program, without extracting the surface again: a
-different texel size or model takes only the unwrapping and baking. The mesh must stay in the dataset's coordinates and near the
+`--from-mesh mesh.ply` on the command line, Bake an existing mesh in the panel, or `from_mesh` in `lichtfeld.generate_mesh` and the
+`scene.generate_mesh` MCP tool, bakes a mesh made earlier, or edited since in another program, without extracting the surface
+again: a different texel size or model takes only the unwrapping and baking. It needs a texel size. The mesh must stay in the dataset's coordinates and near the
 surfaces the views saw, within 2.5 voxels. The file is a PLY, binary or text.
 
 `tools/splats_to_mesh.py --mesh mesh.ply` scores a mesh against held-out views and a LAS scan.

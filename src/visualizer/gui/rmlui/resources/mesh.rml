@@ -8,18 +8,44 @@
     <div data-if="mesh_source == ''" class="text-muted">@tr:rendering_panel.simplify_select_source</div>
     <div data-if="mesh_source != ''"><span>@tr:rendering_panel.simplify_source</span>: {{mesh_source}}</div>
     <div class="text-muted">@tr:mesh.hint</div>
-    <div id="mesh-fields"></div>
-    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.write_osgb">
-      <span class="setting-row__label-col">@tr:mesh.write_osgb</span>
-      <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_write_osgb" /></label>
+    <div class="separator"></div>
+
+    <div class="ep-section">
+      <span class="ep-section-title text-accent">@tr:mesh.section_surface</span>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.from_mesh">
+        <span class="setting-row__label-col">@tr:mesh.from_mesh</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_use_file" /></label>
+      </div>
+      <div data-if="mesh_use_file" class="setting-row setting-row--aligned">
+        <span class="setting-row__label-col" data-class-text-muted="mesh_file == ''">{{mesh_file_name}}</span>
+        <div class="setting-row__control-col">
+          <button class="btn btn--secondary ep-small-btn" data-attrif-disabled="mesh_active" data-event-click="mesh_choose_file">@tr:mesh.choose_file</button>
+        </div>
+      </div>
+      <div id="mesh-shared-fields"></div>
+      <div id="mesh-fields" data-if="!mesh_use_file"></div>
     </div>
+    <div class="separator"></div>
+
+    <div class="ep-section">
+      <span class="ep-section-title text-accent">@tr:mesh.section_texture</span>
+      <div id="mesh-texture-fields"></div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip.mesh.write_osgb">
+        <span class="setting-row__label-col" data-class-text-muted="!mesh_textured">@tr:mesh.write_osgb</span>
+        <label class="setting-row__control-col setting-row__control-col--checkbox"><input type="checkbox" data-checked="mesh_write_osgb" data-attrif-disabled="!mesh_textured" /></label>
+      </div>
+    </div>
+    <div class="separator"></div>
+
+    <div data-if="mesh_notice == ''" class="text-muted">{{mesh_output}}</div>
+    <div data-if="mesh_notice != ''" class="text-error">{{mesh_notice}}</div>
     <div data-if="mesh_active">
       <progress max="1" data-attr-value="mesh_progress" />
       <span>{{mesh_status}}</span>
     </div>
     <div data-if="mesh_error != ''" class="text-error"><span>@tr:status.error</span>: {{mesh_error}}</div>
     <div class="ep-buttons">
-      <button class="btn btn--primary" data-attrif-disabled="mesh_source == '' || mesh_active" data-event-click="mesh_generate">@tr:new_project.create</button>
+      <button class="btn btn--primary" data-attrif-disabled="!mesh_ready" data-event-click="mesh_generate">@tr:new_project.create</button>
       <button data-if="!mesh_active" class="btn btn--secondary ep-action-btn" data-event-click="mesh_close">@tr:common.cancel</button>
       <button data-if="mesh_active" class="btn btn--secondary ep-action-btn" data-event-click="mesh_cancel">@tr:common.cancel</button>
     </div>
