@@ -41,6 +41,7 @@
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/render_constants.hpp"
 #include "sequencer/keyframe.hpp"
+#include "training/noise_infill.hpp"
 #include "training/training_manager.hpp"
 #include "visualizer/apriltag_calibration.hpp"
 #include "visualizer/gui/editor/python_editor.hpp"
@@ -1078,6 +1079,7 @@ namespace lfs::app {
                                  {"show_center_markers", settings.show_center_markers},
                                  {"show_camera_frustums", settings.show_camera_frustums},
                                  {"camera_frustum_scale", settings.camera_frustum_scale},
+                                 {"hide_disabled_camera_frustums", settings.hide_disabled_camera_frustums},
                                  {"train_camera_color", json::array({settings.train_camera_color[0], settings.train_camera_color[1], settings.train_camera_color[2]})},
                                  {"eval_camera_color", json::array({settings.eval_camera_color[0], settings.eval_camera_color[1], settings.eval_camera_color[2]})},
                                  {"show_pivot", settings.show_pivot},
@@ -1305,6 +1307,7 @@ namespace lfs::app {
             set_bool("show_center_markers", settings.show_center_markers);
             set_bool("show_camera_frustums", settings.show_camera_frustums);
             set_float("camera_frustum_scale", settings.camera_frustum_scale);
+            set_bool("hide_disabled_camera_frustums", settings.hide_disabled_camera_frustums);
             set_bool("show_pivot", settings.show_pivot);
             set_int("split_view_mode", settings.split_view_mode);
             set_float("split_position", settings.split_position);
@@ -1936,8 +1939,9 @@ namespace lfs::app {
             auto borrow_plan = make_borrow_single_identity_export_plan(scene_manager, node_names, format);
             const auto* const trainer_manager = scene_manager.getTrainerManager();
             const auto export_crop = trainer_manager ? trainer_manager->exportCropBox() : std::nullopt;
-            // A cropped copy of the training model; the scene model stays whole so a stopped run can resume.
-            std::optional<core::SplatData> cropped;
+            // Copies of the training model without its noise infill and cropped; the scene model stays whole so a stopped
+            // run can resume.
+            std::deque<core::SplatData> copies;
             std::vector<std::pair<const core::SplatData*, glm::mat4>> splats;
             splats.reserve(node_names.size());
             for (const auto& name : node_names) {
@@ -1949,11 +1953,14 @@ namespace lfs::app {
                             "Cannot export '{}': the model is too large to fit in memory and streams from disk", name));
                     }
                     const core::SplatData* data = node->model.get();
-                    if (export_crop && node->uuid == scene.getTrainingModelNodeUuid() &&
-                        (cropped = training::crop_copy_to_training_cropbox(*data, *export_crop))) {
-                        if (cropped->size() == 0)
-                            continue;
-                        data = &*cropped;
+                    if (auto kept = training::without_noise_infill(*data))
+                        data = &copies.emplace_back(std::move(*kept));
+                    if (export_crop && node->uuid == scene.getTrainingModelNodeUuid()) {
+                        if (auto cropped = training::crop_copy_to_training_cropbox(*data, *export_crop)) {
+                            if (cropped->size() == 0)
+                                continue;
+                            data = &copies.emplace_back(std::move(*cropped));
+                        }
                     }
                     splats.emplace_back(data, vis::scene_coords::nodeDataWorldTransform(scene, node->id));
                 }
@@ -2463,6 +2470,55 @@ namespace lfs::app {
 
         // --- Scene operations (posted to GUI thread) ---
         registry.register_tool(
+            McpTool{
+                .name = "camera_selection.start",
+                .description = "Start a cancellable camera-group training selection job",
+                .input_schema = {.type = "object", .properties = json{{"operation", {{"type", "string"}, {"enum", json::array({"enable_all", "disable_all", "invert", "random", "every_n", "distinct", "cropbox_visibility"})}}}, {"camera_group", {{"type", "string"}}}, {"percentage", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}}, {"every_n", {{"type", "integer"}, {"minimum", 1}}}, {"overlap", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}}, {"coverage", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}}, {"cropbox", {{"type", "string"}}}}, .required = {"operation", "camera_group"}},
+                .metadata = {.category = "scene", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread", .long_running = true, .user_visible = true}},
+            [viewer_impl](const json& args) -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args]() -> json {
+                    auto* manager = viewer_impl->getSceneManager();
+                    auto* gui = viewer_impl->getGuiManager();
+                    if (!manager || !gui)
+                        return json{{"error", "Scene manager not initialized"}};
+                    auto& scene = manager->getScene();
+                    const auto operation = args.at("operation").get<std::string>();
+                    using Selection = vis::gui::AsyncTaskManager;
+                    const auto type = operation == "enable_all"           ? Selection::CameraSelectionOperation::EnableAll
+                                      : operation == "disable_all"        ? Selection::CameraSelectionOperation::DisableAll
+                                      : operation == "invert"             ? Selection::CameraSelectionOperation::Invert
+                                      : operation == "random"             ? Selection::CameraSelectionOperation::Random
+                                      : operation == "every_n"            ? Selection::CameraSelectionOperation::EveryN
+                                      : operation == "distinct"           ? Selection::CameraSelectionOperation::Distinct
+                                      : operation == "cropbox_visibility" ? Selection::CameraSelectionOperation::CropBoxVisibility
+                                                                          : Selection::CameraSelectionOperation::Random;
+                    if (operation != "enable_all" && operation != "disable_all" && operation != "invert" &&
+                        operation != "random" && operation != "every_n" && operation != "distinct" && operation != "cropbox_visibility")
+                        return mcp::invalid_argument_result("Unsupported camera selection operation", "operation");
+                    const auto group_id = scene.getNodeIdByName(args.value("camera_group", ""));
+                    const auto* group = scene.getNodeById(group_id);
+                    if (!group || group->type != core::NodeType::CAMERA_GROUP)
+                        return mcp::invalid_argument_result(LOC("scene.camera_selection_group_required"), "camera_group");
+                    core::NodeId cropbox_id = core::NULL_NODE;
+                    if (type == Selection::CameraSelectionOperation::CropBoxVisibility) {
+                        cropbox_id = scene.getNodeIdByName(args.value("cropbox", ""));
+                        const auto* cropbox = scene.getNodeById(cropbox_id);
+                        if (!cropbox || !cropbox->cropbox)
+                            return mcp::invalid_argument_result("A valid crop box is required", "cropbox");
+                    }
+                    const auto handle = gui->asyncTasks().startCameraSelection({.operation = type,
+                                                                                .percentage = args.value("percentage", 25.0F),
+                                                                                .every_n = args.value("every_n", 2),
+                                                                                .overlap = args.value("overlap", 65.0F),
+                                                                                .coverage = args.value("coverage", 40.0F),
+                                                                                .camera_group_id = group_id,
+                                                                                .cropbox_id = cropbox_id});
+                    if (!handle)
+                        return json{{"error", std::string(handle.error().user_message())}};
+                    return json{{"job_id", "camera.selection"}, {"handle", handle->id}, {"operation", operation}};
+                });
+            });
+        registry.register_tool(
             McpTool{.name = "scene.generate_collision",
                     .description = "Voxelize exactly one selected loaded splat into a new undoable collision node; observe collision.main",
                     .input_schema = {.type = "object", .properties = json{{"voxel_size", {{"type", "number"}}}, {"opacity", {{"type", "number"}}}, {"auto_resolution", {{"type", "boolean"}}}, {"cleanup", {{"type", "boolean"}}}, {"max_gaussian_area", {{"type", "number"}}}}, .required = {}},
@@ -2825,17 +2881,20 @@ namespace lfs::app {
                                                       : core::make_provenance_stamp())
                                                : core::make_minimal_provenance_stamp();
 
-                        // A cropped copy with "Crop to ROI at end" on; the model stays whole so a stopped run can resume.
+                        // Copies without the noise infill and cropped with "Crop to ROI at end" on; the model stays whole so
+                        // a stopped run can resume.
+                        const auto without_noise = training::without_noise_infill(*model);
+                        const core::SplatData* exported = without_noise ? &*without_noise : model;
                         std::optional<core::SplatData> cropped;
                         const auto* const trainer_manager =
                             viewer->getSceneManager() ? viewer->getSceneManager()->getTrainerManager() : nullptr;
                         if (const auto crop = trainer_manager ? trainer_manager->exportCropBox() : std::nullopt)
-                            cropped = training::crop_copy_to_training_cropbox(*model, *crop);
+                            cropped = training::crop_copy_to_training_cropbox(*exported, *crop);
                         if (cropped && cropped->size() == 0)
                             return std::unexpected("No splat lies inside the crop box or polygon");
 
                         io::PlySaveOptions options{.output_path = path, .binary = true, .provenance = stamp};
-                        auto result = io::save_ply(cropped ? *cropped : *model, options);
+                        auto result = io::save_ply(cropped ? *cropped : *exported, options);
                         if (!result)
                             return std::unexpected(result.error().message);
                         return {};
@@ -3433,6 +3492,7 @@ namespace lfs::app {
                         {"antialiasing", json{{"type", "boolean"}}},
                         {"show_grid", json{{"type", "boolean"}}},
                         {"show_camera_frustums", json{{"type", "boolean"}}},
+                        {"hide_disabled_camera_frustums", json{{"type", "boolean"}}},
                         {"point_cloud_mode", json{{"type", "boolean"}}},
                         {"selection_outline", json{{"type", "boolean"}}},
                         {"selection_outline_holes", json{{"type", "boolean"}}},

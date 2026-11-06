@@ -339,6 +339,7 @@ namespace lfs::core {
           _mask_path(other._mask_path),
           _depth_path(other._depth_path),
           _normal_path(other._normal_path),
+          _has_alpha(other._has_alpha),
           _has_image(other._has_image),
           _split(other._split),
           _camera_width(other._camera_width),

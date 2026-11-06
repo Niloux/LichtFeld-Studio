@@ -2599,6 +2599,7 @@ namespace lfs::core {
                 } else {
                     copied_cuda |= node.model->means_raw().device() == Device::CUDA;
                     auto copy = std::make_shared<SplatData>(node.model->clone());
+                    copy->set_frozen_ranges(node.model->frozen_ranges());
                     result.push_back({std::move(copy), getWorldTransform(node.id), 0,
                                       static_cast<size_t>(node.model->size()), node.model->get_active_sh_degree()});
                 }
@@ -6788,6 +6789,70 @@ namespace lfs::core {
                 pending_mutations_ |= static_cast<uint32_t>(MutationType::CAMERA_TRAINING_CHANGED);
             notifyMutation(MutationType::VISIBILITY_CHANGED);
         }
+    }
+
+    bool Scene::setCameraTrainingSelection(const std::unordered_set<NodeId>& enabled_camera_ids) {
+        bool changed = false;
+        for (const auto& candidate : nodes_) {
+            auto* node = candidate.get();
+            if (!node || node->type != NodeType::CAMERA)
+                continue;
+            const bool enabled = enabled_camera_ids.contains(node->id);
+            if (node->training_enabled == enabled)
+                continue;
+            node->training_enabled = enabled;
+            changed = true;
+        }
+        if (!changed)
+            return false;
+        if (!restore_staging_)
+            pending_mutations_ |= static_cast<uint32_t>(MutationType::CAMERA_TRAINING_CHANGED);
+        notifyMutation(MutationType::VISIBILITY_CHANGED);
+        return true;
+    }
+
+    bool Scene::setCameraGroupTrainingSelection(const NodeId camera_group_id,
+                                                const std::unordered_set<NodeId>& enabled_camera_ids) {
+        const auto* group = getNodeById(camera_group_id);
+        if (!group || group->type != NodeType::CAMERA_GROUP)
+            return false;
+        bool changed = false;
+        for (const NodeId child_id : group->children) {
+            auto* child = getNodeById(child_id);
+            if (!child || child->type != NodeType::CAMERA || child->training_enabled == enabled_camera_ids.contains(child_id))
+                continue;
+            child->training_enabled = enabled_camera_ids.contains(child_id);
+            changed = true;
+        }
+        if (!changed)
+            return false;
+        if (!restore_staging_)
+            pending_mutations_ |= static_cast<uint32_t>(MutationType::CAMERA_TRAINING_CHANGED);
+        notifyMutation(MutationType::VISIBILITY_CHANGED);
+        return true;
+    }
+
+    void Scene::setAllCameraTrainingEnabled(const bool enabled) {
+        std::unordered_set<NodeId> selected;
+        for (const auto& candidate : nodes_) {
+            auto* node = candidate.get();
+            if (!node || node->type != NodeType::CAMERA || !enabled)
+                continue;
+            selected.insert(node->id);
+        }
+        static_cast<void>(setCameraTrainingSelection(selected));
+    }
+
+    void Scene::invertAllCameraTrainingEnabled() {
+        std::unordered_set<NodeId> selected;
+        for (const auto& candidate : nodes_) {
+            auto* node = candidate.get();
+            if (!node || node->type != NodeType::CAMERA)
+                continue;
+            if (!node->training_enabled)
+                selected.insert(node->id);
+        }
+        static_cast<void>(setCameraTrainingSelection(selected));
     }
 
 } // namespace lfs::core
