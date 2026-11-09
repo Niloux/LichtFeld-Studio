@@ -2474,6 +2474,49 @@ def release_texture(texture_id: int) -> None:
 def release_rml_texture(source: str) -> bool:
     """Release a cached RmlUi texture by source URL"""
 
+def on_open_image_preview(callback: object, include_sequence: bool = False) -> None:
+    """
+    Register the preview callback for extracted images; optionally receive extraction-run metadata as a third argument.
+    """
+
+def sam_preview_submit(path: str, revision: str, mtime_ns: int, size_bytes: int, points: Sequence[Sequence[float]], box: Sequence[float] | None = None, refine_request: int = 0, refine_candidate: int = -1, weights: str = '', export_candidate: int = -1, exclude: bool = False, sequence: object | None = None) -> int:
+    """
+    UI thread: queue native SAM inference, sequence tracking/inspection, or render a selected original-resolution mask. Apply is a separate explicit action.
+    """
+
+def sam_preview_sequence_frames(run: str, first: int = 0, count: int = 64) -> list:
+    """
+    UI thread: read at most 256 current frame summaries from an extraction run.
+    """
+
+def sam_preview_approve_frames(run: str, updates: Sequence[tuple[int, int, bool]]) -> bool:
+    """
+    UI thread: atomically approve/revoke a group of (index, revision, approved) updates. Missing, duplicate or stale frames reject the whole group.
+    """
+
+def sam_preview_end_sequence(run: str) -> None:
+    """
+    UI thread: release an extraction review document; old run IDs cannot close a new document.
+    """
+
+def sam_preview_invalidate_frame(run: str, index: int) -> None:
+    """
+    UI thread: revoke a changed frame's proposal/approval while idle. Reject active work and preserve saved masks.
+    """
+
+def sam_preview_poll() -> dict:
+    """UI thread: inspect the current disposable SAM proposal."""
+
+def sam_preview_close() -> None:
+    """
+    UI thread: cancel the SAM session and retire GPU resources asynchronously.
+    """
+
+def sam_preview_apply(camera_uuid: str, request: int) -> None:
+    """
+    UI thread: apply the rendered full-resolution proposal to its unchanged source camera, with shared undo and project persistence.
+    """
+
 def preview_texture_status(source: str, document: rml.RmlDocument | None = None) -> str:
     """
     UI thread: return unknown, pending, ready or error for a revisioned preview URL in the given document, or the main context when omitted.
@@ -2804,6 +2847,11 @@ class DynamicTexture:
     def update(self, tensor: lichtfeld.Tensor) -> None: ...
 
     def destroy(self) -> None: ...
+
+    def rml_src(self, width: int = 0, height: int = 0) -> str:
+        """
+        RmlUI image source owned by this texture; release it before destroying the texture
+        """
 
     @property
     def id(self) -> int: ...

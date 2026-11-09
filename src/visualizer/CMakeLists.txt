@@ -87,6 +87,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/native_panels.cpp
         gui/layout_state.cpp
         gui/async_task_manager.cpp
+        gui/assisted_masking.cpp
         gui/gallery_scene_publication.cpp
         gui/bounds_gizmo.cpp
         gui/rotation_gizmo.cpp
@@ -244,12 +245,13 @@ target_include_directories(lfs_visualizer
 find_package(OpenXR CONFIG REQUIRED)
 
 target_link_libraries(lfs_visualizer
+        PUBLIC
+        lfs_preprocessing
         PRIVATE
         lfs_core
         lfs_diagnostics
         lfs_video
         lfs_geometry
-        lfs_preprocessing
         lfs_io
         lfs_rendering_tensor
         lfs_training
