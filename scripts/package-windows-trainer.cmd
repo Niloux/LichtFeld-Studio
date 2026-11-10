@@ -46,7 +46,7 @@ if errorlevel 1 exit /b 1
 :have_msvc
 
 pushd "%ROOT%"
-cmake --preset windows-trainer -B "%BUILD%" -DBUILD_CUDA_PTX_ONLY=ON -DBUILD_CUDA_MIN_SM=80 -DENABLE_COMPILER_CACHE=OFF >nul
+cmake --preset windows-trainer -B "%BUILD%" -DBUILD_CUDA_PTX_ONLY=ON -DBUILD_CUDA_MIN_SM=80 "-DBUILD_CUDA_REAL_SMS=86;89" -DENABLE_COMPILER_CACHE=OFF >nul
 set "RC=%ERRORLEVEL%"
 popd
 if not "%RC%"=="0" exit /b %RC%

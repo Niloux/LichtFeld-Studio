@@ -23,9 +23,11 @@ foreach ($path in @($destination, $stage, $archive, $stagedArchive, $checksum, $
 $cache = Get-Content -Raw -LiteralPath (Join-Path $build 'CMakeCache.txt')
 if ($cache -notmatch '(?m)^LFS_TRAINER_ONLY:BOOL=ON\r?$' -or
     $cache -notmatch '(?m)^CMAKE_BUILD_TYPE:STRING=Release\r?$' -or
-    $cache -notmatch '(?m)^CMAKE_CUDA_ARCHITECTURES:STRING=80-virtual\r?$') {
+    $cache -notmatch '(?m)^CMAKE_CUDA_ARCHITECTURES:STRING=(80-virtual(;[0-9]+-real)*)\r?$') {
     throw 'Build the windows-trainer preset with BUILD_CUDA_PTX_ONLY=ON and BUILD_CUDA_MIN_SM=80 first.'
 }
+$null = $cache -match '(?m)^CMAKE_CUDA_ARCHITECTURES:STRING=([^\r\n]+)'
+$architectures = $Matches[1]
 $header = Get-Content -Raw -LiteralPath (Join-Path $build 'include/git_version.h')
 if ($header -notmatch 'GIT_COMMIT_HASH_SHORT "([0-9a-f]+)"') { throw 'Missing trainer build revision.' }
 $revision = $Matches[1]
@@ -73,7 +75,7 @@ $manifest = [ordered]@{
     revision = $revision
     dirty = [bool]$dirty
     geosunpre_revision = $GeosunPreRevision
-    cuda_architectures = '80-virtual'
+    cuda_architectures = $architectures
     files = $files
 }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'package.json') -Encoding UTF8

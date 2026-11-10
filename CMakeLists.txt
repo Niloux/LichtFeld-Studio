@@ -386,6 +386,8 @@ endif()
 
 # Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
+# SMs that also get precompiled SASS in PTX-only builds (e.g. "86;89"); GPUs on other SMs still JIT from the PTX
+set(BUILD_CUDA_REAL_SMS "" CACHE STRING "Extra SMs compiled to machine code in PTX-only builds")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CUDA_STANDARD 20)
@@ -468,6 +470,12 @@ if(BUILD_CUDA_PTX_ONLY)
     endif()
 
     set(LichtFeld-Studio_CUDA_ARCH "${BUILD_CUDA_MIN_SM}-virtual")
+    foreach(_sm IN LISTS BUILD_CUDA_REAL_SMS)
+        if(NOT _sm MATCHES "^[0-9]+$" OR _sm LESS BUILD_CUDA_MIN_SM)
+            message(FATAL_ERROR "BUILD_CUDA_REAL_SMS entries must be integers >= BUILD_CUDA_MIN_SM, got '${_sm}'")
+        endif()
+        list(APPEND LichtFeld-Studio_CUDA_ARCH "${_sm}-real")
+    endforeach()
     set(LFS_RUNTIME_MIN_SM "${BUILD_CUDA_MIN_SM}")
 
     math(EXPR _maj "${BUILD_CUDA_MIN_SM}/10")
