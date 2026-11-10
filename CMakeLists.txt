@@ -1371,6 +1371,9 @@ endif()
 
 set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
 set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
+if(LFS_TRAINER_ONLY)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT trainer-runtime)
+endif()
 
 include(GNUInstallDirs)
 include(InstallRequiredSystemLibraries)

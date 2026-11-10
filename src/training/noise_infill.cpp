@@ -12,7 +12,9 @@
 #include "core/path_utils.hpp"
 #include "core/splat_data_transform.hpp"
 #include "io/loader.hpp"
+#ifndef LFS_TRAINER_ONLY
 #include "rendering/mesh2splat.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -42,15 +44,16 @@ namespace lfs::training {
         constexpr float kSh0 = 0.28209479177387814f;
         // SH0 coefficients of a colour channel at 0 and at 1.
         constexpr float kChannelOff = -0.5f / kSh0, kChannelOn = 0.5f / kSh0;
+        // The share of the training before the noise appears.
+        constexpr float kStartFraction = 0.3f;
+
+#ifndef LFS_TRAINER_ONLY
         // Neighbouring noise Gaussians overlap, so the filled volume renders opaque.
         constexpr float kScaleOfCell = 0.7f;
         // A cell is surface where the mesh's surface splats accumulate this opacity, as the collision grid judges it.
         constexpr float kSurfaceOpacity = 0.1f;
         // The cell edge puts about this many cells inside the mesh, whatever its size and shape.
         constexpr double kInsideCells = 200000.0;
-        // The share of the training before the noise appears.
-        constexpr float kStartFraction = 0.3f;
-
         struct Geometry {
             std::vector<float> vertices; // [V*3]
             std::vector<int> indices;    // [F*3]
@@ -228,8 +231,10 @@ namespace lfs::training {
             });
             return kept;
         }
+#endif
     } // namespace
 
+#ifndef LFS_TRAINER_ONLY
     lfs::Result<NoiseInfill> make_noise_infill(const core::MeshData& mesh) {
         if (!mesh.vertices.is_valid() || !mesh.indices.is_valid() || mesh.face_count() == 0)
             return infill_error("The noise infill mesh has no triangles");
@@ -343,6 +348,12 @@ namespace lfs::training {
         means = (means - core::Tensor::from_vector({origin[0], origin[1], origin[2]}, core::TensorShape({1, 3}), means.device())).contiguous();
         return std::move(infill->splats);
     }
+#else
+    lfs::Result<core::SplatData> load_noise_infill(const std::filesystem::path&,
+                                                 const std::array<float, 3>&) {
+        return infill_error("Noise infill from a mesh requires Mesh2Splat, which is unavailable in lfs_train");
+    }
+#endif
 
     int noise_infill_start_iteration(const core::param::OptimizationParameters& params) {
         return static_cast<int>(kStartFraction * static_cast<float>(params.iterations));

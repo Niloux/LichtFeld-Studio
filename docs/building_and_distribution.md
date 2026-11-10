@@ -118,12 +118,28 @@ cmake --preset windows-trainer
 cmake --build --preset windows-trainer
 ```
 
+For a Windows headless delivery targeting Ampere and newer NVIDIA GPUs, open
+an x64 Visual Studio developer shell and build a separate PTX-only directory.
+The trainer install collects the runtime DLLs and JPEG extensions.
+
+```powershell
+chcp 65001
+cmake --preset windows-trainer -B build-windows-trainer-ptx80 -DBUILD_CUDA_PTX_ONLY=ON -DBUILD_CUDA_MIN_SM=80 -DENABLE_COMPILER_CACHE=OFF
+cmake --build build-windows-trainer-ptx80 --target lfs_train
+.\scripts\package-windows-trainer.ps1 -BuildDir build-windows-trainer-ptx80 -Config "path\to\lfs.json" -Output build-delivery\LFS-trainer-sm80 -GeosunPreRevision "<revision>"
+```
+
+The package script stages the install, copies the supplied training config,
+and writes the package ZIP and SHA-256 checksums. Check the extracted package
+with a short training run on a representative GeosunPre delivery directory
+using a separate output directory and a PATH without CUDA Toolkit or vcpkg.
+
 `lfs_train` accepts the training options of `LichtFeld-Studio --headless` and
 writes the same `project.licht` plus the requested `--export` formats. It does
 not support `--resume`, `.licht` projects as `--data-path`, Python scripts,
-camera-path rendering, TCP control, mesh initialization or depth/normal
-auto-generation (provide the maps with the dataset). For evaluation with
-LPIPS, point `LFS_LPIPS_WEIGHTS` at the weights file.
+camera-path rendering, TCP control, mesh initialization, mesh noise infill,
+or depth/normal auto-generation (provide the maps with the dataset). For
+evaluation with LPIPS, point `LFS_LPIPS_WEIGHTS` at the weights file.
 
 ### 2. Portable Build (Distribution)
 

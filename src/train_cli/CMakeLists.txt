@@ -152,6 +152,20 @@ if(WIN32)
     file(GLOB _lfs_train_cuda_dlls
         "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll"
         "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
+    if(TARGET nvjpeg_ext)
+        file(GLOB _lfs_train_nvjpeg_dlls
+            "${CUDAToolkit_BIN_DIR}/nvjpeg64*.dll"
+            "${CUDAToolkit_BIN_DIR}/x64/nvjpeg64*.dll")
+        list(APPEND _lfs_train_cuda_dlls ${_lfs_train_nvjpeg_dlls})
+        if(WITH_DYNAMIC_NVJPEG)
+            # The extension loads nvJPEG at runtime, so dependency scanning cannot find it.
+            if(NOT _lfs_train_nvjpeg_dlls)
+                message(FATAL_ERROR "WITH_DYNAMIC_NVJPEG is on but no nvjpeg64*.dll was found in ${CUDAToolkit_BIN_DIR}")
+            endif()
+            install(FILES ${_lfs_train_nvjpeg_dlls} DESTINATION ${CMAKE_INSTALL_BINDIR}
+                COMPONENT trainer-runtime)
+        endif()
+    endif()
     if(_lfs_train_cuda_dlls)
         add_custom_command(TARGET lfs_train POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_lfs_train_cuda_dlls} "$<TARGET_FILE_DIR:lfs_train>"
@@ -178,34 +192,43 @@ if(WIN32)
     endif()
 endif()
 
-install(TARGETS lfs_train RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(TARGETS lfs_core lfs_diagnostics lfs_logger lfs_event_bridge
+if(WIN32)
+    set(_lfs_train_runtime_set RUNTIME_DEPENDENCY_SET lfs_train_runtime)
+endif()
+install(TARGETS lfs_train lfs_core lfs_diagnostics lfs_logger lfs_event_bridge
+    ${_lfs_train_runtime_set}
+    COMPONENT trainer-runtime
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 if(TARGET nvimgcodec)
-    install(TARGETS nvimgcodec
+    install(TARGETS nvimgcodec ${_lfs_train_runtime_set}
+        COMPONENT trainer-runtime
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 endif()
 if(TARGET nvjpeg_ext)
     # getExtensionsDir() looks for extensions/ next to bin/.
-    install(TARGETS nvjpeg_ext
+    install(TARGETS nvjpeg_ext ${_lfs_train_runtime_set}
+        COMPONENT trainer-runtime
         LIBRARY DESTINATION extensions
         RUNTIME DESTINATION extensions
     )
 endif()
 if(TARGET nvjpeg2k_ext)
-    install(TARGETS nvjpeg2k_ext
+    install(TARGETS nvjpeg2k_ext ${_lfs_train_runtime_set}
+        COMPONENT trainer-runtime
         LIBRARY DESTINATION extensions
         RUNTIME DESTINATION extensions
     )
     if(DEFINED _lfs_train_nvjpeg2k_runtime_file)
         if(WIN32)
-            install(FILES "${_lfs_train_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+            install(FILES "${_lfs_train_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_BINDIR}
+                COMPONENT trainer-runtime)
         else()
-            install(FILES "${_lfs_train_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
+            install(FILES "${_lfs_train_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                COMPONENT trainer-runtime)
             install(CODE "
                 execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
                     \"${_lfs_train_nvjpeg2k_runtime_name}\"
@@ -215,9 +238,28 @@ if(TARGET nvjpeg2k_ext)
                     \"libnvjpeg2k.so.0\"
                     \"libnvjpeg2k.so\"
                     WORKING_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
-            ")
+            " COMPONENT trainer-runtime)
         endif()
     endif()
 endif()
+
+if(WIN32)
+    install(CODE [[
+        if(POLICY CMP0207)
+            cmake_policy(SET CMP0207 NEW)
+        endif()
+    ]] COMPONENT trainer-runtime)
+    install(RUNTIME_DEPENDENCY_SET lfs_train_runtime
+        DIRECTORIES "$<TARGET_FILE_DIR:lfs_train>"
+        PRE_EXCLUDE_REGEXES [[^api-ms-]] [[^ext-ms-]] [[^nvcuda[.]dll$]]
+        POST_EXCLUDE_REGEXES [[.*[Ss]ystem32[/\\].*]]
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT trainer-runtime
+    )
+endif()
+
+install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/LICENSE-EXCEPTION.txt"
+    DESTINATION "." COMPONENT trainer-runtime)
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/resources/licenses/"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio/licenses" COMPONENT trainer-runtime)
 
 message(STATUS "Trainer-only build: lfs_train (no GUI, Python, video, MCP/TCP, MoGe)")
