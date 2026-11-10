@@ -21,8 +21,6 @@ namespace {
     using lfs::training::rolling_shutter_window_poses;
 
     constexpr const char* kSidecar = R"({
-        "version": 1,
-        "model": "linear rolling shutter about the reference pose",
         "readout_axis": "rows",
         "cameras": [{"camera_id": 1, "readout_s": 0.03}, {"camera_id": 2, "readout_s": -0.02}],
         "images": [
@@ -156,8 +154,6 @@ TEST(RollingShutterSidecar, ParsesVersionOne) {
 }
 
 TEST(RollingShutterSidecar, RejectsUnsupportedOrInconsistentFiles) {
-    EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"version\": 1", "\"version\": 2")));
-    EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "about the reference pose", "between two poses")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"rows\"", "\"diagonal\"")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "[0.01, -0.02, 0.005]", "[0.06, 0.0, 0.0]")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"readout_s\": 0.03", "\"readout_s\": 0.08")));

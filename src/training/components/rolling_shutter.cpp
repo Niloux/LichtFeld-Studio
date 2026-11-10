@@ -124,11 +124,8 @@ namespace lfs::training {
     std::expected<RollingShutterTable, std::string> parse_rolling_shutter(const std::string_view json_text) {
         try {
             const auto j = nlohmann::json::parse(json_text);
-            if (integer(j, "version") != 1)
-                throw ParseError{"unsupported version"};
-            const auto& model = field(j, "model");
-            if (!model.is_string() || model.get<std::string>() != "linear rolling shutter about the reference pose")
-                throw ParseError{"unsupported camera model"};
+            // GeosunPre's sidecar carries no version or model field: the camera model is fixed
+            // by the format documented in its output.md. Unknown extra fields are ignored.
             const auto& axis = field(j, "readout_axis");
             if (!axis.is_string() || (axis.get<std::string>() != "rows" && axis.get<std::string>() != "columns"))
                 throw ParseError{"unknown readout_axis"};

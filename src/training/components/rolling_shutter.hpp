@@ -34,8 +34,9 @@ namespace lfs::training {
         std::unordered_map<std::string, Image> images;
     };
 
-    // Parses version 1 of the sidecar. Rejects unknown models, motion outside GeosunPre's
-    // operating range and translations that disagree with readout time times velocity.
+    // Parses the sidecar (readout_axis, cameras, images; no version or model field). Rejects
+    // motion outside GeosunPre's operating range and translations that disagree with readout
+    // time times velocity.
     std::expected<RollingShutterTable, std::string> parse_rolling_shutter(std::string_view json_text);
 
     // Returns no table when the dataset has no sidecar.
