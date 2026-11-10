@@ -129,6 +129,10 @@ cmake --build build-windows-trainer-ptx80 --target lfs_train
 .\scripts\package-windows-trainer.ps1 -BuildDir build-windows-trainer-ptx80 -Config "path\to\lfs.json" -Output build-delivery\LFS-trainer-sm80 -GeosunPreRevision "<revision>"
 ```
 
+`scripts\package-windows-trainer.cmd [config.json] [geosunpre-revision] [output-dir]` runs all
+three steps from any shell. It defaults to `%USERPROFILE%\Desktop\config.json`, the
+HEAD of the sibling `..\GeosunPre` checkout and a time-stamped output directory.
+
 The package script stages the install, copies the supplied training config,
 and writes the package ZIP and SHA-256 checksums. Check the extracted package
 with a short training run on a representative GeosunPre delivery directory
