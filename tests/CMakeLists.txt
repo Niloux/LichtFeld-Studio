@@ -276,6 +276,7 @@ if(BUILD_VISUALIZER_TESTS)
         test_preferences_tooltips.cpp
         test_guide_segment_clipping.cpp
         test_viewport_depth_layout.cpp
+        test_gt_comparison_loss.cpp
         test_panel_layout_render_demand.cpp
         test_right_panel_tabs.cpp
         test_preferences_migration.cpp
@@ -293,6 +294,7 @@ if(BUILD_VISUALIZER_TESTS)
     # Focused RmlUi migration contracts for the retained master interface.
     add_executable(lichtfeld_rmlui_tests
         test_assisted_masking.cpp
+        test_model_cache.cpp
         test_rml_text_input_handler.cpp
         test_rml_text_input_native_keys.cpp
         test_rml_path_utils.cpp
@@ -1034,6 +1036,7 @@ set(TEST_FILES
     test_tensor_nn_ops.cpp
     test_nn_ops.cpp
     test_weight_file_paths.cpp
+    test_model_cache.cpp
     test_moge2.cpp
     test_lpips.cpp
     test_sam2.cpp

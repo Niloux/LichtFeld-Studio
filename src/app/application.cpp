@@ -81,10 +81,10 @@
 
 namespace lfs::app {
 
-    std::optional<std::filesystem::path> prepare_lpips_weights(const bool allow_download) {
-        if (const auto path = core::environment::value("LFS_LPIPS_WEIGHTS"))
-            return core::utf8_to_path(*path);
-        auto result = lfs::preprocessing::ensure_lpips_weights(allow_download);
+    std::optional<core::nn::WeightFile> prepare_lpips_weights(const bool allow_download) {
+        const auto custom = core::environment::value("LFS_LPIPS_WEIGHTS");
+        auto result = custom ? core::nn::WeightFile::open(core::utf8_to_path(*custom))
+                             : lfs::preprocessing::ensure_lpips_weights(allow_download);
         if (result)
             return std::move(*result);
         LOG_WARN("LPIPS unavailable: {}", result.error().detail());
@@ -1063,7 +1063,7 @@ namespace lfs::app {
                     auto trainer =
                         std::move(installed->trainer);
                     if (project->params.optimization.enable_eval)
-                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+                        trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
                     training::grant_headless_project_saves(
                         *trainer, project->params,
                         headless_project_save_destination(
@@ -1131,7 +1131,7 @@ namespace lfs::app {
                     }
                     LOG_INFO("Resumed from iteration {}", *ckpt_result);
                     if (ckpt_params_result->optimization.enable_eval)
-                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+                        trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
 
                     core::Tensor::trim_memory_pool();
 
@@ -1174,7 +1174,7 @@ namespace lfs::app {
                         return 1;
                     }
                     if (params->optimization.enable_eval)
-                        trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+                        trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
                     training::grant_headless_project_saves(
                         *trainer, *params,
                         headless_dataset_project_destination(*params),
@@ -1276,7 +1276,7 @@ namespace lfs::app {
             if (!trainer)
                 return 1;
 
-            trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
+            trainer->set_lpips_weights_preparer([allow_download = !params->no_download] { return prepare_lpips_weights(allow_download); });
             core::Tensor::trim_memory_pool();
             const auto result = trainer->evaluate_current_model();
             trainer->shutdown();
