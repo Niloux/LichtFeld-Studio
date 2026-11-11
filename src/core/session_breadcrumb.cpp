@@ -9,6 +9,7 @@
 #include "core/path_utils.hpp"
 #include "core/user_paths.hpp"
 #include "core/utc_time.hpp"
+#include "product_identity.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -39,14 +40,14 @@ namespace lfs::core {
         fs::path breadcrumb_path() {
             const auto paths = UserPaths::resolve();
             return (paths ? paths->logDir()
-                          : lichtfeld_home_directory() / ".lichtfeld" / "logs") /
+                          : lichtfeld_home_directory() / LFS_USER_DIRECTORY / "logs") /
                    "last_session.json";
         }
 
         fs::path snapshot_path() {
             const auto paths = UserPaths::resolve();
             return (paths ? paths->logDir()
-                          : lichtfeld_home_directory() / ".lichtfeld" / "logs") /
+                          : lichtfeld_home_directory() / LFS_USER_DIRECTORY / "logs") /
                    "previous_session.log";
         }
 
@@ -149,8 +150,8 @@ namespace lfs::core {
             const auto paths = UserPaths::resolve();
             const auto live_log_path =
                 (paths ? paths->logDir()
-                       : lichtfeld_home_directory() / ".lichtfeld" / "logs") /
-                "lichtfeld.log";
+                       : lichtfeld_home_directory() / LFS_USER_DIRECTORY / "logs") /
+                LFS_LOG_FILENAME;
             current_record = SessionBreadcrumb{
                 .pid = process_id(),
                 .started_at = utc_now(),

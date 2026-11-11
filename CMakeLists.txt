@@ -127,6 +127,20 @@ if(WIN32)
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsVersionResource.cmake")
 
+if(WIN32 AND LFS_TRAINER_ONLY)
+    set(GEOSUN_TRAINER_BUILD ON)
+    set(LFS_PRODUCT_NAME "Geosun 3DGS Trainer")
+    set(LFS_PRODUCT_COMMAND "geosun_3dgs_train")
+    set(LFS_USER_DIRECTORY ".geosun-3dgs-trainer")
+    set(LFS_LOG_FILENAME "geosun-3dgs-trainer.log")
+else()
+    set(LFS_PRODUCT_NAME "LichtFeld Studio")
+    set(LFS_PRODUCT_COMMAND "lichtfeld-studio")
+    set(LFS_USER_DIRECTORY ".lichtfeld")
+    set(LFS_LOG_FILENAME "lichtfeld.log")
+endif()
+configure_file(cmake/product_identity.hpp.in include/product_identity.hpp @ONLY)
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SelectFastLinker.cmake")
 
 # On Linux, hide symbols pulled in from third-party image / compression static

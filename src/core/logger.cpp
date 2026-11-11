@@ -7,6 +7,7 @@
 #include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "diagnostics/vram_profiler.hpp"
+#include "product_identity.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -520,11 +521,11 @@ namespace lfs::core {
         fs::path resolve_default_log_directory(const std::string& user_dir_override) {
             if (!user_dir_override.empty())
                 return utf8_to_path(user_dir_override) / "logs";
-            return lichtfeld_home_directory() / ".lichtfeld" / "logs";
+            return lichtfeld_home_directory() / LFS_USER_DIRECTORY / "logs";
         }
 
         fs::path resolve_default_log_path(const std::string& user_dir_override) {
-            return resolve_default_log_directory(user_dir_override) / "lichtfeld.log";
+            return resolve_default_log_directory(user_dir_override) / LFS_LOG_FILENAME;
         }
 
         // Keeps a line that passes the startup level or the current Capture
@@ -591,14 +592,14 @@ namespace lfs::core {
             std::error_code ec;
             native_fs::create_directories(path.parent_path(), ec);
             if (ec) {
-                std::fprintf(stderr, "lichtfeld: could not create log directory '%s': %s\n",
+                std::fprintf(stderr, LFS_PRODUCT_NAME ": could not create log directory '%s': %s\n",
                              path_to_utf8(path.parent_path()).c_str(), ec.message().c_str());
                 return nullptr;
             }
             try {
                 return make_rotating_file_sink(path);
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "lichtfeld: could not open default log file '%s': %s\n",
+                std::fprintf(stderr, LFS_PRODUCT_NAME ": could not open default log file '%s': %s\n",
                              path_to_utf8(path).c_str(), e.what());
                 return nullptr;
             }
@@ -733,7 +734,7 @@ namespace lfs::core {
         // startup log. It exercises the same UTF-8 -> UTF-16 console path as a
         // real diagnostic without changing the terminal's shared code page.
         impl_->logger->log(spdlog::source_loc{__FILE__, __LINE__, __func__}, spdlog::level::info,
-                           "LichtFeld logger initialized \xE2\x80\x94 UTF-8 console: \xE2\x9C\x93");
+                           LFS_PRODUCT_NAME " logger initialized \xE2\x80\x94 UTF-8 console: \xE2\x9C\x93");
 #endif
     }
 
@@ -804,12 +805,12 @@ namespace lfs::core {
             } catch (const std::exception& e) {
                 // LFS-CENSUS-OK(empty-catch): handler containment reports directly to
                 // stderr, not LOG_*, because the failure is Logger's own handler misbehaving.
-                std::fprintf(stderr, "lichtfeld: log handler %u threw '%s'; disabling it\n",
+                std::fprintf(stderr, LFS_PRODUCT_NAME ": log handler %u threw '%s'; disabling it\n",
                              static_cast<unsigned>(token), e.what());
                 faulty_tokens.push_back(token);
             } catch (...) {
                 // LFS-CENSUS-OK(empty-catch): same rationale as the std::exception branch above.
-                std::fprintf(stderr, "lichtfeld: log handler %u threw a non-std exception; disabling it\n",
+                std::fprintf(stderr, LFS_PRODUCT_NAME ": log handler %u threw a non-std exception; disabling it\n",
                              static_cast<unsigned>(token));
                 faulty_tokens.push_back(token);
             }

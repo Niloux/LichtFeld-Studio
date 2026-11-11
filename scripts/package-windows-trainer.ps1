@@ -7,6 +7,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256([string]$Path) {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        try {
+            return [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
 $build = (Resolve-Path -LiteralPath $BuildDir).ProviderPath
 $configPath = (Resolve-Path -LiteralPath $Config).ProviderPath
 $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
@@ -40,19 +55,21 @@ $version = $Matches[1]
 New-Item -ItemType Directory -Path $stage | Out-Null
 & cmake --install $build --config Release --component trainer-runtime --prefix $stage
 if ($LASTEXITCODE -ne 0) { throw "Trainer install failed. Staged files are in $stage" }
-if (-not (Test-Path -LiteralPath (Join-Path $stage 'bin/lfs_train.exe') -PathType Leaf)) {
-    throw 'Trainer install did not produce bin/lfs_train.exe.'
+if (-not (Test-Path -LiteralPath (Join-Path $stage 'bin/geosun_3dgs_train.exe') -PathType Leaf)) {
+    throw 'Trainer install did not produce bin/geosun_3dgs_train.exe.'
 }
 New-Item -ItemType Directory -Path (Join-Path $stage 'config') | Out-Null
-Copy-Item -LiteralPath $configPath -Destination (Join-Path $stage 'config/lfs.json')
+Copy-Item -LiteralPath $configPath -Destination (Join-Path $stage 'config/trainer.json')
 @'
-# LichtFeld Studio headless trainer
+# Geosun 3DGS Trainer
+
+For internal research use.
 
 Run this command from the extracted directory. Pass the GeosunPre delivery
 directory as input and choose a separate output directory.
 
 ```powershell
-.\bin\lfs_train.exe --config .\config\lfs.json -d "path\to\GeosunPre-output" -o "path\to\training-output"
+.\bin\geosun_3dgs_train.exe --config .\config\trainer.json -d "path\to\GeosunPre-output" -o "path\to\training-output"
 ```
 
 Wait for the process to exit. Exit code 0 indicates success. Keep the package
@@ -61,16 +78,18 @@ Use an ASCII-only path for the extracted package to enable GPU JPEG decoding.
 
 This package targets Windows x64 with an NVIDIA GPU of compute capability 8.0
 or newer and a driver that supports the CUDA Toolkit used to build the package
-(CUDA 12.8 or later). The driver compiles the included PTX for the installed GPU
-on first use. See package.json for the paired GeosunPre revision and checksums.
+(CUDA 12.8 or later). When the package has no native kernels for the installed
+GPU, the driver compiles the included PTX on first use.
+See package.json for the paired GeosunPre revision and checksums.
 '@ | Set-Content -LiteralPath (Join-Path $stage 'README.md') -Encoding Ascii
 
 $files = [ordered]@{}
 Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName | ForEach-Object {
     $relative = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
-    $files[$relative] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $files[$relative] = Get-Sha256 $_.FullName
 }
 $manifest = [ordered]@{
+    name = 'Geosun 3DGS Trainer'
     version = $version
     revision = $revision
     dirty = [bool]$dirty
@@ -82,7 +101,7 @@ $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::CreateFromDirectory($stage, $stagedArchive)
-$digest = (Get-FileHash -LiteralPath $stagedArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+$digest = Get-Sha256 $stagedArchive
 "$digest  $(Split-Path $archive -Leaf)" | Set-Content -LiteralPath $stagedChecksum -Encoding Ascii
 [IO.Directory]::Move($stage, $destination)
 [IO.File]::Move($stagedArchive, $archive)

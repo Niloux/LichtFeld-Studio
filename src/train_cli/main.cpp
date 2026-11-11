@@ -24,6 +24,7 @@
 #include "git_version.h"
 #include "io/cache_image_loader.hpp"
 #include "lfs_core_abi_stamp.h"
+#include "product_identity.hpp"
 #include "training/trainer.hpp"
 #include "training/training_setup.hpp"
 
@@ -63,7 +64,7 @@ namespace {
         } else {
             LOG_INFO("CUDA driver version: {}.{}", info.major, info.minor);
             if (!info.supported) {
-                LOG_ERROR("CUDA {}.{} is too old; lfs_train requires CUDA 12.8 or newer "
+                LOG_ERROR("CUDA {}.{} is too old; the trainer requires CUDA 12.8 or newer "
                           "(NVIDIA driver 570 or newer)",
                           info.major, info.minor);
                 return false;
@@ -100,10 +101,14 @@ namespace {
     }
 
     std::optional<std::filesystem::path> lpipsWeightsFromEnvironment() {
+#if GEOSUN_TRAINER_BUILD
+        if (const auto path = lfs::core::environment::value("GEOSUN_LPIPS_WEIGHTS"))
+            return lfs::core::utf8_to_path(*path);
+#endif
         if (const auto path = lfs::core::environment::value("LFS_LPIPS_WEIGHTS"))
             return lfs::core::utf8_to_path(*path);
-        LOG_WARN("LPIPS unavailable: set LFS_LPIPS_WEIGHTS to the weights file "
-                 "(lfs_train does not download it)");
+        LOG_WARN("LPIPS unavailable: set {} to the weights file",
+                 GEOSUN_TRAINER_BUILD ? "GEOSUN_LPIPS_WEIGHTS" : "LFS_LPIPS_WEIGHTS");
         return std::nullopt;
     }
 
@@ -130,11 +135,11 @@ namespace {
 
     int train(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
         if (const auto option = unsupportedOption(*params)) {
-            LOG_ERROR("{} is not supported by lfs_train; use the LichtFeld-Studio application", *option);
+            LOG_ERROR("{} is not supported by this trainer", *option);
             return 1;
         }
         if (params->dataset.data_path.empty()) {
-            LOG_ERROR("lfs_train requires --data-path");
+            LOG_ERROR("Training requires --data-path");
             return 1;
         }
         params->optimization.headless = true;
@@ -190,7 +195,7 @@ namespace {
             if constexpr (std::is_same_v<T, lfs::core::args::HelpMode>) {
                 return 0;
             } else if constexpr (std::is_same_v<T, lfs::core::args::VersionMode>) {
-                std::println("lfs_train (LichtFeld Studio {} {})", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+                std::println("{} {} ({})", LFS_PRODUCT_NAME, GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
                 return 0;
             } else if constexpr (std::is_same_v<T, lfs::core::args::TrainingMode>) {
 #ifdef __GLIBC__
@@ -198,7 +203,7 @@ namespace {
                 if (std::getenv("MALLOC_ARENA_MAX") == nullptr)
                     (void)mallopt(M_ARENA_MAX, 4);
 #endif
-                LOG_INFO("lfs_train {} ({})", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+                LOG_INFO("{} {} ({})", LFS_PRODUCT_NAME, GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
                 applyCudaContextTuning();
                 if (!preflightGpu()) {
                     lfs::core::teardown_gpu_before_exit();
@@ -206,8 +211,7 @@ namespace {
                 }
                 return train(std::move(mode.params));
             } else {
-                std::println(stderr, "Error: lfs_train only trains; this subcommand needs the "
-                                     "LichtFeld-Studio application");
+                std::println(stderr, "Error: this build supports dataset training only");
                 return 1;
             }
         },
@@ -236,7 +240,7 @@ int main(int argc, char* argv[]) {
     const char* const loaded_core_stamp = lfs_core_abi_stamp();
     if (loaded_core_stamp == nullptr || !lfs_core_abi_matches(LFS_CORE_ABI_STAMP)) {
         std::println(stderr,
-                     "Fatal: lfs_core ABI mismatch. lfs_train expects '{}' but loaded '{}'. "
+                     "Fatal: trainer runtime ABI mismatch. Expected '{}' but loaded '{}'. "
                      "Remove stale binaries and rebuild.",
                      LFS_CORE_ABI_STAMP,
                      loaded_core_stamp != nullptr ? loaded_core_stamp : "<null>");

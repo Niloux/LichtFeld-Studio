@@ -3,7 +3,7 @@ rem Build the headless trainer (PTX-only, sm80+) and package it in one step.
 rem Usage: scripts\package-windows-trainer.cmd [config.json] [geosunpre-revision] [output-dir]
 rem   config.json          default: %USERPROFILE%\Desktop\config.json
 rem   geosunpre-revision   default: HEAD of the sibling ..\GeosunPre checkout
-rem   output-dir           default: build-delivery\LFS-trainer-sm80-<timestamp>
+rem   output-dir           default: build-delivery\Geosun-3DGS-Trainer-sm80-<timestamp>
 rem See build-windows-release.cmd for why the code page and compiler cache matter.
 setlocal
 
@@ -30,7 +30,7 @@ if not defined GSREV (
 set "OUT=%~3"
 if defined OUT goto :have_out
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"`) do set "STAMP=%%i"
-set "OUT=%ROOT%\build-delivery\LFS-trainer-sm80-%STAMP%"
+set "OUT=%ROOT%\build-delivery\Geosun-3DGS-Trainer-sm80-%STAMP%"
 :have_out
 
 if defined VCINSTALLDIR goto :have_msvc

@@ -14,6 +14,7 @@ target_include_directories(lfs_logger
         ${CMAKE_SOURCE_DIR}/src/core/include
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}/include
 )
 
 target_link_libraries(lfs_logger

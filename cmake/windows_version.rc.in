@@ -16,13 +16,15 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
+#if !@LFS_WINDOWS_INTERNAL_TRAINER@
             VALUE "CompanyName", "LichtFeld Studio Authors\0"
+            VALUE "LegalCopyright", "Copyright (c) LichtFeld Studio Authors\0"
+#endif
             VALUE "FileDescription", "@LFS_WINDOWS_FILE_DESCRIPTION@\0"
             VALUE "FileVersion", "@PROJECT_VERSION@\0"
             VALUE "InternalName", "@LFS_WINDOWS_INTERNAL_NAME@\0"
-            VALUE "LegalCopyright", "Copyright (c) LichtFeld Studio Authors\0"
             VALUE "OriginalFilename", "@LFS_WINDOWS_ORIGINAL_FILENAME@\0"
-            VALUE "ProductName", "LichtFeld Studio\0"
+            VALUE "ProductName", "@LFS_PRODUCT_NAME@\0"
             VALUE "ProductVersion", "@PROJECT_VERSION@\0"
         END
     END

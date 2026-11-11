@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/crash_handler.hpp"
+#include "product_identity.hpp"
 #include "core/native_fs.hpp"
 
 #ifndef LFS_UNICODE_TEST_STANDALONE
@@ -163,7 +164,7 @@ namespace lfs::core {
                                        : 0;
                 const int length = std::snprintf(
                     header.data(), header.size(),
-                    "LichtFeld Studio unhandled exception 0x%08lx\r\n", code);
+                    LFS_PRODUCT_NAME " unhandled exception 0x%08lx\r\n", code);
                 DWORD written = 0;
                 if (length > 0) {
                     WriteFile(crash_log, header.data(), static_cast<DWORD>(length), &written, nullptr);
@@ -372,7 +373,7 @@ namespace lfs::core {
                     const auto pid = ::getpid();
 #endif
                     g_crash_log_path = paths->logDir() /
-                                       std::format("lichtfeld-studio-crash-{:%Y-%m-%d-%H%M%S}-{}.log", date, pid);
+                                       std::format(LFS_PRODUCT_COMMAND "-crash-{:%Y-%m-%d-%H%M%S}-{}.log", date, pid);
 #ifdef _WIN32
                     g_crash_log_native_path = lfs::core::native_fs::native_path(g_crash_log_path);
 #endif
@@ -380,7 +381,7 @@ namespace lfs::core {
                     std::fprintf(stderr, "Could not create crash log directory: %s\n", error.message().c_str());
                 }
             } else {
-                std::fprintf(stderr, "Could not resolve LichtFeld home for crash logs\n");
+                std::fprintf(stderr, "Could not resolve the user directory for crash logs\n");
             }
 #ifdef _WIN32
             SetUnhandledExceptionFilter(unhandled_exception_filter);

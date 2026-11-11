@@ -36,11 +36,18 @@ set_target_properties(lfs_train PROPERTIES
     CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
-lfs_add_windows_version_resource(lfs_train "LichtFeld Studio trainer")
-lfs_add_windows_version_resource(lfs_core "LichtFeld Studio core and tensor runtime")
-lfs_add_windows_version_resource(lfs_diagnostics "LichtFeld Studio diagnostics")
-lfs_add_windows_version_resource(lfs_logger "LichtFeld Studio logging")
-lfs_add_windows_version_resource(lfs_event_bridge "LichtFeld Studio event bridge")
+if(GEOSUN_TRAINER_BUILD)
+    set_target_properties(lfs_train PROPERTIES OUTPUT_NAME "${LFS_PRODUCT_COMMAND}")
+    set_target_properties(lfs_core PROPERTIES OUTPUT_NAME geosun_3dgs_core)
+    set_target_properties(lfs_diagnostics PROPERTIES OUTPUT_NAME geosun_3dgs_diagnostics)
+    set_target_properties(lfs_logger PROPERTIES OUTPUT_NAME geosun_3dgs_logger)
+    set_target_properties(lfs_event_bridge PROPERTIES OUTPUT_NAME geosun_3dgs_event_bridge)
+endif()
+lfs_add_windows_version_resource(lfs_train "${LFS_PRODUCT_NAME}")
+lfs_add_windows_version_resource(lfs_core "${LFS_PRODUCT_NAME} core and tensor runtime")
+lfs_add_windows_version_resource(lfs_diagnostics "${LFS_PRODUCT_NAME} diagnostics")
+lfs_add_windows_version_resource(lfs_logger "${LFS_PRODUCT_NAME} logging")
+lfs_add_windows_version_resource(lfs_event_bridge "${LFS_PRODUCT_NAME} event bridge")
 
 get_property(_lfs_train_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(WIN32 AND _lfs_train_multi_config)
@@ -257,9 +264,14 @@ if(WIN32)
     )
 endif()
 
+set(_trainer_license_component trainer-runtime)
+if(GEOSUN_TRAINER_BUILD)
+    # The internal research ZIP installs only trainer-runtime.
+    set(_trainer_license_component trainer-licenses)
+endif()
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/LICENSE-EXCEPTION.txt"
-    DESTINATION "." COMPONENT trainer-runtime)
+    DESTINATION "." COMPONENT ${_trainer_license_component})
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/resources/licenses/"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio/licenses" COMPONENT trainer-runtime)
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio/licenses" COMPONENT ${_trainer_license_component})
 
 message(STATUS "Trainer-only build: lfs_train (no GUI, Python, video, MCP/TCP, MoGe)")

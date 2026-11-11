@@ -15,6 +15,7 @@
 #include "io/exporter.hpp"
 #include "io/project_path.hpp"
 #include "io/splat_path.hpp"
+#include "product_identity.hpp"
 #include <algorithm>
 #include <any>
 #include <args.hxx>
@@ -724,6 +725,13 @@ namespace {
         try {
             lfs::core::param::ensure_optimization_properties_registered();
             ::args::ArgumentParser parser(
+#if GEOSUN_TRAINER_BUILD
+                LFS_PRODUCT_NAME " — CUDA training for 3D Gaussian Splatting.\n",
+                "\nEXAMPLE:\n"
+                LFS_PRODUCT_COMMAND " --config trainer.json -d ./data -o ./output\n"
+                "\nENVIRONMENT:\n"
+                "GEOSUN_LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
+#else
                 "LichtFeld Studio: High-performance CUDA implementation of 3D Gaussian Splatting algorithm.\n",
                 "\nSUBCOMMANDS:\n"
                 "convert -- Convert between .ply, .sog, .ssog, .spz, .usd/.usda/.usdc, .html\n"
@@ -759,6 +767,7 @@ namespace {
                 "\n"
                 "ENVIRONMENT:\n"
                 "LFS_LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
+#endif
             parser.helpParams.width = 240;
 
             // =============================================================================
@@ -780,7 +789,7 @@ namespace {
             ::args::ValueFlag<std::string> data_path(paths_group, "data_path", "Path to training data: a dataset folder or an untrained .licht project", {'d', "data-path"});
             ::args::ValueFlag<std::string> output_path(paths_group, "output_path", "Directory for the project file and --export files", {'o', "output-path"});
             ::args::ValueFlag<std::string> output_name(paths_group, "output_name", "Name of the project file and --export files (default project.licht and splat_ITER)", {"output-name"});
-            ::args::ValueFlag<std::string> config_file(paths_group, "config_file", "LichtFeldStudio config file (json)", {"config"});
+            ::args::ValueFlag<std::string> config_file(paths_group, "config_file", "Training configuration file (JSON)", {"config"});
             ::args::ValueFlag<std::string> init_path(paths_group, "path", "Initialize from a splat, point cloud or mesh file; a mesh must be in the dataset's coordinates and is converted to splats when training starts", {"init"});
             ::args::ValueFlagList<std::string> add_splats(paths_group, "path", "Append trained splat file(s) to the training model before optimizer initialization", {"add-splat"});
             ::args::CounterFlag freeze(paths_group, "freeze", "Freeze the immediately preceding --add-splat rows from optimizer gradients and densification", {"freeze"});
@@ -1112,7 +1121,12 @@ namespace {
                 std::string filter_pattern;
 
                 // Check environment variable first
-                if (const auto env_level = lfs::core::environment::value("LFS_LOG_LEVEL")) {
+                auto env_level = lfs::core::environment::value("LFS_LOG_LEVEL");
+#if GEOSUN_TRAINER_BUILD
+                if (const auto geosun_level = lfs::core::environment::value("GEOSUN_LOG_LEVEL"))
+                    env_level = geosun_level;
+#endif
+                if (env_level) {
                     std::string error;
                     if (!parse_log_level(std::string(*env_level), level, error))
                         return std::unexpected(error);
@@ -3495,6 +3509,15 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
 
 std::expected<lfs::core::args::ParsedArgs, std::string>
 lfs::core::args::parse_args(const int argc, const char* const argv[]) {
+#if GEOSUN_TRAINER_BUILD
+    if (argc >= 2 && (std::string_view(argv[1]) == "-V" || std::string_view(argv[1]) == "--version"))
+        return VersionMode{};
+
+    auto result = parse_args_and_params(argc, argv);
+    if (!result)
+        return std::unexpected(result.error());
+    return TrainingMode{std::move(*result)};
+#else
     if (argc >= 2) {
         const std::string_view arg1 = argv[1];
 
@@ -3638,4 +3661,5 @@ Commands:
             return std::unexpected(result.error());
         return TrainingMode{std::move(*result)};
     }
+#endif
 }
