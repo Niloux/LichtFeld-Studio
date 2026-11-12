@@ -1,7 +1,7 @@
 @echo off
 rem Build the headless trainer (PTX-only, sm80+) and package it in one step.
 rem Usage: scripts\package-windows-trainer.cmd [config.json] [geosunpre-revision] [output-dir]
-rem   config.json          default: %USERPROFILE%\Desktop\config.json
+rem   config.json          default: configs\trainer.json of the sibling ..\GeosunPre checkout
 rem   geosunpre-revision   default: HEAD of the sibling ..\GeosunPre checkout
 rem   output-dir           default: build-delivery\Geosun-3DGS-Trainer-sm80-<timestamp>
 rem See build-windows-release.cmd for why the code page and compiler cache matter.
@@ -12,7 +12,7 @@ for %%i in ("%~dp0..") do set "ROOT=%%~fi"
 set "BUILD=%ROOT%\build-windows-trainer-ptx80"
 
 set "CONFIG=%~1"
-if not defined CONFIG set "CONFIG=%USERPROFILE%\Desktop\config.json"
+if not defined CONFIG set "CONFIG=%ROOT%\..\GeosunPre\configs\trainer.json"
 if not exist "%CONFIG%" (
     echo Training config not found: %CONFIG%
     exit /b 1

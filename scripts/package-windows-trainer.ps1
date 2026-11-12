@@ -48,7 +48,12 @@ if ($header -notmatch 'GIT_COMMIT_HASH_SHORT "([0-9a-f]+)"') { throw 'Missing tr
 $revision = $Matches[1]
 $dirty = (& git -C $PSScriptRoot status --porcelain --untracked-files=no) -ne $null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read git status.' }
-if ($dirty) { Write-Warning 'Working tree has uncommitted changes; package.json records dirty = true.' }
+# A delivery must be reproducible from a commit: clean tree, built from HEAD.
+if ($dirty) { throw 'Working tree has uncommitted changes. Commit, rebuild, then package.' }
+$head = & git -C $PSScriptRoot rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or -not $head.StartsWith($revision)) {
+    throw "Trainer was built from $revision, not HEAD $head. Rebuild, then package."
+}
 if ($header -notmatch 'GIT_TAGGED_VERSION "([^"]+)"') { throw 'Missing trainer build version.' }
 $version = $Matches[1]
 
@@ -92,7 +97,6 @@ $manifest = [ordered]@{
     name = 'Geosun 3DGS Trainer'
     version = $version
     revision = $revision
-    dirty = [bool]$dirty
     geosunpre_revision = $GeosunPreRevision
     cuda_architectures = $architectures
     files = $files
