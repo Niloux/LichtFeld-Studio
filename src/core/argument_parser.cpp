@@ -3510,6 +3510,12 @@ photos. A splat file needs -d. Distances are in scene units. Held-out views are 
 std::expected<lfs::core::args::ParsedArgs, std::string>
 lfs::core::args::parse_args(const int argc, const char* const argv[]) {
 #if GEOSUN_TRAINER_BUILD
+    if (argc >= 2 && std::string_view(argv[1]) == "mesh") {
+        std::string error;
+        if (auto parsed = parseMeshArgs(argc, argv, error))
+            return std::move(*parsed);
+        return std::unexpected(std::move(error));
+    }
     if (argc >= 2 && (std::string_view(argv[1]) == "-V" || std::string_view(argv[1]) == "--version"))
         return VersionMode{};
 

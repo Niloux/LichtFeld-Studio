@@ -10,6 +10,7 @@
 #include "control/command_api.hpp"
 #include "core/abi.hpp"
 #include "core/argument_parser.hpp"
+#include "core/checkpoint_format.hpp"
 #include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
 #include "core/cuda_version.hpp"
@@ -23,8 +24,10 @@
 #include "core/tensor.hpp"
 #include "git_version.h"
 #include "io/cache_image_loader.hpp"
+#include "io/project_document.hpp"
 #include "lfs_core_abi_stamp.h"
 #include "product_identity.hpp"
+#include "training/splat_mesh.hpp"
 #include "training/trainer.hpp"
 #include "training/training_setup.hpp"
 
@@ -197,6 +200,90 @@ namespace {
         lfs::core::flush_and_exit(coordinator.interrupted() ? coordinator.interrupted_exit_code() : 0);
     }
 
+    int exportProjectMesh(const lfs::core::param::TrainingParameters& cli) {
+        namespace core = lfs::core;
+        namespace training = lfs::training;
+        if (!cli.resume_project) {
+            LOG_ERROR("Pass a trained .licht project to mesh");
+            return 1;
+        }
+
+        auto document = lfs::io::project::ProjectDocument::open(*cli.resume_project);
+        if (!document) {
+            LOG_ERROR("Could not open project: {}", lfs::format_for_developer(document.error()));
+            return 1;
+        }
+        core::Scene scene;
+        auto hydrated = document->hydrate(scene);
+        if (!hydrated || !hydrated->checkpoint_uuid || !hydrated->checkpoint_header) {
+            LOG_ERROR("Could not load the trained project checkpoint");
+            return 1;
+        }
+        const auto uuid = *hydrated->checkpoint_uuid;
+        const auto* checkpoint = document->find_checkpoint(uuid);
+        if (!checkpoint) {
+            LOG_ERROR("Project checkpoint is missing");
+            return 1;
+        }
+        std::optional<core::CheckpointParametersLoadResult> saved;
+        auto visited = checkpoint->visit_stream([&](std::istream& stream, std::uint64_t bytes) -> lfs::Result<void> {
+            saved = core::load_checkpoint_params(stream, bytes);
+            return {};
+        });
+        if (!visited || !saved || !*saved) {
+            LOG_ERROR("Could not read project checkpoint parameters");
+            return 1;
+        }
+        auto params = std::move(**saved);
+        if (!cli.dataset.data_path.empty() && cli.dataset.data_path != params.dataset.data_path) {
+            scene.rebaseCameraAssetPaths(params.dataset.data_path, cli.dataset.data_path);
+            params.dataset.data_path = cli.dataset.data_path;
+        }
+        params.dataset.output_path = cli.mesh_output.parent_path();
+        params.optimization.headless = true;
+        params.resume_project = cli.resume_project;
+        installImageLoader(params.dataset.loading_params.use_cpu_memory);
+        lfs::event::CommandCenterBridge::instance().set(&training::CommandCenter::instance());
+        auto installed = training::installTrainerFromProjectCheckpoint(
+            scene, *document, uuid, params, core::path_to_utf8(*cli.resume_project), hydrated->checkpoint_header->iteration);
+        if (!installed) {
+            LOG_ERROR("Could not restore project: {}", installed.error());
+            return 1;
+        }
+        auto& trainer = *installed->trainer;
+        params.export_formats = cli.export_formats;
+        params.dataset.output_name = cli.dataset.output_name;
+        if (const auto exported = training::export_final_splats(trainer, params); !exported) {
+            LOG_ERROR("{}", lfs::format_for_developer(exported.error()));
+            return 1;
+        }
+        const auto& dataset = trainer.train_dataset();
+        std::vector<core::Camera*> cameras;
+        cameras.reserve(dataset->size());
+        for (std::size_t i = 0; i < dataset->size(); ++i)
+            cameras.push_back(dataset->get_camera(i));
+        auto settings = *cli.mesh_settings;
+        settings.invert_mask = params.optimization.invert_masks;
+        settings.mask_threshold = params.optimization.mask_threshold;
+        core::Tensor::trim_memory_pool();
+        lfs::app::HeadlessRunCoordinator coordinator;
+        const auto mesh = training::extract_splat_mesh(
+            trainer.get_strategy_mutable().get_model(), cameras, settings, coordinator.stop_token(), {},
+            trainer.hasPPISP() ? trainer.getPPISP() : nullptr);
+        training::write_splat_mesh_ply(mesh, cli.mesh_output);
+        if (mesh.tiled) {
+            auto folder = cli.mesh_output;
+            folder.replace_extension();
+            folder += "_osgb";
+            training::write_splat_mesh_osgb(*mesh.tiled, folder);
+        }
+        trainer.shutdown();
+        static_cast<void>(installed->trainer.release());
+        core::teardown_gpu_before_exit();
+        core::mark_clean_exit();
+        core::flush_and_exit(0);
+    }
+
     int runMode(lfs::core::args::ParsedArgs args) {
         return std::visit([](auto&& mode) -> int {
             using T = std::decay_t<decltype(mode)>;
@@ -218,6 +305,8 @@ namespace {
                     lfs::core::teardown_gpu_before_exit();
                     lfs::core::flush_and_exit(1);
                 }
+                if (mode.params->mesh_settings)
+                    return exportProjectMesh(*mode.params);
                 return train(std::move(mode.params));
             } else {
                 std::println(stderr, "Error: this build supports dataset training only");
