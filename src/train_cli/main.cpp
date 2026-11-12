@@ -165,7 +165,16 @@ namespace {
             return 1;
         }
         if (params->optimization.enable_eval)
-            trainer->set_lpips_weights_path(lpipsWeightsFromEnvironment());
+            trainer->set_lpips_weights_preparer([]() -> std::optional<lfs::core::nn::WeightFile> {
+                const auto path = lpipsWeightsFromEnvironment();
+                if (!path)
+                    return std::nullopt;
+                auto weights = lfs::core::nn::WeightFile::open(*path);
+                if (weights)
+                    return std::move(*weights);
+                LOG_WARN("LPIPS unavailable: {}", weights.error().detail());
+                return std::nullopt;
+            });
         lfs::training::grant_headless_project_saves(*trainer, *params);
 
         lfs::core::Tensor::trim_memory_pool();
