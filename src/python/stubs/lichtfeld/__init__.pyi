@@ -2721,7 +2721,9 @@ class OptimizationParams:
 
     @property
     def depth_distortion_weight(self) -> float:
-        """Weight for the spread of depth along each ray, which thins layered surfaces (--gut)"""
+        """
+        Weight for the spread of depth along each ray, which thins layered surfaces (--gut)
+        """
 
     @depth_distortion_weight.setter
     def depth_distortion_weight(self, arg: float, /) -> None: ...
