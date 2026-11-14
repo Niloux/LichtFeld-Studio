@@ -613,6 +613,7 @@ EXPECTED_CHECKBOX_ROWS = {
         "training_params.ppisp_freeze_gaussians",
         "training.tooltip.ppisp_freeze_gaussians",
     ),
+    "pose_opt": ("training_params.pose_opt", "training.tooltip.pose_opt"),
     "random": ("training.init.random_init", "training.tooltip.random_init"),
     "enable_eval": (
         "training_params.enable_eval",
@@ -687,6 +688,7 @@ EXPECTED_SELECT_ROWS = {
 
 EXPECTED_ADVANCED_IDS = (
     "means_lr_end",
+    "ray_depth_lr",
     "scaling_lr_end",
     "late_lr_anneal",
     "cropbox_lr_scale",
@@ -753,13 +755,13 @@ def test_full_migration_inventory_and_schema_are_exact(lf):
     assert property_view.NUMBER_PROPS == tuple(EXPECTED_NUMBER_ROWS)
     assert property_view.BOOL_PROPS == tuple(EXPECTED_CHECKBOX_ROWS)
     assert property_view.SELECT_PROPS == tuple(EXPECTED_SELECT_ROWS)
-    assert len(property_view.MIGRATED_PROP_IDS) == 86
-    assert len(set(property_view.MIGRATED_PROP_IDS)) == 86
+    assert len(property_view.MIGRATED_PROP_IDS) == 87
+    assert len(set(property_view.MIGRATED_PROP_IDS)) == 87
 
     group_info = lf.ui.property_group_info("optimization")
     resolved_runs = property_view.resolve_runs(group_info)
     rendered = tuple(prop for run in resolved_runs for prop in run.prop_ids)
-    assert len(EXPECTED_RENDERED_PROP_IDS) == 122
+    assert len(EXPECTED_RENDERED_PROP_IDS) == 124
     assert len(rendered) == len(set(rendered)) == len(EXPECTED_RENDERED_PROP_IDS)
     assert set(rendered) == EXPECTED_RENDERED_PROP_IDS
 
@@ -808,6 +810,9 @@ def test_registry_placement_groups_auto_rows_and_leaves_new_ones_in_more_paramet
         for run_id in property_view.REGISTRY_PLACEMENT
         for prop_id in resolved[run_id]
     ]
+    assert resolved["learning_rates_registry"] == (
+        "means_lr_end", "ray_depth_lr", "scaling_lr_end", "late_lr_anneal", "cropbox_lr_scale"
+    )
     # Crop-at-end has no curated placement and remains in More Parameters.
     assert sorted(placed) == sorted(set(EXPECTED_ADVANCED_IDS) - {"crop_to_cropbox"})
     assert resolved[property_view.AUTO_ADVANCED_RUN_ID] == ("crop_to_cropbox",)
@@ -827,6 +832,7 @@ def test_strategy_applicability_filters_auto_rows_and_search(lf):
     properties = {meta["id"]: meta for meta in group_info["properties"]}
     known_mrnf_only = {
         "means_lr_end",
+        "ray_depth_lr",
         "scaling_lr_end",
         "growth_grad_threshold",
         "grow_fraction",

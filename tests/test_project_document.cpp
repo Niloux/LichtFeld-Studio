@@ -24,6 +24,7 @@
 #include "training/checkpoint.hpp"
 #include "training/project_snapshot_chapters.hpp"
 #include "training/strategies/mcmc.hpp"
+#include "training/training_setup.hpp"
 #include "user_shader_sources.hpp"
 #include "visualizer/core/parameter_manager.hpp"
 
@@ -1314,6 +1315,74 @@ namespace {
         EXPECT_EQ(restored.error().code(), lfs::ErrorCode::DataLoss);
         EXPECT_EQ(live.getNodeCount(), 1u);
         EXPECT_NE(live.getNode("Existing"), nullptr);
+    }
+
+    TEST(SceneChapterAdapterTest, RepeatedCropInstancesRoundTripWithDistinctIdentities) {
+        Scene scene;
+        const auto owner = scene.addSplat("Stack", make_splat(3));
+        const auto box = scene.addCropBox("Box", owner);
+        const auto ellipsoid = scene.addEllipsoid("Ellipsoid", owner);
+        scene.getMutableNode("Ellipsoid")->ellipsoid->radii = glm::vec3(1.0f);
+        lfs::core::CropPolygonData polygon_data;
+        polygon_data.vertices = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+        const auto polygon = scene.addCropPolygon("Polygon", owner, polygon_data);
+        ASSERT_NE(polygon, lfs::core::NULL_NODE);
+        for (const auto id : {box, ellipsoid, polygon}) {
+            const auto copy_name = scene.duplicateNode(scene.getNodeById(id)->name);
+            ASSERT_FALSE(copy_name.empty());
+            auto* child = scene.getMutableNode(copy_name);
+            ASSERT_NE(child, nullptr);
+            child->visible.setQuiet(false);
+            if (child->cropbox) {
+                child->cropbox->enabled = false;
+                child->cropbox->inverse = true;
+            }
+            if (child->ellipsoid) {
+                child->ellipsoid->radii = {2, 3, 4};
+                child->ellipsoid->enabled = true;
+            }
+            if (child->crop_polygon) {
+                child->crop_polygon->half_depth = 4;
+                child->crop_polygon->inverse = true;
+            }
+        }
+        ASSERT_EQ(scene.getNodeById(owner)->children.size(), 6);
+        const auto owner_uuid = scene.getNodeById(owner)->uuid;
+        const ScenePayloadBindings bindings{{owner_uuid, PayloadBinding{.fourcc = "DSRC", .instance_uuid = owner_uuid, .reference_uuid = std::nullopt, .source_kind = "ply"}}};
+        const auto chapter = capture_scene_graph(scene, bindings);
+        ASSERT_TRUE(chapter) << lfs::format_for_developer(chapter.error());
+        const auto decoded = SceneGraphChapter::from_bytes(chapter->to_bytes());
+        ASSERT_TRUE(decoded);
+        Scene restored;
+        const ScenePayloadResolver resolver{.splat = [](const PayloadBinding&) -> lfs::Result<std::unique_ptr<lfs::core::SplatData>> { return make_splat(3); }};
+        ASSERT_TRUE(hydrate_scene_graph(*decoded, restored, resolver));
+        const auto* restored_owner = restored.getNodeByUuid(owner_uuid);
+        ASSERT_NE(restored_owner, nullptr);
+        EXPECT_EQ(restored_owner->children.size(), 6);
+        for (const auto id : scene.getNodeById(owner)->children) {
+            const auto* source = scene.getNodeById(id);
+            const auto* copy = restored.getNodeByUuid(source->uuid);
+            ASSERT_NE(copy, nullptr);
+            EXPECT_EQ(copy->type, source->type);
+            EXPECT_EQ(copy->parent_id, restored_owner->id);
+            EXPECT_EQ(copy->local_transform.get(), source->local_transform.get());
+            EXPECT_EQ(static_cast<bool>(copy->visible), static_cast<bool>(source->visible));
+            if (source->cropbox) {
+                ASSERT_TRUE(copy->cropbox);
+                EXPECT_EQ(copy->cropbox->enabled, source->cropbox->enabled);
+                EXPECT_EQ(copy->cropbox->inverse, source->cropbox->inverse);
+            }
+            if (source->ellipsoid) {
+                ASSERT_TRUE(copy->ellipsoid);
+                EXPECT_EQ(copy->ellipsoid->radii, source->ellipsoid->radii);
+                EXPECT_EQ(copy->ellipsoid->enabled, source->ellipsoid->enabled);
+            }
+            if (source->crop_polygon) {
+                ASSERT_TRUE(copy->crop_polygon);
+                EXPECT_EQ(copy->crop_polygon->vertices, source->crop_polygon->vertices);
+                EXPECT_EQ(copy->crop_polygon->half_depth, source->crop_polygon->half_depth);
+            }
+        }
     }
 
     TEST(SceneChapterAdapterTest, CropPolygonSurvivesCaptureAndHydrationUnderItsSplat) {
@@ -7843,6 +7912,50 @@ namespace {
         adopt(relocated);
         EXPECT_EQ(params.optimization.bg_image_path, fs::path("cli-background.png"));
         EXPECT_EQ(params.optimization.ppisp_sidecar_path, fs::path("cli.ppisp"));
+    }
+
+    TEST(ProjectDocumentTest, HeadlessDatasetRunSkipsCamerasDisabledInTheProject) {
+        if (!cuda_device_available())
+            GTEST_SKIP() << "CUDA device unavailable";
+        TemporaryDirectory temporary;
+        const auto project_path = temporary.path / "training.licht";
+        const auto dataset = temporary.path / "dataset";
+        fs::create_directories(dataset / "images");
+        for (const auto* name : {"a.png", "b.png", "c.png"})
+            write_solid_png(dataset / "images" / name, 1, 1);
+        std::ofstream(dataset / "transforms.json") << R"({
+            "w":1,"h":1,"fl_x":1,"fl_y":1,"cx":0.5,"cy":0.5,"frames":[
+            {"file_path":"images/a.png","transform_matrix":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]},
+            {"file_path":"images/b.png","transform_matrix":[[1,0,0,1],[0,1,0,0],[0,0,1,0],[0,0,0,1]]},
+            {"file_path":"images/c.png","transform_matrix":[[1,0,0,2],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}]})";
+
+        // The project as saved after loading the dataset and disabling one camera.
+        lfs::core::param::TrainingParameters loaded_params;
+        loaded_params.dataset.data_path = dataset;
+        loaded_params.dataset.images = "images";
+        Scene edited;
+        ASSERT_TRUE(lfs::training::loadTrainingDataIntoScene(loaded_params, edited));
+        edited.setCameraTrainingEnabled(std::string("b.png"), false);
+        edited.removeNode("PointCloud", false);
+        auto document = make_empty_document(fixed_uuid(2392), 100);
+        bind_dataset(*document, dataset);
+        document->edit_scene_graph() = require_result(capture_scene_graph(edited, ScenePayloadBindings{}));
+        (void)require_result(document->save(project_path, save_options(2393, 200)));
+
+        // `--data-path training.licht --headless` adopts the project, then loads its dataset.
+        auto reopened = require_result_ptr(ProjectDocument::open(project_path));
+        lfs::core::param::TrainingParameters params;
+        params.dataset_project = project_path;
+        params.optimization.headless = true;
+        adopt_project_training_parameters(params, require_result(reopened->parameters().snapshot()), dataset,
+                                          "images", reopened->references(), temporary.path);
+        params.disabled_camera_uids = require_result(disabled_camera_uids(reopened->scene_graph()));
+        Scene scene;
+        ASSERT_TRUE(lfs::training::loadTrainingDataIntoScene(params, scene));
+
+        const auto active = scene.getActiveCameras();
+        EXPECT_EQ(active.size(), 2u);
+        EXPECT_TRUE(std::ranges::none_of(active, [](const auto& camera) { return camera->image_name() == "b.png"; }));
     }
 
     TEST(ProjectDocumentTest, EmbeddedDatasetRoundTripAndCompaction) {

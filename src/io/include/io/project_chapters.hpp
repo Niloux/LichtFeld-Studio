@@ -445,6 +445,7 @@ namespace lfs::io::project {
         bool visible = true;
         bool locked = false;
         bool training_enabled = true;
+        bool crop_effects_enabled = true;
         bool payload_diverged = false;
         bool point_cloud_source = false;
         std::optional<GeorefPose> georef_pose = std::nullopt;
@@ -573,6 +574,11 @@ namespace lfs::io::project {
         std::string images_folder,
         const ReferencesChapter& references,
         const std::filesystem::path& project_root);
+
+    // Uids of the cameras disabled for training in SCNG, for the
+    // disabled_camera_uids of a headless run that reloads the dataset.
+    [[nodiscard]] LFS_IO_API lfs::Result<std::vector<int>>
+    disabled_camera_uids(const SceneGraphChapter& scene_graph);
 
     class LFS_IO_API ParametersChapter {
     public:

@@ -98,6 +98,7 @@ namespace lfs::rendering {
         bool inverse = false;
         bool desaturate = false;
         int parent_node_index = -1;
+        int source_node_id = -1; // CPU-side identity; never packed as GPU filter data.
     };
 
     struct GaussianScopedEllipsoidFilter {
@@ -105,6 +106,7 @@ namespace lfs::rendering {
         bool inverse = false;
         bool desaturate = false;
         int parent_node_index = -1;
+        int source_node_id = -1; // CPU-side identity; never packed as GPU filter data.
     };
 
     struct GaussianScopedCropPolygonFilter {
@@ -112,6 +114,7 @@ namespace lfs::rendering {
         bool inverse = false;
         bool desaturate = false;
         int parent_node_index = -1;
+        int source_node_id = -1; // CPU-side identity; never packed as GPU filter data.
     };
 
     struct GaussianFilterState {
@@ -285,6 +288,7 @@ namespace lfs::rendering {
         GaussianOverlayState overlay;
         bool transparent_background = false;
         bool depth_view = false;
+        bool normal_view = false;
         // Occlusion consumers need per-pixel depth, not HiGS batch-leading depth.
         bool require_exact_depth = false;
         // Optional row-major bitset of 4x4 pixel regions (rounded up at edges).

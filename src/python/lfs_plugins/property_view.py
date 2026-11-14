@@ -112,6 +112,7 @@ BOOL_PROPS = (
     "ppisp_use_controller",
     "ppisp_freeze_from_sidecar",
     "ppisp_freeze_gaussians",
+    "pose_opt",
     "random",
     "enable_eval",
     "eval_all",
@@ -256,6 +257,7 @@ APPEARANCE_RUNS = (
         visibility_condition_id="dep_ppisp_controller",
     ),
     _run("ppisp_registry", visibility_condition_id="dep_ppisp_params"),
+    _run("pose_opt_toggle", "pose_opt"),
 )
 
 REFINEMENT_RUNS = (
@@ -363,6 +365,7 @@ REGISTRY_PLACEMENT = {
     ),
     "learning_rates_registry": (
         "means_lr_end",
+        "ray_depth_lr",
         "scaling_lr_end",
         "late_lr_anneal",
         "cropbox_lr_scale",

@@ -14,6 +14,7 @@
 #include "gsplat/GeometryFeatures.h"
 #include "gsplat/Intersect.h"
 #include "gsplat/Ops.h"
+#include "lfs/training/splat_dilation.hpp"
 #include "training/components/rolling_shutter.hpp"
 #include "training/kernels/densification_kernels.hpp"
 #include "training/kernels/grad_alpha.hpp"
@@ -117,7 +118,7 @@ namespace lfs::training {
         int tile_width,
         int tile_height,
         float scaling_modifier,
-        bool antialiased,
+        bool mip_filter,
         GsplatRenderMode render_mode,
         bool use_gut,
         const core::Tensor& bg_image,
@@ -260,12 +261,12 @@ namespace lfs::training {
             }
 
             // Settings
-            constexpr float eps2d = 0.3f;
+            const float eps2d = mip_filter ? kMipFilterDilation : kSplatDilation;
             constexpr float near_plane = 0.01f;
             constexpr float far_plane = 10000.0f;
             constexpr float radius_clip = 0.0f;
             constexpr uint32_t tile_size = 16;
-            const bool calc_compensations = antialiased;
+            const bool calc_compensations = mip_filter;
             const float* K_ptr = K_tensor.ptr<float>();
 
             // Distortion coefficients. CPU tensors are uploaded through the
@@ -489,7 +490,8 @@ namespace lfs::training {
             const size_t depths_size = align(C * N * sizeof(float));
             const size_t dirs_size = (sh_degree > 0) ? align(C * N * 3 * sizeof(float)) : 0;
             const size_t conics_size = align(C * N * 3 * sizeof(float));
-            const size_t compensations_size = calc_compensations ? align(C * N * sizeof(float)) : 0;
+            // The mip filter writes the compensations and, after them, the dilations.
+            const size_t compensations_size = calc_compensations ? align(2 * C * N * sizeof(float)) : 0;
             const size_t tiles_per_gauss_size = align(C * N * sizeof(int32_t));
             const size_t tile_offsets_size =
                 align((C * num_tiles_y * num_tiles_x + 1u) * sizeof(int32_t));
@@ -525,8 +527,10 @@ namespace lfs::training {
             auto* conics_ptr_out = reinterpret_cast<float*>(ptr);
             ptr += conics_size;
             float* compensations_ptr_out = nullptr;
+            float* dilations_ptr_out = nullptr;
             if (calc_compensations) {
                 compensations_ptr_out = reinterpret_cast<float*>(ptr);
+                dilations_ptr_out = compensations_ptr_out + C * N;
                 ptr += compensations_size;
             }
             auto* tiles_per_gauss_ptr = reinterpret_cast<int32_t*>(ptr);
@@ -572,6 +576,7 @@ namespace lfs::training {
                 .tile_offsets = tile_offsets_ptr_out,
                 .last_ids = last_ids_ptr_out,
                 .compensations = compensations_ptr_out,
+                .dilations = dilations_ptr_out,
                 .isect_ids = nullptr,
                 .flatten_ids = nullptr,
                 .n_isects = 0};
@@ -686,6 +691,7 @@ namespace lfs::training {
             ctx.tile_offsets_ptr = tile_offsets_ptr_out;
             ctx.last_ids_ptr = last_ids_ptr_out;
             ctx.compensations_ptr = compensations_ptr_out;
+            ctx.dilations_ptr = dilations_ptr_out;
 
             // Borrowed TLS VMM pointers (valid through backward; do not free)
             ctx.isect_ids_ptr = result.isect_ids;
@@ -707,6 +713,7 @@ namespace lfs::training {
 
             // Store camera pointers
             ctx.viewmat_ptr = viewmat_ptr;
+            ctx.cam_position_ptr = viewpoint_camera.cam_position_ptr();
             ctx.K_ptr = K_ptr;
             ctx.K_tensor = K_tensor;
             ctx.shutter_viewmats_ptr = shutter_viewmats_ptr;
@@ -1018,6 +1025,7 @@ namespace lfs::training {
                 ctx.means2d_ptr,
                 ctx.depths_ptr,
                 ctx.compensations_ptr,
+                ctx.dilations_ptr,
                 v_render_colors_ptr,
                 v_render_alphas_ptr,
                 v_means_ptr,
@@ -1038,6 +1046,7 @@ namespace lfs::training {
                     : nullptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
+            optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);
 
             if (stage_means) {
                 kernels::launch_grad_accumulate(means_grad.ptr<float>(), v_means_ptr, N * 3, stream);

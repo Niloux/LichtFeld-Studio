@@ -47,6 +47,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <unordered_set>
 #include <variant>
 
 namespace lfs::training {
@@ -1097,6 +1098,15 @@ namespace lfs::training {
                         if ((i % test_every) == 0) {
                             scene.addCamera(cameras[i]->image_name(), val_cameras_id, cameras[i]);
                         }
+                    }
+                }
+
+                const std::unordered_set<int> disabled_uids(params.disabled_camera_uids.begin(),
+                                                            params.disabled_camera_uids.end());
+                for (const auto* node : scene.getNodes()) {
+                    if (node->type == lfs::core::NodeType::CAMERA && node->camera &&
+                        disabled_uids.contains(node->camera->uid())) {
+                        scene.setCameraTrainingEnabled(node->id, false);
                     }
                 }
 

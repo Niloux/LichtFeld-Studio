@@ -21,7 +21,8 @@ namespace gsplat_lfs {
     // Forward Kernel
     ////////////////////////////////////////////////////////////////
 
-    template <uint32_t CDIM, typename scalar_t, bool kPerfectPinhole, bool kBatched>
+    // kMipFilter is a template parameter so the unfiltered kernel compiles exactly as before.
+    template <uint32_t CDIM, typename scalar_t, bool kPerfectPinhole, bool kBatched, bool kMipFilter>
     __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
         const uint32_t C,
         const uint32_t N,
@@ -35,6 +36,8 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ backgrounds, // [C, CDIM] - solid color (mutually exclusive with bg_images)
         const scalar_t* __restrict__ bg_images,   // [C, CDIM, H, W] - per-pixel background (mutually exclusive with backgrounds)
         const bool* __restrict__ masks,           // [C, tile_height, tile_width]
+        const scalar_t* __restrict__ compensations,
+        const scalar_t* __restrict__ dilations,
         const uint32_t image_width,
         const uint32_t image_height,
         const uint32_t tile_size,
@@ -180,7 +183,9 @@ namespace gsplat_lfs {
             if (tr < stage_n && idx < range_end) {
                 int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
                 const float3 xyz_f = load_float3(reinterpret_cast<const float*>(&means[g]));
-                const float opac = activated_opacity(opacities[g]);
+                float opac = activated_opacity(opacities[g]);
+                if constexpr (kMipFilter)
+                    opac *= compensations[g];
                 xyz_opacity_batch[tr] = {xyz_f.x, xyz_f.y, xyz_f.z, opac};
 
                 const vec4 quat = quats[g];
@@ -197,6 +202,8 @@ namespace gsplat_lfs {
                     0.f,
                     1.0f / scale[2]);
                 iscl_rot_batch[tr] = S * glm::transpose(R);
+                if constexpr (kMipFilter)
+                    iscl_rot_batch[tr] = inverse_scale_matrix(dilated_scale(scale, dilations[g])) * glm::transpose(R);
                 if constexpr (CDIM == 3) {
                     const float3 c = load_float3(colors + g * 3);
                     rgbs_batch[tr * 3u + 0] = c.x;
@@ -321,7 +328,7 @@ namespace gsplat_lfs {
         return enabled;
     }
 
-    template <uint32_t CDIM, bool kPerfectPinhole, bool kBatched>
+    template <uint32_t CDIM, bool kPerfectPinhole, bool kBatched, bool kMipFilter>
     __global__ void __launch_bounds__(kMicroThreads) rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel(
         const uint32_t C,
         const vec3* __restrict__ means,
@@ -332,6 +339,8 @@ namespace gsplat_lfs {
         const float* __restrict__ backgrounds,
         const float* __restrict__ bg_images,
         const bool* __restrict__ masks,
+        const float* __restrict__ compensations,
+        const float* __restrict__ dilations,
         const uint32_t image_width,
         const uint32_t image_height,
         const uint32_t tile_size,
@@ -475,14 +484,14 @@ namespace gsplat_lfs {
                     s_bin[slot] = gi;
                     s_hit[slot] = 0;
                     const float3 xyz_f = load_float3(reinterpret_cast<const float*>(&means[g]));
-                    s_xyz_opacity[slot] = {xyz_f.x, xyz_f.y, xyz_f.z, activated_opacity(opacities[g])};
-                    const vec3 scale = activated_scale(scales[g]);
-                    const mat3 R = quat_to_rotmat(quats[g]);
-                    const mat3 S = mat3(
-                        1.0f / scale[0], 0.f, 0.f,
-                        0.f, 1.0f / scale[1], 0.f,
-                        0.f, 0.f, 1.0f / scale[2]);
-                    s_iscl_rot[slot] = S * glm::transpose(R);
+                    float opacity = activated_opacity(opacities[g]);
+                    vec3 scale = activated_scale(scales[g]);
+                    if constexpr (kMipFilter) {
+                        opacity *= compensations[g];
+                        scale = dilated_scale(scale, dilations[g]);
+                    }
+                    s_xyz_opacity[slot] = {xyz_f.x, xyz_f.y, xyz_f.z, opacity};
+                    s_iscl_rot[slot] = inverse_scale_matrix(scale) * glm::transpose(quat_to_rotmat(quats[g]));
 #pragma unroll
                     for (uint32_t k = 0; k < CDIM; ++k) {
                         s_rgbs[slot * CDIM + k] = colors[g * CDIM + k];
@@ -583,6 +592,8 @@ namespace gsplat_lfs {
         const float* backgrounds,
         const float* bg_images,
         const bool* masks,
+        const float* compensations,
+        const float* dilations,
         uint32_t C,
         uint32_t N,
         uint32_t n_isects,
@@ -673,6 +684,8 @@ namespace gsplat_lfs {
                 backgrounds,
                 bg_images,
                 masks,
+                compensations,
+                dilations,
                 image_width,
                 image_height,
                 tile_size,
@@ -695,7 +708,7 @@ namespace gsplat_lfs {
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd");
         };
 
-        auto dispatch = [&]<bool kBatched>() {
+        auto dispatch = [&]<bool kBatched, bool kMipFilter>() {
             if constexpr (CDIM <= 8) {
                 if (use_micro_forward() && footprint.valid() && tile_size % kMicroSub == 0) {
                     const uint32_t subs = tile_size / kMicroSub;
@@ -706,7 +719,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<const vec3*>(means),
                             reinterpret_cast<const vec4*>(quats),
                             reinterpret_cast<const vec3*>(scales),
-                            colors, opacities, backgrounds, bg_images, masks,
+                            colors, opacities, backgrounds, bg_images, masks, compensations, dilations,
                             image_width, image_height, tile_size, tile_width, tile_height,
                             viewmats0, viewmats1, Ks, camera_model, rs_type,
                             radial_coeffs, tangential_coeffs, thin_prism_coeffs,
@@ -715,24 +728,30 @@ namespace gsplat_lfs {
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd_micro");
                     };
                     if (global_shutter && perfect_pinhole)
-                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, true, kBatched>);
+                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, true, kBatched, kMipFilter>);
                     else
-                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, false, kBatched>);
+                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, false, kBatched, kMipFilter>);
                     return;
                 }
             }
             if constexpr (CDIM == 3) {
                 if (global_shutter && perfect_pinhole) {
-                    launch(rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float, true, kBatched>);
+                    launch(rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float, true, kBatched, kMipFilter>);
                     return;
                 }
             }
-            launch(rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float, false, kBatched>);
+            launch(rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float, false, kBatched, kMipFilter>);
         };
-        if (tiles.end == UINT32_MAX)
-            dispatch.template operator()<false>();
+        auto dispatch_batched = [&]<bool kMipFilter>() {
+            if (tiles.end == UINT32_MAX)
+                dispatch.template operator()<false, kMipFilter>();
+            else
+                dispatch.template operator()<true, kMipFilter>();
+        };
+        if (dilations != nullptr)
+            dispatch_batched.template operator()<true>();
         else
-            dispatch.template operator()<true>();
+            dispatch_batched.template operator()<false>();
     }
 
     ////////////////////////////////////////////////////////////////
@@ -749,6 +768,8 @@ namespace gsplat_lfs {
         const float* backgrounds,                                              \
         const float* bg_images,                                                \
         const bool* masks,                                                     \
+        const float* compensations,                                            \
+        const float* dilations,                                                \
         uint32_t C,                                                            \
         uint32_t N,                                                            \
         uint32_t n_isects,                                                     \
