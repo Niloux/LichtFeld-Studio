@@ -1289,6 +1289,8 @@ namespace {
                 }
                 cfg.include_provenance = params.include_provenance;
                 params.render_path = cfg;
+                params.optimization.gut = bool(gut);
+                params.optimization.mip_filter = bool(enable_mip);
 
                 return std::make_tuple(ParseResult::Success, std::function<void()>{});
             }
