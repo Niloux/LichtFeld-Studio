@@ -258,20 +258,22 @@ if(WIN32)
     ]] COMPONENT trainer-runtime)
     install(RUNTIME_DEPENDENCY_SET lfs_train_runtime
         DIRECTORIES "$<TARGET_FILE_DIR:lfs_train>"
-        PRE_EXCLUDE_REGEXES [[^api-ms-]] [[^ext-ms-]] [[^nvcuda[.]dll$]]
-        POST_EXCLUDE_REGEXES [[.*[Ss]ystem32[/\\].*]]
+        PRE_EXCLUDE_REGEXES
+            [[^[Aa][Pp][Ii]-[Mm][Ss]-]]
+            [[^[Ee][Xx][Tt]-[Mm][Ss]-]]
+            [[^[Uu][Cc][Rr][Tt][Bb][Aa][Ss][Ee][.][Dd][Ll][Ll]$]]
+            [[^[Nn][Vv][Cc][Uu][Dd][Aa][.][Dd][Ll][Ll]$]]
+        POST_EXCLUDE_REGEXES
+            [[.*[Ss]ystem32[/\\].*]]
+            [[.*[Ss]ys[Ww][Oo][Ww]64[/\\].*]]
+            [[.*[Ww]indows [Kk]its[/\\].*]]
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT trainer-runtime
     )
 endif()
 
-set(_trainer_license_component trainer-runtime)
-if(GEOSUN_TRAINER_BUILD)
-    # The internal research ZIP installs only trainer-runtime.
-    set(_trainer_license_component trainer-licenses)
-endif()
-install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/LICENSE-EXCEPTION.txt"
-    DESTINATION "." COMPONENT ${_trainer_license_component})
+install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/LICENSE-EXCEPTION.txt" "${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md"
+    DESTINATION "." COMPONENT trainer-runtime)
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/resources/licenses/"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio/licenses" COMPONENT ${_trainer_license_component})
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio/licenses" COMPONENT trainer-runtime)
 
 message(STATUS "Trainer-only build: lfs_train (no GUI, Python, video, MCP/TCP, MoGe)")

@@ -68,8 +68,6 @@ Copy-Item -LiteralPath $configPath -Destination (Join-Path $stage 'config/traine
 @'
 # Geosun 3DGS Trainer
 
-For internal research use.
-
 Run this command from the extracted directory. Pass the GeosunPre delivery
 directory as input and choose a separate output directory.
 
@@ -82,10 +80,30 @@ directory layout so the trainer can locate its DLLs and image codecs.
 Use an ASCII-only path for the extracted package to enable GPU JPEG decoding.
 
 This package targets Windows x64 with an NVIDIA GPU of compute capability 8.0
-or newer and a driver that supports the CUDA Toolkit used to build the package
-(CUDA 12.8 or later). When the package has no native kernels for the installed
-GPU, the driver compiles the included PTX on first use.
+or newer, at least 12 GB VRAM (16 GB+ recommended), and a driver that supports
+the CUDA Toolkit used to build the package (CUDA 12.8 / NVIDIA R570 or later).
+Precompiled SASS is included for SM 8.6, 8.9, and 12.0; other SM 8.0+ GPUs
+JIT-compile the included PTX on first use.
 See package.json for the paired GeosunPre revision and checksums.
+
+## License and Corresponding Source
+
+This trainer binary is built from modified LichtFeld Studio sources and is
+licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later)
+together with the LichtFeld Studio NVIDIA GPU Library Exception v1.0.
+Full license texts and third-party notices are provided in LICENSE,
+LICENSE-EXCEPTION.txt, THIRD_PARTY_LICENSES.md, and
+share/LichtFeld-Studio/licenses/.
+
+When packaged alongside an independent preprocessing tool as an Aggregate
+under GPLv3 Section 5, this trainer runs as a separate operating-system process
+communicating strictly via standard dataset and output directories on disk.
+
+In accordance with GPLv3 Section 6, any recipient of this binary package may
+obtain the complete machine-readable Corresponding Source (including build
+scripts and modifications matching the commit hash recorded in `revision` in
+package.json) free of charge from the distributor's published source channel
+or upon written request to the distributor.
 '@ | Set-Content -LiteralPath (Join-Path $stage 'README.md') -Encoding Ascii
 
 $files = [ordered]@{}
