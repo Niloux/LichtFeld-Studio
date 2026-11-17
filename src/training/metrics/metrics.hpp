@@ -151,6 +151,8 @@ namespace lfs::training {
         float bias_corr_r = 0.0f;
         float bias_corr_g = 0.0f;
         float bias_corr_b = 0.0f;
+        size_t rolling_shutter_cameras = 0;
+        size_t evaluated_cameras = 0;
         // With scored pixel sets, the fields above are the headline set's.
         lfs::core::param::EvalPixelSet headline = lfs::core::param::EvalPixelSet::Mask;
         PixelSetScores sets;
@@ -192,6 +194,9 @@ namespace lfs::training {
             }
             if (depth_prior_low_alpha && std::isfinite(*depth_prior_low_alpha)) {
                 ss << ", depth_prior_low_alpha: " << *depth_prior_low_alpha;
+            }
+            if (rolling_shutter_cameras > 0 || evaluated_cameras > 0) {
+                ss << ", rolling_shutter_cameras: " << rolling_shutter_cameras << "/" << evaluated_cameras;
             }
             return ss.str();
         }
@@ -290,6 +295,7 @@ namespace lfs::training {
         bool validity_mask_applied = false;
         bool erode_ssim_mask = false;
         bool user_mask_applied = false;
+        bool rolling_shutter_active = false;
     };
 
     struct EvaluationMesh {

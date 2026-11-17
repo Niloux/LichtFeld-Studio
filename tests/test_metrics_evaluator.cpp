@@ -2253,3 +2253,175 @@ TEST(MetricsEvaluator, IgnoredPaintCannotChangeSidecarAlphaOrFolderScores) {
     }
     std::filesystem::remove_all(tmp);
 }
+
+// SegmentAndIgnore treats only 255 pixels as keep, ignoring 128 sky/segment and 0 ignore pixels
+// consistently across sidecar masks, RGBA alpha and masks:<folder>.
+TEST(MetricsEvaluator, SegmentAndIgnoreScoresOnlyWhiteKeepPixelsAcrossSidecarAlphaAndFolder) {
+    if (!torch::cuda::is_available())
+        GTEST_SKIP() << "CUDA not available";
+    ensure_image_loader();
+    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_sai_consistency";
+    std::filesystem::remove_all(tmp);
+    std::filesystem::create_directories(tmp / "masks");
+    constexpr int h = 48, w = 64;
+    constexpr float kExpectedKeepFraction = (16.0f * 16.0f) / static_cast<float>(h * w);
+
+    std::vector<float> sidecar_or_folder_psnr;
+    for (const int source : {0, 1, 2}) {
+        SCOPED_TRACE(::testing::Message() << "source=" << source);
+        std::vector<float> ssims;
+        std::vector<float> psnrs;
+        for (const bool painted : {false, true}) {
+            const auto stem = std::to_string(source) + "_" + std::to_string(painted);
+            const auto image_path = tmp / (stem + ".png");
+            const auto mask_path = tmp / "masks" / (stem + ".png");
+            const int channels = source == 1 ? 4 : 3;
+            std::vector<uint8_t> pixels(h * w * channels, 100), weights(h * w, 0);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const int p = y * w + x;
+                    const bool is_keep = (x >= 16 && x < 32 && y >= 16 && y < 32);
+                    const bool is_segment_sky = (x >= 32 && x < 48 && y >= 16 && y < 32);
+                    const uint8_t value = is_keep ? 255 : (is_segment_sky ? 128 : 0);
+                    weights[p] = value;
+                    if (channels == 4)
+                        pixels[p * channels + 3] = value;
+                    if (painted && !is_keep) {
+                        pixels[p * channels] = is_segment_sky ? 255 : 0;
+                        pixels[p * channels + 1] = is_segment_sky ? 0 : 255;
+                        pixels[p * channels + 2] = 0;
+                    }
+                }
+            }
+            ASSERT_TRUE(lfs::core::save_png(image_path, pixels.data(), w, h, channels, 8, 0));
+            ASSERT_TRUE(lfs::core::save_png(mask_path, weights.data(), w, h, 1, 8, 0));
+            auto cam = std::make_shared<Camera>(
+                Tensor::eye(3, Device::CUDA), Tensor::zeros({3}, Device::CUDA),
+                64.0f, 64.0f, 32.0f, 24.0f, Tensor{}, Tensor{}, CameraModelType::PINHOLE,
+                image_path.filename().string(), image_path,
+                source == 0 ? mask_path : std::filesystem::path{}, w, h, 0);
+            if (source == 1)
+                cam->set_has_alpha(true);
+            auto dataset = std::make_shared<CameraDataset>(std::vector<std::shared_ptr<Camera>>{cam},
+                                                           DatasetConfig{}, CameraDataset::Split::ALL);
+            auto params = make_eval_params(tmp / ("out_" + stem));
+            params.optimization.mask_mode = lfs::core::param::MaskMode::SegmentAndIgnore;
+            params.optimization.mask_threshold = 0.5f;
+            params.optimization.use_alpha_as_mask = source == 1;
+            if (source == 2)
+                params.optimization.eval_mask = "masks:" + (tmp / "masks").string();
+            std::filesystem::create_directories(params.dataset.output_path);
+            MetricsEvaluator evaluator(params);
+            if (source == 2)
+                ASSERT_TRUE(evaluator.install_eval_mask_source({0, 0, 0}).has_value());
+            const auto render = [](Camera&, Camera&, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+                lfs::training::RenderOutput output;
+                output.image = Tensor::full({3, h, w}, 120.0f / 255.0f, Device::CUDA);
+                return lfs::training::EvaluationRenderResult{.output = std::move(output)};
+            };
+            const auto result = evaluator.evaluate_views(1, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+            ASSERT_TRUE(result.valid);
+            ASSERT_EQ(result.views.size(), 1u);
+            ASSERT_TRUE(result.views[0].masked);
+            EXPECT_NEAR(result.views[0].evaluated_pixel_fraction, kExpectedKeepFraction, 1e-6f);
+            ASSERT_TRUE(std::isfinite(result.psnr));
+            ASSERT_TRUE(std::isfinite(result.ssim));
+            ssims.push_back(result.ssim);
+            psnrs.push_back(result.psnr);
+        }
+        EXPECT_NEAR(ssims[0], ssims[1], 1e-6f);
+        EXPECT_FLOAT_EQ(psnrs[0], psnrs[1]);
+        sidecar_or_folder_psnr.push_back(psnrs[0]);
+    }
+    ASSERT_EQ(sidecar_or_folder_psnr.size(), 3u);
+    EXPECT_FLOAT_EQ(sidecar_or_folder_psnr[0], sidecar_or_folder_psnr[1]);
+    EXPECT_FLOAT_EQ(sidecar_or_folder_psnr[0], sidecar_or_folder_psnr[2]);
+    std::filesystem::remove_all(tmp);
+}
+
+// Evaluation explicitly counts and reports cameras whose rolling-shutter readout is actually active.
+TEST(MetricsEvaluator, RecordsRollingShutterActiveCameraCount) {
+    if (!torch::cuda::is_available())
+        GTEST_SKIP() << "CUDA not available";
+    ensure_image_loader();
+
+    const auto tmp = std::filesystem::temp_directory_path() / "lfs_eval_rolling_shutter";
+    std::filesystem::remove_all(tmp);
+    std::filesystem::create_directories(tmp);
+    constexpr int kW = 32, kH = 24;
+    const auto img_a = tmp / "a.png";
+    const auto img_b = tmp / "b.png";
+    write_rgb_png(img_a, 100, 100, 100, kH, kW);
+    write_rgb_png(img_b, 100, 100, 100, kH, kW);
+
+    const lfs::core::RollingShutterMotion motion{
+        .readout_rows = true, .rotation = {0.01f, 0.0f, 0.0f}, .displacement = {0.0f, 0.0f, 0.0f}};
+
+    auto read_report = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+
+    for (const bool gut : {true, false}) {
+        auto cam_a = std::make_shared<Camera>(
+            Tensor::eye(3, Device::CUDA), Tensor::zeros({3}, Device::CUDA),
+            32.0f, 32.0f, 16.0f, 12.0f, Tensor{}, Tensor{}, CameraModelType::FISHEYE,
+            "a.png", img_a, std::filesystem::path{}, kW, kH, 0);
+        cam_a->set_rolling_shutter(motion);
+        auto cam_b = std::make_shared<Camera>(
+            Tensor::eye(3, Device::CUDA), Tensor::zeros({3}, Device::CUDA),
+            32.0f, 32.0f, 16.0f, 12.0f, Tensor{}, Tensor{}, CameraModelType::FISHEYE,
+            "b.png", img_b, std::filesystem::path{}, kW, kH, 1);
+        auto dataset = std::make_shared<CameraDataset>(
+            std::vector<std::shared_ptr<Camera>>{cam_a, cam_b}, DatasetConfig{}, CameraDataset::Split::ALL);
+        auto params = make_eval_params(tmp / (gut ? "gut_on" : "gut_off"));
+        params.optimization.gut = gut;
+        std::filesystem::create_directories(params.dataset.output_path);
+        MetricsEvaluator evaluator(params);
+        const auto render = [](Camera&, Camera& render_cam, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+            lfs::training::RenderOutput output;
+            output.image = Tensor::full({3, static_cast<size_t>(render_cam.image_height()),
+                                         static_cast<size_t>(render_cam.image_width())},
+                                        0.5f, Device::CUDA);
+            return lfs::training::EvaluationRenderResult{.output = std::move(output)};
+        };
+        const auto metrics = evaluator.evaluate_views(10, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+        evaluator.save_report();
+        ASSERT_TRUE(metrics.valid);
+        EXPECT_EQ(metrics.evaluated_cameras, 2u);
+        EXPECT_EQ(metrics.rolling_shutter_cameras, gut ? 1u : 0u);
+        const std::string expected_token = gut ? "rolling_shutter_cameras: 1/2" : "rolling_shutter_cameras: 0/2";
+        EXPECT_NE(metrics.to_string().find(expected_token), std::string::npos);
+        const auto report_text = read_report(params.dataset.output_path / "metrics_report.txt");
+        const std::string expected_report = gut ? "Rolling shutter cameras: 1 / 2" : "Rolling shutter cameras: 0 / 2";
+        EXPECT_NE(report_text.find(expected_report), std::string::npos);
+    }
+
+    for (const auto space : {lfs::core::param::EvalSpace::Distorted, lfs::core::param::EvalSpace::Undistorted}) {
+        auto cam = make_distorted_eval_camera(img_a, {}, kW, kH);
+        cam->set_rolling_shutter(motion);
+        auto dataset = std::make_shared<CameraDataset>(
+            std::vector<std::shared_ptr<Camera>>{cam}, DatasetConfig{}, CameraDataset::Split::ALL);
+        auto params = make_eval_params(tmp / (space == lfs::core::param::EvalSpace::Distorted ? "native_gut" : "undistorted"));
+        params.optimization.gut = true;
+        params.optimization.undistort = true;
+        params.optimization.eval_space = space;
+        std::filesystem::create_directories(params.dataset.output_path);
+        MetricsEvaluator evaluator(params);
+        bool saw_rolling_shutter = false;
+        const auto render = [&saw_rolling_shutter](Camera&, Camera& render_cam, float) -> lfs::Result<lfs::training::EvaluationRenderResult> {
+            saw_rolling_shutter = render_cam.rolling_shutter().has_value();
+            lfs::training::RenderOutput output;
+            output.image = Tensor::full({3, static_cast<size_t>(render_cam.image_height()),
+                                         static_cast<size_t>(render_cam.image_width())},
+                                        0.5f, Device::CUDA);
+            return lfs::training::EvaluationRenderResult{.output = std::move(output)};
+        };
+        const auto metrics = evaluator.evaluate_views(20, dataset, {.render = render}, Tensor::zeros({3}, Device::CUDA));
+        ASSERT_TRUE(metrics.valid);
+        EXPECT_EQ(metrics.evaluated_cameras, 1u);
+        EXPECT_EQ(metrics.rolling_shutter_cameras, space == lfs::core::param::EvalSpace::Distorted ? 1u : 0u);
+        EXPECT_TRUE(saw_rolling_shutter);
+    }
+    std::filesystem::remove_all(tmp);
+}

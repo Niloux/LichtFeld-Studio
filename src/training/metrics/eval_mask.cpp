@@ -92,6 +92,15 @@ namespace lfs::training {
             }
         }
 
+        [[nodiscard]] lfs::core::Tensor finish_keep_mask(
+            lfs::core::Tensor mask,
+            const bool segment_and_ignore) {
+            if (!mask.is_valid()) {
+                return {};
+            }
+            return segment_and_ignore ? classify_keep_mask_for_metrics(mask) : std::move(mask);
+        }
+
         [[nodiscard]] lfs::core::Tensor load_sidecar_keep_mask(
             lfs::core::Camera& camera,
             const MetricsMaskLoadConfig& config) {
@@ -103,13 +112,7 @@ namespace lfs::training {
                 config.mask_threshold,
                 !sai,
                 config.apply_undistortion);
-            if (!mask.is_valid()) {
-                return {};
-            }
-            if (sai) {
-                return classify_keep_mask_for_metrics(mask);
-            }
-            return mask;
+            return finish_keep_mask(std::move(mask), sai);
         }
 
     } // namespace
@@ -148,6 +151,22 @@ namespace lfs::training {
         if (config.replace_gt_image)
             gt_image = std::move(loaded->gt_image);
         return std::move(loaded->mask);
+    }
+
+    lfs::core::Tensor load_eval_mask_file(
+        const lfs::core::Camera& camera,
+        const std::filesystem::path& path,
+        const MetricsMaskLoadConfig& config) {
+        const bool sai = is_segment_and_ignore(config.mask_mode);
+        auto mask = camera.load_mask_file(
+            path,
+            config.resize_factor,
+            config.max_width,
+            config.invert_masks,
+            config.mask_threshold,
+            !sai,
+            config.apply_undistortion);
+        return finish_keep_mask(std::move(mask), sai);
     }
 
     std::expected<lfs::core::Tensor, std::string> load_external_mask_for_metrics(

@@ -724,11 +724,12 @@ namespace lfs::training {
                         return evaluation_error(std::format("no evaluation mask for '{}' in the mask folder",
                                                             camera.image_name()),
                                                 LFS_SOURCE_SITE_CURRENT());
-                    inputs.user_mask = camera.load_mask_file(
-                        mask_path, params.dataset.resize_factor, params.dataset.max_width,
-                        false, params.optimization.mask_threshold, true,
-                        undistorted_reference);
-                    if (inputs.user_mask.shape() != lfs::core::TensorShape({inputs.gt_image.shape()[1], inputs.gt_image.shape()[2]}))
+                    auto mask_config = metrics_mask_config_from(params);
+                    mask_config.invert_masks = false;
+                    mask_config.apply_undistortion = undistorted_reference;
+                    inputs.user_mask = lfs::training::load_eval_mask_file(camera, mask_path, mask_config);
+                    if (!inputs.user_mask.is_valid() ||
+                        inputs.user_mask.shape() != lfs::core::TensorShape({inputs.gt_image.shape()[1], inputs.gt_image.shape()[2]}))
                         return evaluation_error(std::format("evaluation mask '{}' does not match the image size",
                                                             lfs::core::path_to_utf8(mask_path)),
                                                 LFS_SOURCE_SITE_CURRENT());
@@ -798,6 +799,7 @@ namespace lfs::training {
                     camera.camera_model_type(), camera.image_name(), camera.image_path(),
                     camera.mask_path(), inputs.source_width, inputs.source_height,
                     camera.uid(), camera.camera_id(), camera.depth_path(), camera.normal_path());
+                scoped_camera->set_rolling_shutter(camera.rolling_shutter());
                 render_camera = &*scoped_camera;
                 const auto [fx, fy, cx, cy] = render_camera->get_intrinsics();
                 geometry = {
@@ -1105,6 +1107,16 @@ namespace lfs::training {
             const bool user_mask_applied = inputs.user_mask.is_valid() || mesh != nullptr || points != nullptr ||
                                            mask_splat != nullptr ||
                                            lfs::core::param::is_eval_mask_depth(params.optimization.eval_mask);
+            const auto& shutter_motion = render_camera->rolling_shutter();
+            const int shutter_extent = shutter_motion && shutter_motion->readout_rows
+                                           ? render_height
+                                           : render_width;
+            const bool rolling_shutter_active =
+                params.optimization.gut &&
+                shutter_motion.has_value() &&
+                !render_camera->is_undistort_prepared() &&
+                render_camera->camera_model_type() != lfs::core::CameraModelType::EQUIRECTANGULAR &&
+                shutter_extent > 1;
             return PreparedEvaluationView{
                 .inputs = std::move(inputs),
                 .output = std::move(rendered->output),
@@ -1116,7 +1128,8 @@ namespace lfs::training {
                 .erode_ssim_mask = warp_to_distorted || mesh != nullptr || points != nullptr || mask_folder != nullptr ||
                                    mask_splat != nullptr ||
                                    lfs::core::param::is_eval_mask_depth(params.optimization.eval_mask),
-                .user_mask_applied = user_mask_applied};
+                .user_mask_applied = user_mask_applied,
+                .rolling_shutter_active = rolling_shutter_active};
         } catch (const std::exception& e) {
             // LFS-CENSUS-OK(empty-catch): converted into a typed evaluation error
             return evaluation_error(e.what(), LFS_SOURCE_SITE_CURRENT());
@@ -1491,6 +1504,10 @@ namespace lfs::training {
                 report_file << "FLIP:  " << *final.flip << "\n";
             report_file << "Time per image: " << final.elapsed_time << " seconds\n";
             report_file << "Number of Gaussians: " << final.num_gaussians << "\n";
+            if (final.rolling_shutter_cameras > 0 || final.evaluated_cameras > 0) {
+                report_file << "Rolling shutter cameras: " << final.rolling_shutter_cameras
+                            << " / " << final.evaluated_cameras << "\n";
+            }
             report_file << "Bias (raw):  (" << final.bias_r << ", " << final.bias_g << ", " << final.bias_b << ")\n";
             report_file << "Bias (corrected):  (" << final.bias_corr_r << ", " << final.bias_corr_g << ", "
                         << final.bias_corr_b << ")\n";
@@ -1769,6 +1786,7 @@ namespace lfs::training {
                                                                               : std::vector<std::string>{};
         size_t skipped_images = 0;
         size_t evaluated_images = 0;
+        size_t rolling_shutter_cameras = 0;
         size_t saved_images = 0;
         std::optional<std::pair<int, int>> lpips_preflight_size;
         cudaEvent_t lpips_start_event = nullptr;
@@ -1919,6 +1937,9 @@ namespace lfs::training {
             view.ssim = ssim;
             view.masked = headline_pixels.is_valid();
             evaluated_images++;
+            if (prepared->rolling_shutter_active) {
+                rolling_shutter_cameras++;
+            }
 
             struct MaskSet {
                 std::string_view name;
@@ -2404,9 +2425,14 @@ namespace lfs::training {
         }
 
         result.valid = true;
+        result.rolling_shutter_cameras = rolling_shutter_cameras;
+        result.evaluated_cameras = evaluated_images;
 
         if (!source.report_scores)
             return result;
+
+        LOG_INFO("Eval: rolling shutter active for {} / {} cameras",
+                 result.rolling_shutter_cameras, result.evaluated_cameras);
 
         // Emit evaluation completed event for GUI display and other subscribers.
         lfs::core::events::state::EvaluationCompleted{

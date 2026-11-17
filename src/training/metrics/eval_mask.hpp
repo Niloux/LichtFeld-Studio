@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 #include <expected>
+#include <filesystem>
 #include <string>
 
 namespace lfs::training {
@@ -53,6 +54,12 @@ namespace lfs::training {
         lfs::core::Camera* cam,
         lfs::core::Tensor& gt_image,
         bool alpha_as_mask,
+        const MetricsMaskLoadConfig& config);
+
+    /// Explicit-file / mask-folder loader matching sidecar SegmentAndIgnore keep classification.
+    [[nodiscard]] lfs::core::Tensor load_eval_mask_file(
+        const lfs::core::Camera& camera,
+        const std::filesystem::path& path,
         const MetricsMaskLoadConfig& config);
 
     /// Interactive sidecar loader. Uses Camera::load_and_get_mask (lossless PNG /
