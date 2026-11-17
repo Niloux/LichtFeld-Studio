@@ -121,6 +121,7 @@ target_compile_options(lfs_cuda_diagnostics_compile_check PRIVATE
 )
 
 # Windows: Disable fmt Unicode check for CUDA files
+target_compile_definitions(lfs_core_cuda PRIVATE LFS_CORE_EXPORTS)
 if(MSVC)
     target_compile_definitions(lfs_core_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>

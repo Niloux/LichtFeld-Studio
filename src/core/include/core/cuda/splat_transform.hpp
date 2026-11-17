@@ -1,17 +1,18 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
+#include "core/export.hpp"
 #include "core/splat_transform_math.hpp"
 #include <cstddef>
 #include <cuda_runtime.h>
 
 namespace lfs::core::cuda {
-    void transform_splat_geometry(const splat_transform::LinearTransform& matrix,
-                                  const float* scales, const float* rotations,
-                                  float* out_scales, float* out_rotations,
-                                  std::size_t count, cudaStream_t stream);
+    LFS_CORE_API void transform_splat_geometry(const splat_transform::LinearTransform& matrix,
+                                               const float* scales, const float* rotations,
+                                               float* out_scales, float* out_rotations,
+                                               std::size_t count, cudaStream_t stream);
     // Per-axis min/max over finite rows that `deleted` (nullable) keeps, reduced
     // into six device words of `scratch`. False when no row qualifies.
-    bool splat_position_bounds(const float* means, const unsigned char* deleted, std::size_t count,
-                               unsigned* scratch, float out_min[3], float out_max[3], cudaStream_t stream);
+    LFS_CORE_API bool splat_position_bounds(const float* means, const unsigned char* deleted, std::size_t count,
+                                            unsigned* scratch, float out_min[3], float out_max[3], cudaStream_t stream);
 } // namespace lfs::core::cuda

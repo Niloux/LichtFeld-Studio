@@ -49,13 +49,15 @@ target_include_directories(lfs_training_kernels
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(lfs_training_kernels
     PUBLIC
         lfs_core         # For lfs::core::Tensor (tensor merged into lfs_core)
         CUDA::cudart
-        lfs_core_cuda    # q16 encode/decode kernels
 )
 
 set_target_properties(lfs_training_kernels PROPERTIES

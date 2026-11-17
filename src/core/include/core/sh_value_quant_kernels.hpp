@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -17,7 +19,7 @@ namespace lfs::core::sh_value_quant {
     };
 
     /// Encode float4-swizzled SH-rest into pad-dropped u16 + float2 bounds / 256.
-    void encode_shN_float4_to_u16(
+    LFS_CORE_API void encode_shN_float4_to_u16(
         const float* src_float4_swizzled,
         std::uint16_t* dst_u16,
         float* bounds_float2,
@@ -26,7 +28,7 @@ namespace lfs::core::sh_value_quant {
         cudaStream_t stream = nullptr);
 
     /// Decode u16 + bounds into float4-swizzled (zeros float4 tail pad).
-    void decode_shN_u16_to_float4(
+    LFS_CORE_API void decode_shN_u16_to_float4(
         const std::uint16_t* src_u16,
         const float* bounds_float2,
         float* dst_float4_swizzled,
@@ -38,7 +40,7 @@ namespace lfs::core::sh_value_quant {
     /// primitive perm[dest_offset + i] and writes float4-swizzled storage as
     /// if those n_dst primitives started at index 0. Source bounds are the
     /// live per-256-block table indexed by the source primitive.
-    void decode_shN_u16_gathered_to_float4(
+    LFS_CORE_API void decode_shN_u16_gathered_to_float4(
         const std::uint16_t* src_u16,
         const float* src_bounds_float2,
         const std::int64_t* perm,
@@ -52,7 +54,7 @@ namespace lfs::core::sh_value_quant {
     /// Sequential decode of prims [src_offset, src_offset + n_dst) into a
     /// compact float4-swizzled buffer that treats those prims as 0..n_dst-1.
     /// Prims with source index >= n_src_primitives are written as zeros.
-    void decode_shN_u16_range_to_float4(
+    LFS_CORE_API void decode_shN_u16_range_to_float4(
         const std::uint16_t* src_u16,
         const float* src_bounds_float2,
         float* dst_float4_swizzled,
@@ -64,7 +66,7 @@ namespace lfs::core::sh_value_quant {
         bool match_cpu_rounding = false);
 
     /// Gather-decode selected source prims into canonical [n_dst, rest, 3].
-    void decode_shN_u16_gathered_to_canonical(
+    LFS_CORE_API void decode_shN_u16_gathered_to_canonical(
         const std::uint16_t* src_u16,
         const float* src_bounds_float2,
         const std::int64_t* perm,
@@ -77,7 +79,7 @@ namespace lfs::core::sh_value_quant {
         bool host_rounding = false);
 
     /// Gather selected FP32/IEEE-f16 rows and bands from float4-swizzled storage.
-    void decode_shN_float_gathered_to_canonical(
+    LFS_CORE_API void decode_shN_float_gathered_to_canonical(
         const void* source, bool half, const std::int64_t* rows, float* output,
         std::size_t count, std::size_t n_src, std::uint32_t layout_rest,
         std::uint32_t selected_rest, cudaStream_t stream = nullptr);
@@ -86,7 +88,7 @@ namespace lfs::core::sh_value_quant {
     /// chunk of n_chunk prims that represents global prims
     /// [block_start, block_start + n_chunk). dest_indices[group_offset + i]
     /// is the global primitive for canonical row group_offset + i.
-    void overlay_canonical_into_float4_chunk(
+    LFS_CORE_API void overlay_canonical_into_float4_chunk(
         const float* src_canonical,
         const std::int64_t* dest_indices,
         float* dst_float4_swizzled,
@@ -98,7 +100,7 @@ namespace lfs::core::sh_value_quant {
         cudaStream_t stream = nullptr);
 
     /// block_id[i] = dest_indices[i] / 256 as float32 (exact for training-scale N).
-    void fill_quant_block_ids_f32(
+    LFS_CORE_API void fill_quant_block_ids_f32(
         const std::int64_t* dest_indices,
         float* block_ids_f32,
         std::size_t n,
@@ -107,7 +109,7 @@ namespace lfs::core::sh_value_quant {
     /// Compact unique block-ids and run starts from already-sorted float block ids.
     /// unique_block_ids[0..n_runs) and run_offsets[0..n_runs) stay on device.
     /// n_runs_device[0] is the run count. No host readback of block ids.
-    void build_sorted_block_runs(
+    LFS_CORE_API void build_sorted_block_runs(
         const float* sorted_block_ids,
         std::int32_t* unique_block_ids,
         std::int32_t* run_offsets,
@@ -117,7 +119,7 @@ namespace lfs::core::sh_value_quant {
         const SortedBlockRunScratch* scratch = nullptr);
 
     /// Query the CUB scan storage needed by build_sorted_block_runs.
-    std::size_t sorted_block_runs_scan_workspace_bytes(
+    LFS_CORE_API std::size_t sorted_block_runs_scan_workspace_bytes(
         std::size_t n,
         cudaStream_t stream = nullptr);
 
@@ -126,7 +128,7 @@ namespace lfs::core::sh_value_quant {
     /// encode in place. Grid may be K; extra blocks no-op via n_runs_device.
     /// Sorted entry i reads canonical row canonical_rows[i], or row i when
     /// canonical_rows is null (canonical already in sorted order).
-    void reencode_touched_q16_blocks(
+    LFS_CORE_API void reencode_touched_q16_blocks(
         std::uint16_t* codes,
         float* bounds_float2,
         const float* canonical,
@@ -146,7 +148,7 @@ namespace lfs::core::sh_value_quant {
     /// [cell_begin, cell_end) of every dest primitive, written as a code array
     /// with (cell_end - cell_begin) cells per primitive. Together they produce
     /// the same codes and bounds as encode_shN_u16_gathered.
-    void gathered_shN_u16_block_bounds(
+    LFS_CORE_API void gathered_shN_u16_block_bounds(
         const std::uint16_t* src_u16,
         const float* src_bounds_float2,
         const std::int64_t* perm,
@@ -156,7 +158,7 @@ namespace lfs::core::sh_value_quant {
         std::uint32_t coeffs_rest,
         cudaStream_t stream = nullptr);
 
-    void encode_shN_u16_gathered_cells(
+    LFS_CORE_API void encode_shN_u16_gathered_cells(
         const std::uint16_t* src_u16,
         const float* src_bounds_float2,
         const std::int64_t* perm,
@@ -171,7 +173,7 @@ namespace lfs::core::sh_value_quant {
 
     /// Gather-decode perm[dest] with source per-block bounds, reduce dest
     /// bounds, encode dest 256-splat blocks. One launch for the whole dest.
-    void encode_shN_u16_gathered(
+    LFS_CORE_API void encode_shN_u16_gathered(
         const std::uint16_t* src_u16,
         const float* src_bounds_float2,
         const std::int64_t* perm,
@@ -182,7 +184,7 @@ namespace lfs::core::sh_value_quant {
         std::uint32_t coeffs_rest,
         cudaStream_t stream = nullptr);
 
-    void decode_shN_u16_range_to_canonical(
+    LFS_CORE_API void decode_shN_u16_range_to_canonical(
         const std::uint16_t* src_u16,
         const float* bounds_float2,
         float* dst_canonical,
@@ -193,7 +195,7 @@ namespace lfs::core::sh_value_quant {
         std::uint32_t layout_coeffs_rest,
         cudaStream_t stream = nullptr);
 
-    void decode_shN_f16_range_to_canonical(
+    LFS_CORE_API void decode_shN_f16_range_to_canonical(
         const std::uint16_t* src_f16,
         float* dst_canonical,
         std::uint64_t canonical_float_offset,

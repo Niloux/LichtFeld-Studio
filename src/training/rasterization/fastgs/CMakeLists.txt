@@ -30,6 +30,7 @@ target_include_directories(fastlfs_backend
         ${CMAKE_CURRENT_SOURCE_DIR}/optimizer/include
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
         ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/core/include
         ${CUDAToolkit_INCLUDE_DIRS}
         PRIVATE
@@ -42,7 +43,7 @@ target_link_libraries(fastlfs_backend
         CUDA::cudart
         CUDA::curand
         ${CUDA_CUDA_LIBRARY}
-        lfs_core_cuda  # CUDA utilities from core module (memory arena)
+        lfs_core       # CUDA utilities from core module (memory arena)
 )
 
 target_compile_options(fastlfs_backend PRIVATE

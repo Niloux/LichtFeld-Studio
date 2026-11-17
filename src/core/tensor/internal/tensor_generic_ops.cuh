@@ -2,35 +2,20 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#define LFS_TENSOR_GENERIC_OPS_CUH_INCLUDED
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
 #include <thrust/transform.h>
 
 #include "tensor_functors.hpp"
+#include "thrust_policy.cuh"
 
 // Include vectorized operations for float4 / half128 optimizations
 #include "tensor_vectorized_ops.cuh"
 
 namespace lfs::core::tensor_ops {
-
-    // ============================================================================
-    // THRUST POLICY HELPER - Stream support for Thrust operations
-    // ============================================================================
-
-    template <typename Func>
-    inline void run_with_thrust_policy(cudaStream_t stream, Func&& func) {
-        // thrust::cuda::par is synchronous regardless of .on(stream): the calling
-        // thread waits for the stream before the algorithm returns. .on(stream)
-        // only selects which stream to enqueue on; it does not make the call async.
-        // par_nosync skips that blocking wait. Callers get stream-order guarantees
-        // only — later work on the same stream (or an explicit sync) must consume
-        // the output. Do not use this helper for reduce/scan/sort or any algorithm
-        // that returns a host-side result.
-        func(thrust::cuda::par_nosync.on(stream));
-    }
 
     // ============================================================================
     // GENERIC OPERATIONS - Header-only for optimal inlining and specialization

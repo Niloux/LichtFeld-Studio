@@ -21,28 +21,30 @@ namespace lfs::core {
 } // namespace lfs::core
 
 // ============= Generic CUDA Operations =============
-// Include template implementation for inline instantiation
-// Only include in CUDA compilation units - C++ files will link to .cu implementations
+// Explicit instantiations live in tensor_exports.cu (lfs_core DLL); CUDA units
+// outside tensor_exports.cu link against those exports instead of re-instantiating
+// every functor/dtype kernel per translation unit.
 #ifdef __CUDACC__
-#include "tensor_generic_ops.cuh"
 #include <cfloat>
 #define CUDA_INFINITY FLT_MAX
 #else
-// Forward declaration for C++ files - implementation in tensor_ops.cu
+#define CUDA_INFINITY INFINITY
+#endif
+
+#ifndef LFS_TENSOR_GENERIC_OPS_CUH_INCLUDED
 namespace lfs::core::tensor_ops {
     template <typename InT, typename OutT, typename Op>
     LFS_CORE_API void launch_binary_op_generic(const InT* a, const InT* b, OutT* c, size_t n,
                                                Op op, cudaStream_t stream = nullptr);
 
-    template <typename T, typename OutT, typename Op>
-    LFS_CORE_API void launch_unary_op_generic(const T* input, OutT* output, size_t n,
+    template <typename InT, typename OutT, typename Op>
+    LFS_CORE_API void launch_unary_op_generic(const InT* input, OutT* output, size_t n,
                                               Op op, cudaStream_t stream = nullptr);
 
     template <typename T, typename OutputT, typename Op>
     LFS_CORE_API void launch_scalar_op_generic(const T* data, T scalar, OutputT* result, size_t n,
                                                Op op, cudaStream_t stream = nullptr);
 } // namespace lfs::core::tensor_ops
-#define CUDA_INFINITY INFINITY
 #endif
 
 // ============= CPU Helpers (Generic, Header-Only) =============
@@ -236,19 +238,15 @@ namespace lfs::core::tensor_ops {
 
 } // namespace lfs::core::tensor_ops
 
-// Include template implementation for inline instantiation
-// Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
-#include "tensor_broadcast_ops.cuh"
-#else
-// Forward declaration for C++ files - implementation in tensor_broadcast_ops.cu
+// Explicit instantiations live in tensor_broadcast_ops.cu (lfs_core DLL).
+#ifndef LFS_TENSOR_BROADCAST_OPS_CUH_INCLUDED
 namespace lfs::core::tensor_ops {
     template <typename T, typename OutputT, typename BinaryOp>
     LFS_CORE_API void launch_broadcast_binary(const T* a, const T* b, OutputT* c,
                                               const size_t* a_shape, const size_t* b_shape, const size_t* c_shape,
                                               size_t a_rank, size_t b_rank, size_t c_rank,
                                               size_t c_elements, BinaryOp op, cudaStream_t stream);
-}
+} // namespace lfs::core::tensor_ops
 #endif
 
 namespace lfs::core::tensor_ops {

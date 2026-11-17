@@ -179,6 +179,13 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Shared CACHE STRING "CUDA runtime linkage" FORCE)
 # Shared weak template stubs can otherwise select a program with different math flags.
 add_compile_options($<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--static-global-template-stub=true>)
 
+# Compress both PTX and SASS ELF images inside fatbinaries in non-Debug builds.
+# CUDA 12.8+ supports --compress-mode=size; the driver decompresses lazily on module load.
+add_compile_options($<$<AND:$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>,$<NOT:$<CONFIG:Debug>>>:-Xfatbin=-compress-all>)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+    add_compile_options($<$<AND:$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>,$<NOT:$<CONFIG:Debug>>>:--compress-mode=size>)
+endif()
+
 # On Windows with a multi-config generator (MSVC/Visual Studio, Ninja Multi-Config),
 # route all build outputs to build/<Config>/ so Debug and Release binaries are
 # separated. Single-config generators (Ninja, NMake) use a flat binary dir —

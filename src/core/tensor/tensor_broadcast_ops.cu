@@ -6,8 +6,10 @@
 #include "core/logger.hpp"
 #include "core/tensor_fwd.hpp"
 #include "internal/memory_pool.hpp"
+#include "internal/tensor_broadcast_ops.cuh"
 #include "internal/tensor_functors.hpp"
 #include "internal/tensor_ops.hpp"
+#include "internal/thrust_policy.cuh"
 #include <cuda_runtime.h>
 #include <thrust/copy.h>
 #include <thrust/device_ptr.h>

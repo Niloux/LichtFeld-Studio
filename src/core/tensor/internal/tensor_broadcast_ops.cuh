@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#define LFS_TENSOR_BROADCAST_OPS_CUH_INCLUDED
 
 #include "core/assert.hpp"
 #include "core/cuda_error.hpp"

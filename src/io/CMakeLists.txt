@@ -431,9 +431,9 @@ target_link_libraries(lfs_io
         OpenSSL::Crypto
         xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
         CUDA::cudart           # CUDA runtime for nvImageCodec
+        CUDA::cuda_driver      # CUDA driver API for nvcodec context handoff
         lfs_io_cuda            # IO-specific CUDA kernels (morton, e-means)
         lfs_io_rad_quant_cuda  # RAD encode quantization (bit-exact, no fast math)
-        lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
         lfs_tinyusdz           # USDA parser for flat Gaussian ParticleField interchange
         OpenMeshCore

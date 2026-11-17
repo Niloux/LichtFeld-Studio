@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -102,31 +104,31 @@ namespace lfs::core {
     }
 
     // CUDA VMM allocation granularity for `device` (2 MiB on current NVIDIA).
-    [[nodiscard]] std::size_t exportable_allocation_granularity(int device = 0);
+    [[nodiscard]] LFS_CORE_API std::size_t exportable_allocation_granularity(int device = 0);
 
     // Allocates a block reserving max(reserve_bytes, size) virtual bytes and
     // committing [0, size) as shareable chunks. `size` must be non-zero.
-    [[nodiscard]] std::expected<std::shared_ptr<ExportableBlock>, std::string>
+    [[nodiscard]] LFS_CORE_API std::expected<std::shared_ptr<ExportableBlock>, std::string>
     allocateExportableDeviceBlock(std::size_t size, int device = 0, bool track_splat_bytes = true,
                                   std::size_t reserve_bytes = 0);
 
     // Commits the granularity-aligned cover of [offset, offset+bytes) minus
     // ranges that are already committed. Holes are allowed. Existing chunks are
     // untouched.
-    [[nodiscard]] std::expected<void, std::string>
+    [[nodiscard]] LFS_CORE_API std::expected<void, std::string>
     commitExportableDeviceRange(const std::shared_ptr<ExportableBlock>& block, std::size_t offset,
                                 std::size_t bytes);
 
     // Commits [committedPrefixBytes, new_size) as new chunk(s). Returns true if
     // any new physical was committed, false if the prefix already covered
     // new_size. device_ptr is unchanged. Importers bind newly appended chunks.
-    [[nodiscard]] std::expected<bool, std::string>
+    [[nodiscard]] LFS_CORE_API std::expected<bool, std::string>
     growExportableDeviceBlock(const std::shared_ptr<ExportableBlock>& block, std::size_t new_size);
 
     // Decommits whole exportable VMM chunks at or beyond new_size while keeping
     // the virtual reservation and device pointer stable. Any Vulkan import of
     // the affected chunks must be destroyed before this call.
-    [[nodiscard]] std::expected<bool, std::string>
+    [[nodiscard]] LFS_CORE_API std::expected<bool, std::string>
     shrinkExportableDeviceBlock(const std::shared_ptr<ExportableBlock>& block, std::size_t new_size);
 
 } // namespace lfs::core

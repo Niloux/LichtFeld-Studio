@@ -162,7 +162,7 @@ target_link_libraries(lfs_core
         CUDA::curand
         spdlog::spdlog
     PRIVATE
-        lfs_core_cuda
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,lfs_core_cuda>
         lfs_tensor_kernels
         lfs_nn_kernels
         taywee::args

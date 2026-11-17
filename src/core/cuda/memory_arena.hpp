@@ -234,17 +234,17 @@ namespace lfs::core {
 
     public:
         // Constructors
-        RasterizerMemoryArena();
-        explicit RasterizerMemoryArena(const Config& cfg);
-        ~RasterizerMemoryArena();
+        LFS_CORE_API RasterizerMemoryArena();
+        LFS_CORE_API explicit RasterizerMemoryArena(const Config& cfg);
+        LFS_CORE_API ~RasterizerMemoryArena();
 
         // Delete copy operations
         RasterizerMemoryArena(const RasterizerMemoryArena&) = delete;
         RasterizerMemoryArena& operator=(const RasterizerMemoryArena&) = delete;
 
         // Allow move operations
-        RasterizerMemoryArena(RasterizerMemoryArena&&) noexcept;
-        RasterizerMemoryArena& operator=(RasterizerMemoryArena&&) noexcept;
+        LFS_CORE_API RasterizerMemoryArena(RasterizerMemoryArena&&) noexcept;
+        LFS_CORE_API RasterizerMemoryArena& operator=(RasterizerMemoryArena&&) noexcept;
 
         // Stream-aware frames chain begin→end with a GPU event edge: begin_frame
         // waits (on `stream`) for the previous frame's completion event instead of
@@ -258,13 +258,13 @@ namespace lfs::core {
         // event nor cudaDeviceSynchronize can see in-flight Vulkan work, so the
         // next frame waits the imported timeline value instead.
         uint64_t begin_frame(bool from_rendering = false) { return begin_frame(nullptr, from_rendering); }
-        uint64_t begin_frame(cudaStream_t stream, bool from_rendering = false);
+        LFS_CORE_API uint64_t begin_frame(cudaStream_t stream, bool from_rendering = false);
         std::optional<uint64_t> try_begin_frame(bool from_rendering = false) { return try_begin_frame(nullptr, from_rendering); }
-        std::optional<uint64_t> try_begin_frame(cudaStream_t stream, bool from_rendering = false);
+        LFS_CORE_API std::optional<uint64_t> try_begin_frame(cudaStream_t stream, bool from_rendering = false);
         // Debug-only ownership assertion for the shared CUDA/Vulkan scratch
         // epoch. The preceding frame's CUDA event or imported Vulkan timeline
         // wait must have been installed before this frame can touch offset zero.
-        void assert_frame_handoff(uint64_t frame_id) const;
+        LFS_CORE_API void assert_frame_handoff(uint64_t frame_id) const;
 
         // Bounded wait: with a render pending (set_rendering_active), the trainer
         // cannot START a new frame, so waiting out its current one takes ~one
@@ -274,8 +274,8 @@ namespace lfs::core {
         std::optional<uint64_t> try_begin_frame_for(uint32_t timeout_ms, bool from_rendering = false) {
             return try_begin_frame_for(timeout_ms, nullptr, from_rendering);
         }
-        std::optional<uint64_t> try_begin_frame_for(uint32_t timeout_ms, cudaStream_t stream,
-                                                    bool from_rendering = false);
+        LFS_CORE_API std::optional<uint64_t> try_begin_frame_for(uint32_t timeout_ms, cudaStream_t stream,
+                                                                 bool from_rendering = false);
         using RenderHandoffToken = uint64_t;
         // Every live holder renews within a few milliseconds (the parked preview
         // polls at 4 ms, the navigation wait at 1 ms); the lease only bounds what
@@ -288,19 +288,19 @@ namespace lfs::core {
         // that request; an old token can never replace or cancel a newer owner.
         // Training frames still begin first while the turn ledger owes them
         // (owe_training_frames).
-        [[nodiscard]] RenderHandoffToken request_render_handoff(RenderHandoffToken current_token = 0);
-        void cancel_render_handoff(RenderHandoffToken token);
-        [[nodiscard]] bool has_render_handoff(RenderHandoffToken token) const;
+        [[nodiscard]] LFS_CORE_API RenderHandoffToken request_render_handoff(RenderHandoffToken current_token = 0);
+        LFS_CORE_API void cancel_render_handoff(RenderHandoffToken token);
+        [[nodiscard]] LFS_CORE_API bool has_render_handoff(RenderHandoffToken token) const;
         // True while this live reservation still lets training frames begin first.
-        [[nodiscard]] bool render_handoff_owes_training(RenderHandoffToken token) const;
+        [[nodiscard]] LFS_CORE_API bool render_handoff_owes_training(RenderHandoffToken token) const;
         // Stops this reservation from letting any further training frame begin.
-        void withdraw_render_handoff_training_frames(RenderHandoffToken token);
+        LFS_CORE_API void withdraw_render_handoff_training_frames(RenderHandoffToken token);
         // Lets `frames` training frames begin before a waiting renderer takes the
         // arena. Called by the viewer when it releases a navigation frame.
-        void owe_training_frames(uint32_t frames);
-        void prepare_viewer_frame();
-        void cancel_viewer_prediction();
-        [[nodiscard]] RenderHandoffToken reserve_next_viewer_turn(RenderHandoffToken current_token);
+        LFS_CORE_API void owe_training_frames(uint32_t frames);
+        LFS_CORE_API void prepare_viewer_frame();
+        LFS_CORE_API void cancel_viewer_prediction();
+        [[nodiscard]] LFS_CORE_API RenderHandoffToken reserve_next_viewer_turn(RenderHandoffToken current_token);
 
         // Measured turn costs, for the viewer's cadence budget.
         struct TurnStats {
@@ -311,23 +311,23 @@ namespace lfs::core {
             // Period between consecutive training frames with no viewer turn between.
             double training_step_ms = 0.0;
         };
-        [[nodiscard]] TurnStats turn_stats() const;
+        [[nodiscard]] LFS_CORE_API TurnStats turn_stats() const;
         // Test seam: registers an already-recorded event as the pending viewer
         // release, standing in for the imported Vulkan timeline. Owns the event;
         // the optional viewer stream remains owned by the caller.
-        void set_release_event_for_testing(cudaEvent_t event, cudaStream_t viewer_stream = nullptr);
+        LFS_CORE_API void set_release_event_for_testing(cudaEvent_t event, cudaStream_t viewer_stream = nullptr);
         // Host-waits for GPU work only within timeout_ms: while the previous
         // CUDA frame is still running on the GPU it polls that frame, then
         // declines like a busy arena, and the caller's reservation keeps the
         // next training frame out until it retries.
-        std::optional<uint64_t> try_begin_render_frame_for(
+        LFS_CORE_API std::optional<uint64_t> try_begin_render_frame_for(
             uint32_t timeout_ms, RenderHandoffToken token = 0);
         // True when a render holding this reservation could begin now without
         // waiting: no frame is active, no other reservation is live, and the
         // previous CUDA frame has finished on the GPU.
-        [[nodiscard]] bool render_frame_ready(RenderHandoffToken token = 0) const;
+        [[nodiscard]] LFS_CORE_API bool render_frame_ready(RenderHandoffToken token = 0) const;
         void end_frame(uint64_t frame_id, bool from_rendering = false) { end_frame(frame_id, nullptr, from_rendering); }
-        void end_frame(uint64_t frame_id, cudaStream_t stream, bool from_rendering = false);
+        LFS_CORE_API void end_frame(uint64_t frame_id, cudaStream_t stream, bool from_rendering = false);
 
         // Registers the Vulkan-side completion of the current frame's arena work
         // (an imported timeline + the value its submit signals). Consumed once by
@@ -335,10 +335,10 @@ namespace lfs::core {
         // admission (falling back to the tenant stream if setup fails).
         // The non-blocking viewer stream has already queued the input uploads.
         // Its owner must call drain_external_release before destroying it.
-        void await_external_release(cudaExternalSemaphore_t semaphore, uint64_t value, cudaStream_t viewer_stream);
+        LFS_CORE_API void await_external_release(cudaExternalSemaphore_t semaphore, uint64_t value, cudaStream_t viewer_stream);
         // Drain before destroying the imported semaphore, including after the
         // backing has been detached. No arena/model lock may be held.
-        void drain_external_release();
+        LFS_CORE_API void drain_external_release();
 
         // Caps wait-forever begin_frame() on the CURRENT thread to a bounded
         // wait for its scope — so a cross-thread reader (GUI metric render) that
@@ -348,8 +348,8 @@ namespace lfs::core {
         // Training threads never set this, so their acquisition stays blocking.
         class ScopedBeginFrameTimeout {
         public:
-            explicit ScopedBeginFrameTimeout(uint32_t timeout_ms);
-            ~ScopedBeginFrameTimeout();
+            LFS_CORE_API explicit ScopedBeginFrameTimeout(uint32_t timeout_ms);
+            LFS_CORE_API ~ScopedBeginFrameTimeout();
             ScopedBeginFrameTimeout(const ScopedBeginFrameTimeout&) = delete;
             ScopedBeginFrameTimeout& operator=(const ScopedBeginFrameTimeout&) = delete;
 
@@ -357,26 +357,26 @@ namespace lfs::core {
             uint32_t previous_ = 0;
         };
 
-        std::function<char*(size_t)> get_allocator(uint64_t frame_id,
-                                                   const char* label = nullptr);
-        std::vector<BufferHandle> get_frame_buffers(uint64_t frame_id) const;
-        void reset_frame(uint64_t frame_id); // Keeps allocation, resets offset
-        void cleanup_frames(int keep_recent = 3);
+        LFS_CORE_API std::function<char*(size_t)> get_allocator(uint64_t frame_id,
+                                                               const char* label = nullptr);
+        LFS_CORE_API std::vector<BufferHandle> get_frame_buffers(uint64_t frame_id) const;
+        LFS_CORE_API void reset_frame(uint64_t frame_id); // Keeps allocation, resets offset
+        LFS_CORE_API void cleanup_frames(int keep_recent = 3);
         // Named EXACT-3 boundaries only. Both methods globally gate begin_frame,
         // require zero active training/render frames, and device-synchronize
         // before changing physical mappings. B1 is non-blocking because its caller
         // holds topology locks; B3 waits for an already-active frame to finish.
-        bool shrink_to_current_at_boundary();
-        bool release_at_boundary();
+        LFS_CORE_API bool shrink_to_current_at_boundary();
+        LFS_CORE_API bool release_at_boundary();
         // VRAM pressure reclaim: releases every committed piece when no frame
         // is active and no viewer shares the backing, without waiting for a
         // lock. Returns the bytes released; the next frame commits them again.
-        size_t release_idle_for_pressure();
-        void full_reset();
-        bool install_external_backing(ExternalBacking backing);
+        LFS_CORE_API size_t release_idle_for_pressure();
+        LFS_CORE_API void full_reset();
+        LFS_CORE_API bool install_external_backing(ExternalBacking backing);
         // With a nonzero timeout, reserve the next idle window against new training
         // frames. Zero keeps the try-only path used by callers that must not wait.
-        bool try_install_external_backing(ExternalBacking backing, uint32_t timeout_ms = 0);
+        LFS_CORE_API bool try_install_external_backing(ExternalBacking backing, uint32_t timeout_ms = 0);
         // Grows the committed size of an already-installed external backing whose
         // base pointer is `device_ptr` (which must stay constant). The arena
         // drains all frames and the device, then invokes `commit(new_size)` — which
@@ -390,15 +390,15 @@ namespace lfs::core {
                                          BackingMissing,
                                          CudaFailure,
                                          CommitFailure };
-        bool grow_external_backing(const void* device_ptr, size_t new_size,
-                                   const std::function<bool(size_t)>& commit,
-                                   uint32_t timeout_ms = 0,
-                                   ExternalGrowFailure* failure = nullptr);
-        void clear_external_backing(const void* device_ptr = nullptr);
-        [[nodiscard]] bool using_external_backing(const void* device_ptr = nullptr) const;
+        LFS_CORE_API bool grow_external_backing(const void* device_ptr, size_t new_size,
+                                                const std::function<bool(size_t)>& commit,
+                                                uint32_t timeout_ms = 0,
+                                                ExternalGrowFailure* failure = nullptr);
+        LFS_CORE_API void clear_external_backing(const void* device_ptr = nullptr);
+        [[nodiscard]] LFS_CORE_API bool using_external_backing(const void* device_ptr = nullptr) const;
 
-        Statistics get_statistics() const;
-        MemoryInfo get_memory_info() const;
+        LFS_CORE_API Statistics get_statistics() const;
+        LFS_CORE_API MemoryInfo get_memory_info() const;
         // Free VRAM the arena leaves untouched when it grows, for the work that
         // allocates outside it during a frame: what training measured, else
         // 1 GiB (at most a tenth of the device).
@@ -407,14 +407,14 @@ namespace lfs::core {
             const size_t measured = measured_frame_headroom_bytes();
             return measured == 0 ? ceiling : std::min(ceiling, measured);
         }
-        void log_memory_status(uint64_t frame_id, bool force = false);
-        [[nodiscard]] bool has_last_frame_event_for_testing() const;
+        LFS_CORE_API void log_memory_status(uint64_t frame_id, bool force = false);
+        [[nodiscard]] LFS_CORE_API bool has_last_frame_event_for_testing() const;
 
-        bool is_under_memory_pressure() const;
-        float get_memory_pressure() const;
+        LFS_CORE_API bool is_under_memory_pressure() const;
+        LFS_CORE_API float get_memory_pressure() const;
 
-        bool is_rendering_active() const;
-        void set_rendering_active(bool active);
+        LFS_CORE_API bool is_rendering_active() const;
+        LFS_CORE_API void set_rendering_active(bool active);
 
     private:
         Arena& get_or_create_arena(int device);
@@ -457,20 +457,20 @@ namespace lfs::core {
     class GlobalArenaManager {
     public:
         static GlobalArenaManager& instance() { return global_arena_manager(); }
-        RasterizerMemoryArena& get_arena();
-        RasterizerMemoryArena* try_get_arena();
-        bool install_external_backing(RasterizerMemoryArena::ExternalBacking backing);
-        bool try_install_external_backing(RasterizerMemoryArena::ExternalBacking backing,
-                                          uint32_t timeout_ms = 0);
-        bool grow_external_backing(const void* device_ptr, size_t new_size,
-                                   const std::function<bool(size_t)>& commit,
-                                   uint32_t timeout_ms = 0,
-                                   RasterizerMemoryArena::ExternalGrowFailure* failure = nullptr);
-        void clear_external_backing(const void* device_ptr = nullptr);
-        void reset();
+        LFS_CORE_API RasterizerMemoryArena& get_arena();
+        LFS_CORE_API RasterizerMemoryArena* try_get_arena();
+        LFS_CORE_API bool install_external_backing(RasterizerMemoryArena::ExternalBacking backing);
+        LFS_CORE_API bool try_install_external_backing(RasterizerMemoryArena::ExternalBacking backing,
+                                                       uint32_t timeout_ms = 0);
+        LFS_CORE_API bool grow_external_backing(const void* device_ptr, size_t new_size,
+                                                const std::function<bool(size_t)>& commit,
+                                                uint32_t timeout_ms = 0,
+                                                RasterizerMemoryArena::ExternalGrowFailure* failure = nullptr);
+        LFS_CORE_API void clear_external_backing(const void* device_ptr = nullptr);
+        LFS_CORE_API void reset();
         void shutdown() { shutdown_global_arena_manager(); }
         /// Reconstructs the arena with a caller-supplied capacity for deterministic OOM tests.
-        void reconfigure_for_testing(RasterizerMemoryArena::Config config);
+        LFS_CORE_API void reconfigure_for_testing(RasterizerMemoryArena::Config config);
 
     private:
         friend LFS_CORE_API GlobalArenaManager& global_arena_manager();
