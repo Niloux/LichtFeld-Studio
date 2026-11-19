@@ -833,6 +833,7 @@ namespace {
             ::args::ValueFlag<float> cropbox_lr_scale(training_group, "scale", lfs::core::args::optimization_cli_help("--cropbox-lr-scale"), {"cropbox-lr-scale"});
             ::args::ValueFlag<float> cropbox_loss_weight(training_group, "weight", lfs::core::args::optimization_cli_help("--cropbox-loss-weight"), {"cropbox-loss-weight"});
             ::args::ValueFlag<float> cropbox_growth_inside(training_group, "share", lfs::core::args::optimization_cli_help("--cropbox-growth-inside"), {"cropbox-growth-inside"});
+            ::args::Flag no_roi(training_group, "no-roi", "Ignore dataset roi.json sidecar when loading a dataset or evaluating with --eval-mask cropbox", {"no-roi"});
             ::args::ValueFlag<float> thin_structure_weight(training_group, "weight", lfs::core::args::optimization_cli_help("--thin-structure-weight"), {"thin-structure-weight"});
             ::args::ValueFlag<float> late_lr_anneal(training_group, "fraction", lfs::core::args::optimization_cli_help("--late-lr-anneal"), {"late-lr-anneal"});
             ::args::ValueFlag<float> gradient_loss_weight(training_group, "weight", lfs::core::args::optimization_cli_help("--gradient-loss-weight"), {"gradient-loss-weight"});
@@ -1365,6 +1366,10 @@ namespace {
                         ::args::get(cropbox)));
                 params.cropbox = *box;
             }
+            params.no_roi = static_cast<bool>(no_roi);
+            if (params.no_roi && params.cropbox) {
+                return std::unexpected("--no-roi cannot be combined with --cropbox");
+            }
             if (cropbox_rotation) {
                 if (!params.cropbox)
                     return std::unexpected("--cropbox-rotation turns the --cropbox box about its centre: it needs --cropbox");
@@ -1375,10 +1380,6 @@ namespace {
                         ::args::get(cropbox_rotation)));
                 params.cropbox_rotation = *rotation;
             }
-            if (crop && !params.cropbox && !params.resume_checkpoint && !params.resume_project)
-                return std::unexpected(
-                    "--crop removes the splats outside the training crop box when training completes and when exporting: "
-                    "it needs --cropbox, or a resumed project that has a crop box");
 
             auto add_splat_freeze = parse_add_splat_freeze_modifiers(args);
             if (!add_splat_freeze) {
@@ -1503,6 +1504,18 @@ namespace {
                                 lfs::core::path_to_utf8(params.dataset.output_path), ec.message()));
                         }
                     }
+                }
+            }
+
+            if (crop && !params.cropbox && !params.resume_checkpoint && !params.resume_project) {
+                std::error_code roi_ec;
+                const bool has_roi_sidecar =
+                    !params.no_roi && !params.dataset.data_path.empty() &&
+                    lfs::core::native_fs::exists(params.dataset.data_path / "roi.json", roi_ec);
+                if (!has_roi_sidecar) {
+                    return std::unexpected(
+                        "--crop removes the splats outside the training crop box when training completes and when exporting: "
+                        "it needs --cropbox, dataset roi.json, or a resumed project that has a crop box");
                 }
             }
 

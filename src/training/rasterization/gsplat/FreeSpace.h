@@ -44,11 +44,12 @@ namespace gsplat_lfs {
 #endif
     };
 
-    // loss = weight * mean(1 - T_front) over pixels with scan depth.
-    // Writes loss[0] and v_T_front; partials holds free_space_partial_count floats.
+    // loss = weight * weighted mean of (1 - T_front) over pixels with scan depth
+    // (weighted by pixel_weight when non-null). Writes loss[0] and v_T_front;
+    // partials holds free_space_partial_count floats.
     [[nodiscard]] uint32_t free_space_partial_count(uint32_t pixels);
     void free_space_loss(const FreeSpaceRender& free_space, uint32_t width, uint32_t height,
                          float weight, float* v_T_front, float* loss, float* partials,
-                         cudaStream_t stream);
+                         cudaStream_t stream, const float* pixel_weight = nullptr);
 
 } // namespace gsplat_lfs

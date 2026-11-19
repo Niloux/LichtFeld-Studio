@@ -27,6 +27,7 @@
 #include "lfs/training/sh_value_storage.hpp"
 #include "noise_infill.hpp"
 #include "normal_auto_generate.hpp"
+#include "roi_sidecar.hpp"
 #ifndef LFS_TRAINER_ONLY
 #include "rendering/mesh2splat.hpp"
 #endif
@@ -456,7 +457,29 @@ namespace lfs::training {
             }
 
             scene.setInitialPointCloud(point_cloud);
-            scene.addPointCloud("PointCloud", point_cloud, dataset_id);
+            const lfs::core::NodeId pc_id = scene.addPointCloud("PointCloud", point_cloud, dataset_id);
+            if (pc_id != lfs::core::NULL_NODE && !params.no_roi && !params.cropbox &&
+                !params.resume_checkpoint && !params.resume_project && !params.dataset.data_path.empty()) {
+                auto roi = read_roi_sidecar(params.dataset.data_path);
+                if (!roi) {
+                    return lfs::Status::failure(roi.error());
+                }
+                if (*roi) {
+                    const auto placement = make_roi_crop_polygon(**roi, scene.getTrainingDataOrigin());
+                    const lfs::core::NodeId poly_id = scene.addCropPolygon(
+                        "Model_crop_polygon", pc_id, placement.data, placement.local_transform);
+                    if (poly_id == lfs::core::NULL_NODE) {
+                        return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                            .code = lfs::ErrorCode::Internal,
+                            .domain = lfs::ErrorDomain::Training,
+                            .user_message = "Failed to add dataset roi.json crop polygon to scene",
+                            .detection = LFS_SOURCE_SITE_CURRENT(),
+                        }));
+                    }
+                    LOG_INFO("Region of interest: loaded roi.json ({} vertices, z=[{:.2f}, {:.2f}], area={:.1f} m^2)",
+                             (*roi)->vertices_xy.size(), (*roi)->z_min, (*roi)->z_max, (*roi)->area_m2);
+                }
+            }
             return {};
         }
 

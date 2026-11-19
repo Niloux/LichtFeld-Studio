@@ -61,6 +61,7 @@
 #include "metrics/eval_mask.hpp"
 #include "noise_infill.hpp"
 #include "normal_auto_generate.hpp"
+#include "roi_sidecar.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #ifndef LFS_TRAINER_ONLY
 #include "python/runner.hpp"
@@ -2020,11 +2021,13 @@ namespace lfs::training {
                 alpha.is_valid()) {
                 const Tensor alpha_2d = alpha.ndim() == 3 ? alpha.squeeze(0) : alpha;
                 // Fused: band remap + (1-mask)^power + mean/grad (single kernel).
+                // Under SegmentAndIgnore, sky opacity must still clear at full weight even where rendered alpha < 0.5
+                // causes inside-ROI rays to be weighted as outside_weight.
                 const auto penalty = losses::fuse_mask_opacity_penalty(
                     mask_preprocess_workspace_,
                     alpha_2d,
                     mask_2d,
-                    roi_weight,
+                    mode == param::MaskMode::SegmentAndIgnore ? Tensor{} : roi_weight,
                     opt_params.mask_opacity_penalty_power,
                     opt_params.mask_opacity_penalty_weight,
                     mode == param::MaskMode::SegmentAndIgnore);
@@ -3433,6 +3436,11 @@ namespace lfs::training {
                 evaluator_->set_lpips_weights_preparer(lpips_weights_preparer_);
             const glm::vec3 origin = scene_ ? scene_->getTrainingDataOrigin() : glm::vec3{0.0f};
             evaluator_->set_training_origin({origin.x, origin.y, origin.z});
+            const auto active_crop = scene_ ? lfs::training::resolve_training_cropbox_geom(*scene_) : std::nullopt;
+            if (active_crop) {
+                evaluator_->set_roi_summary(lfs::training::format_roi_summary(
+                    *active_crop, active_crop->is_polygon() ? "crop polygon" : "crop box"));
+            }
             if (!params_.optimization.eval_mask.empty()) {
                 auto installed = evaluator_->install_eval_mask_source({origin.x, origin.y, origin.z});
                 if (!installed)
@@ -3455,13 +3463,34 @@ namespace lfs::training {
                         LOG_INFO("Evaluation mask: {} initial points, radius {} px, closed by {} px",
                                  cloud->means.shape()[0], (*splat)[0], (*splat)[1]);
                     } else if (lfs::core::param::is_eval_mask_cropbox(params_.optimization.eval_mask)) {
-                        const auto cropbox = scene_ ? lfs::training::resolve_training_cropbox_geom(*scene_) : std::nullopt;
-                        // A crop polygon trains as the ROI, but the evaluation mask stays box-only.
-                        if (!cropbox || cropbox->is_polygon())
-                            return std::unexpected("Evaluation mask 'cropbox' needs an enabled crop box on the training model");
-                        evaluator_->set_eval_mesh(lfs::training::make_evaluation_box(
-                            lfs::training::training_cropbox_model_corners(*cropbox), cropbox->inverse));
-                        LOG_INFO("Evaluation mask: crop box{}", cropbox->inverse ? " (inverted)" : "");
+                        auto crop_region = active_crop;
+                        bool from_sidecar = false;
+                        if (!crop_region && !params_.no_roi && !params_.dataset.data_path.empty()) {
+                            auto roi = lfs::training::read_roi_sidecar(params_.dataset.data_path);
+                            if (!roi)
+                                return std::unexpected(std::string(roi.error().user_message()));
+                            if (*roi) {
+                                crop_region = lfs::training::make_roi_eval_geometry(**roi, origin);
+                                from_sidecar = true;
+                            }
+                        }
+                        if (!crop_region)
+                            return std::unexpected("Evaluation mask 'cropbox' needs an enabled crop box or polygon on the training model");
+                        if (crop_region->is_polygon()) {
+                            evaluator_->set_eval_crop_region(*crop_region);
+                            if (from_sidecar) {
+                                evaluator_->set_roi_summary(
+                                    lfs::training::format_roi_summary(*crop_region, "roi.json polygon"));
+                            }
+                            LOG_INFO("Evaluation mask: {} ({} vertices){}",
+                                     from_sidecar ? "roi.json polygon" : "crop polygon",
+                                     crop_region->polygon.size(),
+                                     crop_region->inverse ? " (inverted)" : "");
+                        } else {
+                            evaluator_->set_eval_mesh(lfs::training::make_evaluation_box(
+                                lfs::training::training_cropbox_model_corners(*crop_region), crop_region->inverse));
+                            LOG_INFO("Evaluation mask: crop box{}", crop_region->inverse ? " (inverted)" : "");
+                        }
                     } else {
                         LOG_INFO("Evaluation mask: {}", params_.optimization.eval_mask);
                     }
@@ -7947,11 +7976,16 @@ namespace lfs::training {
                                 free_space_partials_ = lfs::core::Tensor::empty({partials}, lfs::core::Device::CUDA);
                             }
                             free_space_partials_.set_stream(free_space_stream);
+                            const float* const free_space_pixel_weight =
+                                (roi_weight.is_valid() && roi_weight.numel() == static_cast<size_t>(width) * height)
+                                    ? roi_weight_ptr_on_stream(free_space_stream)
+                                    : nullptr;
                             gsplat_lfs::free_space_loss(rendered, width, height, step_params.free_space_weight,
                                                         free_space_grad_.ptr<float>(),
                                                         free_space_scalar_.ptr<float>(),
                                                         free_space_partials_.ptr<float>(),
-                                                        free_space_stream);
+                                                        free_space_stream,
+                                                        free_space_pixel_weight);
                             tile_loss = tile_loss + free_space_scalar_;
                         }
 

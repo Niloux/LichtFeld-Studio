@@ -843,6 +843,22 @@ TEST_P(TrainerMaskSupervisionTest, PartialRegionRetainsTrainingWeightedMaskPenal
     EXPECT_NEAR(report.item<float>(), image_value + 0.625f, 1e-5f);
 }
 
+TEST_P(TrainerMaskSupervisionTest, SegmentAndIgnoreKeepsFullSkyOpacityPenaltyUnderPartialRoi) {
+    params.mask_mode = param::MaskMode::SegmentAndIgnore;
+    params.mask_opacity_penalty_weight = 10.0f;
+    params.mask_opacity_penalty_power = 2.0f;
+    const auto alpha = Tensor::full({32, 32}, 0.5f, Device::CUDA);
+    auto mask = Tensor::ones({32, 32}, Device::CUDA);
+    mask.slice(0, 16, 32).fill_(0.75f);
+    auto training_weight = Tensor::ones({32, 32}, Device::CUDA);
+    training_weight.slice(0, 16, 32).fill_(0.1f);
+    const auto result = lfs::training::TrainerMaskSupervisionTestAccess::loss(
+        *trainer, image, target, mask, params, raw, {}, alpha, training_weight);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->mask_regularization_loss.is_valid());
+    EXPECT_NEAR(result->mask_regularization_loss.item<float>(), 2.5f, 1e-6f);
+}
+
 TEST_P(TrainerMaskSupervisionTest, RegionReportWithoutMaskPenaltyKeepsImageLoss) {
     const auto mask = Tensor::ones({32, 32}, Device::CUDA);
     const auto region = Tensor::ones({32, 32}, Device::CUDA);

@@ -5,8 +5,10 @@
 #include "metrics.hpp"
 #include "../kernels/depth_loss.hpp"
 #include "../kernels/normal_loss.hpp"
+#include "../kernels/roi_weight_map.hpp"
 #include "../noise_infill.hpp"
 #include "../rasterization/fast_rasterizer.hpp"
+#include "../rasterization/gsplat/GeometryFeatures.h"
 #include "../rasterization/gsplat_rasterizer.hpp"
 #include "core/cuda/lanczos_resize/lanczos_resize.hpp"
 #include "core/cuda/undistort/undistort.hpp"
@@ -659,6 +661,7 @@ namespace lfs::training {
         const auto* points = mask_sources.points;
         const auto* mask_folder = mask_sources.folder;
         const auto* mask_splat = mask_sources.splat;
+        const auto* crop_region = mask_sources.crop_region;
         RestoreCameraImageDimensions restore_dimensions{
             camera, camera.image_width(), camera.image_height(), camera.image_size_loaded()};
 
@@ -1087,6 +1090,183 @@ namespace lfs::training {
                     return evaluation_error("mesh mask covers no evaluated pixel", LFS_SOURCE_SITE_CURRENT());
             }
 
+            if (crop_region) {
+                const auto stream = consumer;
+                const auto R = camera.R().cpu().contiguous().to_vector();
+                const auto T = camera.T().cpu().contiguous().to_vector();
+                if (R.size() < 9 || T.size() < 3) {
+                    return evaluation_error("cropbox evaluation mask needs valid camera pose",
+                                            LFS_SOURCE_SITE_CURRENT());
+                }
+                const glm::vec3 centre(-(R[0] * T[0] + R[3] * T[1] + R[6] * T[2]),
+                                       -(R[1] * T[0] + R[4] * T[1] + R[7] * T[2]),
+                                       -(R[2] * T[0] + R[5] * T[1] + R[8] * T[2]));
+                const bool camera_inside_roi = training_crop_region_contains(
+                    *crop_region, glm::vec3(crop_region->world_to_cropbox * glm::vec4(centre, 1.0f)));
+
+                const lfs::core::Camera& lens_cam = warp_to_distorted ? camera : *render_camera;
+                const ::CameraModelType ray_model =
+                    geometry.undistorted
+                        ? ::CameraModelType::PINHOLE
+                        : static_cast<::CameraModelType>(static_cast<int>(lens_cam.camera_model_type()));
+                lfs::core::Tensor radial_cuda, tangential_cuda, thin_prism_cuda, K_cuda, rays_cuda;
+                const float* radial_ptr = nullptr;
+                const float* tangential_ptr = nullptr;
+                const float* thin_prism_ptr = nullptr;
+                const float* roi_rays = nullptr;
+                const auto upload_dist = [&](const lfs::core::Tensor& src, const size_t fixed_size) -> lfs::core::Tensor {
+                    if (!src.is_valid() || src.numel() == 0)
+                        return {};
+                    auto host = src.cpu().contiguous();
+                    if (host.dtype() != lfs::core::DataType::Float32)
+                        host = host.to(lfs::core::DataType::Float32);
+                    const size_t n = std::min(host.numel(), fixed_size);
+                    std::vector<float> padded(fixed_size, 0.0f);
+                    std::memcpy(padded.data(), host.ptr<float>(), n * sizeof(float));
+                    auto gpu = lfs::core::Tensor::from_vector(
+                        padded, lfs::core::TensorShape({fixed_size}), lfs::core::Device::CUDA);
+                    gpu.sync_to_stream(stream);
+                    return gpu;
+                };
+                if (!geometry.undistorted) {
+                    const auto radial_dist = lens_cam.radial_distortion();
+                    const auto tangential_dist = lens_cam.tangential_distortion();
+                    if (ray_model == ::CameraModelType::THIN_PRISM_FISHEYE) {
+                        if (radial_dist.is_valid() && radial_dist.numel() > 0) {
+                            if (radial_dist.numel() != 4)
+                                return evaluation_error("Thin-prism fisheye requires four radial coefficients",
+                                                        LFS_SOURCE_SITE_CURRENT());
+                            radial_cuda = upload_dist(radial_dist, 4);
+                            radial_ptr = radial_cuda.ptr<float>();
+                        }
+                        if (tangential_dist.is_valid() && tangential_dist.numel() > 0) {
+                            if (tangential_dist.numel() != 4)
+                                return evaluation_error(
+                                    "Thin-prism fisheye requires four tangential and prism coefficients",
+                                    LFS_SOURCE_SITE_CURRENT());
+                            thin_prism_cuda = upload_dist(tangential_dist, 4);
+                            thin_prism_ptr = thin_prism_cuda.ptr<float>();
+                        }
+                    } else if (ray_model == ::CameraModelType::FISHEYE) {
+                        if (radial_dist.is_valid() && radial_dist.numel() > 0) {
+                            radial_cuda = upload_dist(radial_dist, 4);
+                            radial_ptr = radial_cuda.ptr<float>();
+                        }
+                    } else if (ray_model == ::CameraModelType::PINHOLE) {
+                        if (radial_dist.is_valid() && radial_dist.numel() > 0) {
+                            if (radial_dist.numel() > 3 && radial_dist.numel() != 6)
+                                return evaluation_error(
+                                    "Pinhole cameras require at most three polynomial or six rational radial coefficients",
+                                    LFS_SOURCE_SITE_CURRENT());
+                            radial_cuda = upload_dist(radial_dist, 6);
+                            radial_ptr = radial_cuda.ptr<float>();
+                        }
+                        if (tangential_dist.is_valid() && tangential_dist.numel() > 0) {
+                            if (tangential_dist.numel() != 2)
+                                return evaluation_error("Pinhole cameras require two tangential coefficients",
+                                                        LFS_SOURCE_SITE_CURRENT());
+                            tangential_cuda = upload_dist(tangential_dist, 2);
+                            tangential_ptr = tangential_cuda.ptr<float>();
+                        }
+                    }
+                }
+                if (ray_model != ::CameraModelType::PINHOLE || radial_ptr || tangential_ptr || thin_prism_ptr) {
+                    const std::vector<float> k_host =
+                        ray_model == ::CameraModelType::EQUIRECTANGULAR
+                            ? std::vector<float>{static_cast<float>(geometry.width), 0.0f, 0.0f,
+                                                 0.0f, static_cast<float>(geometry.height), 0.0f,
+                                                 0.0f, 0.0f, 1.0f}
+                            : std::vector<float>{geometry.fx, 0.0f, geometry.cx,
+                                                 0.0f, geometry.fy, geometry.cy,
+                                                 0.0f, 0.0f, 1.0f};
+                    K_cuda = lfs::core::Tensor::from_vector(
+                        k_host, lfs::core::TensorShape({9}), lfs::core::Device::CUDA);
+                    K_cuda.sync_to_stream(stream);
+                    rays_cuda = lfs::core::Tensor::empty(
+                        lfs::core::TensorShape({static_cast<size_t>(geometry.height),
+                                                static_cast<size_t>(geometry.width), 3}),
+                        lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                    rays_cuda.set_stream(stream);
+                    gsplat_lfs::geometry_camera_rays(
+                        rays_cuda.ptr<float>(), static_cast<uint32_t>(geometry.width),
+                        static_cast<uint32_t>(geometry.height), K_cuda.ptr<float>(), ray_model,
+                        radial_ptr, tangential_ptr, thin_prism_ptr, stream);
+                    roi_rays = rays_cuda.ptr<float>();
+                }
+
+                lfs::core::Tensor eff_depth, eff_alpha;
+                if (camera_inside_roi) {
+                    const lfs::core::TensorShape hw_shape{
+                        static_cast<size_t>(geometry.height), static_cast<size_t>(geometry.width)};
+                    if (rendered->output.depth.is_valid() && rendered->output.alpha.is_valid()) {
+                        auto d = squeeze_to_hw(rendered->output.depth).to(lfs::core::DataType::Float32).contiguous();
+                        auto a = squeeze_to_hw(rendered->output.alpha).to(lfs::core::DataType::Float32).contiguous();
+                        if (d.ndim() == 2 && d.shape() == hw_shape && a.ndim() == 2 && a.shape() == hw_shape) {
+                            eff_depth = std::move(d);
+                            eff_alpha = std::move(a);
+                        }
+                    }
+                    if (!eff_depth.is_valid() || !eff_alpha.is_valid()) {
+                        return evaluation_error(
+                            "cropbox evaluation mask needs depth and alpha when camera is inside ROI",
+                            LFS_SOURCE_SITE_CURRENT());
+                    }
+                    eff_depth.sync_to_stream(stream);
+                    eff_alpha.sync_to_stream(stream);
+                }
+
+                auto roi_weights = lfs::core::Tensor::empty(
+                    lfs::core::TensorShape({static_cast<size_t>(geometry.height),
+                                            static_cast<size_t>(geometry.width)}),
+                    lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                roi_weights.set_stream(stream);
+                if (crop_region->is_polygon()) {
+                    const lfs::training::kernels::RoiPolygon poly{
+                        .vertices = crop_region->polygon.data(),
+                        .count = static_cast<int>(crop_region->polygon.size()),
+                        .half_depth = crop_region->max.z};
+                    lfs::training::kernels::launch_roi_weight_map(
+                        render_camera->world_view_transform_ptr(),
+                        render_camera->cam_position_ptr(),
+                        geometry.fx, geometry.fy, geometry.cx, geometry.cy,
+                        geometry.width, geometry.height,
+                        crop_region->world_to_cropbox, poly, crop_region->inverse,
+                        0.0f, roi_rays,
+                        camera_inside_roi ? eff_depth.ptr<float>() : nullptr,
+                        camera_inside_roi ? eff_alpha.ptr<float>() : nullptr,
+                        roi_weights.ptr<float>(), stream);
+                } else {
+                    lfs::training::kernels::launch_roi_weight_map(
+                        render_camera->world_view_transform_ptr(),
+                        render_camera->cam_position_ptr(),
+                        geometry.fx, geometry.fy, geometry.cx, geometry.cy,
+                        geometry.width, geometry.height,
+                        crop_region->world_to_cropbox, crop_region->min, crop_region->max,
+                        crop_region->inverse, 0.0f, roi_rays,
+                        camera_inside_roi ? eff_depth.ptr<float>() : nullptr,
+                        camera_inside_roi ? eff_alpha.ptr<float>() : nullptr,
+                        roi_weights.ptr<float>(), stream);
+                }
+
+                const auto roi_coverage = roi_weights.gt(0.5f).to(lfs::core::DataType::UInt8);
+                if (metric_mask.is_valid()) {
+                    metric_mask = (mask_as_float01(metric_mask) * roi_coverage.to(lfs::core::DataType::Float32))
+                                      .gt(0.5f)
+                                      .to(lfs::core::DataType::UInt8)
+                                      .contiguous();
+                } else if (validity_mask.is_valid()) {
+                    metric_mask = (roi_coverage.to(lfs::core::DataType::Float32) *
+                                   validity_mask.to(lfs::core::DataType::Float32))
+                                      .gt(0.5f)
+                                      .to(lfs::core::DataType::UInt8)
+                                      .contiguous();
+                } else {
+                    metric_mask = roi_coverage.contiguous();
+                }
+                if (metric_mask.to(lfs::core::DataType::Float32).sum().item<float>() <= 0.0f)
+                    return evaluation_error("cropbox mask covers no evaluated pixel", LFS_SOURCE_SITE_CURRENT());
+            }
+
             if (rendered->raw_image.is_valid())
                 rendered->raw_image = rendered->raw_image.clamp(0.0f, 1.0f);
             rendered->output.image = image_for_metrics(rendered->output.image, inputs.bit_depth);
@@ -1105,7 +1285,7 @@ namespace lfs::training {
             }
 
             const bool user_mask_applied = inputs.user_mask.is_valid() || mesh != nullptr || points != nullptr ||
-                                           mask_splat != nullptr ||
+                                           mask_splat != nullptr || crop_region != nullptr ||
                                            lfs::core::param::is_eval_mask_depth(params.optimization.eval_mask);
             const auto& shutter_motion = render_camera->rolling_shutter();
             const int shutter_extent = shutter_motion && shutter_motion->readout_rows
@@ -1126,7 +1306,7 @@ namespace lfs::training {
                 .render_geometry = geometry,
                 .validity_mask_applied = warp_to_distorted,
                 .erode_ssim_mask = warp_to_distorted || mesh != nullptr || points != nullptr || mask_folder != nullptr ||
-                                   mask_splat != nullptr ||
+                                   mask_splat != nullptr || crop_region != nullptr ||
                                    lfs::core::param::is_eval_mask_depth(params.optimization.eval_mask),
                 .user_mask_applied = user_mask_applied,
                 .rolling_shutter_active = rolling_shutter_active};
@@ -1507,6 +1687,9 @@ namespace lfs::training {
             if (final.rolling_shutter_cameras > 0 || final.evaluated_cameras > 0) {
                 report_file << "Rolling shutter cameras: " << final.rolling_shutter_cameras
                             << " / " << final.evaluated_cameras << "\n";
+            }
+            if (!final.roi_summary.empty()) {
+                report_file << "Region of interest: " << final.roi_summary << "\n";
             }
             report_file << "Bias (raw):  (" << final.bias_r << ", " << final.bias_g << ", " << final.bias_b << ")\n";
             report_file << "Bias (corrected):  (" << final.bias_corr_r << ", " << final.bias_corr_g << ", "
@@ -2427,12 +2610,16 @@ namespace lfs::training {
         result.valid = true;
         result.rolling_shutter_cameras = rolling_shutter_cameras;
         result.evaluated_cameras = evaluated_images;
+        result.roi_summary = _roi_summary;
 
         if (!source.report_scores)
             return result;
 
         LOG_INFO("Eval: rolling shutter active for {} / {} cameras",
                  result.rolling_shutter_cameras, result.evaluated_cameras);
+        if (!result.roi_summary.empty()) {
+            LOG_INFO("Eval: region of interest: {}", result.roi_summary);
+        }
 
         // Emit evaluation completed event for GUI display and other subscribers.
         lfs::core::events::state::EvaluationCompleted{

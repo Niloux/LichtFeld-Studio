@@ -2948,6 +2948,62 @@ TEST_F(GsplatRasterizerTest, FreeSpaceLossAveragesOverScannedPixels) {
         EXPECT_FLOAT_EQ(g.ptr<float>()[i], scan[i] > 0.f ? -weight / scanned : 0.f) << i;
 }
 
+TEST_F(GsplatRasterizerTest, FreeSpaceLossWeightsByRoiAndHandlesAllZeroWeights) {
+    constexpr uint32_t w = 8, h = 4;
+    std::vector<float> scan(w * h), t_front(w * h), pix_w(w * h);
+    double w_num = 0.0;
+    double w_den = 0.0;
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint32_t i = y * w + x;
+            scan[i] = x < 6 ? 1200.f + i : 0.f;
+            t_front[i] = 1.f - 0.02f * static_cast<float>(x);
+            pix_w[i] = y < 2 ? 1.0f : 0.1f;
+            if (scan[i] > 0.f) {
+                w_num += static_cast<double>(pix_w[i]) * (1.0 - t_front[i]);
+                w_den += static_cast<double>(pix_w[i]);
+            }
+        }
+    }
+    auto gt = Tensor::from_vector(scan, {h, w}, Device::CUDA);
+    auto tf = Tensor::from_vector(t_front, {h, w}, Device::CUDA);
+    auto pw = Tensor::from_vector(pix_w, {h, w}, Device::CUDA);
+    auto grad = Tensor::empty({h, w}, Device::CUDA);
+    auto loss = Tensor::empty({1}, Device::CUDA);
+    auto partials = Tensor::empty({gsplat_lfs::free_space_partial_count(w * h)}, Device::CUDA);
+    gsplat_lfs::FreeSpaceRender free_space;
+    free_space.gt_depth = gt.ptr<float>();
+    free_space.T_front = tf.ptr<float>();
+    free_space.gt_w = w;
+    free_space.gt_h = h;
+    free_space.unit = 0.001f;
+    constexpr float weight = 0.05f;
+
+    gsplat_lfs::free_space_loss(free_space, w, h, weight, grad.ptr<float>(), loss.ptr<float>(),
+                                partials.ptr<float>(), nullptr, pw.ptr<float>());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_NEAR(loss.cpu().ptr<float>()[0], static_cast<float>(weight * w_num / w_den), 1e-6f);
+    const auto g = grad.cpu();
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint32_t i = y * w + x;
+            const float expected = scan[i] > 0.f ? static_cast<float>(-weight * pix_w[i] / w_den) : 0.f;
+            EXPECT_NEAR(g.ptr<float>()[i], expected, 1e-7f) << i;
+        }
+    }
+
+    auto zeros = Tensor::zeros({h, w}, Device::CUDA);
+    gsplat_lfs::free_space_loss(free_space, w, h, weight, grad.ptr<float>(), loss.ptr<float>(),
+                                partials.ptr<float>(), nullptr, zeros.ptr<float>());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_FLOAT_EQ(loss.cpu().ptr<float>()[0], 0.0f);
+    const auto g0 = grad.cpu();
+    for (uint32_t i = 0; i < w * h; ++i) {
+        EXPECT_TRUE(std::isfinite(g0.ptr<float>()[i]));
+        EXPECT_FLOAT_EQ(g0.ptr<float>()[i], 0.0f);
+    }
+}
+
 TEST_F(GsplatRasterizerTest, FreeSpaceTransmittanceCountsOnlySplatsBeforeTheScan) {
     constexpr size_t w = 64, h = 48;
     auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);

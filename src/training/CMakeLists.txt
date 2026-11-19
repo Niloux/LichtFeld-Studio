@@ -141,6 +141,7 @@ set(TRAINING_NEW_SOURCES
         noise_infill.cpp
         normal_auto_generate.cpp
         las_prior_sidecar.cpp
+        roi_sidecar.cpp
         vram_ledger.cpp
         perf_bench.cpp
     training_setup.cpp

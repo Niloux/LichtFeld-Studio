@@ -630,6 +630,8 @@ namespace lfs::core {
             // Turns the --cropbox box about its centre by X, Y, Z degrees about the dataset's axes, as Rx * Ry * Rz.
             // Unset keeps the box axis-aligned with its corners stored as given.
             std::optional<std::array<float, 3>> cropbox_rotation = std::nullopt;
+            // Ignore dataset roi.json sidecar when loading a dataset or evaluating with --eval-mask cropbox.
+            bool no_roi = false;
 
             // Optional trained splats to append to the training model before optimizer initialization
             std::vector<std::filesystem::path> add_splat_paths;

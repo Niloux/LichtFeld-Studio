@@ -858,6 +858,7 @@ set(TEST_FILES
     test_compare_images.cpp
     test_roi_weighted_losses.cpp
     test_las_priors.cpp
+    test_roi_sidecar.cpp
     test_checkpoint_resume.cpp
     test_evaluation_split.cpp
     test_component_config_serialization.cpp

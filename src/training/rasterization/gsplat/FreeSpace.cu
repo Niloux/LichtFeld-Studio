@@ -28,12 +28,15 @@ namespace gsplat_lfs {
             return v;
         }
 
-        // Per block: (sum of 1 - T_front, pixels with scan depth).
-        __global__ void partial_kernel(const FreeSpaceRender f, const uint32_t W, const uint32_t H, float2* partials) {
+        // Per block: (sum of w * (1 - T_front), sum of w) over pixels with scan depth.
+        __global__ void partial_kernel(const FreeSpaceRender f, const uint32_t W, const uint32_t H,
+                                       const float* __restrict__ pixel_weight, float2* partials) {
             const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
             float2 v = make_float2(0.f, 0.f);
-            if (i < W * H && f.scan_depth(0, i % W, i / W, W, H) > 0.f)
-                v = make_float2(1.f - f.T_front[i], 1.f);
+            if (i < W * H && f.scan_depth(0, i % W, i / W, W, H) > 0.f) {
+                const float w = pixel_weight ? pixel_weight[i] : 1.f;
+                v = make_float2(w * (1.f - f.T_front[i]), w);
+            }
             v = block_sum(v);
             if (threadIdx.x == 0)
                 partials[1 + blockIdx.x] = v;
@@ -53,12 +56,14 @@ namespace gsplat_lfs {
         }
 
         __global__ void grad_kernel(const FreeSpaceRender f, const uint32_t W, const uint32_t H,
-                                    const float2* partials, const float weight, float* v_T_front) {
+                                    const float* __restrict__ pixel_weight, const float2* partials,
+                                    const float weight, float* v_T_front) {
             const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
             if (i >= W * H)
                 return;
-            const float count = partials[0].y;
-            v_T_front[i] = count > 0.f && f.scan_depth(0, i % W, i / W, W, H) > 0.f ? -weight / count : 0.f;
+            const float denom = partials[0].y;
+            const float w = pixel_weight ? pixel_weight[i] : 1.f;
+            v_T_front[i] = denom > 0.f && f.scan_depth(0, i % W, i / W, W, H) > 0.f ? -weight * w / denom : 0.f;
         }
     } // namespace
 
@@ -68,17 +73,17 @@ namespace gsplat_lfs {
 
     void free_space_loss(const FreeSpaceRender& free_space, const uint32_t width, const uint32_t height,
                          const float weight, float* v_T_front, float* loss, float* partials,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, const float* pixel_weight) {
         const uint32_t pixels = width * height;
         if (!pixels || !free_space.enabled())
             return;
         const uint32_t blocks = (pixels + kThreads - 1) / kThreads;
         auto* sums = reinterpret_cast<float2*>(partials);
-        partial_kernel<<<blocks, kThreads, 0, stream>>>(free_space, width, height, sums);
+        partial_kernel<<<blocks, kThreads, 0, stream>>>(free_space, width, height, pixel_weight, sums);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.free_space.partials");
         reduce_kernel<<<1, kThreads, 0, stream>>>(sums, blocks, weight, loss);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.free_space.reduce");
-        grad_kernel<<<blocks, kThreads, 0, stream>>>(free_space, width, height, sums, weight, v_T_front);
+        grad_kernel<<<blocks, kThreads, 0, stream>>>(free_space, width, height, pixel_weight, sums, weight, v_T_front);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.free_space.grad");
     }
 } // namespace gsplat_lfs

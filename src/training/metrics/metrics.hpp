@@ -11,6 +11,7 @@
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "../training_cropbox_mask.hpp"
 #include "training/optimizer/render_output.hpp"
 #include <algorithm>
 #include <array>
@@ -153,6 +154,7 @@ namespace lfs::training {
         float bias_corr_b = 0.0f;
         size_t rolling_shutter_cameras = 0;
         size_t evaluated_cameras = 0;
+        std::string roi_summary;
         // With scored pixel sets, the fields above are the headline set's.
         lfs::core::param::EvalPixelSet headline = lfs::core::param::EvalPixelSet::Mask;
         PixelSetScores sets;
@@ -197,6 +199,9 @@ namespace lfs::training {
             }
             if (rolling_shutter_cameras > 0 || evaluated_cameras > 0) {
                 ss << ", rolling_shutter_cameras: " << rolling_shutter_cameras << "/" << evaluated_cameras;
+            }
+            if (!roi_summary.empty()) {
+                ss << ", roi: " << roi_summary;
             }
             return ss.str();
         }
@@ -322,6 +327,7 @@ namespace lfs::training {
         const EvaluationPoints* points = nullptr;
         const lfs::io::MaskDirCache* folder = nullptr;
         const EvaluationSplat* splat = nullptr;
+        const TrainingCropBoxGeometry* crop_region = nullptr;
     };
 
     [[nodiscard]] lfs::Result<EvaluationMesh> load_evaluation_mesh(
@@ -485,6 +491,8 @@ namespace lfs::training {
         }
         void set_eval_points(EvaluationPoints points) { _eval_points = std::move(points); }
         void set_eval_splat(EvaluationSplat splat) { _eval_splat = std::move(splat); }
+        void set_eval_crop_region(TrainingCropBoxGeometry region) { _eval_crop_region = std::move(region); }
+        void set_roi_summary(std::string summary) { _roi_summary = std::move(summary); }
         // Installs the configured eval_mask when it is a splat or point PLY, a mask folder, a box or a mesh, with
         // files in a frame whose origin is training_origin. False for masks that need the trained scene: the crop
         // box, the initial points and depth.
@@ -493,7 +501,8 @@ namespace lfs::training {
             return {.mesh = eval_mesh(),
                     .points = _eval_points ? &*_eval_points : nullptr,
                     .folder = _eval_mask_folder.get(),
-                    .splat = _eval_splat ? &*_eval_splat : nullptr};
+                    .splat = _eval_splat ? &*_eval_splat : nullptr,
+                    .crop_region = _eval_crop_region ? &*_eval_crop_region : nullptr};
         }
 
         void set_normal_prior_decode(const lfs::core::Camera::NormalPriorDecode& decode) {
@@ -562,5 +571,7 @@ namespace lfs::training {
         std::shared_ptr<const lfs::io::MaskDirCache> _eval_mask_folder;
         std::optional<EvaluationPoints> _eval_points;
         std::optional<EvaluationSplat> _eval_splat;
+        std::optional<TrainingCropBoxGeometry> _eval_crop_region;
+        std::string _roi_summary;
     };
 } // namespace lfs::training
