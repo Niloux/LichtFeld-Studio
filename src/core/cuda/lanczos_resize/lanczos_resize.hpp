@@ -76,11 +76,11 @@ namespace lfs::core {
     // would have resized it to (request_h x request_w; 0 means the render's size),
     // then Lanczos if the render differs from that size. The prior resize runs on
     // cuda_stream without waiting for it; read the result on that stream.
-    Tensor fit_depth_prior(const Tensor& input, int request_h, int request_w,
-                           int render_h, int render_w,
-                           cudaStream_t cuda_stream = nullptr);
-    Tensor fit_normal_prior(const Tensor& input, int request_h, int request_w,
-                            int render_h, int render_w,
-                            cudaStream_t cuda_stream = nullptr);
+    LFS_CORE_API Tensor fit_depth_prior(const Tensor& input, int request_h, int request_w,
+                                                           int render_h, int render_w,
+                                           cudaStream_t cuda_stream = nullptr);
+    LFS_CORE_API Tensor fit_normal_prior(const Tensor& input, int request_h, int request_w,
+                                                            int render_h, int render_w,
+                                            cudaStream_t cuda_stream = nullptr);
 
 } // namespace lfs::core
