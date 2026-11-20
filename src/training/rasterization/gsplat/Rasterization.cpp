@@ -312,7 +312,7 @@ namespace gsplat_lfs {
                 sh_degree, sh_layout_degree, sh_degree > 0 ? result.dirs : nullptr,
                 sh0, shN, C, N, result.colors, channels, stream);
         }
-        if (channels != 3) {
+        if (channels == 8) {
             geometry_features_fwd(means, quats, scales, reference, result.colors,
                                   N, C, channels, camera_model, stream);
         }
@@ -524,7 +524,7 @@ namespace gsplat_lfs {
             }
         }
 
-        if (channels != 3) {
+        if (channels == 8) {
             geometry_features_bwd(means, quats, scales, reference, v_colors, v_means, v_quats,
                                   N, C, channels, camera_model, stream);
         }

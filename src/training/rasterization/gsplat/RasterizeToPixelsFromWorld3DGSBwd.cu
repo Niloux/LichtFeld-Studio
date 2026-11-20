@@ -670,6 +670,12 @@ namespace gsplat_lfs {
             radial_coeffs, tangential_coeffs, thin_prism_coeffs);
         const vec3 ray_d = ray.ray_dir;
         const vec3 ray_o = ray.ray_org;
+        const float depth_scale =
+            (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
+        constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+        constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
 
         // keep not rasterizing threads around for reading data
         const bool active = (i < image_height && j < image_width) && ray.valid_flag;
@@ -809,6 +815,9 @@ namespace gsplat_lfs {
                 float alpha = 0.f;
                 float opac = 0.f;
                 float vis = 0.f;
+                float inv_grd_len = 0.f;
+                float t_hit = 0.f;
+                float depth = 0.f;
                 vec3 xyz, o_minus_mu, gro, grd, grd_n, gcrod;
                 mat3 Mt;
                 if (valid) {
@@ -819,10 +828,16 @@ namespace gsplat_lfs {
                     o_minus_mu = ray_o - xyz;
                     gro = Mt * o_minus_mu;
                     grd = Mt * ray_d;
-                    grd_n = safe_normalize(grd);
-                    gcrod = glm::cross(grd_n, gro);
-                    const float grayDist = glm::dot(gcrod, gcrod);
-                    const float power = -0.5f * grayDist;
+                    float power;
+                    if constexpr (kHasRayDepth) {
+                        ray_gaussian_eval(gro, grd, depth_scale,
+                                          grd_n, gcrod, inv_grd_len, t_hit, depth, power);
+                    } else {
+                        grd_n = safe_normalize(grd);
+                        gcrod = glm::cross(grd_n, gro);
+                        const float grayDist = glm::dot(gcrod, gcrod);
+                        power = -0.5f * grayDist;
+                    }
                     vis = __expf(power);
                     alpha = min(0.999f, opac * vis);
                     if (power > 0.f || alpha < 1.f / 255.f) {
@@ -849,9 +864,34 @@ namespace gsplat_lfs {
                     if (valid) {
                         T *= ra;
                         const float fac = alpha * T;
+                        float v_depth = 0.f;
+                        float v_alpha = 0.f;
 #pragma unroll
                         for (uint32_t k = 0; k < CDIM; ++k) {
-                            v_rgb_local[k] = fac * v_render_c[k];
+                            const float v_c = v_render_c[k];
+                            float c_val;
+                            if constexpr (kHasRayDepth) {
+                                if (k == kDepthChannel) {
+                                    c_val = depth;
+                                    v_depth += fac * v_c;
+                                } else if constexpr (kHasDepthSq) {
+                                    if (k == kDepthSqChannel) {
+                                        c_val = depth * depth;
+                                        v_depth += fac * (2.0f * depth) * v_c;
+                                    } else {
+                                        c_val = rgbs_batch[t * CDIM + k];
+                                        v_rgb_local[k] = fac * v_c;
+                                    }
+                                } else {
+                                    c_val = rgbs_batch[t * CDIM + k];
+                                    v_rgb_local[k] = fac * v_c;
+                                }
+                            } else {
+                                c_val = rgbs_batch[t * CDIM + k];
+                                v_rgb_local[k] = fac * v_c;
+                            }
+                            v_alpha += (c_val * T - buffer[k] * ra) * v_c;
+                            buffer[k] += c_val * fac;
                         }
                         if (do_dens) {
                             densification_weight_local = fac;
@@ -864,27 +904,41 @@ namespace gsplat_lfs {
                                 edge_score_local = edge_contribution;
                             }
                         }
-                        float v_alpha = 0.f;
-#pragma unroll
-                        for (uint32_t k = 0; k < CDIM; ++k) {
-                            v_alpha += (rgbs_batch[t * CDIM + k] * T - buffer[k] * ra) *
-                                       v_render_c[k];
-                        }
                         v_alpha += T_final * ra * v_render_a;
                         if (have_bg) {
                             v_alpha += -T_final * ra * bg_accum;
                         }
-                        if (free_limit > 0.f && rgbs_batch[t * CDIM + free_space.depth_channel] < free_limit) {
-                            v_alpha -= free_v_T * ra;
+                        if (free_limit > 0.f) {
+                            const float free_depth =
+                                (kHasRayDepth && free_space.depth_channel == kDepthChannel)
+                                    ? depth
+                                    : rgbs_batch[t * CDIM + free_space.depth_channel];
+                            if (free_depth < free_limit) {
+                                v_alpha -= free_v_T * ra;
+                            }
                         }
 
-                        if (opac * vis <= 0.999f) {
-                            const float v_vis = opac * v_alpha;
-                            const float v_gradDist = -0.5f * vis * v_vis;
-                            const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
-                            const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
-                            const vec3 v_gro = glm::cross(v_gcrod, grd_n);
-                            const vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
+                        const bool alpha_grad = (opac * vis <= 0.999f);
+                        const bool depth_grad =
+                            kHasRayDepth && (v_depth != 0.f && t_hit > 0.f && inv_grd_len > 0.f);
+                        if (alpha_grad || depth_grad) {
+                            vec3 v_gro{0.f};
+                            vec3 v_grd{0.f};
+                            if (alpha_grad) {
+                                const float v_vis = opac * v_alpha;
+                                const float v_gradDist = -0.5f * vis * v_vis;
+                                const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
+                                const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
+                                v_gro = glm::cross(v_gcrod, grd_n);
+                                v_grd = safe_normalize_bw(grd, v_grd_n);
+                                v_opacity_local = vis * v_alpha;
+                            }
+                            if constexpr (kHasRayDepth) {
+                                if (depth_grad) {
+                                    ray_gaussian_depth_vjp(gro, grd_n, inv_grd_len, t_hit,
+                                                           depth_scale, v_depth, v_gro, v_grd);
+                                }
+                            }
                             const mat3 v_Mt = glm::outerProduct(v_grd, ray_d) +
                                               glm::outerProduct(v_gro, o_minus_mu);
                             const vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
@@ -894,12 +948,6 @@ namespace gsplat_lfs {
                             const mat3 R = quat_to_rotmat(quat);
                             quat_scale_to_preci_half_vjp(
                                 quat, scale_act, R, glm::transpose(v_Mt), v_quat_local, v_scale_local);
-                            v_opacity_local = vis * v_alpha;
-                        }
-
-#pragma unroll
-                        for (uint32_t k = 0; k < CDIM; ++k) {
-                            buffer[k] += rgbs_batch[t * CDIM + k] * fac;
                         }
                     }
                     warpSum<CDIM>(v_rgb_local, warp);
@@ -914,6 +962,10 @@ namespace gsplat_lfs {
                         float* v_rgb_ptr = (float*)(v_colors) + CDIM * g;
 #pragma unroll
                         for (uint32_t k = 0; k < CDIM; ++k) {
+                            if constexpr (kHasRayDepth) {
+                                if (k == kDepthChannel || (kHasDepthSq && k == kDepthSqChannel))
+                                    continue;
+                            }
                             gpuAtomicAdd(v_rgb_ptr + k, v_rgb_local[k]);
                         }
                         float* v_mean_ptr = (float*)(v_means) + 3 * g;
@@ -1065,7 +1117,7 @@ namespace gsplat_lfs {
         __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
         __shared__ float2 s_free[kSplatBwdPixels]; // (limit, v_T_front * T_front)
         __shared__ float3 s_ray_o[kSplatBwdPixels];
-        __shared__ float3 s_ray_d[kSplatBwdPixels];
+        __shared__ float4 s_ray_d[kSplatBwdPixels];
         __shared__ int32_t s_bin[kSplatBwdPixels]; // last contributing pair; -1 inactive
         __shared__ int32_t s_surv[kSplatBwdSurvivors];
 
@@ -1082,8 +1134,10 @@ namespace gsplat_lfs {
             const bool active = inside && ray.valid_flag;
             s_bin[p] = active ? last_ids[pix] : -1;
             bin_max = max(bin_max, s_bin[p]);
+            const float depth_scale =
+                (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
             s_ray_o[p] = make_float3(ray.ray_org.x, ray.ray_org.y, ray.ray_org.z);
-            s_ray_d[p] = make_float3(ray.ray_dir.x, ray.ray_dir.y, ray.ray_dir.z);
+            s_ray_d[p] = make_float4(ray.ray_dir.x, ray.ray_dir.y, ray.ray_dir.z, depth_scale);
             const float T_final = 1.0f - render_alphas[pix];
             s_T[p] = T_final;
             s_T_final[p] = T_final;
@@ -1208,19 +1262,36 @@ namespace gsplat_lfs {
                 float edge_score = 0.f;
                 bool touched = false;
 
+                constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+                constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+                constexpr bool kHasDepthSq = (CDIM == 8);
+                constexpr uint32_t kDepthSqChannel = 7u;
+
                 for (int t = 0; t < batch + static_cast<int>(kSplatBwdPixels) - 1; ++t) {
                     const int p = t - static_cast<int>(lane);
                     if (owns && p >= 0 && p < static_cast<int>(kSplatBwdPixels) && isect_idx <= s_bin[p]) {
                         const float3 o = s_ray_o[p];
-                        const float3 d = s_ray_d[p];
+                        const float4 d = s_ray_d[p];
                         const vec3 ray_o{o.x, o.y, o.z};
                         const vec3 ray_d{d.x, d.y, d.z};
+                        const float depth_scale = d.w;
                         const vec3 o_minus_mu = ray_o - xyz;
                         const vec3 gro = Mt * o_minus_mu;
                         const vec3 grd = Mt * ray_d;
-                        const vec3 grd_n = safe_normalize(grd);
-                        const vec3 gcrod = glm::cross(grd_n, gro);
-                        const float power = -0.5f * glm::dot(gcrod, gcrod);
+                        vec3 grd_n;
+                        vec3 gcrod;
+                        float inv_grd_len = 0.f;
+                        float t_hit = 0.f;
+                        float depth = 0.f;
+                        float power;
+                        if constexpr (kHasRayDepth) {
+                            ray_gaussian_eval(gro, grd, depth_scale,
+                                              grd_n, gcrod, inv_grd_len, t_hit, depth, power);
+                        } else {
+                            grd_n = safe_normalize(grd);
+                            gcrod = glm::cross(grd_n, gro);
+                            power = -0.5f * glm::dot(gcrod, gcrod);
+                        }
                         const float vis = __expf(power);
                         const float alpha = min(0.999f, opac * vis);
                         if (power <= 0.f && alpha >= 1.f / 255.f) {
@@ -1229,22 +1300,47 @@ namespace gsplat_lfs {
                             const float T = s_T[p] * ra;
                             const float fac = alpha * T;
                             const float T_final = s_T_final[p];
+                            float v_depth = 0.f;
                             float v_alpha = 0.f;
 #pragma unroll
                             for (uint32_t k = 0; k < kUsed; ++k) {
                                 const float v_c = s_v_c[p * kUsed + k];
                                 const float buffer = s_buffer[p * kUsed + k];
-                                v_rgb[k] += fac * v_c;
-                                v_alpha += (rgb[k] * T - buffer * ra) * v_c;
-                                s_buffer[p * kUsed + k] = buffer + rgb[k] * fac;
+                                float c_val;
+                                if constexpr (kHasRayDepth) {
+                                    if (k == kDepthChannel) {
+                                        c_val = depth;
+                                        v_depth += fac * v_c;
+                                    } else if constexpr (kHasDepthSq) {
+                                        if (k == kDepthSqChannel) {
+                                            c_val = depth * depth;
+                                            v_depth += fac * (2.0f * depth) * v_c;
+                                        } else {
+                                            c_val = rgb[k];
+                                            v_rgb[k] += fac * v_c;
+                                        }
+                                    } else {
+                                        c_val = rgb[k];
+                                        v_rgb[k] += fac * v_c;
+                                    }
+                                } else {
+                                    c_val = rgb[k];
+                                    v_rgb[k] += fac * v_c;
+                                }
+                                v_alpha += (c_val * T - buffer * ra) * v_c;
+                                s_buffer[p * kUsed + k] = buffer + c_val * fac;
                             }
                             v_alpha += T_final * ra * s_v_a[p];
                             if (have_bg) {
                                 v_alpha += -T_final * ra * s_bg[p];
                             }
                             const float2 free = s_free[p];
-                            if (free.x > 0.f && splat_depth < free.x) {
-                                v_alpha -= free.y * ra;
+                            if (free.x > 0.f) {
+                                const float free_depth =
+                                    (kHasRayDepth && depth_channel == kDepthChannel) ? depth : splat_depth;
+                                if (free_depth < free.x) {
+                                    v_alpha -= free.y * ra;
+                                }
                             }
                             if (do_dens) {
                                 dens_w += fac;
@@ -1256,17 +1352,30 @@ namespace gsplat_lfs {
                                     edge_score += edge_contribution;
                                 }
                             }
-                            if (opac * vis <= 0.999f) {
-                                const float v_vis = opac * v_alpha;
-                                const float v_gradDist = -0.5f * vis * v_vis;
-                                const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
-                                const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
-                                const vec3 v_gro = glm::cross(v_gcrod, grd_n);
-                                const vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
+                            const bool alpha_grad = (opac * vis <= 0.999f);
+                            const bool depth_grad =
+                                kHasRayDepth && (v_depth != 0.f && t_hit > 0.f && inv_grd_len > 0.f);
+                            if (alpha_grad || depth_grad) {
+                                vec3 v_gro{0.f};
+                                vec3 v_grd{0.f};
+                                if (alpha_grad) {
+                                    const float v_vis = opac * v_alpha;
+                                    const float v_gradDist = -0.5f * vis * v_vis;
+                                    const vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
+                                    const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
+                                    v_gro = glm::cross(v_gcrod, grd_n);
+                                    v_grd = safe_normalize_bw(grd, v_grd_n);
+                                    v_opacity += vis * v_alpha;
+                                }
+                                if constexpr (kHasRayDepth) {
+                                    if (depth_grad) {
+                                        ray_gaussian_depth_vjp(gro, grd_n, inv_grd_len, t_hit,
+                                                               depth_scale, v_depth, v_gro, v_grd);
+                                    }
+                                }
                                 v_Mt_sum += glm::outerProduct(v_grd, ray_d) +
                                             glm::outerProduct(v_gro, o_minus_mu);
                                 v_gro_sum += v_gro;
-                                v_opacity += vis * v_alpha;
                             }
                             s_T[p] = T;
                         }
@@ -1283,6 +1392,10 @@ namespace gsplat_lfs {
                     float* v_rgb_ptr = v_colors + CDIM * g;
 #pragma unroll
                     for (uint32_t k = 0; k < kUsed; ++k) {
+                        if constexpr (kHasRayDepth) {
+                            if (k == kDepthChannel || (kHasDepthSq && k == kDepthSqChannel))
+                                continue;
+                        }
                         gpuAtomicAdd(v_rgb_ptr + k, v_rgb[k]);
                     }
                     float* v_mean_ptr = reinterpret_cast<float*>(v_means) + 3 * g;

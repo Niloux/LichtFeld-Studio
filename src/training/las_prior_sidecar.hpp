@@ -20,6 +20,7 @@ namespace lfs::training {
         bool depth_millimetres = false;     // depth_format "uint16_png_mm"
         bool ray_distance = false;          // depth_type "ray_distance", as GUT renders non-pinhole depth
         bool normals_camera_opencv = false; // normal_frame "opencv_camera..."
+        bool sparse_las_depth = false;      // depth_source is sparse LiDAR rather than dense monocular
     };
 
     [[nodiscard]] std::optional<LasPriorSidecar> read_las_prior_sidecar(

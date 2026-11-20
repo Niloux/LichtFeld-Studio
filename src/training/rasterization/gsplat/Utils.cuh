@@ -218,6 +218,50 @@ namespace gsplat_lfs {
         return d_out;
     }
 
+    // Evaluates ray-Gaussian log-density exponent `power` and per-pixel closest-approach depth.
+    inline __device__ __forceinline__ void ray_gaussian_eval(
+        const vec3 gro,
+        const vec3 grd,
+        const float depth_scale,
+        vec3& grd_n,
+        vec3& gcrod,
+        float& inv_grd_len,
+        float& t_hit,
+        float& depth,
+        float& power) {
+        const float l2 = grd.x * grd.x + grd.y * grd.y + grd.z * grd.z;
+        if (l2 > 0.0f) {
+            inv_grd_len = rsqrtf(l2);
+            grd_n = grd * inv_grd_len;
+            t_hit = -glm::dot(grd_n, gro) * inv_grd_len;
+            depth = t_hit > 0.0f ? t_hit * depth_scale : 0.0f;
+        } else {
+            inv_grd_len = 0.0f;
+            grd_n = grd;
+            t_hit = 0.0f;
+            depth = 0.0f;
+        }
+        gcrod = glm::cross(grd_n, gro);
+        power = -0.5f * glm::dot(gcrod, gcrod);
+    }
+
+    // Accumulates gradients from per-pixel ray-Gaussian depth into local origin/direction vectors.
+    inline __device__ __forceinline__ void ray_gaussian_depth_vjp(
+        const vec3 gro,
+        const vec3 grd_n,
+        const float inv_grd_len,
+        const float t_hit,
+        const float depth_scale,
+        const float v_depth,
+        vec3& v_gro,
+        vec3& v_grd) {
+        if (v_depth != 0.0f && t_hit > 0.0f && inv_grd_len > 0.0f) {
+            const float k = -v_depth * depth_scale * inv_grd_len;
+            v_gro += k * grd_n;
+            v_grd += k * (gro * inv_grd_len + (2.0f * t_hit) * grd_n);
+        }
+    }
+
     inline __device__ float3 load_float3(const float* p) {
         return *reinterpret_cast<const float3*>(p);
     }

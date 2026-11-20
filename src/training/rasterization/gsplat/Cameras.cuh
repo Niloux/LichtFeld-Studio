@@ -247,6 +247,7 @@ struct WorldRay {
     glm::fvec3 ray_org;
     glm::fvec3 ray_dir;
     bool valid_flag;
+    float cam_ray_z = 1.0f;
 };
 
 struct CameraRay {
@@ -265,7 +266,7 @@ struct ShutterPose {
     inline __device__ auto camera_ray_to_world_ray(glm::fvec3 const& camera_ray) const -> WorldRay {
         auto const R_inv = glm::mat3_cast(glm::inverse(q));
 
-        return {-R_inv * t, R_inv * camera_ray, true};
+        return {-R_inv * t, R_inv * camera_ray, true, camera_ray.z};
     }
 };
 
@@ -333,7 +334,7 @@ struct BaseCameraModel {
         auto const camera_ray = derived->image_point_to_camera_ray(image_point);
         // If the camera ray is invalid, return an invalid world ray
         if (!camera_ray.valid_flag) {
-            return {glm::fvec3{}, glm::fvec3{}, false};
+            return {glm::fvec3{}, glm::fvec3{}, false, 1.0f};
         }
 
         return interpolate_shutter_pose(

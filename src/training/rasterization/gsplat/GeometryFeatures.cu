@@ -41,7 +41,9 @@ namespace gsplat_lfs {
         __global__ void features_kernel(const float* means, const float* quats, const float* scales,
                                         const float* views, float* features,
                                         const float* gf, float* gm, float* gq,
-                                        uint32_t N, uint32_t C, uint32_t channels, CameraModelType model) {
+                                        uint32_t N, uint32_t C, uint32_t channels, CameraModelType /*model*/) {
+            if (channels != 8)
+                return;
             const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= N * C)
                 return;
@@ -49,37 +51,22 @@ namespace gsplat_lfs {
             const float* v = views + (i / N) * 16;
             const mat3 V = camera_rotation(v);
             const vec3 p = V * vec3(means[3 * g], means[3 * g + 1], means[3 * g + 2]) + vec3(v[3], v[7], v[11]);
-            const bool radial = model != CameraModelType::PINHOLE;
-            const float depth = radial ? length(p) : p.z;
-            const uint32_t d = channels == 1 ? 0 : 3;
+            (void)gm;
+            const vec4 q(quats[4 * g], quats[4 * g + 1], quats[4 * g + 2], quats[4 * g + 3]);
+            const int axis = min_axis(scales + 3 * g);
+            const vec3 normal = V * quat_to_rotmat(q)[axis];
+            const float sign = dot(normal, p) > 0 ? -1.f : 1.f;
             if constexpr (!Backward) {
-                features[i * channels + d] = depth;
-                if (channels == 8)
-                    features[i * channels + 7] = depth * depth;
-            } else {
-                const vec3 dp = radial ? p / fmaxf(depth, 1.e-12f) : vec3(0, 0, 1);
-                const float gd = gf[i * channels + d] + (channels == 8 ? 2.f * depth * gf[i * channels + 7] : 0.f);
-                const vec3 grad = transpose(V) * dp * gd;
                 for (int c = 0; c < 3; ++c)
-                    atomicAdd(gm + 3 * g + c, grad[c]);
-            }
-            if (channels == 8) {
-                const vec4 q(quats[4 * g], quats[4 * g + 1], quats[4 * g + 2], quats[4 * g + 3]);
-                const int axis = min_axis(scales + 3 * g);
-                const vec3 normal = V * quat_to_rotmat(q)[axis];
-                const float sign = dot(normal, p) > 0 ? -1.f : 1.f;
-                if constexpr (!Backward) {
-                    for (int c = 0; c < 3; ++c)
-                        features[i * channels + 4 + c] = sign * normal[c];
-                } else {
-                    const vec3 gn = sign * (transpose(V) * vec3(gf[i * channels + 4], gf[i * channels + 5], gf[i * channels + 6]));
-                    mat3 gR(0.f);
-                    gR[axis] = gn;
-                    vec4 grad(0.f);
-                    quat_to_rotmat_vjp(q, gR, grad);
-                    for (int c = 0; c < 4; ++c)
-                        atomicAdd(gq + 4 * g + c, grad[c]);
-                }
+                    features[i * channels + 4 + c] = sign * normal[c];
+            } else {
+                const vec3 gn = sign * (transpose(V) * vec3(gf[i * channels + 4], gf[i * channels + 5], gf[i * channels + 6]));
+                mat3 gR(0.f);
+                gR[axis] = gn;
+                vec4 grad(0.f);
+                quat_to_rotmat_vjp(q, gR, grad);
+                for (int c = 0; c < 4; ++c)
+                    atomicAdd(gq + 4 * g + c, grad[c]);
             }
         }
         __global__ void flatten_kernel(const float* s, float* gs, uint32_t N, float weight) {

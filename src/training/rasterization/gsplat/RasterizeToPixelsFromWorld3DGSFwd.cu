@@ -106,6 +106,12 @@ namespace gsplat_lfs {
             radial_coeffs, tangential_coeffs, thin_prism_coeffs);
         const vec3 ray_d = ray.ray_dir;
         const vec3 ray_o = ray.ray_org;
+        const float depth_scale =
+            (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
+        constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+        constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
 
         // return if out of bounds
         // keep not rasterizing threads around for reading data
@@ -235,10 +241,21 @@ namespace gsplat_lfs {
                 const mat3 iscl_rot = iscl_rot_batch[t];
 
                 const vec3 gro = iscl_rot * (ray_o - xyz);
-                const vec3 grd = safe_normalize(iscl_rot * ray_d);
-                const vec3 gcrod = glm::cross(grd, gro);
-                const float grayDist = glm::dot(gcrod, gcrod);
-                const float power = -0.5f * grayDist;
+                vec3 grd_n;
+                vec3 gcrod;
+                float power;
+                float depth = 0.0f;
+                if constexpr (kHasRayDepth) {
+                    float inv_grd_len = 0.0f;
+                    float t_hit = 0.0f;
+                    ray_gaussian_eval(gro, iscl_rot * ray_d, depth_scale,
+                                      grd_n, gcrod, inv_grd_len, t_hit, depth, power);
+                } else {
+                    grd_n = safe_normalize(iscl_rot * ray_d);
+                    gcrod = glm::cross(grd_n, gro);
+                    const float grayDist = glm::dot(gcrod, gcrod);
+                    power = -0.5f * grayDist;
+                }
 
                 float alpha = min(0.999f, opac * __expf(power));
                 if (alpha < 1.f / 255.f) {
@@ -251,8 +268,12 @@ namespace gsplat_lfs {
                     break;
                 }
 
+                const float splat_depth =
+                    (kHasRayDepth && free_space.depth_channel == kDepthChannel)
+                        ? depth
+                        : (free_space.depth_channel < CDIM ? rgbs_batch[t * CDIM + free_space.depth_channel] : 0.0f);
                 if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
-                    median = rgbs_batch[t * CDIM + free_space.depth_channel];
+                    median = splat_depth;
                 }
 
                 const float vis = alpha * T;
@@ -266,15 +287,20 @@ namespace gsplat_lfs {
                     pix_out[0] += c.x * vis;
                     pix_out[1] += c.y * vis;
                     pix_out[2] += c.z * vis;
-                    pix_out[3] += c.w * vis;
+                    pix_out[3] += depth * vis;
                 } else {
 #pragma unroll
                     for (uint32_t k = 0; k < CDIM; ++k) {
-                        pix_out[k] += rgbs_batch[t * CDIM + k] * vis;
+                        const float c_val = (kHasRayDepth && k == kDepthChannel)
+                                                ? depth
+                                                : ((kHasDepthSq && k == kDepthSqChannel)
+                                                       ? depth * depth
+                                                       : rgbs_batch[t * CDIM + k]);
+                        pix_out[k] += c_val * vis;
                     }
                 }
                 cur_idx = batch_start + t;
-                if (free_limit > 0.0f && rgbs_batch[t * CDIM + free_space.depth_channel] < free_limit) {
+                if (free_limit > 0.0f && splat_depth < free_limit) {
                     T_front *= 1.0f - alpha;
                 }
 
@@ -405,6 +431,12 @@ namespace gsplat_lfs {
             radial_coeffs, tangential_coeffs, thin_prism_coeffs);
         const vec3 ray_d = ray.ray_dir;
         const vec3 ray_o = ray.ray_org;
+        const float depth_scale =
+            (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
+        constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+        constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
 
         const bool inside = i < image_height && j < image_width;
         bool done = !inside || !ray.valid_flag;
@@ -509,9 +541,20 @@ namespace gsplat_lfs {
                 const mat3 iscl_rot = s_iscl_rot[t];
 
                 const vec3 gro = iscl_rot * (ray_o - xyz);
-                const vec3 grd = safe_normalize(iscl_rot * ray_d);
-                const vec3 gcrod = glm::cross(grd, gro);
-                const float power = -0.5f * glm::dot(gcrod, gcrod);
+                vec3 grd_n;
+                vec3 gcrod;
+                float power;
+                float depth = 0.0f;
+                if constexpr (kHasRayDepth) {
+                    float inv_grd_len = 0.0f;
+                    float t_hit = 0.0f;
+                    ray_gaussian_eval(gro, iscl_rot * ray_d, depth_scale,
+                                      grd_n, gcrod, inv_grd_len, t_hit, depth, power);
+                } else {
+                    grd_n = safe_normalize(iscl_rot * ray_d);
+                    gcrod = glm::cross(grd_n, gro);
+                    power = -0.5f * glm::dot(gcrod, gcrod);
+                }
 
                 const float alpha = min(0.999f, xyz_opac.w * __expf(power));
                 if (alpha < 1.f / 255.f) {
@@ -522,17 +565,26 @@ namespace gsplat_lfs {
                     done = true;
                     break;
                 }
+                const float splat_depth =
+                    (kHasRayDepth && free_space.depth_channel == kDepthChannel)
+                        ? depth
+                        : (free_space.depth_channel < CDIM ? s_rgbs[t * CDIM + free_space.depth_channel] : 0.0f);
                 if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
-                    median = s_rgbs[t * CDIM + free_space.depth_channel];
+                    median = splat_depth;
                 }
                 const float vis = alpha * T;
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    pix_out[k] += s_rgbs[t * CDIM + k] * vis;
+                    const float c_val = (kHasRayDepth && k == kDepthChannel)
+                                            ? depth
+                                            : ((kHasDepthSq && k == kDepthSqChannel)
+                                                   ? depth * depth
+                                                   : s_rgbs[t * CDIM + k]);
+                    pix_out[k] += c_val * vis;
                 }
                 cur_idx = static_cast<uint32_t>(s_bin[t]);
                 s_hit[t] = 1;
-                if (free_limit > 0.0f && s_rgbs[t * CDIM + free_space.depth_channel] < free_limit) {
+                if (free_limit > 0.0f && splat_depth < free_limit) {
                     T_front *= 1.0f - alpha;
                 }
                 T = next_T;

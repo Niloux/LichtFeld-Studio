@@ -628,6 +628,23 @@ namespace lfs::core {
                    static_cast<float>(iter) < normal_end_fraction * total_f;
         }
 
+        float OptimizationParameters::normal_prior_scale_at(const int iter) const {
+            if (!normal_supervision_active(iter))
+                return 0.0f;
+            if (normal_prior_decay_start >= 1.0f)
+                return 1.0f;
+            const float total_f = static_cast<float>(std::max(1, resolved_total_iterations()));
+            const float progress = std::clamp(static_cast<float>(iter) / total_f, 0.0f, 1.0f);
+            if (progress <= normal_prior_decay_start)
+                return 1.0f;
+            if (progress >= normal_prior_decay_end)
+                return 0.0f;
+            constexpr float kPi = 3.14159265358979323846f;
+            const float t = (progress - normal_prior_decay_start) /
+                            (normal_prior_decay_end - normal_prior_decay_start);
+            return 0.5f * (1.0f + std::cos(kPi * t));
+        }
+
         float OptimizationParameters::scale_reg_at(const int iter) const {
             if (scale_reg_decay_power < 0.0f)
                 return scale_reg;
@@ -1029,6 +1046,7 @@ namespace lfs::core {
                 std::pair{"sh_rest_reg", sh_rest_reg},
                 std::pair{"mask_opacity_penalty_weight", mask_opacity_penalty_weight},
                 std::pair{"depth_loss_weight", depth_loss_weight},
+                std::pair{"depth_loss_gradient_weight", depth_loss_gradient_weight},
                 std::pair{"free_space_weight", free_space_weight},
                 std::pair{"free_space_margin", free_space_margin},
                 std::pair{"bilateral_grid_lr", bilateral_grid_lr},
@@ -1062,6 +1080,8 @@ namespace lfs::core {
                 std::pair{"bounds_percentile", bounds_percentile},
                 std::pair{"normal_start_fraction", normal_start_fraction},
                 std::pair{"normal_end_fraction", normal_end_fraction},
+                std::pair{"normal_prior_decay_start", normal_prior_decay_start},
+                std::pair{"normal_prior_decay_end", normal_prior_decay_end},
                 std::pair{"free_space_margin_rel", free_space_margin_rel},
             };
             for (const auto& [name, value] : probability_fields) {
@@ -1114,6 +1134,10 @@ namespace lfs::core {
                 return std::format(
                     "normal_start_fraction must not exceed normal_end_fraction ({} > {})",
                     normal_start_fraction, normal_end_fraction);
+            if (normal_prior_decay_start > normal_prior_decay_end)
+                return std::format(
+                    "normal_prior_decay_start must not exceed normal_prior_decay_end ({} > {})",
+                    normal_prior_decay_start, normal_prior_decay_end);
             return {};
         }
 

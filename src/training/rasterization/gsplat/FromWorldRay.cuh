@@ -116,7 +116,7 @@ namespace gsplat_lfs {
             ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
         } else {
             assert(false);
-            ray = {vec3{}, vec3{}, false};
+            ray = {vec3{}, vec3{}, false, 1.0f};
         }
         return ray;
     }

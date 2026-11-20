@@ -2026,6 +2026,34 @@ TEST(ArgumentParserTest, TrainingRejectsLegacyDepthLossAlias) {
     EXPECT_NE(parsed.error().find("depth_loss_mode must be 'ssi', 'ssi-disparity', 'ssi-depth', or 'metric'"), std::string::npos);
 }
 
+TEST(ArgumentParserTest, TrainingParsesPhaseADepthGradientAndNormalDecayOptions) {
+    const auto data_path = make_test_path("lfs_arg_parser_phase_a_data");
+    const auto output_path = make_test_path("lfs_arg_parser_phase_a_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--use-depth-loss",
+        "--depth-loss-gradient-weight",
+        "0.25",
+        "--use-normal-loss",
+        "--normal-prior-decay-start",
+        "0.5",
+        "--normal-prior-decay-end",
+        "0.8"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    EXPECT_FLOAT_EQ((*parsed)->optimization.depth_loss_gradient_weight, 0.25f);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_decay_start, 0.5f);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_decay_end, 0.8f);
+}
+
 TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
     const auto data_path = make_test_path("lfs_arg_parser_normal_loss_data");
     const auto output_path = make_test_path("lfs_arg_parser_normal_loss_output");

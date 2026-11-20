@@ -83,6 +83,7 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--no-alpha-as-mask", "use_alpha_as_mask", Bool, true},
             OptimizationCliBinding{"--use-depth-loss", "use_depth_loss", Bool},
             OptimizationCliBinding{"--depth-loss-weight", "depth_loss_weight", Float},
+            OptimizationCliBinding{"--depth-loss-gradient-weight", "depth_loss_gradient_weight", Float},
             OptimizationCliBinding{"--depth-loss-mode", "depth_loss_mode", String},
             OptimizationCliBinding{"--no-depth-auto-generate", "depth_auto_generate", Bool, true},
             OptimizationCliBinding{"--free-space-weight", "free_space_weight", Float},
@@ -97,6 +98,8 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--normal-flatten-weight", "normal_flatten_weight", Float},
             OptimizationCliBinding{"--normal-start-fraction", "normal_start_fraction", Float},
             OptimizationCliBinding{"--normal-end-fraction", "normal_end_fraction", Float},
+            OptimizationCliBinding{"--normal-prior-decay-start", "normal_prior_decay_start", Float},
+            OptimizationCliBinding{"--normal-prior-decay-end", "normal_prior_decay_end", Float},
             OptimizationCliBinding{"--ppisp-holdout-appearance", "ppisp_holdout_appearance", Enum},
             OptimizationCliBinding{"--normal-loss-space", "normal_loss_space", Enum},
             OptimizationCliBinding{"--enable-sparsity", "enable_sparsity", Bool},
@@ -927,6 +930,7 @@ namespace {
             ::args::Flag no_alpha_as_mask(mask_group, "no_alpha_as_mask", lfs::core::args::optimization_cli_help("--no-alpha-as-mask"), {"no-alpha-as-mask"});
             ::args::Flag use_depth_loss(mask_group, "use_depth_loss", lfs::core::args::optimization_cli_help("--use-depth-loss"), {"use-depth-loss"});
             ::args::ValueFlag<float> depth_loss_weight(mask_group, "depth_loss_weight", lfs::core::args::optimization_cli_help("--depth-loss-weight"), {"depth-loss-weight"});
+            ::args::ValueFlag<float> depth_loss_gradient_weight(mask_group, "depth_loss_gradient_weight", lfs::core::args::optimization_cli_help("--depth-loss-gradient-weight"), {"depth-loss-gradient-weight"});
             ::args::ValueFlag<std::string> depth_loss_mode(mask_group, "depth_loss_mode", lfs::core::args::optimization_cli_help("--depth-loss-mode"), {"depth-loss-mode"});
             ::args::Flag no_depth_auto_generate(mask_group, "no_depth_auto_generate", lfs::core::args::optimization_cli_help("--no-depth-auto-generate"), {"no-depth-auto-generate"});
             ::args::ValueFlag<float> free_space_weight(mask_group, "weight", lfs::core::args::optimization_cli_help("--free-space-weight"), {"free-space-weight"});
@@ -941,6 +945,8 @@ namespace {
             ::args::ValueFlag<float> normal_flatten_weight(mask_group, "normal_flatten_weight", lfs::core::args::optimization_cli_help("--normal-flatten-weight"), {"normal-flatten-weight"});
             ::args::ValueFlag<float> normal_start_fraction(mask_group, "normal_start_fraction", lfs::core::args::optimization_cli_help("--normal-start-fraction"), {"normal-start-fraction"});
             ::args::ValueFlag<float> normal_end_fraction(mask_group, "normal_end_fraction", lfs::core::args::optimization_cli_help("--normal-end-fraction"), {"normal-end-fraction"});
+            ::args::ValueFlag<float> normal_prior_decay_start(mask_group, "normal_prior_decay_start", lfs::core::args::optimization_cli_help("--normal-prior-decay-start"), {"normal-prior-decay-start"});
+            ::args::ValueFlag<float> normal_prior_decay_end(mask_group, "normal_prior_decay_end", lfs::core::args::optimization_cli_help("--normal-prior-decay-end"), {"normal-prior-decay-end"});
             ::args::ValueFlag<std::string> normal_loss_space(mask_group, "normal_loss_space", lfs::core::args::optimization_cli_help("--normal-loss-space"), {"normal-loss-space"});
 
             // =============================================================================
@@ -1711,6 +1717,7 @@ namespace {
                                         // Mask parameters
                                         mask_mode_val = cli_option_present({"--mask-mode"}) ? std::optional<lfs::core::param::MaskMode>(::args::get(mask_mode)) : std::optional<lfs::core::param::MaskMode>(),
                                         depth_loss_weight_val = cli_option_present({"--depth-loss-weight"}) ? std::optional<float>(::args::get(depth_loss_weight)) : std::optional<float>(),
+                                        depth_loss_gradient_weight_val = cli_option_present({"--depth-loss-gradient-weight"}) ? std::optional<float>(::args::get(depth_loss_gradient_weight)) : std::optional<float>(),
                                         depth_loss_mode_val = cli_option_present({"--depth-loss-mode"}) ? std::optional<std::string>(::args::get(depth_loss_mode)) : std::optional<std::string>(),
                                         free_space_weight_val = cli_option_present({"--free-space-weight"}) ? std::optional<float>(::args::get(free_space_weight)) : std::optional<float>(),
                                         free_space_margin_val = cli_option_present({"--free-space-margin"}) ? std::optional<float>(::args::get(free_space_margin)) : std::optional<float>(),
@@ -1722,6 +1729,8 @@ namespace {
                                         normal_flatten_weight_val = cli_option_present({"--normal-flatten-weight"}) ? std::optional<float>(::args::get(normal_flatten_weight)) : std::optional<float>(),
                                         normal_start_fraction_val = cli_option_present({"--normal-start-fraction"}) ? std::optional<float>(::args::get(normal_start_fraction)) : std::optional<float>(),
                                         normal_end_fraction_val = cli_option_present({"--normal-end-fraction"}) ? std::optional<float>(::args::get(normal_end_fraction)) : std::optional<float>(),
+                                        normal_prior_decay_start_val = cli_option_present({"--normal-prior-decay-start"}) ? std::optional<float>(::args::get(normal_prior_decay_start)) : std::optional<float>(),
+                                        normal_prior_decay_end_val = cli_option_present({"--normal-prior-decay-end"}) ? std::optional<float>(::args::get(normal_prior_decay_end)) : std::optional<float>(),
                                         ppisp_holdout_appearance_val = cli_option_present({"--ppisp-holdout-appearance"}) ? std::optional<std::string>(::args::get(ppisp_holdout_appearance)) : std::optional<std::string>(),
                                         normal_loss_space_val = parsed_normal_loss_space,
                                         // Python scripts
@@ -1998,6 +2007,7 @@ namespace {
                     opt.use_alpha_as_mask = false;
                 setFlag(use_depth_loss_flag, opt.use_depth_loss);
                 setVal(depth_loss_weight_val, opt.depth_loss_weight);
+                setVal(depth_loss_gradient_weight_val, opt.depth_loss_gradient_weight);
                 if (depth_loss_mode_val) {
                     opt.depth_loss_mode = *depth_loss_mode_val;
                 }
@@ -2016,6 +2026,8 @@ namespace {
                 setVal(normal_flatten_weight_val, opt.normal_flatten_weight);
                 setVal(normal_start_fraction_val, opt.normal_start_fraction);
                 setVal(normal_end_fraction_val, opt.normal_end_fraction);
+                setVal(normal_prior_decay_start_val, opt.normal_prior_decay_start);
+                setVal(normal_prior_decay_end_val, opt.normal_prior_decay_end);
                 if (ppisp_holdout_appearance_val) {
                     opt.ppisp_holdout_appearance = *lfs::core::param::ppisp_holdout_appearance_from_string(*ppisp_holdout_appearance_val);
                 }
@@ -2112,6 +2124,7 @@ namespace {
                 note_opt("use_alpha_as_mask", no_alpha_as_mask_flag);
                 note_opt("use_depth_loss", use_depth_loss_flag);
                 note_opt("depth_loss_weight", depth_loss_weight_val.has_value());
+                note_opt("depth_loss_gradient_weight", depth_loss_gradient_weight_val.has_value());
                 note_opt("depth_loss_mode", depth_loss_mode_val.has_value());
                 note_opt("free_space_weight", free_space_weight_val.has_value());
                 note_opt("free_space_margin", free_space_margin_val.has_value());
@@ -2122,6 +2135,8 @@ namespace {
                 note_opt("depth_distortion_weight", depth_distortion_weight_val.has_value());
                 note_opt("normal_prior_depth_weight", normal_prior_depth_weight_val.has_value());
                 note_opt("normal_flatten_weight", normal_flatten_weight_val.has_value());
+                note_opt("normal_prior_decay_start", normal_prior_decay_start_val.has_value());
+                note_opt("normal_prior_decay_end", normal_prior_decay_end_val.has_value());
                 note_opt("ppisp_holdout_appearance", ppisp_holdout_appearance_val.has_value());
                 note_opt("normal_loss_space", normal_loss_space_val.has_value());
 

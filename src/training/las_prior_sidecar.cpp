@@ -42,6 +42,11 @@ namespace lfs::training {
         sidecar.depth_millimetres = string_field(json, "depth_format") == "uint16_png_mm";
         sidecar.ray_distance = string_field(json, "depth_type") == "ray_distance";
         sidecar.normals_camera_opencv = string_field(json, "normal_frame").starts_with("opencv_camera");
+        const auto depth_source = string_field(json, "depth_source");
+        const auto source = string_field(json, "source");
+        sidecar.sparse_las_depth =
+            depth_source == "las_moge_cleaned" || depth_source == "las" ||
+            source == "valid original LAS records" || source == "las_cleaned_moge2_normals";
         if (!sidecar.depth_millimetres && !sidecar.normals_camera_opencv) {
             return std::nullopt;
         }
@@ -61,6 +66,10 @@ namespace lfs::training {
             if (opt.depth_auto_generate) {
                 opt.depth_auto_generate = false;
                 changes.emplace_back("depth_auto_generate off");
+            }
+            if (sidecar.sparse_las_depth && opt.depth_loss_gradient_weight == 1.0f) {
+                opt.depth_loss_gradient_weight = 0.0f;
+                changes.emplace_back("depth_loss_gradient_weight 1 -> 0 (sparse LiDAR)");
             }
         }
         if (sidecar.normals_camera_opencv) {

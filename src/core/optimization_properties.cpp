@@ -447,6 +447,15 @@ namespace lfs::core::param {
             .precision(3)
             .ui_step(0.005)
             .all_strategies()
+            .float_prop(&OptimizationParameters::depth_loss_gradient_weight,
+                        "depth_loss_gradient_weight", "Depth Gradient Weight", d.depth_loss_gradient_weight, 0.0f, 10.0f,
+                        "Weight for the 4-neighbour spatial gradient term inside depth loss; 0 disables it for sparse LiDAR depth maps")
+            .locale("training.losses.depth_loss_gradient_weight")
+            .tooltip("training.tooltip.depth_loss_gradient_weight")
+            .flags(PROP_ADVANCED)
+            .precision(2)
+            .ui_step(0.1)
+            .all_strategies()
             .bool_prop(&OptimizationParameters::use_normal_loss,
                        "use_normal_loss", "Use Normal Loss", d.use_normal_loss,
                        "Use dataset normal maps for normal supervision")
@@ -514,6 +523,24 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.normal_end_fraction")
             .precision(3)
             .ui_step(0.01)
+            .all_strategies()
+            .float_prop(&OptimizationParameters::normal_prior_decay_start,
+                        "normal_prior_decay_start", "Normal Prior Decay Start", d.normal_prior_decay_start, 0.0f, 1.0f,
+                        "Fraction of total iterations where cosine decay of external normal priors begins; 1.0 keeps full weight")
+            .locale("training.losses.normal_prior_decay_start")
+            .tooltip("training.tooltip.normal_prior_decay_start")
+            .flags(PROP_ADVANCED)
+            .precision(2)
+            .ui_step(0.05)
+            .all_strategies()
+            .float_prop(&OptimizationParameters::normal_prior_decay_end,
+                        "normal_prior_decay_end", "Normal Prior Decay End", d.normal_prior_decay_end, 0.0f, 1.0f,
+                        "Fraction of total iterations where external normal priors finish decaying to 0")
+            .locale("training.losses.normal_prior_decay_end")
+            .tooltip("training.tooltip.normal_prior_decay_end")
+            .flags(PROP_ADVANCED)
+            .precision(2)
+            .ui_step(0.05)
             .all_strategies()
             .enum_prop(&OptimizationParameters::normal_loss_space,
                        "normal_loss_space", "Normal Loss Space", d.normal_loss_space,

@@ -101,6 +101,27 @@ TEST(LasPriorSidecar, IgnoresUnrelatedOrBrokenJson) {
     EXPECT_FALSE(lfs::training::read_las_prior_sidecar(dir.path()).has_value());
 }
 
+TEST(LasPriorSidecar, SparseLasDepthAutoDisablesDepthGradientUnlessExplicit) {
+    TempDir dir;
+    write_text(dir.path() / "supervision.json",
+               R"({"depth_format": "uint16_png_mm", "depth_type": "ray_distance",
+                   "depth_source": "las_moge_cleaned",
+                   "normal_frame": "opencv_camera_facing_camera"})");
+    const auto sidecar = lfs::training::read_las_prior_sidecar(dir.path());
+    ASSERT_TRUE(sidecar.has_value());
+    EXPECT_TRUE(sidecar->sparse_las_depth);
+
+    lfs::core::param::OptimizationParameters auto_opt;
+    const auto auto_changes = lfs::training::apply_las_prior_defaults(auto_opt, *sidecar);
+    EXPECT_FLOAT_EQ(auto_opt.depth_loss_gradient_weight, 0.0f);
+    EXPECT_EQ(auto_changes.size(), 5u);
+
+    lfs::core::param::OptimizationParameters explicit_opt;
+    explicit_opt.depth_loss_gradient_weight = 0.25f;
+    lfs::training::apply_las_prior_defaults(explicit_opt, *sidecar);
+    EXPECT_FLOAT_EQ(explicit_opt.depth_loss_gradient_weight, 0.25f);
+}
+
 TEST(MetricDepthLoss, MatchingRenderHasNoLossAndFartherRenderIsPulledIn) {
     if (!cuda_available()) {
         GTEST_SKIP() << "No CUDA device available";
@@ -153,6 +174,60 @@ TEST(MetricDepthLoss, MatchingRenderHasNoLossAndFartherRenderIsPulledIn) {
     const auto [far_loss, far_grad] = run(1.1f);
     EXPECT_GT(far_loss, 0.0f);
     EXPECT_GT(far_grad.sum().item<float>(), 0.0f);
+    EXPECT_EQ(far_grad.slice(1, width - 1, width).abs().max().item<float>(), 0.0f);
+}
+
+TEST(MetricDepthLoss, ZeroGradientWeightComputesPixelwiseLossWithoutNeighborTerms) {
+    if (!cuda_available()) {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+    constexpr int height = 16;
+    constexpr int width = 16;
+    constexpr float step = 1.0f / 65535.0f;
+    std::vector<float> target_values(height * width);
+    std::vector<float> metres(height * width);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = static_cast<size_t>(y) * width + x;
+            const uint16_t mm = static_cast<uint16_t>(1500 + 40 * x + 25 * y);
+            target_values[idx] = x == width - 1 ? 0.0f : mm * step;
+            metres[idx] = mm * 0.001f;
+        }
+    }
+    const auto anchor = lfs::training::kernels::metric_depth_anchor(0.001f / step);
+    ASSERT_TRUE(anchor.valid);
+
+    const auto target = Tensor::from_vector(target_values, {size_t{height}, size_t{width}}, Device::CUDA);
+    const auto alpha = Tensor::ones({size_t{height}, size_t{width}}, Device::CUDA);
+    const auto run = [&](const float render_scale) {
+        std::vector<float> render(metres);
+        for (auto& v : render) {
+            v *= render_scale;
+        }
+        const auto depth = Tensor::from_vector(render, {size_t{height}, size_t{width}}, Device::CUDA);
+        const cudaStream_t stream = depth.stream();
+        auto loss = Tensor::empty({size_t{1}}, Device::CUDA);
+        auto grad_depth = Tensor::empty(depth.shape(), Device::CUDA);
+        auto grad_alpha = Tensor::empty(alpha.shape(), Device::CUDA);
+        auto partials = Tensor::empty(
+            {lfs::training::kernels::depth_loss_partial_count(depth.numel())}, Device::CUDA);
+        for (auto* t : {&loss, &grad_depth, &grad_alpha, &partials}) {
+            t->set_stream(stream);
+        }
+        lfs::training::kernels::launch_depth_loss(
+            depth.ptr<float>(), alpha.ptr<float>(), target.ptr<float>(),
+            grad_depth.ptr<float>(), grad_alpha.ptr<float>(), loss.ptr<float>(), partials.ptr<float>(),
+            width, height, 1.0f, 0.0f, step, &anchor, stream);
+        return std::pair{loss.item<float>(), grad_depth};
+    };
+
+    const auto [matched_loss, matched_grad] = run(1.0f);
+    EXPECT_NEAR(matched_loss, 0.0f, 1.0e-6f);
+    EXPECT_LE(matched_grad.abs().max().item<float>(), 1.0e-6f);
+
+    const auto [far_loss, far_grad] = run(1.1f);
+    EXPECT_GT(far_loss, 0.0f);
+    EXPECT_GT(far_grad.slice(1, 0, width - 1).min().item<float>(), 0.0f);
     EXPECT_EQ(far_grad.slice(1, width - 1, width).abs().max().item<float>(), 0.0f);
 }
 

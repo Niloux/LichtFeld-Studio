@@ -594,6 +594,43 @@ namespace {
         EXPECT_TRUE(params.normal_supervision_active(scaled_total));
     }
 
+    TEST_F(TrainingParametersTest, NormalPriorScaleAndDecayValidation) {
+        OptimizationParameters params;
+        params.use_normal_loss = true;
+        params.iterations = 30'000;
+        params.normal_start_fraction = 0.08f;
+        params.normal_end_fraction = 1.0f;
+
+        // Default [1.0, 1.0] keeps prior active across all active iterations.
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(2'399), 0.0f);
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(2'400), 1.0f);
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(15'000), 1.0f);
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(30'000), 1.0f);
+
+        // Cosine decay over [0.5, 0.8] of 30k iterations (15k -> 24k).
+        params.normal_prior_decay_start = 0.5f;
+        params.normal_prior_decay_end = 0.8f;
+        EXPECT_TRUE(params.validate().empty());
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(15'000), 1.0f);
+        EXPECT_NEAR(params.normal_prior_scale_at(19'500), 0.5f, 1.0e-5f);
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(24'000), 0.0f);
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(29'999), 0.0f);
+
+        params.use_normal_loss = false;
+        EXPECT_FLOAT_EQ(params.normal_prior_scale_at(15'000), 0.0f);
+        params.use_normal_loss = true;
+
+        params.normal_prior_decay_start = 0.9f;
+        params.normal_prior_decay_end = 0.8f;
+        EXPECT_NE(params.validate().find("normal_prior_decay_start must not exceed normal_prior_decay_end"),
+                  std::string::npos);
+
+        params.normal_prior_decay_start = 0.5f;
+        params.normal_prior_decay_end = 0.8f;
+        params.depth_loss_gradient_weight = -0.1f;
+        EXPECT_NE(params.validate().find("depth_loss_gradient_weight"), std::string::npos);
+    }
+
     TEST_F(TrainingParametersTest, OldNewToJsonParity) {
         const std::array<std::pair<std::string_view, OptimizationParameters>, 3> factories = {{
             {"mcmc", OptimizationParameters::mcmc_defaults()},
