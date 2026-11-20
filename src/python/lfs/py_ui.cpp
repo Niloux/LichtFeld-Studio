@@ -70,6 +70,7 @@
 #include "visualizer/tools/unified_tool_registry.hpp"
 #include "visualizer/training/training_manager.hpp"
 #include "visualizer/visualizer.hpp"
+#include "vr/openxr_runtimes.hpp"
 #include "window/window_manager.hpp"
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/ElementDocument.h>
@@ -4548,11 +4549,10 @@ namespace lfs::python {
         m.def(
             "set_crop_tool_shape",
             [](const std::string& shape) {
-                invoke_on_viewer([shape = shape] {
-                    if (auto* const gui = lfs::python::get_gui_manager())
-                        gui->gizmo().setCropToolShape(shape);
-                    markProjectSessionChapterCommitted("VIEW");
-                });
+                if (auto* const gui = lfs::python::get_gui_manager()) {
+                    gui->gizmo().setCropToolShape(shape);
+                }
+                markProjectSessionChapterCommitted("VIEW");
             },
             nb::arg("shape"),
             "Set the active crop tool shape: box, ellipsoid, or polygon");
@@ -4570,11 +4570,10 @@ namespace lfs::python {
         m.def(
             "set_crop_tool_operation",
             [](const std::string& operation) {
-                invoke_on_viewer([operation = operation] {
-                    if (auto* const gui = lfs::python::get_gui_manager())
-                        gui->gizmo().setCropToolOperation(operation);
-                    markProjectSessionChapterCommitted("VIEW");
-                });
+                if (auto* const gui = lfs::python::get_gui_manager()) {
+                    gui->gizmo().setCropToolOperation(operation);
+                }
+                markProjectSessionChapterCommitted("VIEW");
             },
             nb::arg("operation"),
             "Set the active crop or selection-volume gizmo operation: translate, rotate, or scale");
@@ -4588,77 +4587,6 @@ namespace lfs::python {
                 return "translate";
             },
             "Get the active crop or selection-volume gizmo operation");
-
-        m.def("crop_group_enabled", [](const std::string& uuid) {
-            const auto parsed=lfs::core::Uuid::from_string(uuid);
-            if (!parsed) return false;
-            return invoke_on_viewer([uuid=*parsed] {
-                auto* sm=lfs::vis::services().sceneOrNull();
-                const auto* owner=sm ? sm->getScene().getNodeByUuid(uuid) : nullptr;
-                return owner && owner->type==lfs::core::NodeType::SPLAT && owner->crop_effects_enabled;
-            },false); }, nb::arg("owner_uuid"), "Read the collective crop gate on an exact splat owner");
-        m.def("set_crop_group_enabled", [](const std::string& uuid, bool enabled) {
-            const auto parsed=lfs::core::Uuid::from_string(uuid);
-            if (!parsed) return false;
-            return invoke_on_viewer([uuid=*parsed,enabled] {
-                auto* sm=lfs::vis::services().sceneOrNull();
-                return sm && static_cast<bool>(sm->setSplatCropGroupEnabled(uuid,enabled));
-            },false); }, nb::arg("owner_uuid"), nb::arg("enabled"), "Toggle the collective crop gate without changing individual flags");
-        for (const bool bake : {false, true}) {
-            m.def(bake ? "bake_crop_group" : "delete_crop_group", [bake](const std::string& uuid) {
-                const auto parsed=lfs::core::Uuid::from_string(uuid);
-                if (!parsed) return false;
-                return invoke_on_viewer([uuid=*parsed,bake] {
-                    auto* sm=lfs::vis::services().sceneOrNull();
-                    return sm && static_cast<bool>(bake ? sm->bakeSplatCropGroup(uuid) : sm->deleteSplatCropGroup(uuid));
-                },false); }, nb::arg("owner_uuid"), bake ? "Apply enabled crop volumes as one undoable action" : "Remove all crop volumes as one undoable action");
-        }
-
-        m.def(
-            "finish_crop_tool", []() {
-                invoke_on_viewer([] {
-                    if (auto* gui = lfs::python::get_gui_manager())
-                        gui->gizmo().finishCropTool();
-                });
-            },
-            "Finish crop editing while retaining the editable volume and original geometry");
-        m.def(
-            "is_crop_tool_shape_locked", [] {
-                return invoke_on_viewer([] {
-                    auto* gui = lfs::python::get_gui_manager();
-                    return gui && gui->gizmo().isCropToolShapeLocked();
-                },
-                                        false);
-            },
-            "Whether editing an existing crop keeps its saved shape type");
-        m.def(
-            "change_crop_tool_shape", [](const std::string& shape) {
-                return invoke_on_viewer([shape = shape] {
-                    auto* gui = lfs::python::get_gui_manager();
-                    return gui && gui->gizmo().changeCropToolShape(shape);
-                },
-                                        false);
-            },
-            nb::arg("shape"), "Change only the crop being edited, preserving its identity and siblings");
-        m.def(
-            "edit_crop_tool", [](const std::string& uuid) {
-                const auto parsed = lfs::core::Uuid::from_string(uuid);
-                if (!parsed)
-                    return;
-                invoke_on_viewer([uuid = *parsed] {
-                    if (auto* gui = lfs::python::get_gui_manager())
-                        gui->gizmo().editCropTool(uuid);
-                });
-            },
-            nb::arg("uuid"), "Edit an existing crop volume without creating another");
-        m.def(
-            "new_crop_tool", [](const std::string& shape) {
-                invoke_on_viewer([shape = shape] {
-                    if (auto* gui = lfs::python::get_gui_manager())
-                        gui->gizmo().newCropTool(shape);
-                });
-            },
-            nb::arg("shape"), "Create another independent crop on the selected splat");
 
         m.def(
             "apply_crop_tool",
@@ -6312,6 +6240,7 @@ namespace lfs::python {
                 result["resolution_scale"] = preferences.resolution_scale;
                 result["scene_units_per_meter"] = preferences.scene_units_per_meter;
                 result["move_speed"] = preferences.move_speed;
+                result["show_hands"] = preferences.show_hands;
                 return result;
             },
             "Get the VR preferences");
@@ -6319,18 +6248,47 @@ namespace lfs::python {
         m.def(
             "set_vr_preferences",
             [](const bool enabled, const float resolution_scale, const float scene_units_per_meter,
-               const float move_speed, const bool persist) {
+               const float move_speed, const bool show_hands, const bool persist) {
                 invoke_on_viewer([=] {
                     lfs::core::events::cmd::SetVrPreferences{.enabled = enabled,
                                                              .resolution_scale = resolution_scale,
                                                              .scene_units_per_meter = scene_units_per_meter,
                                                              .move_speed = move_speed,
+                                                             .show_hands = show_hands,
                                                              .persist = persist}
                         .emit();
                 });
             },
             nb::arg("enabled"), nb::arg("resolution_scale"), nb::arg("scene_units_per_meter"), nb::arg("move_speed"),
-            nb::arg("persist") = true, "Set the VR preferences; VR support takes effect after restart");
+            nb::arg("show_hands") = true, nb::arg("persist") = true,
+            "Set the VR preferences; VR support takes effect after restart");
+
+        m.def(
+            "get_vr_runtimes",
+            [] {
+                const auto runtimes = vis::vr::installedOpenXrRuntimes();
+                nb::dict result;
+                result["active"] = runtimes.active;
+                result["selected"] = vis::UserPreferences::instance().vrRuntime();
+                nb::list installed;
+                for (const auto& runtime : runtimes.installed) {
+                    nb::dict entry;
+                    entry["name"] = runtime.name;
+                    entry["manifest"] = runtime.manifest;
+                    installed.append(entry);
+                }
+                result["installed"] = installed;
+                return result;
+            },
+            "Get the OpenXR runtimes installed on this computer, the name of the system's active one, and the "
+            "manifest of the one chosen for VR (empty: the active one)");
+
+        m.def(
+            "set_vr_runtime",
+            [](const std::string& manifest) { vis::UserPreferences::instance().setVrRuntime(manifest); },
+            nb::arg("manifest"),
+            "Choose the OpenXR runtime VR uses by its manifest path; empty follows the system's active runtime. "
+            "Takes effect after restart");
 
         m.def(
             "get_mcp_port_override",

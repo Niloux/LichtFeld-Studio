@@ -554,7 +554,8 @@ namespace lfs::vis::gui {
             });
         }
 
-        const auto append_ellipsoid = [&](const VideoExportEllipsoidSnapshot& el) {
+        if (snapshot.active_ellipsoid) {
+            const auto& el = *snapshot.active_ellipsoid;
             state.ellipsoids.push_back(lfs::core::Scene::RenderableEllipsoid{
                 .node_id = el.node_id,
                 .parent_splat_id = el.parent_splat_id,
@@ -564,11 +565,7 @@ namespace lfs::vis::gui {
                 .local_transform = glm::mat4(1.0f),
                 .effectively_visible = true,
             });
-        };
-        for (const auto& el : snapshot.ellipsoids)
-            append_ellipsoid(el);
-        if (snapshot.ellipsoids.empty() && snapshot.active_ellipsoid)
-            append_ellipsoid(*snapshot.active_ellipsoid);
+        }
 
         state.crop_polygons.reserve(snapshot.crop_polygons.size());
         for (const auto& polygon : snapshot.crop_polygons) {
@@ -4295,7 +4292,10 @@ namespace lfs::vis::gui {
     }
 
     void AsyncTaskManager::cancelCollision() {
-        jobs_.requestCancel(collision_job_, LOC("common.cancel"));
+        // Look the label up only for a live job: shutdown also runs from the
+        // destructor, after the localization tables are gone.
+        if (const auto state = collisionJob(); state && state->running())
+            jobs_.requestCancel(collision_job_, LOC("common.cancel"));
         collision_stop_.request_stop();
         publish_viewport_toolbar_generation();
     }
@@ -5108,7 +5108,8 @@ namespace lfs::vis::gui {
     }
 
     void AsyncTaskManager::cancelCameraSelection() {
-        jobs_.requestCancel(camera_selection_state_.job, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
+        if (const auto state = cameraSelectionStatus(); state && state->running())
+            jobs_.requestCancel(camera_selection_state_.job, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
         publishCameraSelectionState();
         if (camera_selection_state_.thread)
             camera_selection_state_.thread->request_stop();
