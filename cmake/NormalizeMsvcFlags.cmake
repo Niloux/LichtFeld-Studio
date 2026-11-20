@@ -57,7 +57,8 @@ foreach(_lfs_index RANGE ${_lfs_first_argument} ${_lfs_last_argument})
     string(APPEND _lfs_command " \"\${CMAKE_ARGV${_lfs_index}}\"")
 endforeach()
 
-string(APPEND _lfs_command " RESULT_VARIABLE _lfs_result)")
+# Preserve the localized /showIncludes prefix exactly as Ninja detected it.
+string(APPEND _lfs_command " ENCODING NONE RESULT_VARIABLE _lfs_result)")
 cmake_language(EVAL CODE "${_lfs_command}")
 if(_lfs_result MATCHES "^[0-9]+$")
     cmake_language(EXIT ${_lfs_result})
