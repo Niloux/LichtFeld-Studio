@@ -13,7 +13,6 @@ add_library(lfs_preprocessing STATIC
     video_mask_command.cpp
     operator_view.cu
     lens_priors.cpp
-    lens_views.cu
     lens_views.hpp
     include/preprocessing/preprocess.hpp
     include/preprocessing/lens_priors.hpp
@@ -49,11 +48,4 @@ set_target_properties(lfs_preprocessing PROPERTIES
     CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON
     CUDA_SEPARABLE_COMPILATION OFF
-)
-
-# The lens views include the rasterizer's camera models, built like the training kernels.
-target_compile_options(lfs_preprocessing PRIVATE
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:--extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 --diag-suppress=27>
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:--extended-lambda --expt-relaxed-constexpr>
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
 )

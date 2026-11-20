@@ -19,7 +19,6 @@
 #include "core/checked_arithmetic.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/cuda/lanczos_resize/lanczos_resize.hpp"
-#include "core/distortion_model.hpp"
 #include "core/cuda/memory_arena.hpp"
 #include "core/cuda_error.hpp"
 #include "core/cuda_error_typed.hpp"
@@ -66,6 +65,7 @@
 #include "normal_auto_generate.hpp"
 #include "roi_sidecar.hpp"
 #include "optimizer/adam_optimizer.hpp"
+#include "preprocessing/lens_priors.hpp"
 #ifndef LFS_TRAINER_ONLY
 #include "python/runner.hpp"
 #endif
@@ -149,7 +149,7 @@ namespace lfs::training {
             const auto model = camera->camera_model_type();
             float lens_limit = 0;
             if (model == core::CameraModelType::FISHEYE || model == core::CameraModelType::THIN_PRISM_FISHEYE)
-                lens_limit = static_cast<float>(core::fisheye_radial_limit(photograph_projection(*camera).radial));
+                lens_limit = preprocessing::lens_max_angle(preprocessing::make_lens_camera(*camera));
             auto plan = plan_camera_views(*camera, lens_limit);
             if (plan.empty())
                 continue;

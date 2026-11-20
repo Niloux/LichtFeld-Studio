@@ -7,10 +7,12 @@
 add_library(lfs_depth_anchor STATIC
     depth_anchor_cache.cpp
     depth_anchor_cache.hpp
+    ../../preprocessing/lens_views.cu
 )
 
 target_include_directories(lfs_depth_anchor
     PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/preprocessing/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src          # For training/kernels/depth_loss.hpp
@@ -34,4 +36,14 @@ set_target_properties(lfs_depth_anchor PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
+# The lens views include the rasterizer's camera models, built like the training kernels.
+target_compile_options(lfs_depth_anchor PRIVATE
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:--extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 --diag-suppress=27>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:--extended-lambda --expt-relaxed-constexpr>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
 )
