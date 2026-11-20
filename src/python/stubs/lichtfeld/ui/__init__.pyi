@@ -2370,37 +2370,6 @@ def set_crop_tool_operation(operation: str) -> None:
 def get_crop_tool_operation() -> str:
     """Get the active crop or selection-volume gizmo operation"""
 
-def crop_group_enabled(owner_uuid: str) -> bool:
-    """Read the collective crop gate on an exact splat owner"""
-
-def set_crop_group_enabled(owner_uuid: str, enabled: bool) -> bool:
-    """Toggle the collective crop gate without changing individual flags"""
-
-def delete_crop_group(owner_uuid: str) -> bool:
-    """Remove all crop volumes as one undoable action"""
-
-def bake_crop_group(owner_uuid: str) -> bool:
-    """Apply enabled crop volumes as one undoable action"""
-
-def finish_crop_tool() -> None:
-    """
-    Finish crop editing while retaining the editable volume and original geometry
-    """
-
-def is_crop_tool_shape_locked() -> bool:
-    """Whether editing an existing crop keeps its saved shape type"""
-
-def change_crop_tool_shape(shape: str) -> bool:
-    """
-    Change only the crop being edited, preserving its identity and siblings
-    """
-
-def edit_crop_tool(uuid: str) -> None:
-    """Edit an existing crop volume without creating another"""
-
-def new_crop_tool(shape: str) -> None:
-    """Create another independent crop on the selected splat"""
-
 def apply_crop_tool() -> None:
     """
     Apply the active crop tool primitive through the node-backed crop command path
@@ -3132,8 +3101,18 @@ def get_vr_state() -> dict:
 def get_vr_preferences() -> dict:
     """Get the VR preferences"""
 
-def set_vr_preferences(enabled: bool, resolution_scale: float, scene_units_per_meter: float, move_speed: float, persist: bool = True) -> None:
+def set_vr_preferences(enabled: bool, resolution_scale: float, scene_units_per_meter: float, move_speed: float, show_hands: bool = True, persist: bool = True) -> None:
     """Set the VR preferences; VR support takes effect after restart"""
+
+def get_vr_runtimes() -> dict:
+    """
+    Get the OpenXR runtimes installed on this computer, the name of the system's active one, and the manifest of the one chosen for VR (empty: the active one)
+    """
+
+def set_vr_runtime(manifest: str) -> None:
+    """
+    Choose the OpenXR runtime VR uses by its manifest path; empty follows the system's active runtime. Takes effect after restart
+    """
 
 def get_mcp_port_override() -> int | None:
     """Get the MCP port set on the command line for this session, or None"""
