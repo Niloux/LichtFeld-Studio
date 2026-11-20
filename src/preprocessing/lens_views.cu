@@ -3,26 +3,13 @@
 
 #include "lens_views.hpp"
 
-#include "core/camera.hpp"
 #include "core/cuda_error.hpp"
 #include "core/distortion_model.hpp"
-#include "depth_anchor_cache.hpp"
 #include "training/rasterization/gsplat/Cameras.cuh"
 
 #include <cmath>
 
 namespace lfs::preprocessing {
-    LensCamera make_lens_camera(const core::Camera& photograph) {
-        const auto projection = training::photograph_projection(photograph);
-        // Prepared cameras expose the destination grid, while maps still use the photograph's grid.
-        if (photograph.is_undistort_prepared()) {
-            const auto& p = photograph.undistort_params();
-            return {projection, p.src_fx, p.src_fy, p.src_cx, p.src_cy, p.src_width, p.src_height};
-        }
-        return {projection, photograph.focal_x(), photograph.focal_y(), photograph.center_x(), photograph.center_y(),
-                photograph.camera_width(), photograph.camera_height()};
-    }
-
     namespace {
 
         constexpr int kThreads = 256;
