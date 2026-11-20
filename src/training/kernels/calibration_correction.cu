@@ -467,7 +467,7 @@ namespace lfs::training {
         reserve(partials_, {size_t(cells * cells), size_t(chunks), partial_size});
         const float2* row = reinterpret_cast<const float2*>(field_.ptr<float>()) + slot_ * points;
         const float* normalization = nullptr;
-        if (values_device && values_device->is_valid()) {
+        if (values <= 0.0f && values_device && values_device->is_valid()) {
             values_device->sync_to_stream(stream);
             normalization = values_device->ptr<float>();
         }
