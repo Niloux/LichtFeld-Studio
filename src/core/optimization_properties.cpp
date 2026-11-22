@@ -240,6 +240,7 @@ namespace lfs::core::param {
             .flags(PROP_ADVANCED)
             .precision(4)
             .ui_step(0.001)
+            .strategies({"mrnf"})
             .float_prop(&OptimizationParameters::sh_rest_reg,
                         "sh_rest_reg", "View-Dependent Color Penalty", d.sh_rest_reg, 0.0f, 1.0f,
                         "Keeps the angle-dependent part of each color small so splats cannot fake detail by changing color with the view; 0 turns it off")
@@ -490,6 +491,12 @@ namespace lfs::core::param {
                         "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
             .locale("training_params.depth_distortion_weight")
             .tooltip("training.tooltip.depth_distortion_weight")
+            .precision(3)
+            .ui_step(0.01)
+            .all_strategies()
+            .float_prop(&OptimizationParameters::normal_variance_weight,
+                        "normal_variance_weight", "Normal Variance Weight", d.normal_variance_weight, 0.0f, 10.0f,
+                        "Weight for per-splat normal variance along each ray; 0 turns it off")
             .precision(3)
             .ui_step(0.01)
             .all_strategies()

@@ -1059,11 +1059,9 @@ namespace lfs::core {
             if (color_variance_weight > 0.0f) {
                 if (color_variance_warmup_iters >= iterations)
                     return "color_variance_warmup_iters must be less than iterations when color variance is enabled";
-                if (gut)
-                    return "Color variance requires the FastGS training renderer (GUT is not supported)";
                 if (mip_filter)
                     return "Color variance does not yet support mip filtering";
-                if (mask_mode != MaskMode::None)
+                if (!gut && mask_mode != MaskMode::None)
                     return "Color variance does not yet support masked training";
                 if (enable_sparsity)
                     return "Color variance does not yet support POPSpa";
@@ -1094,6 +1092,7 @@ namespace lfs::core {
                 std::pair{"scale_reg", scale_reg},
                 std::pair{"erank_reg", erank_reg},
                 std::pair{"dc_reg", dc_reg},
+                std::pair{"normal_variance_weight", normal_variance_weight},
                 std::pair{"sh_rest_reg", sh_rest_reg},
                 std::pair{"mask_opacity_penalty_weight", mask_opacity_penalty_weight},
                 std::pair{"depth_loss_weight", depth_loss_weight},

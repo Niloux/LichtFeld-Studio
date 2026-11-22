@@ -156,6 +156,12 @@ namespace lfs::training {
         // weight > 0 are not rasterized and stay background with zero alpha.
         const lfs::core::Tensor& pixel_weights = {});
 
+    struct GsplatColorVarianceLoss {
+        lfs::core::Tensor loss;
+        float weight = 0.0f;
+        lfs::core::Tensor pixel_weight;
+    };
+
     // Explicit backward pass - computes gradients and accumulates into optimizer
     void gsplat_rasterize_backward(
         const GsplatRasterizeContext& ctx,
@@ -170,7 +176,8 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_normal = {},
         float flatten_weight = 0.f,
         const lfs::core::Tensor& grad_T_front = {},
-        const lfs::core::Tensor& grad_depth_sq = {});
+        const lfs::core::Tensor& grad_depth_sq = {},
+        const GsplatColorVarianceLoss& color_variance = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;

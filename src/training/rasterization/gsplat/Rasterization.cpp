@@ -163,7 +163,8 @@ namespace gsplat_lfs {
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
         const FreeSpaceRender& free_space,
-        const ScreenFootprint& footprint) {
+        const ScreenFootprint& footprint,
+        const ColorVarianceRender& color_variance) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -194,7 +195,7 @@ namespace gsplat_lfs {
             render_alphas, last_ids,                                 \
             v_render_colors, v_render_alphas,                        \
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
-            densification_weight, densification_error,                           densification_error_map,                                             edge_weight_map, edge_score_out, stream, tiles,                      free_space, footprint);                                          break;
+            densification_weight, densification_error,                           densification_error_map,                                             edge_weight_map, edge_score_out, stream, tiles,                      free_space, footprint, color_variance);                          break;
 
         switch (channels) {
             __LAUNCH_KERNEL__(1)
@@ -458,7 +459,8 @@ namespace gsplat_lfs {
         const FreeSpaceRender& free_space,
         const float* conics,
         const int64_t* tile_keys,
-        const uint32_t* tile_sub_masks) {
+        const uint32_t* tile_sub_masks,
+        const ColorVarianceRender& color_variance) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -502,7 +504,8 @@ namespace gsplat_lfs {
                 densification_weight, densification_error, densification_error_map,
                 edge_weight_map, edge_score_out,
                 stream, tiles, free_space,
-                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys});
+                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys},
+                color_variance);
         };
         if (batches.empty()) {
             render_backward({});

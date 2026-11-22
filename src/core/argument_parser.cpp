@@ -95,6 +95,7 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--normal-consistency-weight", "normal_consistency_weight", Float},
             OptimizationCliBinding{"--depth-distortion-weight", "depth_distortion_weight", Float},
             OptimizationCliBinding{"--normal-prior-depth-weight", "normal_prior_depth_weight", Float},
+            OptimizationCliBinding{"--normal-variance-weight", "normal_variance_weight", Float},
             OptimizationCliBinding{"--normal-flatten-weight", "normal_flatten_weight", Float},
             OptimizationCliBinding{"--normal-start-fraction", "normal_start_fraction", Float},
             OptimizationCliBinding{"--normal-end-fraction", "normal_end_fraction", Float},
@@ -944,6 +945,7 @@ namespace {
             ::args::ValueFlag<float> normal_consistency_weight(mask_group, "normal_consistency_weight", lfs::core::args::optimization_cli_help("--normal-consistency-weight"), {"normal-consistency-weight"});
             ::args::ValueFlag<float> depth_distortion_weight(mask_group, "depth_distortion_weight", lfs::core::args::optimization_cli_help("--depth-distortion-weight"), {"depth-distortion-weight"});
             ::args::ValueFlag<float> normal_prior_depth_weight(mask_group, "normal_prior_depth_weight", lfs::core::args::optimization_cli_help("--normal-prior-depth-weight"), {"normal-prior-depth-weight"});
+            ::args::ValueFlag<float> normal_variance_weight(mask_group, "normal_variance_weight", lfs::core::args::optimization_cli_help("--normal-variance-weight"), {"normal-variance-weight"});
             ::args::ValueFlag<float> normal_flatten_weight(mask_group, "normal_flatten_weight", lfs::core::args::optimization_cli_help("--normal-flatten-weight"), {"normal-flatten-weight"});
             ::args::ValueFlag<float> normal_start_fraction(mask_group, "normal_start_fraction", lfs::core::args::optimization_cli_help("--normal-start-fraction"), {"normal-start-fraction"});
             ::args::ValueFlag<float> normal_end_fraction(mask_group, "normal_end_fraction", lfs::core::args::optimization_cli_help("--normal-end-fraction"), {"normal-end-fraction"});
@@ -1729,6 +1731,7 @@ namespace {
                                         normal_consistency_weight_val = cli_option_present({"--normal-consistency-weight"}) ? std::optional<float>(::args::get(normal_consistency_weight)) : std::optional<float>(),
                                         depth_distortion_weight_val = cli_option_present({"--depth-distortion-weight"}) ? std::optional<float>(::args::get(depth_distortion_weight)) : std::optional<float>(),
                                         normal_prior_depth_weight_val = cli_option_present({"--normal-prior-depth-weight"}) ? std::optional<float>(::args::get(normal_prior_depth_weight)) : std::optional<float>(),
+                                        normal_variance_weight_val = cli_option_present({"--normal-variance-weight"}) ? std::optional<float>(::args::get(normal_variance_weight)) : std::optional<float>(),
                                         normal_flatten_weight_val = cli_option_present({"--normal-flatten-weight"}) ? std::optional<float>(::args::get(normal_flatten_weight)) : std::optional<float>(),
                                         normal_start_fraction_val = cli_option_present({"--normal-start-fraction"}) ? std::optional<float>(::args::get(normal_start_fraction)) : std::optional<float>(),
                                         normal_end_fraction_val = cli_option_present({"--normal-end-fraction"}) ? std::optional<float>(::args::get(normal_end_fraction)) : std::optional<float>(),
@@ -2029,6 +2032,7 @@ namespace {
                 setVal(normal_consistency_weight_val, opt.normal_consistency_weight);
                 setVal(depth_distortion_weight_val, opt.depth_distortion_weight);
                 setVal(normal_prior_depth_weight_val, opt.normal_prior_depth_weight);
+                setVal(normal_variance_weight_val, opt.normal_variance_weight);
                 setVal(normal_flatten_weight_val, opt.normal_flatten_weight);
                 setVal(normal_start_fraction_val, opt.normal_start_fraction);
                 setVal(normal_end_fraction_val, opt.normal_end_fraction);
@@ -2141,6 +2145,7 @@ namespace {
                 note_opt("normal_consistency_weight", normal_consistency_weight_val.has_value());
                 note_opt("depth_distortion_weight", depth_distortion_weight_val.has_value());
                 note_opt("normal_prior_depth_weight", normal_prior_depth_weight_val.has_value());
+                note_opt("normal_variance_weight", normal_variance_weight_val.has_value());
                 note_opt("normal_flatten_weight", normal_flatten_weight_val.has_value());
                 note_opt("normal_prior_decay_start", normal_prior_decay_start_val.has_value());
                 note_opt("normal_prior_decay_end", normal_prior_decay_end_val.has_value());
@@ -2364,6 +2369,9 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[], const
         return std::unexpected("ERROR: " + *error);
     if (auto error = validate_cli_nonnegative("--depth-distortion-weight", "depth_distortion_weight",
                                               params->optimization.depth_distortion_weight))
+        return std::unexpected("ERROR: " + *error);
+    if (auto error = validate_cli_nonnegative("--normal-variance-weight", "normal_variance_weight",
+                                              params->optimization.normal_variance_weight))
         return std::unexpected("ERROR: " + *error);
     if (auto error = validate_cli_nonnegative("--normal-flatten-weight", "normal_flatten_weight",
                                               params->optimization.normal_flatten_weight))

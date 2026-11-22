@@ -279,6 +279,19 @@ namespace gsplat_lfs {
     // Rasterization - Backward
     //=========================================================================
 
+    struct ColorVarianceRender {
+        const float* render_colors = nullptr;    // [C, channels, H, W] forward render output
+        const float* pixel_weight = nullptr;     // [C, H, W] (or [H, W] when C == 1)
+        const float* pixel_weight_sum = nullptr; // [1] device scalar sum(pixel_weight)
+        float* loss_out = nullptr;               // [1] optional device scalar loss
+        float weight = 0.0f;
+
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        [[nodiscard]] bool enabled() const { return weight > 0.0f && render_colors != nullptr; }
+    };
+
     void rasterize_to_pixels_from_world_3dgs_bwd(
         // Gaussian parameters
         const float* means,       // [N, 3]
@@ -332,7 +345,8 @@ namespace gsplat_lfs {
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const FreeSpaceRender& free_space = {},
-        const ScreenFootprint& footprint = {});
+        const ScreenFootprint& footprint = {},
+        const ColorVarianceRender& color_variance = {});
 
     //=========================================================================
     // High-level API: Fully fused rasterization with SH evaluation
@@ -479,6 +493,7 @@ namespace gsplat_lfs {
         const FreeSpaceRender& free_space = {},
         const float* conics = nullptr,             // [C, N, 3] the forward's, so tile batches re-cull alike
         const int64_t* tile_keys = nullptr,        // the forward's keys when they hold sub-tile masks
-        const uint32_t* tile_sub_masks = nullptr); // the forward's, so tile batches re-cull alike
+        const uint32_t* tile_sub_masks = nullptr,  // the forward's, so tile batches re-cull alike
+        const ColorVarianceRender& color_variance = {});
 
 } // namespace gsplat_lfs

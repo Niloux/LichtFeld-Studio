@@ -84,6 +84,7 @@
 #include "training/kernels/depth_distortion_loss.hpp"
 #include "training/kernels/normal_consistency_loss.hpp"
 #include "training/kernels/normal_loss.hpp"
+#include "training/kernels/normal_variance_loss.hpp"
 #include "training/kernels/roi_weight_map.hpp"
 #include "training/training_setup.hpp"
 #include "training_cropbox_mask.hpp"
@@ -2122,7 +2123,9 @@ namespace lfs::training {
             (opt_params.use_normal_loss &&
              (opt_params.normal_loss_weight > 0.0f || opt_params.normal_prior_depth_weight > 0.0f)) ||
             opt_params.normal_consistency_weight > 0.0f ||
-            opt_params.depth_distortion_weight > 0.0f;
+            opt_params.depth_distortion_weight > 0.0f ||
+            opt_params.normal_variance_weight > 0.0f ||
+            (opt_params.gut && opt_params.color_variance_weight > 0.0f);
 
         // Fused mask preprocess: SegmentAndIgnore band remap + optional ROI → one kernel.
         // Steady state is allocation-free via mask_preprocess_workspace_ (grow-only).
@@ -7146,7 +7149,10 @@ namespace lfs::training {
                 // iterations the whole-image terms are swapped for the same terms over the box.
                 lfs::core::Tensor reported_image_loss;
                 lfs::core::Tensor region_image_loss;
-                if (run_fastgs_gaussian_backward && step_params.color_variance_weight_at(iter) > 0.0f) {
+                const bool run_gut_gaussian_backward =
+                    step_params.gut && update_gaussians_this_iter;
+                if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
+                    step_params.color_variance_weight_at(iter) > 0.0f) {
                     if (!color_variance_loss_.is_valid())
                         color_variance_loss_ = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
                     color_variance_loss_.zero_();
@@ -7170,8 +7176,6 @@ namespace lfs::training {
                 lfs::core::Tensor fused_dc_reg_loss_gpu;
                 lfs::core::Tensor fused_sh_rest_reg_loss_gpu;
                 lfs::core::Tensor sparsity_loss_gpu;
-                const bool run_gut_gaussian_backward =
-                    step_params.gut && update_gaussians_this_iter;
                 if (run_fastgs_gaussian_backward || run_gut_gaussian_backward) {
                     auto& model = strategy_->get_model();
                     edge_score_scratch = in_popspa ? lfs::core::Tensor{} : strategy_->edge_score_scratch(iter);
@@ -7444,7 +7448,8 @@ namespace lfs::training {
                                          normal_prior_depth_weight_now > 0.f ||
                                          (normal_supervision_started &&
                                           (step_params.normal_consistency_weight > 0.f ||
-                                           step_params.depth_distortion_weight > 0.f)))
+                                           step_params.depth_distortion_weight > 0.f ||
+                                           step_params.normal_variance_weight > 0.f)))
                                             ? GsplatRenderMode::RGB_D_N
                                         : ((step_params.use_depth_loss && step_params.depth_loss_weight > 0.f) ||
                                            roi_surface_weights || free_space.enabled())
@@ -7501,7 +7506,8 @@ namespace lfs::training {
                                  cam->has_normal()) ||
                                 (normal_supervision_started &&
                                  (step_params.normal_consistency_weight > 0.0f ||
-                                  step_params.depth_distortion_weight > 0.0f));
+                                  step_params.depth_distortion_weight > 0.0f ||
+                                  step_params.normal_variance_weight > 0.0f));
                             const bool render_depth =
                                 render_normal || roi_surface_weights ||
                                 (step_params.use_depth_loss &&
@@ -8641,6 +8647,52 @@ namespace lfs::training {
                             tile_grad_depth_sq = depth_distortion_grad_;
                         }
 
+                        if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
+                            normal_supervision_started &&
+                            step_params.normal_variance_weight > 0.0f &&
+                            output.normal.is_valid() && output.normal.numel() > 0 &&
+                            output.alpha.is_valid() && output.alpha.numel() > 0) {
+                            LFS_VRAM_SCOPE("train.normal_variance_loss");
+                            lfs::core::Tensor rendered_normal = output.normal;
+                            if (!rendered_normal.is_contiguous()) {
+                                rendered_normal = rendered_normal.contiguous();
+                            }
+                            lfs::core::Tensor rendered_alpha = output.alpha;
+                            if (rendered_alpha.ndim() == 3 && rendered_alpha.shape()[0] == 1) {
+                                rendered_alpha = rendered_alpha.squeeze(0);
+                            }
+                            if (!rendered_alpha.is_contiguous()) {
+                                rendered_alpha = rendered_alpha.contiguous();
+                            }
+                            if (rendered_normal.ndim() == 3 && rendered_normal.shape()[0] == 3 &&
+                                rendered_alpha.ndim() == 2 &&
+                                rendered_alpha.shape()[0] == rendered_normal.shape()[1] &&
+                                rendered_alpha.shape()[1] == rendered_normal.shape()[2]) {
+                                const cudaStream_t nvar_stream = rendered_normal.stream();
+                                if (!tile_grad_normal.is_valid()) {
+                                    if (!normal_loss_grad_.is_valid() ||
+                                        normal_loss_grad_.shape() != rendered_normal.shape()) {
+                                        normal_loss_grad_ = lfs::core::Tensor::empty(rendered_normal.shape(), lfs::core::Device::CUDA);
+                                    }
+                                    normal_loss_grad_.set_stream(nvar_stream);
+                                    normal_loss_grad_.zero_();
+                                    tile_grad_normal = normal_loss_grad_;
+                                }
+                                ensure_depth_grad_buffers(rendered_alpha, nvar_stream, !depth_grad_buffers_active);
+                                lfs::core::pin_operands({&rendered_normal, &rendered_alpha, &tile_grad_normal});
+                                lfs::training::kernels::launch_normal_variance_loss(
+                                    rendered_normal.ptr<float>(),
+                                    rendered_alpha.ptr<float>(),
+                                    tile_grad_normal.ptr<float>(),
+                                    depth_loss_grad_alpha_.ptr<float>(),
+                                    static_cast<int>(rendered_normal.shape()[2]),
+                                    static_cast<int>(rendered_normal.shape()[1]),
+                                    step_params.normal_variance_weight,
+                                    nvar_stream,
+                                    normal_weight_ptr_on_stream(nvar_stream));
+                            }
+                        }
+
                         merge_depth_grad_buffers();
 
                         // 2) Extract error map from workspace's ssim_map
@@ -8898,7 +8950,11 @@ namespace lfs::training {
                                                           tile_grad_depth, tile_grad_normal,
                                                           normal_supervision_started ? step_params.normal_flatten_weight : 0.f,
                                                           gsplat_ctx->free_space.enabled() ? free_space_grad_ : lfs::core::Tensor{},
-                                                          tile_grad_depth_sq);
+                                                          tile_grad_depth_sq,
+                                                          GsplatColorVarianceLoss{
+                                                              color_variance.loss,
+                                                              color_variance.weight,
+                                                              normal_terms_weight.is_valid() ? normal_terms_weight : color_variance.pixel_weight});
                                 if (edge_weight_scoring_active_) {
                                     strategy_->on_edge_score_accumulated(iter);
                                 }

@@ -361,7 +361,8 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map,
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const FreeSpaceRender) {
+        const FreeSpaceRender,
+        const ColorVarianceRender) {
         auto block = cg::this_thread_block();
         const uint32_t cid = block.group_index().x;
         const uint32_t tile_id =
@@ -621,7 +622,8 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map, // [H, W] or nullptr
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const FreeSpaceRender free_space) {
+        const FreeSpaceRender free_space,
+        const ColorVarianceRender color_variance) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
         uint32_t tile_id =
@@ -749,6 +751,42 @@ namespace gsplat_lfs {
             const size_t free_pix = static_cast<size_t>(cid) * image_height * image_width + pix_id;
             free_limit = free_space.limit(cid, j, i, image_width, image_height);
             free_v_T = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
+        }
+        const bool do_cv = (CDIM >= 3) && color_variance.enabled();
+        float4 cv_target = make_float4(0.f, 0.f, 0.f, 0.f);
+        float cv_buf = 0.f;
+        if constexpr (CDIM >= 3) {
+            if (do_cv && active) {
+                const float cov = 1.0f - T_final;
+                if (cov >= 0.5f / 255.f) {
+                    const uint32_t pixels = image_height * image_width;
+                    float pw_scale = 0.f;
+                    if (color_variance.pixel_weight == nullptr) {
+                        pw_scale = color_variance.weight / static_cast<float>(pixels);
+                    } else {
+                        const float pw_sum = *color_variance.pixel_weight_sum;
+                        if (pw_sum > 0.f) {
+                            pw_scale = color_variance.weight *
+                                       color_variance.pixel_weight[static_cast<size_t>(cid) * pixels + pix_id] / pw_sum;
+                        }
+                    }
+                    if (pw_scale > 0.f) {
+                        const float* rc = color_variance.render_colors + static_cast<size_t>(cid) * CDIM * pixels;
+                        float bg_c[3] = {0.f, 0.f, 0.f};
+                        if (have_bg) {
+#pragma unroll
+                            for (uint32_t c = 0; c < 3u; ++c) {
+                                bg_c[c] = bg_images != nullptr ? bg_images[c * pixels + pix_id] : backgrounds[c];
+                            }
+                        }
+                        cv_target = make_float4(
+                            (rc[chw_pix(0, pix_id, image_height, image_width)] - T_final * bg_c[0]) / cov,
+                            (rc[chw_pix(1, pix_id, image_height, image_width)] - T_final * bg_c[1]) / cov,
+                            (rc[chw_pix(2, pix_id, image_height, image_width)] - T_final * bg_c[2]) / cov,
+                            pw_scale);
+                    }
+                }
+            }
         }
 
         // collect and process batches of gaussians
@@ -917,6 +955,20 @@ namespace gsplat_lfs {
                                 v_alpha -= free_v_T * ra;
                             }
                         }
+                        if constexpr (CDIM >= 3) {
+                            if (cv_target.w > 0.f) {
+                                const float r0 = rgbs_batch[t * CDIM + 0] - cv_target.x;
+                                const float r1 = rgbs_batch[t * CDIM + 1] - cv_target.y;
+                                const float r2 = rgbs_batch[t * CDIM + 2] - cv_target.z;
+                                const float u = cv_target.w * (r0 * r0 + r1 * r1 + r2 * r2);
+                                const float two_w = 2.0f * cv_target.w * fac;
+                                v_rgb_local[0] += two_w * r0;
+                                v_rgb_local[1] += two_w * r1;
+                                v_rgb_local[2] += two_w * r2;
+                                v_alpha += u * T - cv_buf * ra;
+                                cv_buf += u * fac;
+                            }
+                        }
 
                         const bool alpha_grad = (opac * vis <= 0.999f);
                         const bool depth_grad =
@@ -1012,6 +1064,14 @@ namespace gsplat_lfs {
                 block.sync();
             }
         }
+        if constexpr (CDIM >= 3) {
+            if (do_cv && color_variance.loss_out != nullptr) {
+                warpSum(cv_buf, warp);
+                if (warp.thread_rank() == 0 && cv_buf != 0.f) {
+                    gpuAtomicAdd(color_variance.loss_out, cv_buf);
+                }
+            }
+        }
     }
 
     // Per-splat backward. One warp takes an 8x8 sub-tile of a 16x16 tile. Each lane
@@ -1069,7 +1129,8 @@ namespace gsplat_lfs {
         float* __restrict__ edge_score_out,
         const TileRange tiles,
         const FreeSpaceRender free_space,
-        const ScreenFootprint footprint) {
+        const ScreenFootprint footprint,
+        const ColorVarianceRender color_variance) {
         const uint32_t cid = blockIdx.x;
         const uint32_t subs = tile_size / kSplatBwdSub;
         const uint32_t sub_y = blockIdx.y;
@@ -1105,6 +1166,7 @@ namespace gsplat_lfs {
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
+        const bool do_cv = (CDIM >= 3) && color_variance.enabled();
 
         constexpr uint32_t kUsed = CDIM;
         __shared__ float s_T[kSplatBwdPixels];
@@ -1116,6 +1178,8 @@ namespace gsplat_lfs {
         __shared__ float s_error[kSplatBwdPixels];
         __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
         __shared__ float2 s_free[kSplatBwdPixels]; // (limit, v_T_front * T_front)
+        __shared__ float4 s_cv_target[CDIM >= 3 ? kSplatBwdPixels : 1];
+        __shared__ float s_cv_buf[CDIM >= 3 ? kSplatBwdPixels : 1];
         __shared__ float3 s_ray_o[kSplatBwdPixels];
         __shared__ float4 s_ray_d[kSplatBwdPixels];
         __shared__ int32_t s_bin[kSplatBwdPixels]; // last contributing pair; -1 inactive
@@ -1165,6 +1229,41 @@ namespace gsplat_lfs {
                 free.y = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
             }
             s_free[p] = free;
+            if constexpr (CDIM >= 3) {
+                float4 cv_t = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (do_cv && active) {
+                    const float cov = 1.0f - T_final;
+                    if (cov >= 0.5f / 255.f) {
+                        float pw_scale = 0.f;
+                        if (color_variance.pixel_weight == nullptr) {
+                            pw_scale = color_variance.weight / static_cast<float>(pixels);
+                        } else {
+                            const float pw_sum = *color_variance.pixel_weight_sum;
+                            if (pw_sum > 0.f) {
+                                pw_scale = color_variance.weight *
+                                           color_variance.pixel_weight[static_cast<size_t>(cid) * pixels + pix] / pw_sum;
+                            }
+                        }
+                        if (pw_scale > 0.f) {
+                            const float* rc = color_variance.render_colors + static_cast<size_t>(cid) * CDIM * pixels;
+                            float bg_c[3] = {0.f, 0.f, 0.f};
+                            if (have_bg) {
+#pragma unroll
+                                for (uint32_t c = 0; c < 3u; ++c) {
+                                    bg_c[c] = bg_images != nullptr ? bg_images[c * pixels + pix] : backgrounds[c];
+                                }
+                            }
+                            cv_t = make_float4(
+                                (rc[chw_pix(0, pix, image_height, image_width)] - T_final * bg_c[0]) / cov,
+                                (rc[chw_pix(1, pix, image_height, image_width)] - T_final * bg_c[1]) / cov,
+                                (rc[chw_pix(2, pix, image_height, image_width)] - T_final * bg_c[2]) / cov,
+                                pw_scale);
+                        }
+                    }
+                }
+                s_cv_target[p] = cv_t;
+                s_cv_buf[p] = 0.f;
+            }
         }
         for (int offset = 16; offset > 0; offset /= 2) {
             bin_max = max(bin_max, __shfl_xor_sync(0xffffffffu, bin_max, offset));
@@ -1342,6 +1441,24 @@ namespace gsplat_lfs {
                                     v_alpha -= free.y * ra;
                                 }
                             }
+                            if constexpr (CDIM >= 3) {
+                                if (do_cv) {
+                                    const float4 cv_t = s_cv_target[p];
+                                    if (cv_t.w > 0.f) {
+                                        const float r0 = rgb[0] - cv_t.x;
+                                        const float r1 = rgb[1] - cv_t.y;
+                                        const float r2 = rgb[2] - cv_t.z;
+                                        const float u = cv_t.w * (r0 * r0 + r1 * r1 + r2 * r2);
+                                        const float two_w = 2.0f * cv_t.w * fac;
+                                        v_rgb[0] += two_w * r0;
+                                        v_rgb[1] += two_w * r1;
+                                        v_rgb[2] += two_w * r2;
+                                        const float cv_buf = s_cv_buf[p];
+                                        v_alpha += u * T - cv_buf * ra;
+                                        s_cv_buf[p] = cv_buf + u * fac;
+                                    }
+                                }
+                            }
                             if (do_dens) {
                                 dens_w += fac;
                                 dens_e += fac * s_error[p];
@@ -1427,6 +1544,21 @@ namespace gsplat_lfs {
             }
             __syncwarp();
         }
+        if constexpr (CDIM >= 3) {
+            if (do_cv && color_variance.loss_out != nullptr) {
+                __syncwarp();
+                float local_loss = 0.f;
+                for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
+                    local_loss += s_cv_buf[p];
+                }
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    local_loss += __shfl_xor_sync(0xffffffffu, local_loss, offset);
+                }
+                if (lane == 0 && local_loss != 0.f) {
+                    gpuAtomicAdd(color_variance.loss_out, local_loss);
+                }
+            }
+        }
     }
 
     // The per-splat backward is the default; LFS_GUT_SPLAT_BWD=0 falls back to the
@@ -1488,7 +1620,8 @@ namespace gsplat_lfs {
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
         const FreeSpaceRender& free_space_in,
-        const ScreenFootprint& footprint) {
+        const ScreenFootprint& footprint,
+        const ColorVarianceRender& color_variance) {
         const bool packed = false; // Only support non-packed for now
         // The free-space test reads the splat depth from a render channel.
         const FreeSpaceRender free_space =
@@ -1552,7 +1685,7 @@ namespace gsplat_lfs {
                 densification_error,
                 densification_error_map,
                 edge_weight_map,
-                edge_score_out, tiles, free_space);
+                edge_score_out, tiles, free_space, color_variance);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
         };
 
@@ -1578,7 +1711,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec4*>(v_quats),
                             reinterpret_cast<vec3*>(v_scales),
                             v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
-                            edge_weight_map, edge_score_out, tiles, free_space, footprint);
+                            edge_weight_map, edge_score_out, tiles, free_space, footprint, color_variance);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
@@ -1597,7 +1730,7 @@ namespace gsplat_lfs {
                 }
             }
             if constexpr (CDIM == 3) {
-                if (tile_size == 16) {
+                if (tile_size == 16 && !color_variance.enabled()) {
                     dim3 threads = {8, 16, 1};
                     dim3 grid = {C, tile_height, tile_width};
                     int64_t shmem_size =
@@ -1735,7 +1868,8 @@ namespace gsplat_lfs {
         float* edge_score_out,                                                 \
         cudaStream_t stream, TileRange tiles,                                  \
         const FreeSpaceRender& free_space,                                     \
-        const ScreenFootprint& footprint);
+        const ScreenFootprint& footprint,                                      \
+        const ColorVarianceRender& color_variance);
 
     __INS__(1)
     __INS__(2)

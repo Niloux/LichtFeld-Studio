@@ -789,7 +789,8 @@ namespace lfs::training {
         const core::Tensor& grad_normal,
         float flatten_weight,
         const core::Tensor& grad_T_front,
-        const core::Tensor& grad_depth_sq) {
+        const core::Tensor& grad_depth_sq,
+        const GsplatColorVarianceLoss& color_variance) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -969,6 +970,43 @@ namespace lfs::training {
                 free_space.v_T_front = grad_T_front.ptr<float>();
             }
 
+            gsplat_lfs::ColorVarianceRender gsplat_color_variance;
+            core::Tensor color_variance_pixel_weight_sum;
+            if (!std::isfinite(color_variance.weight) || color_variance.weight < 0.0f) {
+                throw std::runtime_error("Color variance weight must be finite and nonnegative");
+            }
+            if (color_variance.weight > 0.0f && channels >= 3 && ctx.render_colors_ptr != nullptr) {
+                auto loss = color_variance.loss;
+                if (loss.is_valid() && (loss.numel() != 1 || loss.device() != core::Device::CUDA ||
+                                        loss.dtype() != core::DataType::Float32 || !loss.is_contiguous())) {
+                    throw std::runtime_error("Color variance loss must be a CUDA Float32 scalar");
+                }
+                const auto& pixel_weight = color_variance.pixel_weight;
+                const bool has_pixel_weight = pixel_weight.is_valid() && pixel_weight.numel() > 0;
+                if (has_pixel_weight) {
+                    if (pixel_weight.shape() != core::TensorShape{static_cast<size_t>(H), static_cast<size_t>(W)} ||
+                        pixel_weight.device() != core::Device::CUDA || !pixel_weight.is_contiguous() ||
+                        pixel_weight.dtype() != core::DataType::Float32) {
+                        throw std::runtime_error("Color variance pixel weights must be contiguous CUDA Float32 [H, W]");
+                    }
+                    core::CUDAStreamGuard sum_guard(stream);
+                    pixel_weight.sync_to_stream(stream);
+                    color_variance_pixel_weight_sum = pixel_weight.sum();
+                    color_variance_pixel_weight_sum.sync_to_stream(stream);
+                }
+                core::pin_operands({&loss, &pixel_weight, &color_variance_pixel_weight_sum});
+                if (loss.is_valid()) {
+                    loss.sync_to_stream(stream);
+                }
+                gsplat_color_variance.render_colors = ctx.render_colors_ptr;
+                if (has_pixel_weight) {
+                    gsplat_color_variance.pixel_weight = pixel_weight.ptr<float>();
+                    gsplat_color_variance.pixel_weight_sum = color_variance_pixel_weight_sum.ptr<float>();
+                }
+                gsplat_color_variance.loss_out = loss.is_valid() ? loss.ptr<float>() : nullptr;
+                gsplat_color_variance.weight = color_variance.weight;
+            }
+
             // The SH backward adds straight into the optimizer's sh0 and swizzled shN gradients.
             auto& sh0_grad = optimizer.get_grad(ParamType::Sh0);
             sh0_grad.set_stream(stream);
@@ -1043,7 +1081,8 @@ namespace lfs::training {
                 ctx.conics_ptr, ctx.sub_tile_masks ? ctx.isect_ids_ptr : nullptr,
                 ctx.tile_sub_masks.is_valid()
                     ? reinterpret_cast<const uint32_t*>(ctx.tile_sub_masks.ptr<int32_t>())
-                    : nullptr);
+                    : nullptr,
+                gsplat_color_variance);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);

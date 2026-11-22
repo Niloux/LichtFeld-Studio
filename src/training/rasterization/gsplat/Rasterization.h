@@ -6,6 +6,7 @@
 
 #include "Common.h"
 #include "FreeSpace.h"
+#include "Ops.h"
 #include "TileBatch.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -115,7 +116,8 @@ namespace gsplat_lfs {
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const FreeSpaceRender& free_space = {},
-        const ScreenFootprint& footprint = {}); // lets the per-splat backward cull sub-tiles
+        const ScreenFootprint& footprint = {}, // lets the per-splat backward cull sub-tiles
+        const ColorVarianceRender& color_variance = {});
 
     /////////////////////////////////////////////////
     // rasterize_to_indices_3dgs
