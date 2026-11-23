@@ -575,23 +575,4 @@ namespace {
         }
         EXPECT_TRUE(param::OptimizationParameters::mrnf_defaults().use_exposure_correction);
     }
-
-    TEST(NormalVarianceParameters, ValidatesAndRoundTrips) {
-        for (const auto* strategy : {"mcmc", "mrnf", "igs+"}) {
-            SCOPED_TRACE(strategy);
-            auto p = param::OptimizationParameters::defaults_for_strategy(strategy);
-            EXPECT_EQ(p.normal_variance_weight, 0.0f);
-            for (float invalid : {-0.1f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
-                p.normal_variance_weight = invalid;
-                EXPECT_FALSE(p.validate().empty());
-            }
-            p.normal_variance_weight = 0.06f;
-            EXPECT_TRUE(p.validate().empty()) << p.validate();
-            const auto restored = param::OptimizationParameters::from_json(p.to_json());
-            EXPECT_FLOAT_EQ(restored.normal_variance_weight, 0.06f);
-            auto legacy = p.to_json();
-            legacy.erase("normal_variance_weight");
-            EXPECT_EQ(param::OptimizationParameters::from_json(legacy).normal_variance_weight, 0.0f);
-        }
-    }
 } // namespace

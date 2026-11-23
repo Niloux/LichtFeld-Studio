@@ -1465,7 +1465,7 @@ namespace lfs::python {
                 "depth_loss_mode",
                 [](PyOptimizationParams& self) { return self.params().depth_loss_mode; },
                 [](PyOptimizationParams&, const std::string& v) { modify_params([v](auto& p) { p.depth_loss_mode = v; }); },
-                "Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', 'ssi-depth', or 'metric' (absolute depth, 16-bit in mm)")
+                "Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', or 'ssi-depth'")
             .def_prop_rw(
                 "depth_auto_generate",
                 [](PyOptimizationParams& self) { return self.params().depth_auto_generate; },
@@ -1491,11 +1491,6 @@ namespace lfs::python {
                 [](PyOptimizationParams& self) { return self.params().normal_consistency_weight; },
                 [](PyOptimizationParams& self, float v) { self.set("normal_consistency_weight", nb::cast(v)); },
                 "Weight for depth-normal consistency supervision")
-            .def_prop_rw(
-                "depth_distortion_weight",
-                [](PyOptimizationParams& self) { return self.params().depth_distortion_weight; },
-                [](PyOptimizationParams& self, float v) { self.set("depth_distortion_weight", nb::cast(v)); },
-                "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
             .def_prop_rw(
                 "normal_flatten_weight",
                 [](PyOptimizationParams& self) { return self.params().normal_flatten_weight; },

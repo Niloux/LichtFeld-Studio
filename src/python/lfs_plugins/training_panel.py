@@ -145,7 +145,7 @@ def _restore_stored_session_if_needed(then_start=False):
     return True
 
 
-DEPTH_LOSS_MODE_VALUES = ("ssi", "ssi-disparity", "ssi-depth", "metric")
+DEPTH_LOSS_MODE_VALUES = ("ssi", "ssi-disparity", "ssi-depth")
 DEFAULT_DEPTH_LOSS_MODE = "ssi"
 
 
@@ -439,10 +439,6 @@ class TrainingPanel(Panel):
         model.bind_func(
             "label_depth_loss_ssi_depth",
             lambda: tr("training.options.depth_loss.ssi_depth"),
-        )
-        model.bind_func(
-            "label_depth_loss_metric",
-            lambda: tr("training.options.depth_loss.metric"),
         )
         model.bind_func(
             "label_ppisp_sidecar_path",

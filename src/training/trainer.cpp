@@ -81,10 +81,8 @@
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mask_preprocess.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
-#include "training/kernels/depth_distortion_loss.hpp"
 #include "training/kernels/normal_consistency_loss.hpp"
 #include "training/kernels/normal_loss.hpp"
-#include "training/kernels/normal_variance_loss.hpp"
 #include "training/kernels/roi_weight_map.hpp"
 #include "training/training_setup.hpp"
 #include "training_cropbox_mask.hpp"
@@ -574,10 +572,7 @@ namespace lfs::training {
         }
 
         constexpr float kDepthLossFinalScale = 0.02f;
-        // Metric priors (LiDAR) stay trustworthy late in training, so they decay far less.
-        constexpr float kMetricDepthLossFinalScale = 0.25f;
-        // Integer metric priors are millimetres (the common 16-bit PNG convention); float priors are metres.
-        constexpr float kMetricDepthIntegerUnitMetres = 0.001f;
+        constexpr float kDepthLossGradientTermWeight = 1.0f;
 
         [[nodiscard]] kernels::DepthPriorType depth_prior_from_mode(const std::string_view mode) {
             if (mode == "ssi-disparity") {
@@ -590,27 +585,13 @@ namespace lfs::training {
         }
 
         [[nodiscard]] bool depth_prior_mode_supported(const std::string_view mode) {
-            return mode == "ssi" || mode == "ssi-disparity" || mode == "ssi-depth" || mode == "metric";
-        }
-
-        [[nodiscard]] bool depth_prior_mode_is_metric(const std::string_view mode) {
-            return mode == "metric";
-        }
-
-        [[nodiscard]] float depth_loss_final_scale(const std::string_view mode) {
-            return depth_prior_mode_is_metric(mode) ? kMetricDepthLossFinalScale : kDepthLossFinalScale;
+            return mode == "ssi" || mode == "ssi-disparity" || mode == "ssi-depth";
         }
 
         // Float [H, W] base weights can normalize a structure-weighted loss on the device.
         [[nodiscard]] bool is_device_denominator_weight(const lfs::core::Tensor& weight) {
             return weight.is_valid() && weight.ndim() == 2 && weight.dtype() == lfs::core::DataType::Float32 &&
                    weight.device() == lfs::core::Device::CUDA && weight.is_contiguous();
-        }
-
-        // Prior samples decode to [0,1] for integer files, so one stored unit is
-        // quantization_step of a decoded value.
-        [[nodiscard]] float metric_depth_metres_per_decoded_unit(const float quantization_step) {
-            return quantization_step > 0.0f ? kMetricDepthIntegerUnitMetres / quantization_step : 1.0f;
         }
 
         [[nodiscard]] const char* depth_prior_name(const kernels::DepthPriorType prior) {
@@ -1177,10 +1158,6 @@ namespace lfs::training {
         depth_loss_grad_ = {};
         depth_loss_grad_alpha_ = {};
         depth_loss_partials_ = {};
-        free_space_T_front_ = {};
-        free_space_grad_ = {};
-        free_space_scalar_ = {};
-        free_space_partials_ = {};
         normal_loss_scalar_ = {};
         normal_loss_grad_ = {};
         normal_loss_partials_ = {};
@@ -2120,11 +2097,8 @@ namespace lfs::training {
              mode == param::MaskMode::SegmentAndIgnore);
 
         const bool normal_terms_on =
-            (opt_params.use_normal_loss &&
-             (opt_params.normal_loss_weight > 0.0f || opt_params.normal_prior_depth_weight > 0.0f)) ||
+            (opt_params.use_normal_loss && opt_params.normal_loss_weight > 0.0f) ||
             opt_params.normal_consistency_weight > 0.0f ||
-            opt_params.depth_distortion_weight > 0.0f ||
-            opt_params.normal_variance_weight > 0.0f ||
             (opt_params.gut && opt_params.color_variance_weight > 0.0f);
 
         // Fused mask preprocess: SegmentAndIgnore band remap + optional ROI → one kernel.
@@ -2873,30 +2847,6 @@ namespace lfs::training {
 
         depth_anchors_.clear();
         depth_anchor_fit_attempted_ = false;
-        if (depth_prior_mode_is_metric(params_.optimization.depth_loss_mode)) {
-            size_t eight_bit = 0;
-            for (const auto& cam : train_dataset_->get_cameras()) {
-                if (!cam || !cam->has_depth()) {
-                    continue;
-                }
-                const float step = cam->depth_prior_quantization_step();
-                if (step > 1.0f / 1000.0f) {
-                    ++eight_bit;
-                }
-                depth_anchors_[cam->uid()] =
-                    lfs::training::kernels::metric_depth_anchor(metric_depth_metres_per_decoded_unit(step));
-            }
-            depth_anchor_fit_attempted_ = true;
-            LOG_INFO("Depth anchors: metric priors for {} cameras (integer maps in mm, float maps in m)",
-                     depth_anchors_.size());
-            if (eight_bit > 0) {
-                LOG_WARN("Metric depth: {} depth maps are 8-bit and cannot hold millimetre depth; "
-                         "write 16-bit PNG (mm) or float TIFF/EXR (m)",
-                         eight_bit);
-            }
-            nvtxRangePop();
-            return;
-        }
         const auto configured_depth_prior = depth_prior_from_mode(params_.optimization.depth_loss_mode);
         resolved_depth_prior_ = configured_depth_prior;
         auto& model = strategy_->get_model();
@@ -4225,10 +4175,6 @@ namespace lfs::training {
         depth_loss_grad_ = {};
         depth_loss_grad_alpha_ = {};
         depth_loss_partials_ = {};
-        free_space_T_front_ = {};
-        free_space_grad_ = {};
-        free_space_scalar_ = {};
-        free_space_partials_ = {};
         normal_loss_scalar_ = {};
         normal_loss_grad_ = {};
         normal_loss_partials_ = {};
@@ -7134,14 +7080,8 @@ namespace lfs::training {
                 }
 
                 const bool normal_supervision_started = !in_popspa && normal_supervision_active(iter);
-                const float normal_prior_scale =
-                    normal_supervision_started ? step_params.normal_prior_scale_at(iter) : 0.0f;
-                const float normal_loss_weight_now = step_params.normal_loss_weight * normal_prior_scale;
-                const float normal_prior_depth_weight_now =
-                    (step_params.normal_prior_depth_weight >= 0.0f
-                         ? step_params.normal_prior_depth_weight
-                         : step_params.normal_loss_weight) *
-                    normal_prior_scale;
+                const float normal_loss_weight_now =
+                    normal_supervision_started ? step_params.normal_loss_weight : 0.0f;
 
                 FastGSFusedExtraGradients fused_extra_gradients;
                 FastGSColorVarianceLoss color_variance;
@@ -7359,61 +7299,6 @@ namespace lfs::training {
                                                      params_.optimization.cropbox_loss_weight < 1.0f &&
                                                      cropbox_contains_camera(*cam);
 
-                    // Opacity in front of a metric depth map: GUT renders T_front against the
-                    // map while it composites, so the map has to be on the GPU before the forward.
-                    gsplat_lfs::FreeSpaceRender free_space;
-                    lfs::core::Tensor free_space_depth;
-                    if (step_params.gut && step_params.free_space_weight > 0.0f &&
-                        step_params.use_depth_loss &&
-                        depth_prior_mode_is_metric(step_params.depth_loss_mode)) {
-                        const auto anchor_it = depth_anchors_.find(cam->uid());
-                        if (anchor_it != depth_anchors_.end() && anchor_it->second.valid &&
-                            anchor_it->second.model == 1) {
-                            if (pipelined_depth_.is_valid() && pipelined_depth_.numel() > 0) {
-                                free_space_depth = pipelined_depth_;
-                                if (pipelined_depth_own_size_) {
-                                    free_space_depth = lfs::core::fit_depth_prior(
-                                        free_space_depth, pipelined_prior_target_height_, pipelined_prior_target_width_,
-                                        cam->image_height(), cam->image_width(), lfs::core::getCurrentCUDAStream());
-                                }
-                            } else if (cam->has_depth()) {
-                                free_space_depth = cam->load_and_get_depth(
-                                    params_.dataset.resize_factor,
-                                    params_.dataset.max_width);
-                            }
-                            if (free_space_depth.is_valid() && free_space_depth.ndim() == 3 &&
-                                free_space_depth.shape()[0] == 1) {
-                                free_space_depth = free_space_depth.squeeze(0);
-                            }
-                            if (free_space_depth.is_valid() && free_space_depth.ndim() == 2 &&
-                                free_space_depth.numel() > 0) {
-                                if (free_space_depth.device() != lfs::core::Device::CUDA) {
-                                    free_space_depth = free_space_depth.cuda();
-                                }
-                                if (!free_space_depth.is_contiguous()) {
-                                    free_space_depth = free_space_depth.contiguous();
-                                }
-                                const lfs::core::TensorShape t_front_shape{
-                                    static_cast<size_t>(cam->image_height()),
-                                    static_cast<size_t>(cam->image_width())};
-                                if (!free_space_T_front_.is_valid() ||
-                                    free_space_T_front_.shape() != t_front_shape) {
-                                    free_space_T_front_ = lfs::core::Tensor::empty(
-                                        t_front_shape, lfs::core::Device::CUDA);
-                                }
-                                free_space_T_front_.set_stream(lfs::core::getCurrentCUDAStream());
-                                free_space_depth.sync_to_stream(lfs::core::getCurrentCUDAStream());
-                                lfs::core::pin_operands({&free_space_depth});
-                                free_space.gt_depth = free_space_depth.ptr<float>();
-                                free_space.T_front = free_space_T_front_.ptr<float>();
-                                free_space.gt_h = static_cast<uint32_t>(free_space_depth.shape()[0]);
-                                free_space.gt_w = static_cast<uint32_t>(free_space_depth.shape()[1]);
-                                free_space.unit = anchor_it->second.scale;
-                                free_space.margin = step_params.free_space_margin;
-                                free_space.margin_rel = step_params.free_space_margin_rel;
-                            }
-                        }
-                    }
                     {
                         LFS_VRAM_SCOPE("train.rasterize_forward");
                         LOG_VRAM_DIFF("train.rasterize_forward");
@@ -7445,17 +7330,14 @@ namespace lfs::training {
                                         0, 0, 0, 0,
                                         1.0f, step_params.mip_filter,
                                         (normal_loss_weight_now > 0.f ||
-                                         normal_prior_depth_weight_now > 0.f ||
                                          (normal_supervision_started &&
-                                          (step_params.normal_consistency_weight > 0.f ||
-                                           step_params.depth_distortion_weight > 0.f ||
-                                           step_params.normal_variance_weight > 0.f)))
+                                          step_params.normal_consistency_weight > 0.f))
                                             ? GsplatRenderMode::RGB_D_N
                                         : ((step_params.use_depth_loss && step_params.depth_loss_weight > 0.f) ||
-                                           roi_surface_weights || free_space.enabled())
+                                           roi_surface_weights)
                                             ? GsplatRenderMode::RGB_D
                                             : GsplatRenderMode::RGB,
-                                        true, bg_tile, free_space, cull_weights);
+                                        true, bg_tile, cull_weights);
                                     if (!rasterize_result) {
                                         auto typed = lfs::from_legacy_expected<
                                             std::pair<RenderOutput, GsplatRasterizeContext>>(
@@ -7501,13 +7383,11 @@ namespace lfs::training {
                             }
                         } else {
                             const bool render_normal =
-                                ((normal_loss_weight_now > 0.0f || normal_prior_depth_weight_now > 0.0f) &&
+                                (normal_loss_weight_now > 0.0f &&
                                  normal_prior_usable_ &&
                                  cam->has_normal()) ||
                                 (normal_supervision_started &&
-                                 (step_params.normal_consistency_weight > 0.0f ||
-                                  step_params.depth_distortion_weight > 0.0f ||
-                                  step_params.normal_variance_weight > 0.0f));
+                                 step_params.normal_consistency_weight > 0.0f);
                             const bool render_depth =
                                 render_normal || roi_surface_weights ||
                                 (step_params.use_depth_loss &&
@@ -7992,7 +7872,6 @@ namespace lfs::training {
                         lfs::core::Tensor tile_grad_alpha;
                         lfs::core::Tensor tile_grad_depth;
                         lfs::core::Tensor tile_grad_normal;
-                        lfs::core::Tensor tile_grad_depth_sq;
                         lfs::core::Tensor tile_error_map;
                         lfs::core::Tensor mask_tile;
                         // Retain the photometric workspace view through all normal terms.
@@ -8147,17 +8026,7 @@ namespace lfs::training {
 
                             lfs::core::Tensor target_depth;
                             bool depth_own_size = false;
-                            if (!fit && free_space_depth.is_valid() && free_space_depth.ndim() == 2 &&
-                                free_space_depth.numel() > 0 &&
-                                free_space_depth.shape()[0] == static_cast<size_t>(cam->image_height()) &&
-                                free_space_depth.shape()[1] == static_cast<size_t>(cam->image_width()) &&
-                                (!pipelined_depth_own_size_ ||
-                                 ((pipelined_prior_target_height_ <= 0 ||
-                                   pipelined_prior_target_height_ == cam->image_height()) &&
-                                  (pipelined_prior_target_width_ <= 0 ||
-                                   pipelined_prior_target_width_ == cam->image_width())))) {
-                                target_depth = free_space_depth;
-                            } else if (pipelined_depth_.is_valid() && pipelined_depth_.numel() > 0) {
+                            if (pipelined_depth_.is_valid() && pipelined_depth_.numel() > 0) {
                                 target_depth = pipelined_depth_;
                                 depth_own_size = pipelined_depth_own_size_;
                             } else if (cam->has_depth()) {
@@ -8234,7 +8103,7 @@ namespace lfs::training {
                                         std::min(static_cast<float>(iter) / static_cast<float>(total_iterations), 1.0f);
                                     const float depth_weight_now =
                                         step_params.depth_loss_weight *
-                                        std::pow(depth_loss_final_scale(step_params.depth_loss_mode), depth_progress);
+                                        std::pow(kDepthLossFinalScale, depth_progress);
 
                                     if (!depth_loss_scalar_.is_valid()) {
                                         depth_loss_scalar_ = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
@@ -8273,7 +8142,7 @@ namespace lfs::training {
                                             depth_width,
                                             depth_height,
                                             depth_weight_now,
-                                            step_params.depth_loss_gradient_weight,
+                                            kDepthLossGradientTermWeight,
                                             depth_prior_qstep,
                                             depth_anchor,
                                             depth_stream,
@@ -8293,41 +8162,8 @@ namespace lfs::training {
                             }
                         }
 
-                        if (run_gut_gaussian_backward && gsplat_ctx && gsplat_ctx->free_space.enabled()) {
-                            LFS_VRAM_SCOPE("train.free_space_loss");
-                            const cudaStream_t free_space_stream = gsplat_ctx->stream;
-                            const auto& rendered = gsplat_ctx->free_space;
-                            const uint32_t width = gsplat_ctx->image_width;
-                            const uint32_t height = gsplat_ctx->image_height;
-                            const lfs::core::TensorShape grad_shape{static_cast<size_t>(height), static_cast<size_t>(width)};
-                            if (!free_space_grad_.is_valid() || free_space_grad_.shape() != grad_shape) {
-                                free_space_grad_ = lfs::core::Tensor::empty(grad_shape, lfs::core::Device::CUDA);
-                            }
-                            free_space_grad_.set_stream(free_space_stream);
-                            if (!free_space_scalar_.is_valid()) {
-                                free_space_scalar_ = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
-                            }
-                            free_space_scalar_.set_stream(free_space_stream);
-                            const size_t partials = gsplat_lfs::free_space_partial_count(width * height);
-                            if (!free_space_partials_.is_valid() || free_space_partials_.numel() != partials) {
-                                free_space_partials_ = lfs::core::Tensor::empty({partials}, lfs::core::Device::CUDA);
-                            }
-                            free_space_partials_.set_stream(free_space_stream);
-                            const float* const free_space_pixel_weight =
-                                (roi_weight.is_valid() && roi_weight.numel() == static_cast<size_t>(width) * height)
-                                    ? roi_weight_ptr_on_stream(free_space_stream)
-                                    : nullptr;
-                            gsplat_lfs::free_space_loss(rendered, width, height, step_params.free_space_weight,
-                                                        free_space_grad_.ptr<float>(),
-                                                        free_space_scalar_.ptr<float>(),
-                                                        free_space_partials_.ptr<float>(),
-                                                        free_space_stream,
-                                                        free_space_pixel_weight);
-                            tile_loss = tile_loss + free_space_scalar_;
-                        }
-
                         if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
-                            (normal_loss_weight_now > 0.0f || normal_prior_depth_weight_now > 0.0f) &&
+                            normal_loss_weight_now > 0.0f &&
                             output.normal.is_valid() &&
                             output.normal.numel() > 0 &&
                             output.alpha.is_valid() &&
@@ -8439,7 +8275,7 @@ namespace lfs::training {
                                         tile_loss = tile_loss + normal_loss_scalar_;
                                     }
 
-                                    if (normal_prior_depth_weight_now > 0.0f &&
+                                    if (normal_loss_weight_now > 0.0f &&
                                         output.depth.is_valid() &&
                                         output.depth.numel() > 0 &&
                                         cam->camera_width() > 0 && cam->camera_height() > 0 &&
@@ -8500,7 +8336,7 @@ namespace lfs::training {
                                                 fy,
                                                 cx,
                                                 cy,
-                                                normal_prior_depth_weight_now,
+                                                normal_loss_weight_now,
                                                 normal_stream,
                                                 normal_pixel_weight,
                                                 gsplat_ctx ? gsplat_ctx->camera_rays.ptr<float>() : nullptr,
@@ -8625,82 +8461,6 @@ namespace lfs::training {
                                     gsplat_ctx && gsplat_ctx->camera_model == ::CameraModelType::EQUIRECTANGULAR);
 
                                 tile_loss = tile_loss + normal_consistency_scalar_;
-                            }
-                        }
-
-                        if (gsplat_ctx && normal_supervision_started &&
-                            step_params.depth_distortion_weight > 0.0f &&
-                            output.depth_sq.is_valid() && output.depth_sq.numel() > 0) {
-                            LFS_VRAM_SCOPE("train.depth_distortion_loss");
-                            lfs::core::Tensor rendered_depth = output.depth.squeeze(0).contiguous();
-                            lfs::core::Tensor rendered_depth_sq = output.depth_sq.squeeze(0).contiguous();
-                            lfs::core::Tensor rendered_alpha = output.alpha.squeeze(0).contiguous();
-                            const cudaStream_t distortion_stream = rendered_depth.stream();
-                            ensure_depth_grad_buffers(rendered_depth, distortion_stream, !depth_grad_buffers_active);
-                            if (!depth_distortion_grad_.is_valid() ||
-                                depth_distortion_grad_.shape() != rendered_depth.shape()) {
-                                depth_distortion_grad_ = lfs::core::Tensor::empty(rendered_depth.shape(), lfs::core::Device::CUDA);
-                            }
-                            depth_distortion_grad_.set_stream(distortion_stream);
-                            lfs::core::pin_operands({&rendered_depth, &rendered_depth_sq, &rendered_alpha});
-                            lfs::training::kernels::launch_depth_distortion_loss(
-                                rendered_depth.ptr<float>(),
-                                rendered_depth_sq.ptr<float>(),
-                                rendered_alpha.ptr<float>(),
-                                depth_loss_grad_.ptr<float>(),
-                                depth_distortion_grad_.ptr<float>(),
-                                depth_loss_grad_alpha_.ptr<float>(),
-                                static_cast<int>(rendered_depth.shape()[1]),
-                                static_cast<int>(rendered_depth.shape()[0]),
-                                step_params.depth_distortion_weight,
-                                distortion_stream,
-                                normal_weight_ptr_on_stream(distortion_stream));
-                            tile_grad_depth_sq = depth_distortion_grad_;
-                        }
-
-                        if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
-                            normal_supervision_started &&
-                            step_params.normal_variance_weight > 0.0f &&
-                            output.normal.is_valid() && output.normal.numel() > 0 &&
-                            output.alpha.is_valid() && output.alpha.numel() > 0) {
-                            LFS_VRAM_SCOPE("train.normal_variance_loss");
-                            lfs::core::Tensor rendered_normal = output.normal;
-                            if (!rendered_normal.is_contiguous()) {
-                                rendered_normal = rendered_normal.contiguous();
-                            }
-                            lfs::core::Tensor rendered_alpha = output.alpha;
-                            if (rendered_alpha.ndim() == 3 && rendered_alpha.shape()[0] == 1) {
-                                rendered_alpha = rendered_alpha.squeeze(0);
-                            }
-                            if (!rendered_alpha.is_contiguous()) {
-                                rendered_alpha = rendered_alpha.contiguous();
-                            }
-                            if (rendered_normal.ndim() == 3 && rendered_normal.shape()[0] == 3 &&
-                                rendered_alpha.ndim() == 2 &&
-                                rendered_alpha.shape()[0] == rendered_normal.shape()[1] &&
-                                rendered_alpha.shape()[1] == rendered_normal.shape()[2]) {
-                                const cudaStream_t nvar_stream = rendered_normal.stream();
-                                if (!tile_grad_normal.is_valid()) {
-                                    if (!normal_loss_grad_.is_valid() ||
-                                        normal_loss_grad_.shape() != rendered_normal.shape()) {
-                                        normal_loss_grad_ = lfs::core::Tensor::empty(rendered_normal.shape(), lfs::core::Device::CUDA);
-                                    }
-                                    normal_loss_grad_.set_stream(nvar_stream);
-                                    normal_loss_grad_.zero_();
-                                    tile_grad_normal = normal_loss_grad_;
-                                }
-                                ensure_depth_grad_buffers(rendered_alpha, nvar_stream, !depth_grad_buffers_active);
-                                lfs::core::pin_operands({&rendered_normal, &rendered_alpha, &tile_grad_normal});
-                                lfs::training::kernels::launch_normal_variance_loss(
-                                    rendered_normal.ptr<float>(),
-                                    rendered_alpha.ptr<float>(),
-                                    tile_grad_normal.ptr<float>(),
-                                    depth_loss_grad_alpha_.ptr<float>(),
-                                    static_cast<int>(rendered_normal.shape()[2]),
-                                    static_cast<int>(rendered_normal.shape()[1]),
-                                    step_params.normal_variance_weight,
-                                    nvar_stream,
-                                    normal_weight_ptr_on_stream(nvar_stream));
                             }
                         }
 
@@ -8960,8 +8720,6 @@ namespace lfs::training {
                                                           edge_weight_scoring_active_ ? edge_score_scratch : lfs::core::Tensor{},
                                                           tile_grad_depth, tile_grad_normal,
                                                           normal_supervision_started ? step_params.normal_flatten_weight : 0.f,
-                                                          gsplat_ctx->free_space.enabled() ? free_space_grad_ : lfs::core::Tensor{},
-                                                          tile_grad_depth_sq,
                                                           GsplatColorVarianceLoss{
                                                               color_variance.loss,
                                                               color_variance.weight,
@@ -10007,10 +9765,10 @@ namespace lfs::training {
             const bool alpha_available = scene_ && scene_->imagesHaveAlpha();
             if (const auto las_priors = read_las_prior_sidecar(params_.dataset.data_path)) {
                 for (const auto& change : apply_las_prior_defaults(params_.optimization, *las_priors)) {
-                    LOG_INFO("LiDAR priors (supervision.json): {}", change);
+                    LOG_INFO("Supervision priors (supervision.json): {}", change);
                 }
                 if (las_priors->ray_distance && !params_.optimization.gut) {
-                    LOG_WARN("LiDAR depth maps hold ray distance, which only the GUT rasterizer renders for "
+                    LOG_WARN("Depth maps (supervision.json) hold ray distance, which only the GUT rasterizer renders for "
                              "fisheye cameras; enable --gut or depth supervision will be biased off-axis");
                 }
             }
@@ -10020,12 +9778,6 @@ namespace lfs::training {
                 LOG_WARN("Unknown depth loss mode '{}'; disabling depth loss",
                          params_.optimization.depth_loss_mode);
                 params_.optimization.use_depth_loss = false;
-            }
-            if (params_.optimization.free_space_weight > 0.0f &&
-                !(params_.optimization.gut && params_.optimization.use_depth_loss &&
-                  depth_prior_mode_is_metric(params_.optimization.depth_loss_mode))) {
-                LOG_WARN("Free-space loss needs --gut, --use-depth-loss and --depth-loss-mode metric; "
-                         "it stays off for this run");
             }
             aux_pipeline_config.load_depths = training_depth_priors_enabled(params_.optimization);
             aux_pipeline_config.load_normals = training_normal_priors_enabled(params_.optimization);
@@ -10042,13 +9794,10 @@ namespace lfs::training {
                         ++cameras_with_depth;
                     }
                 }
-                LOG_INFO("Depth loss enabled (mode={}, weight={}, grad_weight={}, exponential decay to {:.0f}% by end of training)",
-                         depth_prior_mode_is_metric(params_.optimization.depth_loss_mode)
-                             ? "metric"
-                             : depth_prior_name(depth_prior_from_mode(params_.optimization.depth_loss_mode)),
+                LOG_INFO("Depth loss enabled (mode={}, weight={}, exponential decay to {:.0f}% by end of training)",
+                         depth_prior_name(depth_prior_from_mode(params_.optimization.depth_loss_mode)),
                          params_.optimization.depth_loss_weight,
-                         params_.optimization.depth_loss_gradient_weight,
-                         depth_loss_final_scale(params_.optimization.depth_loss_mode) * 100.0f);
+                         kDepthLossFinalScale * 100.0f);
                 if (cameras_with_depth == 0) {
                     LOG_WARN("Depth loss is enabled but none of the {} training cameras has a depth map — "
                              "the depth loss will be inactive. Depth files go in <dataset>/depths (or depth/) "
@@ -10072,11 +9821,8 @@ namespace lfs::training {
                         normal_cameras.push_back(cam.get());
                     }
                 }
-                LOG_INFO("Normal loss enabled (weight={}, prior_depth_weight={}, prior_decay=[{}, {}], space={})",
+                LOG_INFO("Normal loss enabled (weight={}, space={})",
                          params_.optimization.normal_loss_weight,
-                         params_.optimization.normal_prior_depth_weight,
-                         params_.optimization.normal_prior_decay_start,
-                         params_.optimization.normal_prior_decay_end,
                          lfs::core::param::normal_loss_space_name(params_.optimization.normal_loss_space));
                 if (normal_cameras.empty()) {
                     LOG_WARN("Normal loss is enabled but none of the {} training cameras has a normal map — "

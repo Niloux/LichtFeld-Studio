@@ -9,7 +9,6 @@
 #include "core/error.hpp"
 #include "core/splat_data.hpp"
 #include "gsplat/Common.h"
-#include "gsplat/FreeSpace.h"
 #include "gsplat/TileBatch.h"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/render_output.hpp"
@@ -28,7 +27,7 @@ namespace lfs::training {
         ED = 2,     // Expected depth
         RGB_D = 3,  // RGB + depth
         RGB_ED = 4, // RGB + expected depth
-        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals + accumulated squared depth
+        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals
     };
 
     // Forward pass context - holds raw pointers needed for backward (arena allocated)
@@ -124,9 +123,6 @@ namespace lfs::training {
         // Background image for per-pixel blending (optional, empty = use bg_color)
         lfs::core::Tensor bg_image;
 
-        // T_front render in front of a laser scan (disabled = gt_depth null)
-        gsplat_lfs::FreeSpaceRender free_space;
-
         lfs::core::Tensor tile_sub_masks; // [tile_height, tile_width] live sub-tiles, or empty for all
     };
 
@@ -137,7 +133,6 @@ namespace lfs::training {
     // Forward pass with optional tiling (tile_width/height=0 = full image)
     // mip_filter: optimization.mip_filter, the smaller dilation plus opacity compensation
     // bg_image is optional - if provided, uses per-pixel background blending instead of solid color
-    // free_space renders T_front (full image only; needs a render mode with depth)
     std::expected<std::pair<RenderOutput, GsplatRasterizeContext>, std::string> gsplat_rasterize_forward(
         lfs::core::Camera& viewpoint_camera,
         lfs::core::SplatData& gaussian_model,
@@ -151,10 +146,10 @@ namespace lfs::training {
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
         bool use_gut = false,
         const lfs::core::Tensor& bg_image = {},
-        const gsplat_lfs::FreeSpaceRender& free_space = {},
         // [H, W] Float32 pixel weights: pixels farther than one 8 px sub-tile from any
         // weight > 0 are not rasterized and stay background with zero alpha.
-        const lfs::core::Tensor& pixel_weights = {});
+        const lfs::core::Tensor& pixel_weights = {},
+        float* median_depth = nullptr);
 
     struct GsplatColorVarianceLoss {
         lfs::core::Tensor loss;
@@ -175,8 +170,6 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_depth = {},
         const lfs::core::Tensor& grad_normal = {},
         float flatten_weight = 0.f,
-        const lfs::core::Tensor& grad_T_front = {},
-        const lfs::core::Tensor& grad_depth_sq = {},
         const GsplatColorVarianceLoss& color_variance = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.

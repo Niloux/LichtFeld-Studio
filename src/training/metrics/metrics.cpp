@@ -1466,63 +1466,6 @@ namespace lfs::training {
         return errors[mid];
     }
 
-    std::optional<DepthPriorError> depth_prior_error(
-        const lfs::core::Tensor& rendered_depth,
-        const lfs::core::Tensor& rendered_alpha,
-        const lfs::core::Tensor& prior_depth_m) {
-        if (!rendered_depth.is_valid() || !rendered_alpha.is_valid() || !prior_depth_m.is_valid()) {
-            return std::nullopt;
-        }
-        const auto depth = squeeze_to_hw(rendered_depth);
-        const auto alpha = squeeze_to_hw(rendered_alpha);
-        const auto prior = squeeze_to_hw(prior_depth_m);
-        if (depth.ndim() != 2 || depth.shape() != alpha.shape() || depth.shape() != prior.shape()) {
-            return std::nullopt;
-        }
-        const auto depth_cpu = depth.cpu().contiguous();
-        const auto alpha_cpu = alpha.cpu().contiguous();
-        const auto prior_cpu = prior.cpu().contiguous();
-        if (depth_cpu.dtype() != lfs::core::DataType::Float32 || alpha_cpu.dtype() != lfs::core::DataType::Float32 ||
-            prior_cpu.dtype() != lfs::core::DataType::Float32) {
-            return std::nullopt;
-        }
-        const float* const d = depth_cpu.ptr<float>();
-        const float* const a = alpha_cpu.ptr<float>();
-        const float* const p = prior_cpu.ptr<float>();
-        const size_t hw = depth.shape()[0] * depth.shape()[1];
-
-        std::vector<float> errors;
-        size_t prior_pixels = 0;
-        size_t low_alpha = 0;
-        for (size_t i = 0; i < hw; ++i) {
-            if (!std::isfinite(p[i]) || p[i] <= 0.0f) {
-                continue;
-            }
-            ++prior_pixels;
-            const bool finite_alpha = std::isfinite(a[i]);
-            if (!finite_alpha || a[i] < kDepthPriorSolidAlpha) {
-                ++low_alpha;
-            }
-            if (!finite_alpha || a[i] < kDepthPriorMinAlpha || !std::isfinite(d[i])) {
-                continue;
-            }
-            errors.push_back(std::abs(d[i] / a[i] - p[i]));
-        }
-        if (errors.empty()) {
-            return std::nullopt;
-        }
-        const auto quantile = [&errors](const double q) {
-            const auto k = static_cast<std::ptrdiff_t>(q * static_cast<double>(errors.size() - 1));
-            std::nth_element(errors.begin(), errors.begin() + k, errors.end());
-            return errors[static_cast<size_t>(k)];
-        };
-        return DepthPriorError{
-            .median_m = quantile(0.5),
-            .p90_m = quantile(0.9),
-            .low_alpha_fraction = static_cast<float>(low_alpha) / static_cast<float>(prior_pixels),
-            .prior_pixels = prior_pixels};
-    }
-
     // MetricsReporter Implementation
     MetricsReporter::MetricsReporter(const std::filesystem::path& output_dir, const bool aligned_scores)
         : output_dir_(output_dir),
@@ -1730,16 +1673,6 @@ namespace lfs::training {
             }
             if (final.depth_absrel && std::isfinite(*final.depth_absrel)) {
                 report_file << "Depth AbsRel: " << *final.depth_absrel << "\n";
-            }
-            if (final.depth_prior_err_median_mm && std::isfinite(*final.depth_prior_err_median_mm)) {
-                report_file << "Depth error vs prior (mm): median " << *final.depth_prior_err_median_mm;
-                if (final.depth_prior_err_p90_mm && std::isfinite(*final.depth_prior_err_p90_mm))
-                    report_file << ", p90 " << *final.depth_prior_err_p90_mm;
-                report_file << "\n";
-            }
-            if (final.depth_prior_low_alpha && std::isfinite(*final.depth_prior_low_alpha)) {
-                report_file << "Prior pixels with alpha < " << kDepthPriorSolidAlpha << ": "
-                            << *final.depth_prior_low_alpha << "\n";
             }
             for (const auto& line : final.mask_set_summaries())
                 report_file << line << "\n";
@@ -1984,7 +1917,6 @@ namespace lfs::training {
         result.iteration = iteration;
 
         std::vector<float> psnr_values, ssim_values, lpips_values, flip_values, normal_values, depth_values;
-        std::vector<float> depth_prior_median_mm, depth_prior_p90_mm, depth_prior_low_alpha;
         std::vector<float> bias_r_values, bias_g_values, bias_b_values;
         std::vector<float> bias_corr_r_values, bias_corr_g_values, bias_corr_b_values;
         const auto start_time = std::chrono::steady_clock::now();
@@ -2506,34 +2438,6 @@ namespace lfs::training {
                 LOG_DEBUG("Eval: depth_absrel skipped for '{}': {}", cam->image_name(), e.what());
             }
 
-            // A metric prior is in metres, so the rendered depth can be scored against it pixel by pixel.
-            // The camera loads it undistorted whenever it can undistort, so a distorted-space view is skipped.
-            if (_params.optimization.depth_loss_mode == "metric" && cam->has_depth() && !distorted_coordinates &&
-                r_output.depth.is_valid() && r_output.alpha.is_valid()) {
-                try {
-                    RestoreCameraImageDimensions restore_depth_dimensions{
-                        *cam, cam->image_width(), cam->image_height(), cam->image_size_loaded()};
-                    cam->release_depth_cache();
-                    lfs::core::Tensor prior = cam->load_and_get_depth(_params.dataset.resize_factor,
-                                                                       _params.dataset.max_width);
-                    cam->release_depth_cache();
-                    // Integer priors decode to [0, 1] with one stored millimetre per quantization step.
-                    const float step = cam->depth_prior_quantization_step();
-                    const float metres_per_unit = step > 0.0f ? 0.001f / step : 1.0f;
-                    if (const auto error = depth_prior_error(r_output.depth, r_output.alpha,
-                                                             prior.mul(metres_per_unit))) {
-                        depth_prior_median_mm.push_back(1000.0f * error->median_m);
-                        depth_prior_p90_mm.push_back(1000.0f * error->p90_m);
-                        depth_prior_low_alpha.push_back(error->low_alpha_fraction);
-                    } else {
-                        LOG_DEBUG("Eval: depth prior error skipped for '{}': no scorable prior pixels",
-                                  cam->image_name());
-                    }
-                } catch (const std::exception& e) {
-                    LOG_DEBUG("Eval: depth prior error skipped for '{}': {}", cam->image_name(), e.what());
-                }
-            }
-
             if (_params.optimization.enable_save_eval_images) {
                 const auto& stem = image_stems[image_idx];
                 auto stamp = _params.include_provenance ? lfs::core::make_provenance_stamp()
@@ -2647,9 +2551,6 @@ namespace lfs::training {
         }
         result.normal_angle_deg = mean_of_finite(normal_values);
         result.depth_absrel = mean_of_finite(depth_values);
-        result.depth_prior_err_median_mm = mean_of_finite(depth_prior_median_mm);
-        result.depth_prior_err_p90_mm = mean_of_finite(depth_prior_p90_mm);
-        result.depth_prior_low_alpha = mean_of_finite(depth_prior_low_alpha);
         const auto summarize = [](const MaskSetScores& scores) {
             MaskSetMetrics summary;
             if (!scores.psnr.empty()) {

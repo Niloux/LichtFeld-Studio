@@ -414,49 +414,13 @@ namespace lfs::core::param {
             .all_strategies()
             .string_prop(&OptimizationParameters::depth_loss_mode,
                          "depth_loss_mode", "Depth Loss Mode", d.depth_loss_mode,
-                         "Depth prior convention: ssi (auto-detect), ssi-disparity, ssi-depth, or metric (absolute depth, 16-bit in mm)")
+                         "Depth prior convention: ssi (auto-detect), ssi-disparity, or ssi-depth")
             .all_strategies()
             .bool_prop(&OptimizationParameters::depth_auto_generate,
                        "depth_auto_generate", "Auto-generate Depth", d.depth_auto_generate,
                        "Generate missing or size-mismatched depth maps with MoGe-2 from the full-resolution images/ folder")
             .locale("training_params.depth_auto_generate")
             .tooltip("training.tooltip.depth_auto_generate")
-            .all_strategies()
-            .float_prop(&OptimizationParameters::free_space_weight,
-                        "free_space_weight", "Free Space Weight", d.free_space_weight, 0.0f, 1.0f,
-                        "With metric depth maps and --gut, removes opacity in front of the depth map surface; 0 turns it off, 0.05 works well")
-            .locale("training.losses.free_space_weight")
-            .tooltip("training.tooltip.free_space_weight")
-            .flags(PROP_ADVANCED)
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::free_space_margin,
-                        "free_space_margin", "Free Space Margin", d.free_space_margin, 0.0f, 10.0f,
-                        "Metres in front of the depth map surface where opacity stays allowed")
-            .locale("training.losses.free_space_margin")
-            .tooltip("training.tooltip.free_space_margin")
-            .flags(PROP_ADVANCED)
-            .precision(2)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::free_space_margin_rel,
-                        "free_space_margin_rel", "Free Space Relative Margin", d.free_space_margin_rel, 0.0f, 1.0f,
-                        "Fraction of the depth used as margin where it is larger than the margin in metres")
-            .locale("training.losses.free_space_margin_rel")
-            .tooltip("training.tooltip.free_space_margin_rel")
-            .flags(PROP_ADVANCED)
-            .precision(3)
-            .ui_step(0.005)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::depth_loss_gradient_weight,
-                        "depth_loss_gradient_weight", "Depth Gradient Weight", d.depth_loss_gradient_weight, 0.0f, 10.0f,
-                        "Weight for the 4-neighbour spatial gradient term inside depth loss; 0 disables it for sparse LiDAR depth maps")
-            .locale("training.losses.depth_loss_gradient_weight")
-            .tooltip("training.tooltip.depth_loss_gradient_weight")
-            .flags(PROP_ADVANCED)
-            .precision(2)
-            .ui_step(0.1)
             .all_strategies()
             .bool_prop(&OptimizationParameters::use_normal_loss,
                        "use_normal_loss", "Use Normal Loss", d.use_normal_loss,
@@ -486,28 +450,6 @@ namespace lfs::core::param {
             .precision(3)
             .ui_step(0.01)
             .all_strategies()
-            .float_prop(&OptimizationParameters::depth_distortion_weight,
-                        "depth_distortion_weight", "Depth Distortion Weight", d.depth_distortion_weight, 0.0f, 100.0f,
-                        "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
-            .locale("training_params.depth_distortion_weight")
-            .tooltip("training.tooltip.depth_distortion_weight")
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::normal_variance_weight,
-                        "normal_variance_weight", "Normal Variance Weight", d.normal_variance_weight, 0.0f, 10.0f,
-                        "Weight for per-splat normal variance along each ray; 0 turns it off")
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::normal_prior_depth_weight,
-                        "normal_prior_depth_weight", "Normal Prior Depth Weight", d.normal_prior_depth_weight, -1.0f, 100.0f,
-                        "Weight for the prior normal against the normal of the rendered depth, which moves surfaces; -1 uses the normal loss weight")
-            .locale("training_params.normal_prior_depth_weight")
-            .tooltip("training.tooltip.normal_prior_depth_weight")
-            .precision(3)
-            .ui_step(0.01)
-            .all_strategies()
             .float_prop(&OptimizationParameters::normal_flatten_weight,
                         "normal_flatten_weight", "Normal Flatten Weight", d.normal_flatten_weight, 0.0f, 1000.0f,
                         "Min-axis scale flattening weight while normal supervision is active")
@@ -531,24 +473,6 @@ namespace lfs::core::param {
             .tooltip("training.tooltip.normal_end_fraction")
             .precision(3)
             .ui_step(0.01)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::normal_prior_decay_start,
-                        "normal_prior_decay_start", "Normal Prior Decay Start", d.normal_prior_decay_start, 0.0f, 1.0f,
-                        "Fraction of total iterations where cosine decay of external normal priors begins; 1.0 keeps full weight")
-            .locale("training.losses.normal_prior_decay_start")
-            .tooltip("training.tooltip.normal_prior_decay_start")
-            .flags(PROP_ADVANCED)
-            .precision(2)
-            .ui_step(0.05)
-            .all_strategies()
-            .float_prop(&OptimizationParameters::normal_prior_decay_end,
-                        "normal_prior_decay_end", "Normal Prior Decay End", d.normal_prior_decay_end, 0.0f, 1.0f,
-                        "Fraction of total iterations where external normal priors finish decaying to 0")
-            .locale("training.losses.normal_prior_decay_end")
-            .tooltip("training.tooltip.normal_prior_decay_end")
-            .flags(PROP_ADVANCED)
-            .precision(2)
-            .ui_step(0.05)
             .all_strategies()
             .enum_prop(&OptimizationParameters::normal_loss_space,
                        "normal_loss_space", "Normal Loss Space", d.normal_loss_space,

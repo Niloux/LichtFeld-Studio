@@ -2019,32 +2019,6 @@ TEST(ArgumentParserTest, TrainingParsesExplicitDepthLossOptions) {
     EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "ssi-disparity");
 }
 
-TEST(ArgumentParserTest, TrainingParsesFreeSpaceOptions) {
-    const auto data_path = make_test_path("lfs_arg_parser_free_space_data");
-    const auto output_path = make_test_path("lfs_arg_parser_free_space_output");
-
-    const char* argv[] = {
-        "LichtFeld-Studio",
-        "--headless",
-        "--data-path",
-        data_path.c_str(),
-        "--output-path",
-        output_path.c_str(),
-        "--free-space-weight",
-        "0.05",
-        "--free-space-margin",
-        "0.2",
-        "--free-space-margin-rel",
-        "0.03"};
-
-    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
-    ASSERT_TRUE(parsed.has_value()) << parsed.error();
-
-    EXPECT_FLOAT_EQ((*parsed)->optimization.free_space_weight, 0.05f);
-    EXPECT_FLOAT_EQ((*parsed)->optimization.free_space_margin, 0.2f);
-    EXPECT_FLOAT_EQ((*parsed)->optimization.free_space_margin_rel, 0.03f);
-}
-
 TEST(ArgumentParserTest, TrainingRejectsLegacyDepthLossAlias) {
     const auto data_path = make_test_path("lfs_arg_parser_depth_invalid_data");
     const auto output_path = make_test_path("lfs_arg_parser_depth_invalid_output");
@@ -2062,35 +2036,7 @@ TEST(ArgumentParserTest, TrainingRejectsLegacyDepthLossAlias) {
 
     auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
     ASSERT_FALSE(parsed.has_value());
-    EXPECT_NE(parsed.error().find("depth_loss_mode must be 'ssi', 'ssi-disparity', 'ssi-depth', or 'metric'"), std::string::npos);
-}
-
-TEST(ArgumentParserTest, TrainingParsesPhaseADepthGradientAndNormalDecayOptions) {
-    const auto data_path = make_test_path("lfs_arg_parser_phase_a_data");
-    const auto output_path = make_test_path("lfs_arg_parser_phase_a_output");
-
-    const char* argv[] = {
-        "LichtFeld-Studio",
-        "--headless",
-        "--data-path",
-        data_path.c_str(),
-        "--output-path",
-        output_path.c_str(),
-        "--use-depth-loss",
-        "--depth-loss-gradient-weight",
-        "0.25",
-        "--use-normal-loss",
-        "--normal-prior-decay-start",
-        "0.5",
-        "--normal-prior-decay-end",
-        "0.8"};
-
-    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
-    ASSERT_TRUE(parsed.has_value()) << parsed.error();
-
-    EXPECT_FLOAT_EQ((*parsed)->optimization.depth_loss_gradient_weight, 0.25f);
-    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_decay_start, 0.5f);
-    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_decay_end, 0.8f);
+    EXPECT_NE(parsed.error().find("depth_loss_mode must be 'ssi', 'ssi-disparity', or 'ssi-depth'"), std::string::npos);
 }
 
 TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
@@ -2109,10 +2055,6 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
         "0.75",
         "--normal-consistency-weight",
         "0.25",
-        "--depth-distortion-weight",
-        "0.5",
-        "--normal-prior-depth-weight",
-        "0.125",
         "--normal-flatten-weight",
         "5.0",
         "--normal-start-fraction",
@@ -2129,8 +2071,6 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
     EXPECT_TRUE((*parsed)->optimization.normal_auto_generate);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_loss_weight, 0.75f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_consistency_weight, 0.25f);
-    EXPECT_FLOAT_EQ((*parsed)->optimization.depth_distortion_weight, 0.5f);
-    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_prior_depth_weight, 0.125f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_flatten_weight, 5.0f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_start_fraction, 0.3f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_end_fraction, 0.9f);
@@ -2143,7 +2083,6 @@ TEST(ArgumentParserTest, TrainingRejectsOutOfRangeNumericFlags) {
     const std::vector<std::pair<std::vector<std::string>, std::string>> cases{
         {{"--normal-loss-weight", "-1"}, "normal_loss_weight"},
         {{"--normal-consistency-weight", "-1"}, "normal_consistency_weight"},
-        {{"--depth-distortion-weight", "-1"}, "depth_distortion_weight"},
         {{"--normal-flatten-weight", "-1"}, "normal_flatten_weight"},
         {{"--perf-bench-warmup", "-1"}, "perf_bench_warmup"},
         {{"--max-screen-share", "-1"}, "max_screen_share"},

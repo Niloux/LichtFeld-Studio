@@ -122,8 +122,8 @@ namespace lfs::training {
         GsplatRenderMode render_mode,
         bool use_gut,
         const core::Tensor& bg_image,
-        const gsplat_lfs::FreeSpaceRender& free_space_in,
-        const core::Tensor& pixel_weights) {
+        const core::Tensor& pixel_weights,
+        float* median_depth_in) {
 
         // Begin arena frame for memory allocation
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -426,12 +426,11 @@ namespace lfs::training {
                 channels = 8;
             }
 
-            // The free-space test and the median depth need the splat depth channel and the whole image.
-            gsplat_lfs::FreeSpaceRender free_space;
-            if ((free_space_in.enabled() || free_space_in.median_depth != nullptr) && channels != 3 && tile_width == 0 && tile_height == 0) {
-                free_space = free_space_in;
-                free_space.depth_channel = channels == 1 ? 0 : 3;
-            }
+            // Median depth needs the splat depth channel and the whole image.
+            float* const median_depth =
+                (median_depth_in != nullptr && channels != 3 && tile_width == 0 && tile_height == 0)
+                    ? median_depth_in
+                    : nullptr;
 
             // Weighted pixels decide which sub-tiles get pairs; only whole-frame renders.
             core::Tensor tile_sub_masks;
@@ -619,7 +618,7 @@ namespace lfs::training {
                 result,
                 fwd_stream,
                 viewmat_ptr,
-                free_space,
+                median_depth,
                 tile_sub_masks_ptr);
             // isect_ids / flatten_ids are borrowed from the TLS VMM cache —
             // never transfer ownership or free on error paths.
@@ -647,7 +646,6 @@ namespace lfs::training {
             }
             case GsplatRenderMode::RGB_D_N:
                 render_output.normal = cached_image_chw.slice(0, 4, 7);
-                render_output.depth_sq = cached_image_chw.slice(0, 7, 8);
                 [[fallthrough]];
             case GsplatRenderMode::RGB_D:
                 render_output.image = cached_image_chw.slice(0, 0, 3);
@@ -755,7 +753,6 @@ namespace lfs::training {
             ctx.render_tile_y_offset = tile_y_offset;
             ctx.render_tile_width = tile_width;
             ctx.render_tile_height = tile_height;
-            ctx.free_space = free_space;
             ctx.tile_sub_masks = tile_sub_masks;
 
             return std::pair{render_output, ctx};
@@ -788,8 +785,6 @@ namespace lfs::training {
         const core::Tensor& grad_depth,
         const core::Tensor& grad_normal,
         float flatten_weight,
-        const core::Tensor& grad_T_front,
-        const core::Tensor& grad_depth_sq,
         const GsplatColorVarianceLoss& color_variance) {
 
         // Get arena for temporary allocations
@@ -807,7 +802,7 @@ namespace lfs::training {
         try {
             // A caller may produce loss gradients on a different stream from
             // the saved forward context. Order every raw-pointer read explicitly.
-            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal, &grad_T_front, &grad_depth_sq}) {
+            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal}) {
                 if (gradient->is_valid() && gradient->numel() > 0) {
                     gradient->sync_to_stream(stream);
                 }
@@ -919,7 +914,6 @@ namespace lfs::training {
                 copy_grad(grad_depth, channels == 1 ? 0 : 3, 1);
                 if (channels == 8) {
                     copy_grad(grad_normal, 4, 3);
-                    copy_grad(grad_depth_sq, 7, 1);
                 }
                 if (expected_depth) {
                     if (grad_alpha.is_valid() && grad_alpha.numel()) {
@@ -959,16 +953,6 @@ namespace lfs::training {
                 edge_scoring ? edge_weight_map.ptr<float>() : nullptr;
             float* const edge_score_out_ptr =
                 edge_scoring ? edge_score_out.ptr<float>() : nullptr;
-
-            gsplat_lfs::FreeSpaceRender free_space;
-            if (ctx.free_space.enabled() && grad_T_front.is_valid() &&
-                grad_T_front.numel() == static_cast<size_t>(H) * W) {
-                LFS_ASSERT_MSG(grad_T_front.is_contiguous() && grad_T_front.device() == core::Device::CUDA,
-                               "T_front gradient must be a contiguous CUDA tensor");
-                core::pin_operands({&grad_T_front});
-                free_space = ctx.free_space;
-                free_space.v_T_front = grad_T_front.ptr<float>();
-            }
 
             gsplat_lfs::ColorVarianceRender gsplat_color_variance;
             core::Tensor color_variance_pixel_weight_sum;
@@ -1077,7 +1061,7 @@ namespace lfs::training {
                 pixel_error_map_ptr,
                 edge_weight_map_ptr,
                 edge_score_out_ptr,
-                stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr, free_space,
+                stream, ctx.batches, ctx.tiles_per_gauss_ptr, ctx.viewmat_ptr,
                 ctx.conics_ptr, ctx.sub_tile_masks ? ctx.isect_ids_ptr : nullptr,
                 ctx.tile_sub_masks.is_valid()
                     ? reinterpret_cast<const uint32_t*>(ctx.tile_sub_masks.ptr<int32_t>())

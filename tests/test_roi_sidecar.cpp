@@ -210,7 +210,6 @@ TEST(EvalMaskCropPolygonTest, IntersectsRoiStaticMaskAndRenderedSurface) {
 
     lfs::core::param::TrainingParameters params;
     params.optimization.mask_mode = lfs::core::param::MaskMode::SegmentAndIgnore;
-    params.optimization.depth_loss_mode = "metric";
     params.optimization.eval_mask = "cropbox";
     params.optimization.enable_eval = true;
 

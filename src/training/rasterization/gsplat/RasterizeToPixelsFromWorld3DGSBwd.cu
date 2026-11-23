@@ -8,7 +8,6 @@
 
 #include "Cameras.cuh"
 #include "Common.h"
-#include "FreeSpace.h"
 #include "FromWorldRay.cuh"
 #include "Rasterization.h"
 #include "Utils.cuh"
@@ -361,7 +360,6 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map,
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const FreeSpaceRender,
         const ColorVarianceRender) {
         auto block = cg::this_thread_block();
         const uint32_t cid = block.group_index().x;
@@ -622,7 +620,6 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map, // [H, W] or nullptr
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const FreeSpaceRender free_space,
         const ColorVarianceRender color_variance) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
@@ -676,8 +673,7 @@ namespace gsplat_lfs {
             (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
         constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
         constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
-        constexpr bool kHasDepthSq = (CDIM == 8);
-        constexpr uint32_t kDepthSqChannel = 7u;
+        constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
 
         // keep not rasterizing threads around for reading data
         const bool active = (i < image_height && j < image_width) && ray.valid_flag;
@@ -712,14 +708,14 @@ namespace gsplat_lfs {
         float T_final = 1.0f - render_alphas[pix_id];
         float T = T_final;
         // the contribution from gaussians behind the current one
-        float buffer[CDIM] = {0.f};
+        float buffer[kUsed] = {0.f};
         // index of last gaussian to contribute to this pixel
         const int32_t bin_final = active ? last_ids[pix_id] : 0;
 
         // df/d_out for this pixel
-        float v_render_c[CDIM];
+        float v_render_c[kUsed];
 #pragma unroll
-        for (uint32_t k = 0; k < CDIM; ++k) {
+        for (uint32_t k = 0; k < kUsed; ++k) {
             v_render_c[k] = v_render_colors[chw_pix(k, pix_id, image_height, image_width)];
         }
         const float v_render_a = v_render_alphas[pix_id];
@@ -728,7 +724,7 @@ namespace gsplat_lfs {
         float bg_accum = 0.f;
         if (have_bg) {
 #pragma unroll
-            for (uint32_t k = 0; k < CDIM; ++k) {
+            for (uint32_t k = 0; k < kUsed; ++k) {
                 float bg_val;
                 if (bg_images != nullptr && k < 3u) {
                     bg_val = bg_images[k * image_height * image_width + pix_id];
@@ -743,15 +739,6 @@ namespace gsplat_lfs {
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const float pixel_error = do_dens ? densification_error_map[pix_id] : 0.f;
 
-        // T_front = prod(1 - alpha) over the splats in front of the scan limit,
-        // so each of them gets -v_T_front * T_front / (1 - alpha) on its alpha.
-        float free_limit = 0.f;
-        float free_v_T = 0.f;
-        if (free_space.v_T_front != nullptr && free_space.gt_depth != nullptr && active) {
-            const size_t free_pix = static_cast<size_t>(cid) * image_height * image_width + pix_id;
-            free_limit = free_space.limit(cid, j, i, image_width, image_height);
-            free_v_T = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
-        }
         const bool do_cv = (CDIM >= 3) && color_variance.enabled();
         float4 cv_target = make_float4(0.f, 0.f, 0.f, 0.f);
         float cv_buf = 0.f;
@@ -905,21 +892,13 @@ namespace gsplat_lfs {
                         float v_depth = 0.f;
                         float v_alpha = 0.f;
 #pragma unroll
-                        for (uint32_t k = 0; k < CDIM; ++k) {
+                        for (uint32_t k = 0; k < kUsed; ++k) {
                             const float v_c = v_render_c[k];
                             float c_val;
                             if constexpr (kHasRayDepth) {
                                 if (k == kDepthChannel) {
                                     c_val = depth;
                                     v_depth += fac * v_c;
-                                } else if constexpr (kHasDepthSq) {
-                                    if (k == kDepthSqChannel) {
-                                        c_val = depth * depth;
-                                        v_depth += fac * (2.0f * depth) * v_c;
-                                    } else {
-                                        c_val = rgbs_batch[t * CDIM + k];
-                                        v_rgb_local[k] = fac * v_c;
-                                    }
                                 } else {
                                     c_val = rgbs_batch[t * CDIM + k];
                                     v_rgb_local[k] = fac * v_c;
@@ -945,15 +924,6 @@ namespace gsplat_lfs {
                         v_alpha += T_final * ra * v_render_a;
                         if (have_bg) {
                             v_alpha += -T_final * ra * bg_accum;
-                        }
-                        if (free_limit > 0.f) {
-                            const float free_depth =
-                                (kHasRayDepth && free_space.depth_channel == kDepthChannel)
-                                    ? depth
-                                    : rgbs_batch[t * CDIM + free_space.depth_channel];
-                            if (free_depth < free_limit) {
-                                v_alpha -= free_v_T * ra;
-                            }
                         }
                         if constexpr (CDIM >= 3) {
                             if (cv_target.w > 0.f) {
@@ -1015,7 +985,7 @@ namespace gsplat_lfs {
 #pragma unroll
                         for (uint32_t k = 0; k < CDIM; ++k) {
                             if constexpr (kHasRayDepth) {
-                                if (k == kDepthChannel || (kHasDepthSq && k == kDepthSqChannel))
+                                if (k == kDepthChannel || (CDIM == 8 && k == 7u))
                                     continue;
                             }
                             gpuAtomicAdd(v_rgb_ptr + k, v_rgb_local[k]);
@@ -1128,7 +1098,6 @@ namespace gsplat_lfs {
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out,
         const TileRange tiles,
-        const FreeSpaceRender free_space,
         const ScreenFootprint footprint,
         const ColorVarianceRender color_variance) {
         const uint32_t cid = blockIdx.x;
@@ -1165,10 +1134,9 @@ namespace gsplat_lfs {
         }
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
-        const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
         constexpr bool kUseCv = kColorVariance && (CDIM >= 3);
 
-        constexpr uint32_t kUsed = CDIM;
+        constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
         __shared__ float s_T[kSplatBwdPixels];
         __shared__ float s_buffer[kSplatBwdPixels * kUsed];
         __shared__ float s_v_c[kSplatBwdPixels * kUsed];
@@ -1177,7 +1145,6 @@ namespace gsplat_lfs {
         __shared__ float s_bg[kSplatBwdPixels];
         __shared__ float s_error[kSplatBwdPixels];
         __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
-        __shared__ float2 s_free[kSplatBwdPixels]; // (limit, v_T_front * T_front)
         __shared__ float4 s_cv_target[kUseCv ? kSplatBwdPixels : 1];
         __shared__ float s_cv_buf[kUseCv ? kSplatBwdPixels : 1];
         __shared__ float3 s_ray_o[kSplatBwdPixels];
@@ -1232,13 +1199,6 @@ namespace gsplat_lfs {
             if constexpr (kEdgeScoring) {
                 s_edge[p] = edge_weight_map[pix];
             }
-            float2 free = make_float2(0.f, 0.f);
-            if (do_free && active) {
-                const size_t free_pix = static_cast<size_t>(cid) * pixels + pix;
-                free.x = free_space.limit(cid, x, y, image_width, image_height);
-                free.y = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
-            }
-            s_free[p] = free;
             if constexpr (kUseCv) {
                 float4 cv_t = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (active && color_variance.enabled()) {
@@ -1282,7 +1242,6 @@ namespace gsplat_lfs {
         const float sub_x0 = static_cast<float>(sub_x * kSplatBwdSub);
         const float sub_y0 = static_cast<float>(sub_y * kSplatBwdSub);
         const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
-        const uint32_t depth_channel = free_space.depth_channel;
         const bool cull = footprint.means2d != nullptr && footprint.conics != nullptr &&
                           footprint.radii != nullptr;
 
@@ -1329,7 +1288,6 @@ namespace gsplat_lfs {
                 for (uint32_t k = 0; k < kUsed; ++k) {
                     rgb[k] = 0.f;
                 }
-                float splat_depth = 0.f;
                 if (owns) {
                     xyz = means[g];
                     opac = activated_opacity(opacities[g]);
@@ -1347,9 +1305,6 @@ namespace gsplat_lfs {
 #pragma unroll
                     for (uint32_t k = 0; k < kUsed; ++k) {
                         rgb[k] = colors[g * CDIM + k];
-                    }
-                    if (depth_channel < CDIM) {
-                        splat_depth = colors[g * CDIM + depth_channel];
                     }
                 }
 
@@ -1370,8 +1325,6 @@ namespace gsplat_lfs {
 
                 constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
                 constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
-                constexpr bool kHasDepthSq = (CDIM == 8);
-                constexpr uint32_t kDepthSqChannel = 7u;
 
                 for (int t = 0; t < batch + static_cast<int>(kSplatBwdPixels) - 1; ++t) {
                     const int p = t - static_cast<int>(lane);
@@ -1417,14 +1370,6 @@ namespace gsplat_lfs {
                                     if (k == kDepthChannel) {
                                         c_val = depth;
                                         v_depth += fac * v_c;
-                                    } else if constexpr (kHasDepthSq) {
-                                        if (k == kDepthSqChannel) {
-                                            c_val = depth * depth;
-                                            v_depth += fac * (2.0f * depth) * v_c;
-                                        } else {
-                                            c_val = rgb[k];
-                                            v_rgb[k] += fac * v_c;
-                                        }
                                     } else {
                                         c_val = rgb[k];
                                         v_rgb[k] += fac * v_c;
@@ -1439,14 +1384,6 @@ namespace gsplat_lfs {
                             v_alpha += T_final * ra * s_v_a[p];
                             if (have_bg) {
                                 v_alpha += -T_final * ra * s_bg[p];
-                            }
-                            const float2 free = s_free[p];
-                            if (free.x > 0.f) {
-                                const float free_depth =
-                                    (kHasRayDepth && depth_channel == kDepthChannel) ? depth : splat_depth;
-                                if (free_depth < free.x) {
-                                    v_alpha -= free.y * ra;
-                                }
                             }
                             if constexpr (kUseCv) {
                                 const float4 cv_t = s_cv_target[p];
@@ -1515,7 +1452,7 @@ namespace gsplat_lfs {
 #pragma unroll
                     for (uint32_t k = 0; k < kUsed; ++k) {
                         if constexpr (kHasRayDepth) {
-                            if (k == kDepthChannel || (kHasDepthSq && k == kDepthSqChannel))
+                            if (k == kDepthChannel)
                                 continue;
                         }
                         gpuAtomicAdd(v_rgb_ptr + k, v_rgb[k]);
@@ -1624,13 +1561,9 @@ namespace gsplat_lfs {
         const float* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space_in,
         const ScreenFootprint& footprint,
         const ColorVarianceRender& color_variance) {
         const bool packed = false; // Only support non-packed for now
-        // The free-space test reads the splat depth from a render channel.
-        const FreeSpaceRender free_space =
-            free_space_in.depth_channel < CDIM ? free_space_in : FreeSpaceRender{};
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
 
@@ -1690,7 +1623,7 @@ namespace gsplat_lfs {
                 densification_error,
                 densification_error_map,
                 edge_weight_map,
-                edge_score_out, tiles, free_space, color_variance);
+                edge_score_out, tiles, color_variance);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
         };
 
@@ -1716,7 +1649,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec4*>(v_quats),
                             reinterpret_cast<vec3*>(v_scales),
                             v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
-                            edge_weight_map, edge_score_out, tiles, free_space, footprint, color_variance);
+                            edge_weight_map, edge_score_out, tiles, footprint, color_variance);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
@@ -1881,7 +1814,6 @@ namespace gsplat_lfs {
         const float* edge_weight_map,                                          \
         float* edge_score_out,                                                 \
         cudaStream_t stream, TileRange tiles,                                  \
-        const FreeSpaceRender& free_space,                                     \
         const ScreenFootprint& footprint,                                      \
         const ColorVarianceRender& color_variance);
 

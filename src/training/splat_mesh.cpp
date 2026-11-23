@@ -248,11 +248,9 @@ namespace lfs::training {
             const size_t width = camera.image_width(), height = camera.image_height();
             auto depth = Tensor::empty({height, width}, Device::CUDA);
             depth.set_stream(stream);
-            gsplat_lfs::FreeSpaceRender request;
-            request.median_depth = depth.ptr<float>();
             Tensor background;
             auto forward = gsplat_rasterize_forward(camera, model, background, 0, 0, 0, 0, 1.f, false,
-                                                    GsplatRenderMode::D, true, {}, request);
+                                                    GsplatRenderMode::D, true, {}, {}, depth.ptr<float>());
             if (!forward)
                 throw collisionError("mesh.render_failed", forward.error(), ErrorCode::Internal);
             const cudaStream_t render_stream = forward->second.stream;

@@ -13,14 +13,13 @@
 
 namespace lfs::training {
 
-    // <dataset>/supervision.json written next to depth and normal maps rendered
-    // from a LiDAR scan (GeosunPre). Only the fields that change how the maps
-    // must be read are kept.
+    // <dataset>/supervision.json written next to depth and normal maps from
+    // GeosunPre (MoGe-2 SSI depth + normals). Only the fields that change how
+    // training configures prior loading and rasterization are kept.
     struct LasPriorSidecar {
-        bool depth_millimetres = false;     // depth_format "uint16_png_mm"
+        bool ssi_depth = false;             // depth_format "uint16_png_ssi" or MoGe-2 SSI metadata
         bool ray_distance = false;          // depth_type "ray_distance", as GUT renders non-pinhole depth
         bool normals_camera_opencv = false; // normal_frame "opencv_camera..."
-        bool sparse_las_depth = false;      // depth_source is sparse LiDAR rather than dense monocular
     };
 
     [[nodiscard]] std::optional<LasPriorSidecar> read_las_prior_sidecar(

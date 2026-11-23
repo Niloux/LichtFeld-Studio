@@ -324,28 +324,19 @@ namespace lfs::core {
             bool use_alpha_as_mask = true;            // Auto-use alpha channel from RGBA images as mask
 
             // Depth supervision
-            bool use_depth_loss = false;             // Use dataset depth maps when available
-            float depth_loss_weight = 2.0f;          // Depth supervision weight (decays over training)
-            float depth_loss_gradient_weight = 1.0f; // Spatial gradient term weight inside depth loss (0 disables for sparse LiDAR)
-            std::string depth_loss_mode = "ssi";     // ssi (auto prior), ssi-disparity, ssi-depth, or metric
-            bool depth_auto_generate = true;         // Generate missing/mismatched maps from images/ with MoGe-2
-            float free_space_weight = 0.0f;          // Opacity in front of metric depth maps (--gut); 0 = off
-            float free_space_margin = 0.15f;         // Metres in front of the depth map that stay unpenalized
-            float free_space_margin_rel = 0.02f;     // Or this fraction of the depth, whichever is larger
+            bool use_depth_loss = false;         // Use dataset depth maps when available
+            float depth_loss_weight = 2.0f;      // Depth supervision weight (decays over training)
+            std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, or ssi-depth
+            bool depth_auto_generate = true;     // Generate missing/mismatched maps from images/ with MoGe-2
 
             // Normal supervision
             bool use_normal_loss = false;             // Use dataset normal maps when available
             bool normal_auto_generate = true;         // Generate missing/mismatched maps from images/ with MoGe-2
             float normal_loss_weight = 0.005f;        // Prior normal supervision weight (sweep: free geometry; raise to ~0.1 when geometry is the product)
             float normal_consistency_weight = 0.001f; // Depth-normal consistency weight
-            float depth_distortion_weight = 0.0f;     // Spread of depth along each ray (--gut); 0 = off
-            float normal_variance_weight = 0.0f;      // Per-splat normal spread along each ray; 0 = off
-            float normal_prior_depth_weight = -1.0f;  // Prior normal vs rendered-depth normal; -1 follows normal_loss_weight
             float normal_flatten_weight = 0.0f;       // L1 on the smallest scale axis; off by default - it suppresses densification under the benchmark refine regime
             float normal_start_fraction = 0.08f;      // Start normal supervision at floor(fraction * total iterations)
             float normal_end_fraction = 1.0f;         // Active while iter < end_fraction * total; 1.0 means until the end
-            float normal_prior_decay_start = 1.0f;    // Fraction of total iterations where cosine decay of external normal prior begins; 1.0 = no decay
-            float normal_prior_decay_end = 1.0f;      // Fraction of total iterations where external normal prior reaches 0
             NormalLossSpace normal_loss_space = NormalLossSpace::Auto;
 
             // Mip filter (anti-aliasing)
@@ -470,7 +461,6 @@ namespace lfs::core {
             [[nodiscard]] int resolved_total_iterations() const;
             [[nodiscard]] float color_variance_weight_at(int iteration) const;
             [[nodiscard]] bool normal_supervision_active(int iter) const;
-            [[nodiscard]] float normal_prior_scale_at(int iter) const;
             [[nodiscard]] float scale_reg_at(int iter) const;
             void resolve_mrnf_capacity_defaults();
             // Every test_every-th image is withheld from training for evaluation.

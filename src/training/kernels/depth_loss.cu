@@ -239,9 +239,8 @@ namespace lfs::training::kernels {
                 return;
             }
 
-            // A non-positive anchor floor (metric anchors) keeps the render-derived floor.
             bool valid = finals[slots::kValid] > 0.5f &&
-                         (anchor_floor > 0.0f || anchor_model == 1) &&
+                         anchor_floor > 0.0f &&
                          isfinite(anchor_scale) &&
                          isfinite(anchor_shift);
             const double sum_alpha = finals[slots::kSumAlpha];
@@ -255,7 +254,7 @@ namespace lfs::training::kernels {
                 sigma_p = sqrt(fmax(var_p, kMinVariance));
             }
 
-            if (valid && anchor_floor > 0.0f) {
+            if (valid) {
                 finals[slots::kFloor] = anchor_floor;
             }
 
@@ -378,63 +377,61 @@ namespace lfs::training::kernels {
                         gp += c.weighted_alpha * robust_psi(x_r) * inv_scaled_sigma;
                     }
 
-                    if (lambda_grad > 0.0f) {
-                        if (x + 1 < width) {
-                            const PixelSample n = load_sample<Weighted>(
-                                idx + 1, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
-                                model, a, b, floor_f, p_max, half_step);
-                            if (n.ok) {
-                                const float h = (n.p - c.p) - (n.d - c.d);
-                                const float x_h =
-                                    deadband_signed_residual(h, c.delta + n.delta) * inv_scaled_sigma;
-                                if (x_h != 0.0f) {
-                                    const float w2 = fminf(c.weighted_alpha, n.weighted_alpha);
-                                    sums[1] += static_cast<double>(w2) * robust_rho(x_h);
-                                    gp -= lambda_grad * w2 * robust_psi(x_h) * inv_scaled_sigma;
-                                }
+                    if (x + 1 < width) {
+                        const PixelSample n = load_sample<Weighted>(
+                            idx + 1, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
+                            model, a, b, floor_f, p_max, half_step);
+                        if (n.ok) {
+                            const float h = (n.p - c.p) - (n.d - c.d);
+                            const float x_h =
+                                deadband_signed_residual(h, c.delta + n.delta) * inv_scaled_sigma;
+                            if (x_h != 0.0f) {
+                                const float w2 = fminf(c.weighted_alpha, n.weighted_alpha);
+                                sums[1] += static_cast<double>(w2) * robust_rho(x_h);
+                                gp -= lambda_grad * w2 * robust_psi(x_h) * inv_scaled_sigma;
                             }
                         }
-                        if (y + 1 < height) {
-                            const PixelSample n = load_sample<Weighted>(
-                                idx + width, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
-                                model, a, b, floor_f, p_max, half_step);
-                            if (n.ok) {
-                                const float v = (n.p - c.p) - (n.d - c.d);
-                                const float x_v =
-                                    deadband_signed_residual(v, c.delta + n.delta) * inv_scaled_sigma;
-                                if (x_v != 0.0f) {
-                                    const float w2 = fminf(c.weighted_alpha, n.weighted_alpha);
-                                    sums[1] += static_cast<double>(w2) * robust_rho(x_v);
-                                    gp -= lambda_grad * w2 * robust_psi(x_v) * inv_scaled_sigma;
-                                }
+                    }
+                    if (y + 1 < height) {
+                        const PixelSample n = load_sample<Weighted>(
+                            idx + width, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
+                            model, a, b, floor_f, p_max, half_step);
+                        if (n.ok) {
+                            const float v = (n.p - c.p) - (n.d - c.d);
+                            const float x_v =
+                                deadband_signed_residual(v, c.delta + n.delta) * inv_scaled_sigma;
+                            if (x_v != 0.0f) {
+                                const float w2 = fminf(c.weighted_alpha, n.weighted_alpha);
+                                sums[1] += static_cast<double>(w2) * robust_rho(x_v);
+                                gp -= lambda_grad * w2 * robust_psi(x_v) * inv_scaled_sigma;
                             }
                         }
-                        if (x > 0) {
-                            const PixelSample n = load_sample<Weighted>(
-                                idx - 1, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
-                                model, a, b, floor_f, p_max, half_step);
-                            if (n.ok) {
-                                const float h = (c.p - n.p) - (c.d - n.d);
-                                const float x_h =
-                                    deadband_signed_residual(h, c.delta + n.delta) * inv_scaled_sigma;
-                                if (x_h != 0.0f) {
-                                    const float w2 = fminf(n.weighted_alpha, c.weighted_alpha);
-                                    gp += lambda_grad * w2 * robust_psi(x_h) * inv_scaled_sigma;
-                                }
+                    }
+                    if (x > 0) {
+                        const PixelSample n = load_sample<Weighted>(
+                            idx - 1, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
+                            model, a, b, floor_f, p_max, half_step);
+                        if (n.ok) {
+                            const float h = (c.p - n.p) - (c.d - n.d);
+                            const float x_h =
+                                deadband_signed_residual(h, c.delta + n.delta) * inv_scaled_sigma;
+                            if (x_h != 0.0f) {
+                                const float w2 = fminf(n.weighted_alpha, c.weighted_alpha);
+                                gp += lambda_grad * w2 * robust_psi(x_h) * inv_scaled_sigma;
                             }
                         }
-                        if (y > 0) {
-                            const PixelSample n = load_sample<Weighted>(
-                                idx - width, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
-                                model, a, b, floor_f, p_max, half_step);
-                            if (n.ok) {
-                                const float v = (c.p - n.p) - (c.d - n.d);
-                                const float x_v =
-                                    deadband_signed_residual(v, c.delta + n.delta) * inv_scaled_sigma;
-                                if (x_v != 0.0f) {
-                                    const float w2 = fminf(n.weighted_alpha, c.weighted_alpha);
-                                    gp += lambda_grad * w2 * robust_psi(x_v) * inv_scaled_sigma;
-                                }
+                    }
+                    if (y > 0) {
+                        const PixelSample n = load_sample<Weighted>(
+                            idx - width, rendered_depth_accum, rendered_alpha_accum, target_depth, pixel_weight,
+                            model, a, b, floor_f, p_max, half_step);
+                        if (n.ok) {
+                            const float v = (c.p - n.p) - (c.d - n.d);
+                            const float x_v =
+                                deadband_signed_residual(v, c.delta + n.delta) * inv_scaled_sigma;
+                            if (x_v != 0.0f) {
+                                const float w2 = fminf(n.weighted_alpha, c.weighted_alpha);
+                                gp += lambda_grad * w2 * robust_psi(x_v) * inv_scaled_sigma;
                             }
                         }
                     }

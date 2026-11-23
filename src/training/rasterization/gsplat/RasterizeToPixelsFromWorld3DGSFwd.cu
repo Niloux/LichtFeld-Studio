@@ -8,7 +8,6 @@
 
 #include "Cameras.cuh"
 #include "Common.h"
-#include "FreeSpace.h"
 #include "FromWorldRay.cuh"
 #include "Rasterization.h"
 #include "Utils.cuh"
@@ -61,7 +60,7 @@ namespace gsplat_lfs {
         scalar_t* __restrict__ render_alphas,     // [C, image_height, image_width, 1]
         int32_t* __restrict__ last_ids,           // [C, image_height, image_width]
         const TileRange tiles,
-        const FreeSpaceRender free_space) {
+        float* __restrict__ median_depth) {
         // each thread draws one pixel, but also timeshares caching gaussians in a
         // shared tile
 
@@ -80,12 +79,8 @@ namespace gsplat_lfs {
         render_colors += cid * image_height * image_width * CDIM;
         render_alphas += cid * image_height * image_width;
         last_ids += cid * image_height * image_width;
-        float* const T_front_out =
-            free_space.T_front != nullptr && free_space.gt_depth != nullptr
-                ? free_space.T_front + cid * image_height * image_width
-                : nullptr;
         float* const median_out =
-            free_space.median_depth != nullptr ? free_space.median_depth + cid * image_height * image_width : nullptr;
+            median_depth != nullptr ? median_depth + cid * image_height * image_width : nullptr;
         if (backgrounds != nullptr) {
             backgrounds += cid * CDIM;
         }
@@ -110,8 +105,6 @@ namespace gsplat_lfs {
             (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
         constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
         constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
-        constexpr bool kHasDepthSq = (CDIM == 8);
-        constexpr uint32_t kDepthSqChannel = 7u;
 
         // return if out of bounds
         // keep not rasterizing threads around for reading data
@@ -132,8 +125,8 @@ namespace gsplat_lfs {
                 }
                 render_colors[chw_pix(k, pix_id, image_height, image_width)] = bg_val;
             }
-            if (T_front_out != nullptr)
-                T_front_out[pix_id] = 1.0f;
+            if (median_out != nullptr)
+                median_out[pix_id] = 0.0f;
             return;
         }
 
@@ -162,12 +155,7 @@ namespace gsplat_lfs {
         float T = 1.0f;
         // index of most recent gaussian to write to this thread's pixel
         uint32_t cur_idx = 0;
-        // transmittance of the splats in front of the scan surface
-        float T_front = 1.0f;
         float median = 0.0f;
-        const float free_limit = T_front_out != nullptr && inside
-                                     ? free_space.limit(cid, j, i, image_width, image_height)
-                                     : 0.0f;
 
         // collect and process batches of gaussians
         // each thread loads one gaussian at a time before rasterizing its
@@ -268,10 +256,7 @@ namespace gsplat_lfs {
                     break;
                 }
 
-                const float splat_depth =
-                    (kHasRayDepth && free_space.depth_channel == kDepthChannel)
-                        ? depth
-                        : (free_space.depth_channel < CDIM ? rgbs_batch[t * CDIM + free_space.depth_channel] : 0.0f);
+                const float splat_depth = kHasRayDepth ? depth : 0.0f;
                 if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
                     median = splat_depth;
                 }
@@ -293,16 +278,11 @@ namespace gsplat_lfs {
                     for (uint32_t k = 0; k < CDIM; ++k) {
                         const float c_val = (kHasRayDepth && k == kDepthChannel)
                                                 ? depth
-                                                : ((kHasDepthSq && k == kDepthSqChannel)
-                                                       ? depth * depth
-                                                       : rgbs_batch[t * CDIM + k]);
+                                                : rgbs_batch[t * CDIM + k];
                         pix_out[k] += c_val * vis;
                     }
                 }
                 cur_idx = batch_start + t;
-                if (free_limit > 0.0f && splat_depth < free_limit) {
-                    T_front *= 1.0f - alpha;
-                }
 
                 T = next_T;
             }
@@ -328,8 +308,6 @@ namespace gsplat_lfs {
             }
             // index in bin of last gaussian in this pixel
             last_ids[pix_id] = static_cast<int32_t>(cur_idx);
-            if (T_front_out != nullptr)
-                T_front_out[pix_id] = T_front;
             if (median_out != nullptr)
                 median_out[pix_id] = median;
         }
@@ -386,7 +364,7 @@ namespace gsplat_lfs {
         float* __restrict__ render_alphas,
         int32_t* __restrict__ last_ids,
         const TileRange tiles,
-        const FreeSpaceRender free_space,
+        float* __restrict__ median_depth,
         const ScreenFootprint footprint) {
         const uint32_t cid = blockIdx.x;
         const uint32_t subs = tile_size / kMicroSub;
@@ -407,12 +385,8 @@ namespace gsplat_lfs {
         render_colors += cid * image_height * image_width * CDIM;
         render_alphas += cid * image_height * image_width;
         last_ids += cid * image_height * image_width;
-        float* const T_front_out =
-            free_space.T_front != nullptr && free_space.gt_depth != nullptr
-                ? free_space.T_front + cid * image_height * image_width
-                : nullptr;
         float* const median_out =
-            free_space.median_depth != nullptr ? free_space.median_depth + cid * image_height * image_width : nullptr;
+            median_depth != nullptr ? median_depth + cid * image_height * image_width : nullptr;
         if (backgrounds != nullptr) {
             backgrounds += cid * CDIM;
         }
@@ -435,8 +409,6 @@ namespace gsplat_lfs {
             (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
         constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
         constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
-        constexpr bool kHasDepthSq = (CDIM == 8);
-        constexpr uint32_t kDepthSqChannel = 7u;
 
         const bool inside = i < image_height && j < image_width;
         bool done = !inside || !ray.valid_flag;
@@ -455,8 +427,8 @@ namespace gsplat_lfs {
                 }
                 render_colors[chw_pix(k, pix_id, image_height, image_width)] = bg_val;
             }
-            if (T_front_out != nullptr)
-                T_front_out[pix_id] = 1.0f;
+            if (median_out != nullptr)
+                median_out[pix_id] = 0.0f;
             return;
         }
 
@@ -476,11 +448,7 @@ namespace gsplat_lfs {
 
         float T = 1.0f;
         uint32_t cur_idx = 0;
-        float T_front = 1.0f;
         float median = 0.0f;
-        const float free_limit = T_front_out != nullptr && inside
-                                     ? free_space.limit(cid, j, i, image_width, image_height)
-                                     : 0.0f;
         float pix_out[CDIM] = {0.f};
 
         // The trip counts below depend only on shared values, so the loops are
@@ -565,10 +533,7 @@ namespace gsplat_lfs {
                     done = true;
                     break;
                 }
-                const float splat_depth =
-                    (kHasRayDepth && free_space.depth_channel == kDepthChannel)
-                        ? depth
-                        : (free_space.depth_channel < CDIM ? s_rgbs[t * CDIM + free_space.depth_channel] : 0.0f);
+                const float splat_depth = kHasRayDepth ? depth : 0.0f;
                 if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
                     median = splat_depth;
                 }
@@ -577,16 +542,11 @@ namespace gsplat_lfs {
                 for (uint32_t k = 0; k < CDIM; ++k) {
                     const float c_val = (kHasRayDepth && k == kDepthChannel)
                                             ? depth
-                                            : ((kHasDepthSq && k == kDepthSqChannel)
-                                                   ? depth * depth
-                                                   : s_rgbs[t * CDIM + k]);
+                                            : s_rgbs[t * CDIM + k];
                     pix_out[k] += c_val * vis;
                 }
                 cur_idx = static_cast<uint32_t>(s_bin[t]);
                 s_hit[t] = 1;
-                if (free_limit > 0.0f && splat_depth < free_limit) {
-                    T_front *= 1.0f - alpha;
-                }
                 T = next_T;
             }
 
@@ -615,20 +575,10 @@ namespace gsplat_lfs {
                 render_colors[chw_pix(k, pix_id, image_height, image_width)] = pix_out[k] + T * bg_val;
             }
             last_ids[pix_id] = static_cast<int32_t>(cur_idx);
-            if (T_front_out != nullptr)
-                T_front_out[pix_id] = T_front;
             if (median_out != nullptr)
                 median_out[pix_id] = median;
         }
     }
-
-    namespace {
-        __global__ void fill_ones_kernel(float* out, const uint32_t n) {
-            const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i < n)
-                out[i] = 1.0f;
-        }
-    } // namespace
 
     ////////////////////////////////////////////////////////////////
     // Launch Function
@@ -667,12 +617,9 @@ namespace gsplat_lfs {
         float* alphas,
         int32_t* last_ids,
         cudaStream_t stream, TileRange tiles,
-        const FreeSpaceRender& free_space_in,
+        float* median_depth,
         const ScreenFootprint& footprint) {
         const bool packed = false; // Only support non-packed for now
-        // The free-space test reads the splat depth from a render channel.
-        const FreeSpaceRender free_space =
-            free_space_in.depth_channel < CDIM ? free_space_in : FreeSpaceRender{};
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
 
@@ -706,16 +653,11 @@ namespace gsplat_lfs {
                 cudaMemsetAsync(last_ids, 0,
                                 C * image_height * image_width * sizeof(int32_t), stream),
                 "gsplat empty-forward last-id clear");
-            if (free_space.median_depth != nullptr) {
+            if (median_depth != nullptr) {
                 LFS_CUDA_CHECK_MSG(
-                    cudaMemsetAsync(free_space.median_depth, 0,
+                    cudaMemsetAsync(median_depth, 0,
                                     C * image_height * image_width * sizeof(float), stream),
                     "gsplat empty-forward median depth clear");
-            }
-            if (free_space.T_front != nullptr) {
-                fill_ones_kernel<<<(C * image_height * image_width + 255) / 256, 256, 0, stream>>>(
-                    free_space.T_front, C * image_height * image_width);
-                LFS_CUDA_LAUNCH_CHECK(stream, "gsplat empty-forward T_front fill");
             }
             return;
         }
@@ -756,7 +698,7 @@ namespace gsplat_lfs {
                 flatten_ids,
                 renders,
                 alphas,
-                last_ids, tiles, free_space);
+                last_ids, tiles, median_depth);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd");
         };
 
@@ -776,7 +718,7 @@ namespace gsplat_lfs {
                             viewmats0, viewmats1, Ks, camera_model, rs_type,
                             radial_coeffs, tangential_coeffs, thin_prism_coeffs,
                             tile_offsets, flatten_ids, renders, alphas, last_ids,
-                            tiles, free_space, footprint);
+                            tiles, median_depth, footprint);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd_micro");
                     };
                     if (global_shutter && perfect_pinhole)
@@ -843,7 +785,7 @@ namespace gsplat_lfs {
         float* alphas,                                                         \
         int32_t* last_ids,                                                     \
         cudaStream_t stream, TileRange tiles,                                  \
-        const FreeSpaceRender& free_space,                                     \
+        float* median_depth,                                                   \
         const ScreenFootprint& footprint);
 
     __INS__(1)

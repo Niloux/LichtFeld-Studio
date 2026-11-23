@@ -2689,7 +2689,7 @@ class OptimizationParams:
     @property
     def depth_loss_mode(self) -> str:
         """
-        Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', 'ssi-depth', or 'metric' (absolute depth, 16-bit in mm)
+        Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', or 'ssi-depth'
         """
 
     @depth_loss_mode.setter
@@ -2733,15 +2733,6 @@ class OptimizationParams:
 
     @normal_consistency_weight.setter
     def normal_consistency_weight(self, arg: float, /) -> None: ...
-
-    @property
-    def depth_distortion_weight(self) -> float:
-        """
-        Weight for the spread of depth along each ray, which thins layered surfaces (--gut)
-        """
-
-    @depth_distortion_weight.setter
-    def depth_distortion_weight(self, arg: float, /) -> None: ...
 
     @property
     def normal_flatten_weight(self) -> float:

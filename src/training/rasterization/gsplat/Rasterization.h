@@ -5,7 +5,6 @@
 #pragma once
 
 #include "Common.h"
-#include "FreeSpace.h"
 #include "Ops.h"
 #include "TileBatch.h"
 #include <cstdint>
@@ -56,7 +55,7 @@ namespace gsplat_lfs {
         float* alphas,     // [C, image_height, image_width, 1]
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {},
+        float* median_depth = nullptr,
         const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
 
     /////////////////////////////////////////////////
@@ -115,7 +114,6 @@ namespace gsplat_lfs {
         const float* edge_weight_map,         // [H, W] or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
-        const FreeSpaceRender& free_space = {},
         const ScreenFootprint& footprint = {}, // lets the per-splat backward cull sub-tiles
         const ColorVarianceRender& color_variance = {});
 
