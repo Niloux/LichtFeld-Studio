@@ -59,6 +59,7 @@
 #include "training/components/rolling_shutter.hpp"
 #include "training/splat_mesh.hpp"
 #include "training/noise_infill.hpp"
+#include "training/normal_auto_generate.hpp"
 #include "training/training_manager.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
@@ -3471,6 +3472,12 @@ namespace lfs::vis::gui {
                         .images_folder = local_params.dataset.images,
                         .min_track_length = effective_min_track_length,
                         .validate_only = false,
+                        .load_masks = local_params.optimization.mask_mode != lfs::core::param::MaskMode::None,
+                        .load_depths = lfs::training::training_depth_priors_enabled(local_params.optimization),
+                        .load_normals = lfs::training::training_normal_priors_enabled(local_params.optimization) ||
+                                        local_params.optimization.enable_eval,
+                        .normal_auto_generate = local_params.optimization.normal_auto_generate,
+                        .depth_auto_generate = local_params.optimization.depth_auto_generate,
                         .centralize = parse_centralize(local_params.dataset.centralize_dataset),
                         .progress = [this, job, &stop_token](const float pct, const std::string& msg) {
                         if (stop_token.stop_requested())

@@ -978,6 +978,60 @@ namespace lfs::training {
             return ScopeGuard<Fn>(std::move(fn));
         }
 
+        void probeMissingPriorSizes(
+            const std::shared_ptr<CameraDataset>& dataset,
+            const PipelinedAuxiliaryImageConfig& aux_config) {
+            if (!dataset || (!aux_config.load_depths && !aux_config.load_normals)) {
+                return;
+            }
+            for (const auto& cam : dataset->get_cameras()) {
+                if (!cam) {
+                    continue;
+                }
+                auto depth_size = cam->depth_prior_size();
+                auto normal_size = cam->normal_prior_size();
+                const bool need_depth =
+                    aux_config.load_depths && cam->has_depth() &&
+                    (depth_size.width <= 0 || depth_size.height <= 0);
+                const bool need_normal =
+                    aux_config.load_normals && cam->has_normal() &&
+                    (normal_size.width <= 0 || normal_size.height <= 0);
+                if (!need_depth && !need_normal) {
+                    continue;
+                }
+                bool updated = false;
+                if (need_depth) {
+                    try {
+                        const auto [w, h, c] = lfs::core::get_image_info(cam->depth_path());
+                        (void)c;
+                        if (w > 0 && h > 0) {
+                            depth_size = {w, h};
+                            updated = true;
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_DEBUG("Could not probe depth prior '{}': {}",
+                                  lfs::core::path_to_utf8(cam->depth_path()), e.what());
+                    }
+                }
+                if (need_normal) {
+                    try {
+                        const auto [w, h, c] = lfs::core::get_image_info(cam->normal_path());
+                        (void)c;
+                        if (w > 0 && h > 0) {
+                            normal_size = {w, h};
+                            updated = true;
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_DEBUG("Could not probe normal prior '{}': {}",
+                                  lfs::core::path_to_utf8(cam->normal_path()), e.what());
+                    }
+                }
+                if (updated) {
+                    cam->set_prior_sizes(depth_size, normal_size);
+                }
+            }
+        }
+
         struct PipelineMemoryEstimate {
             size_t max_slot_bytes = 0;
         };
@@ -9936,6 +9990,7 @@ namespace lfs::training {
                 }
             }
 
+            probeMissingPriorSizes(train_dataset_, aux_pipeline_config);
             pipelined_config = tunePipelinedLoaderConfig(
                 pipelined_config, train_dataset_, aux_pipeline_config);
             // Decoders warmed for another pool size would only hold VRAM beside the loader's own.
