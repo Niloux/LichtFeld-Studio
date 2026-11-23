@@ -1084,7 +1084,7 @@ namespace gsplat_lfs {
     constexpr uint32_t kSplatBwdPixels = kSplatBwdSub * kSplatBwdSub;
     constexpr int kSplatBwdSurvivors = 8 * 32;
 
-    template <uint32_t CDIM, bool kPerfectPinhole, bool kEdgeScoring, bool kBatched>
+    template <uint32_t CDIM, bool kPerfectPinhole, bool kEdgeScoring, bool kBatched, bool kColorVariance = false>
     __global__ void __launch_bounds__(32) rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel(
         const uint32_t C,
         const uint32_t N,
@@ -1166,7 +1166,7 @@ namespace gsplat_lfs {
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const bool do_free = free_space.v_T_front != nullptr && free_space.gt_depth != nullptr;
-        const bool do_cv = (CDIM >= 3) && color_variance.enabled();
+        constexpr bool kUseCv = kColorVariance && (CDIM >= 3);
 
         constexpr uint32_t kUsed = CDIM;
         __shared__ float s_T[kSplatBwdPixels];
@@ -1178,12 +1178,22 @@ namespace gsplat_lfs {
         __shared__ float s_error[kSplatBwdPixels];
         __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
         __shared__ float2 s_free[kSplatBwdPixels]; // (limit, v_T_front * T_front)
-        __shared__ float4 s_cv_target[CDIM >= 3 ? kSplatBwdPixels : 1];
-        __shared__ float s_cv_buf[CDIM >= 3 ? kSplatBwdPixels : 1];
+        __shared__ float4 s_cv_target[kUseCv ? kSplatBwdPixels : 1];
+        __shared__ float s_cv_buf[kUseCv ? kSplatBwdPixels : 1];
         __shared__ float3 s_ray_o[kSplatBwdPixels];
         __shared__ float4 s_ray_d[kSplatBwdPixels];
         __shared__ int32_t s_bin[kSplatBwdPixels]; // last contributing pair; -1 inactive
         __shared__ int32_t s_surv[kSplatBwdSurvivors];
+
+        float cv_pw_sum = 0.f;
+        if constexpr (kUseCv) {
+            if (color_variance.pixel_weight != nullptr) {
+                if (lane == 0) {
+                    cv_pw_sum = *color_variance.pixel_weight_sum;
+                }
+                cv_pw_sum = __shfl_sync(0xffffffffu, cv_pw_sum, 0);
+            }
+        }
 
         int32_t bin_max = -1;
         for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
@@ -1229,20 +1239,17 @@ namespace gsplat_lfs {
                 free.y = free_space.v_T_front[free_pix] * free_space.T_front[free_pix];
             }
             s_free[p] = free;
-            if constexpr (CDIM >= 3) {
+            if constexpr (kUseCv) {
                 float4 cv_t = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (do_cv && active) {
+                if (active && color_variance.enabled()) {
                     const float cov = 1.0f - T_final;
                     if (cov >= 0.5f / 255.f) {
                         float pw_scale = 0.f;
                         if (color_variance.pixel_weight == nullptr) {
                             pw_scale = color_variance.weight / static_cast<float>(pixels);
-                        } else {
-                            const float pw_sum = *color_variance.pixel_weight_sum;
-                            if (pw_sum > 0.f) {
-                                pw_scale = color_variance.weight *
-                                           color_variance.pixel_weight[static_cast<size_t>(cid) * pixels + pix] / pw_sum;
-                            }
+                        } else if (cv_pw_sum > 0.f) {
+                            pw_scale = color_variance.weight *
+                                       color_variance.pixel_weight[static_cast<size_t>(cid) * pixels + pix] / cv_pw_sum;
                         }
                         if (pw_scale > 0.f) {
                             const float* rc = color_variance.render_colors + static_cast<size_t>(cid) * CDIM * pixels;
@@ -1441,22 +1448,20 @@ namespace gsplat_lfs {
                                     v_alpha -= free.y * ra;
                                 }
                             }
-                            if constexpr (CDIM >= 3) {
-                                if (do_cv) {
-                                    const float4 cv_t = s_cv_target[p];
-                                    if (cv_t.w > 0.f) {
-                                        const float r0 = rgb[0] - cv_t.x;
-                                        const float r1 = rgb[1] - cv_t.y;
-                                        const float r2 = rgb[2] - cv_t.z;
-                                        const float u = cv_t.w * (r0 * r0 + r1 * r1 + r2 * r2);
-                                        const float two_w = 2.0f * cv_t.w * fac;
-                                        v_rgb[0] += two_w * r0;
-                                        v_rgb[1] += two_w * r1;
-                                        v_rgb[2] += two_w * r2;
-                                        const float cv_buf = s_cv_buf[p];
-                                        v_alpha += u * T - cv_buf * ra;
-                                        s_cv_buf[p] = cv_buf + u * fac;
-                                    }
+                            if constexpr (kUseCv) {
+                                const float4 cv_t = s_cv_target[p];
+                                if (cv_t.w > 0.f) {
+                                    const float r0 = rgb[0] - cv_t.x;
+                                    const float r1 = rgb[1] - cv_t.y;
+                                    const float r2 = rgb[2] - cv_t.z;
+                                    const float u = cv_t.w * (r0 * r0 + r1 * r1 + r2 * r2);
+                                    const float two_w = 2.0f * cv_t.w * fac;
+                                    v_rgb[0] += two_w * r0;
+                                    v_rgb[1] += two_w * r1;
+                                    v_rgb[2] += two_w * r2;
+                                    const float cv_buf = s_cv_buf[p];
+                                    v_alpha += u * T - cv_buf * ra;
+                                    s_cv_buf[p] = cv_buf + u * fac;
                                 }
                             }
                             if (do_dens) {
@@ -1544,8 +1549,8 @@ namespace gsplat_lfs {
             }
             __syncwarp();
         }
-        if constexpr (CDIM >= 3) {
-            if (do_cv && color_variance.loss_out != nullptr) {
+        if constexpr (kUseCv) {
+            if (color_variance.enabled() && color_variance.loss_out != nullptr) {
                 __syncwarp();
                 float local_loss = 0.f;
                 for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
@@ -1715,17 +1720,26 @@ namespace gsplat_lfs {
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
-                    if (global_shutter && perfect_pinhole) {
-                        if (edges)
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched>);
-                        else
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched>);
-                    } else {
-                        if (edges)
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched>);
-                        else
-                            launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched>);
+                    auto dispatch_splat = [&]<bool kUseCv>() {
+                        if (global_shutter && perfect_pinhole) {
+                            if (edges)
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched, kUseCv>);
+                            else
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched, kUseCv>);
+                        } else {
+                            if (edges)
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv>);
+                            else
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv>);
+                        }
+                    };
+                    if constexpr (CDIM >= 3) {
+                        if (color_variance.enabled()) {
+                            dispatch_splat.template operator()<true>();
+                            return;
+                        }
                     }
+                    dispatch_splat.template operator()<false>();
                     return;
                 }
             }

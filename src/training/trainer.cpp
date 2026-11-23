@@ -8147,7 +8147,17 @@ namespace lfs::training {
 
                             lfs::core::Tensor target_depth;
                             bool depth_own_size = false;
-                            if (pipelined_depth_.is_valid() && pipelined_depth_.numel() > 0) {
+                            if (!fit && free_space_depth.is_valid() && free_space_depth.ndim() == 2 &&
+                                free_space_depth.numel() > 0 &&
+                                free_space_depth.shape()[0] == static_cast<size_t>(cam->image_height()) &&
+                                free_space_depth.shape()[1] == static_cast<size_t>(cam->image_width()) &&
+                                (!pipelined_depth_own_size_ ||
+                                 ((pipelined_prior_target_height_ <= 0 ||
+                                   pipelined_prior_target_height_ == cam->image_height()) &&
+                                  (pipelined_prior_target_width_ <= 0 ||
+                                   pipelined_prior_target_width_ == cam->image_width())))) {
+                                target_depth = free_space_depth;
+                            } else if (pipelined_depth_.is_valid() && pipelined_depth_.numel() > 0) {
                                 target_depth = pipelined_depth_;
                                 depth_own_size = pipelined_depth_own_size_;
                             } else if (cam->has_depth()) {
@@ -8187,6 +8197,7 @@ namespace lfs::training {
                                 }
 
                                 const cudaStream_t depth_stream = rendered_depth.stream();
+                                target_depth.sync_to_stream(depth_stream);
 
                                 if (target_depth.ndim() == 2 && rendered_depth.ndim() == 2) {
                                     const int render_h = static_cast<int>(rendered_depth.shape()[0]);
