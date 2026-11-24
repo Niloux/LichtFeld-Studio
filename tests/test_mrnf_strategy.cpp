@@ -43,6 +43,7 @@ class MRNFStrategyTest_RetireQuotaTakesDeadThenLowestReachAndKeepsLargeCoveredSp
 #include "core/scene.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
+#include "core/splat_exportable_storage.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/tensor_ops.hpp"
 #include "io/formats/ply.hpp"
@@ -3086,4 +3087,323 @@ TEST(MRNFStrategyTest, AsksForRenderedOnlyRegularizers) {
     MRNF strategy(data);
     strategy.initialize(recipe_test_params(32));
     EXPECT_TRUE(strategy.regularize_rendered_only());
+}
+
+TEST(MRNFStrategyTest, RemoveGaussiansPreservesExportableStorageAndValues) {
+    for (const int sh_degree : {0, 3}) {
+        SCOPED_TRACE(::testing::Message() << "sh_degree=" << sh_degree);
+
+        struct QuantReset {
+            ~QuantReset() { sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt); }
+        } quant_reset;
+        if (sh_degree > 0) {
+            sh_value::set_sh_value_quant_enabled_for_testing(true);
+        }
+
+        constexpr size_t kN = 300;
+        constexpr size_t kCap = 512;
+        constexpr size_t kReserve = 1024;
+
+        auto storage_result = SplatExportableStorage::create(kCap, sh_degree, /*device=*/0, kReserve);
+        if (!storage_result) {
+            GTEST_SKIP() << "SplatExportableStorage::create failed: " << storage_result.error();
+        }
+        auto storage = std::make_shared<SplatExportableStorage>(std::move(*storage_result));
+        auto allocator = storage->make_allocator();
+
+        std::vector<float> means_vec(kN * 3);
+        std::vector<float> sh0_vec(kN * 3);
+        std::vector<float> scaling_vec(kN * 3);
+        std::vector<float> rotation_vec(kN * 4);
+        std::vector<float> opacity_vec(kN);
+        for (size_t i = 0; i < kN; ++i) {
+            const float f = static_cast<float>(i);
+            means_vec[i * 3 + 0] = f * 0.25f;
+            means_vec[i * 3 + 1] = -f * 0.5f;
+            means_vec[i * 3 + 2] = f * 0.125f + 1.0f;
+            sh0_vec[i * 3 + 0] = 0.1f + 0.002f * f;
+            sh0_vec[i * 3 + 1] = 0.2f + 0.001f * f;
+            sh0_vec[i * 3 + 2] = 0.3f - 0.0005f * f;
+            scaling_vec[i * 3 + 0] = -2.0f + 0.001f * f;
+            scaling_vec[i * 3 + 1] = -2.5f + 0.002f * f;
+            scaling_vec[i * 3 + 2] = -3.0f + 0.003f * f;
+            rotation_vec[i * 4 + 0] = 1.0f;
+            rotation_vec[i * 4 + 1] = 0.001f * f;
+            rotation_vec[i * 4 + 2] = -0.001f * f;
+            rotation_vec[i * 4 + 3] = 0.0005f * f;
+            opacity_vec[i] = -1.0f + 0.005f * f;
+        }
+
+        Tensor means = allocator(TensorShape({kN, 3}), kCap, DataType::Float32, "SplatData.means");
+        Tensor sh0 = allocator(TensorShape({kN, 1, 3}), kCap, DataType::Float32, "SplatData.sh0");
+        Tensor scaling = allocator(TensorShape({kN, 3}), kCap, DataType::Float32, "SplatData.scaling");
+        Tensor rotation = allocator(TensorShape({kN, 4}), kCap, DataType::Float32, "SplatData.rotation");
+        Tensor opacity = allocator(TensorShape({kN, 1}), kCap, DataType::Float32, "SplatData.opacity");
+        means.copy_from(Tensor::from_vector(means_vec, TensorShape({kN, 3}), Device::CUDA));
+        sh0.copy_from(Tensor::from_vector(sh0_vec, TensorShape({kN, 1, 3}), Device::CUDA));
+        scaling.copy_from(Tensor::from_vector(scaling_vec, TensorShape({kN, 3}), Device::CUDA));
+        rotation.copy_from(Tensor::from_vector(rotation_vec, TensorShape({kN, 4}), Device::CUDA));
+        opacity.copy_from(Tensor::from_vector(opacity_vec, TensorShape({kN, 1}), Device::CUDA));
+
+        const size_t rest = sh_rest_coefficients_for_degree(sh_degree);
+        Tensor shN_float = Tensor::zeros({0}, Device::CUDA);
+        if (rest > 0) {
+            std::vector<float> shN_can(kN * rest * 3);
+            for (size_t i = 0; i < kN; ++i) {
+                for (size_t k = 0; k < rest * 3; ++k) {
+                    shN_can[i * rest * 3 + k] =
+                        std::sin(static_cast<float>(i * 7 + k) * 0.03125f) * 0.4f;
+                }
+            }
+            auto canonical = Tensor::from_vector(shN_can, TensorShape({kN, rest, 3}), Device::CUDA);
+            shN_float = Tensor::zeros_direct(
+                TensorShape({sh_swizzled_float_count(kN, static_cast<uint32_t>(rest))}),
+                sh_swizzled_float_count(kCap, static_cast<uint32_t>(rest)),
+                Device::CUDA);
+            SplatData tmp_model(sh_degree, means.clone(), sh0.clone(), shN_float, scaling.clone(),
+                                rotation.clone(), opacity.clone(), 1.0f,
+                                SplatData::ShNLayout::Swizzled);
+            tmp_model.shN_set_from_canonical(canonical, kCap);
+            shN_float = std::move(tmp_model.shN());
+        }
+
+        SplatData model(sh_degree, std::move(means), std::move(sh0), std::move(shN_float),
+                        std::move(scaling), std::move(rotation), std::move(opacity), 1.0f,
+                        SplatData::ShNLayout::Swizzled);
+        model.set_tensor_allocator(allocator);
+        if (rest > 0) {
+            ASSERT_TRUE(sh_value::apply_shN_value_quant(model));
+            ASSERT_TRUE(model.shN_value_quantized());
+        }
+
+        auto params = vanilla_mrnf_params();
+        params.max_cap = static_cast<int>(kReserve);
+        params.refine_every = 1000;
+        MRNF strategy(model);
+        strategy.initialize(params);
+
+        // Remove every 3rd row plus leading rows to force overlapping left-shifts on aliased regions.
+        std::vector<uint8_t> remove_host(kN, 0);
+        std::vector<int> kept_idx;
+        for (size_t i = 0; i < kN; ++i) {
+            if (i < 17 || i % 3 == 0) {
+                remove_host[i] = 1;
+            } else {
+                kept_idx.push_back(static_cast<int>(i));
+            }
+        }
+        const size_t keep_n = kept_idx.size();
+        auto keep_indices = Tensor::from_vector(kept_idx, TensorShape({keep_n}), Device::CUDA);
+        auto ref_means = model.means_raw().index_select(0, keep_indices).cpu().to_vector();
+        auto ref_sh0 = model.sh0_raw().index_select(0, keep_indices).cpu().to_vector();
+        auto ref_scaling = model.scaling_raw().index_select(0, keep_indices).cpu().to_vector();
+        auto ref_rotation = model.rotation_raw().index_select(0, keep_indices).cpu().to_vector();
+        auto ref_opacity = model.opacity_raw().index_select(0, keep_indices).cpu().to_vector();
+        std::vector<float> ref_shN;
+        if (rest > 0) {
+            ref_shN = model.shN_canonical().index_select(0, keep_indices).cpu().to_vector();
+        }
+
+        auto remove_cpu = Tensor::zeros_bool(TensorShape({kN}), Device::CPU);
+        std::memcpy(remove_cpu.ptr<uint8_t>(), remove_host.data(), kN);
+        auto remove_mask = remove_cpu.to(Device::CUDA);
+
+        {
+            LiveModelMutationGuard mutation_guard("test_exportable_remove_gaussians");
+            strategy.remove_gaussians(remove_mask);
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        EXPECT_EQ(static_cast<size_t>(model.size()), keep_n);
+        EXPECT_TRUE(model.means_raw().is_external_storage());
+        EXPECT_EQ(model.means_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.sh0_raw().is_external_storage());
+        EXPECT_EQ(model.sh0_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.scaling_raw().is_external_storage());
+        EXPECT_EQ(model.scaling_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.rotation_raw().is_external_storage());
+        EXPECT_EQ(model.rotation_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.opacity_raw().is_external_storage());
+        EXPECT_EQ(model.opacity_raw().external_storage_kind(), "splat.exportable");
+        if (rest > 0) {
+            EXPECT_TRUE(model.shN_value_quantized());
+            EXPECT_TRUE(model.shN_raw().is_external_storage());
+            EXPECT_EQ(model.shN_raw().external_storage_kind(), "splat.exportable");
+            EXPECT_TRUE(model.shN_value_bounds().is_external_storage());
+            EXPECT_EQ(model.shN_value_bounds().external_storage_kind(), "splat.exportable");
+        }
+
+        const auto got_means = model.means_raw().cpu().to_vector();
+        const auto got_sh0 = model.sh0_raw().cpu().to_vector();
+        const auto got_scaling = model.scaling_raw().cpu().to_vector();
+        const auto got_rotation = model.rotation_raw().cpu().to_vector();
+        const auto got_opacity = model.opacity_raw().cpu().to_vector();
+        ASSERT_EQ(got_means.size(), ref_means.size());
+        for (size_t i = 0; i < got_means.size(); ++i) {
+            EXPECT_FLOAT_EQ(got_means[i], ref_means[i]) << "means i=" << i;
+        }
+        ASSERT_EQ(got_sh0.size(), ref_sh0.size());
+        for (size_t i = 0; i < got_sh0.size(); ++i) {
+            EXPECT_FLOAT_EQ(got_sh0[i], ref_sh0[i]) << "sh0 i=" << i;
+        }
+        ASSERT_EQ(got_scaling.size(), ref_scaling.size());
+        for (size_t i = 0; i < got_scaling.size(); ++i) {
+            EXPECT_FLOAT_EQ(got_scaling[i], ref_scaling[i]) << "scaling i=" << i;
+        }
+        ASSERT_EQ(got_rotation.size(), ref_rotation.size());
+        for (size_t i = 0; i < got_rotation.size(); ++i) {
+            EXPECT_FLOAT_EQ(got_rotation[i], ref_rotation[i]) << "rotation i=" << i;
+        }
+        ASSERT_EQ(got_opacity.size(), ref_opacity.size());
+        for (size_t i = 0; i < got_opacity.size(); ++i) {
+            EXPECT_FLOAT_EQ(got_opacity[i], ref_opacity[i]) << "opacity i=" << i;
+        }
+        if (rest > 0) {
+            const auto got_shN = model.shN_canonical().cpu().to_vector();
+            ASSERT_EQ(got_shN.size(), ref_shN.size());
+            for (size_t i = 0; i < got_shN.size(); ++i) {
+                EXPECT_NEAR(got_shN[i], ref_shN[i], 1e-4f) << "shN i=" << i;
+            }
+        }
+
+        // Removing every remaining row keeps external storage intact with size == 0.
+        auto remove_all = Tensor::ones_bool(TensorShape({keep_n}), Device::CUDA);
+        {
+            LiveModelMutationGuard mutation_guard("test_exportable_remove_all");
+            strategy.remove_gaussians(remove_all);
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_EQ(model.size(), 0);
+        EXPECT_TRUE(model.means_raw().is_external_storage());
+        EXPECT_EQ(model.means_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.sh0_raw().is_external_storage());
+        EXPECT_EQ(model.sh0_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.scaling_raw().is_external_storage());
+        EXPECT_EQ(model.scaling_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.rotation_raw().is_external_storage());
+        EXPECT_EQ(model.rotation_raw().external_storage_kind(), "splat.exportable");
+        EXPECT_TRUE(model.opacity_raw().is_external_storage());
+        EXPECT_EQ(model.opacity_raw().external_storage_kind(), "splat.exportable");
+        if (rest > 0) {
+            EXPECT_TRUE(model.shN_raw().is_external_storage());
+            EXPECT_EQ(model.shN_raw().external_storage_kind(), "splat.exportable");
+            EXPECT_TRUE(model.shN_value_bounds().is_external_storage());
+            EXPECT_EQ(model.shN_value_bounds().external_storage_kind(), "splat.exportable");
+        }
+    }
+}
+
+TEST(MRNFStrategyTest, RemoveGaussiansPreservesDisjointExternalAllocator) {
+    struct DisjointCudaBuffer {
+        void* ptr = nullptr;
+        ~DisjointCudaBuffer() {
+            if (ptr) {
+                cudaFree(ptr);
+            }
+        }
+    };
+    const SplatTensorAllocator disjoint_allocator =
+        [](TensorShape shape, size_t capacity, DataType dtype, std::string_view /*name*/) -> Tensor {
+        const size_t rows = shape.rank() == 0 ? 0 : std::max<size_t>(shape[0], capacity);
+        size_t row_elems = 1;
+        for (size_t i = 1; i < shape.rank(); ++i) {
+            row_elems *= shape[i];
+        }
+        const size_t alloc_bytes = std::max<size_t>(1, rows * row_elems * dtype_size(dtype));
+        auto owner = std::make_shared<DisjointCudaBuffer>();
+        const cudaError_t err = cudaMalloc(&owner->ptr, alloc_bytes);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        void* const ptr = owner->ptr;
+        return Tensor::from_external_owner(
+            ptr,
+            std::move(shape),
+            Device::CUDA,
+            dtype,
+            std::move(owner),
+            capacity,
+            nullptr,
+            "vulkan_external_buffer");
+    };
+
+    for (const int sh_degree : {0, 1}) {
+        SCOPED_TRACE(::testing::Message() << "disjoint sh_degree=" << sh_degree);
+        struct QuantReset {
+            ~QuantReset() { sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt); }
+        } quant_reset;
+        if (sh_degree > 0) {
+            sh_value::set_sh_value_quant_enabled_for_testing(false);
+        }
+
+        constexpr size_t kN = 16;
+        constexpr size_t kCap = 32;
+        auto base = create_mrnf_test_splat_data(static_cast<int>(kN), sh_degree);
+        const size_t rest = sh_rest_coefficients_for_degree(sh_degree);
+        auto alloc_copy = [&](const Tensor& src, size_t cap, std::string_view name) {
+            Tensor dst = disjoint_allocator(src.shape(), cap, src.dtype(), name);
+            dst.copy_from(src);
+            return dst;
+        };
+        Tensor shN = Tensor::zeros({0}, Device::CUDA);
+        if (rest > 0) {
+            std::vector<float> shN_can(kN * rest * 3);
+            for (size_t i = 0; i < shN_can.size(); ++i) {
+                shN_can[i] = 0.01f * static_cast<float>(i + 1);
+            }
+            base.shN_set_from_canonical(
+                Tensor::from_vector(shN_can, TensorShape({kN, rest, 3}), Device::CUDA), kCap);
+            shN = alloc_copy(base.shN_raw(), sh_swizzled_float_count(kCap, static_cast<uint32_t>(rest)),
+                             "SplatData.shN");
+        }
+        SplatData model(
+            sh_degree,
+            alloc_copy(base.means_raw(), kCap, "SplatData.means"),
+            alloc_copy(base.sh0_raw(), kCap, "SplatData.sh0"),
+            std::move(shN),
+            alloc_copy(base.scaling_raw(), kCap, "SplatData.scaling"),
+            alloc_copy(base.rotation_raw(), kCap, "SplatData.rotation"),
+            alloc_copy(base.opacity_raw(), kCap, "SplatData.opacity"),
+            1.0f,
+            SplatData::ShNLayout::Swizzled);
+        model.set_tensor_allocator(disjoint_allocator);
+
+        auto params = vanilla_mrnf_params();
+        params.max_cap = static_cast<int>(kCap);
+        params.refine_every = 1000;
+        MRNF strategy(model);
+        strategy.initialize(params);
+
+        std::vector<uint8_t> remove_host(kN, 0);
+        std::vector<int> kept_idx;
+        for (size_t i = 0; i < kN; ++i) {
+            if (i % 2 == 0) {
+                remove_host[i] = 1;
+            } else {
+                kept_idx.push_back(static_cast<int>(i));
+            }
+        }
+        auto keep_indices = Tensor::from_vector(kept_idx, TensorShape({kept_idx.size()}), Device::CUDA);
+        const auto ref_means = model.means_raw().index_select(0, keep_indices).cpu().to_vector();
+        std::vector<float> ref_shN;
+        if (rest > 0) {
+            ref_shN = model.shN_canonical().index_select(0, keep_indices).cpu().to_vector();
+        }
+        auto remove_cpu = Tensor::zeros_bool(TensorShape({kN}), Device::CPU);
+        std::memcpy(remove_cpu.ptr<uint8_t>(), remove_host.data(), kN);
+        strategy.remove_gaussians(remove_cpu.to(Device::CUDA));
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        EXPECT_EQ(static_cast<size_t>(model.size()), kept_idx.size());
+        EXPECT_EQ(model.means_raw().external_storage_kind(), "vulkan_external_buffer");
+        EXPECT_EQ(model.sh0_raw().external_storage_kind(), "vulkan_external_buffer");
+        EXPECT_EQ(model.scaling_raw().external_storage_kind(), "vulkan_external_buffer");
+        EXPECT_EQ(model.rotation_raw().external_storage_kind(), "vulkan_external_buffer");
+        EXPECT_EQ(model.opacity_raw().external_storage_kind(), "vulkan_external_buffer");
+        if (rest > 0) {
+            EXPECT_EQ(model.shN_raw().external_storage_kind(), "vulkan_external_buffer");
+            EXPECT_EQ(model.shN_canonical().cpu().to_vector(), ref_shN);
+        }
+        EXPECT_EQ(model.means_raw().cpu().to_vector(), ref_means);
+    }
 }

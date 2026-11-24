@@ -1688,9 +1688,36 @@ namespace lfs::training {
             t = std::move(dest);
         };
 
+        auto compact_param = [&](Tensor& t, std::string_view param_name) {
+            if (!t.is_valid() || t.numel() == 0)
+                return;
+            if (!_splat_data->has_tensor_allocator() || t.device() != Device::CUDA) {
+                compact(t);
+                return;
+            }
+            auto dims = t.shape().dims();
+            dims[0] = new_size;
+            const size_t dest_cap = cap > 0 ? cap : std::max(new_size, t.capacity());
+            Tensor dest = _splat_data->allocate_named_param(
+                TensorShape(dims), dest_cap, t.dtype(), param_name);
+            dest.set_stream(t.stream());
+            if (new_size > 0) {
+                if (dest.data_ptr() == t.data_ptr()) {
+                    Tensor tmp = Tensor::zeros_direct(
+                        TensorShape(dims), new_size, t.device(), t.dtype());
+                    t.index_select_into(tmp, 0, valid_indices, BoundaryMode::Assert);
+                    dest.copy_from(tmp);
+                } else {
+                    t.index_select_into(dest, 0, valid_indices, BoundaryMode::Assert);
+                }
+            }
+            t = std::move(dest);
+        };
+
         // shN is swizzled — compact via block-aware gather.
         const auto layout_rest_u32 = static_cast<uint32_t>(_splat_data->max_sh_coeffs_rest());
-        auto compact_shN_swizzled = [&](Tensor& t, size_t cap_rows, int uint8_fill = -1) {
+        auto compact_shN_swizzled = [&](Tensor& t, size_t cap_rows, int uint8_fill = -1,
+                                        std::string_view param_name = {}) {
             if (!t.is_valid() || t.numel() == 0)
                 return;
             if (layout_rest_u32 == 0)
@@ -1701,11 +1728,44 @@ namespace lfs::training {
             const size_t cap_floats = cap_rows > 0 ? lfs::core::sh_swizzled_float_count(cap_rows, layout_rest_u32)
                                                    : lfs::core::sh_swizzled_float_count(new_size, layout_rest_u32);
             const size_t logical_floats = lfs::core::sh_swizzled_float_count(new_size, layout_rest_u32);
+            if (!param_name.empty() && _splat_data->has_tensor_allocator() &&
+                t.device() == Device::CUDA && t.dtype() == DataType::Float32 &&
+                !lfs::core::sh_value_quant::enabled()) {
+                Tensor dest;
+                try {
+                    dest = _splat_data->allocate_named_param(
+                        TensorShape({logical_floats}), cap_floats, DataType::Float32, param_name);
+                } catch (const std::exception&) {
+                    dest = {};
+                }
+                if (dest.is_valid() && dest.dtype() == DataType::Float32 &&
+                    dest.capacity() >= logical_floats) {
+                    dest.set_stream(t.stream());
+                    if (logical_floats > 0) {
+                        if (dest.data_ptr() == t.data_ptr()) {
+                            auto tmp = Tensor::zeros_direct(
+                                TensorShape({logical_floats}), logical_floats, t.device(), DataType::Float32);
+                            lfs::core::shN_swizzled_gather_self(
+                                t.ptr<float>(), tmp.ptr<float>(),
+                                idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
+                            dest.copy_from(tmp);
+                        } else {
+                            lfs::core::shN_swizzled_gather_self(
+                                t.ptr<float>(), dest.ptr<float>(),
+                                idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
+                        }
+                    }
+                    t = std::move(dest);
+                    return;
+                }
+            }
             auto fresh = Tensor::zeros_direct(TensorShape({logical_floats}), cap_floats, t.device(), t.dtype());
             if (t.dtype() == DataType::Float32) {
-                lfs::core::shN_swizzled_gather_self(
-                    t.ptr<float>(), fresh.ptr<float>(),
-                    idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
+                if (new_size > 0) {
+                    lfs::core::shN_swizzled_gather_self(
+                        t.ptr<float>(), fresh.ptr<float>(),
+                        idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
+                }
             } else if (t.dtype() == DataType::UInt8 || t.dtype() == DataType::Bool) {
                 if (uint8_fill >= 0 && cap_floats > 0) {
                     fresh.commit_rows(cap_floats);
@@ -1720,28 +1780,30 @@ namespace lfs::training {
                             cudaGetErrorString(err));
                     }
                 }
-                lfs::core::shN_swizzled_gather_self_u8(
-                    t.ptr<uint8_t>(), fresh.ptr<uint8_t>(),
-                    idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
+                if (new_size > 0) {
+                    lfs::core::shN_swizzled_gather_self_u8(
+                        t.ptr<uint8_t>(), fresh.ptr<uint8_t>(),
+                        idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
+                }
             } else {
                 throw std::runtime_error("MRNF::compact_splats: unsupported swizzled shN dtype");
             }
             t = std::move(fresh);
         };
 
-        compact(_splat_data->means());
-        compact(_splat_data->sh0());
+        compact_param(_splat_data->means(), "SplatData.means");
+        compact_param(_splat_data->sh0(), "SplatData.sh0");
         if (_splat_data->shN().is_valid() && _splat_data->shN().numel() > 0) {
             if (_splat_data->shN_value_quantized()) {
                 lfs::training::sh_value::compact_shN_gather(
                     *_splat_data, valid_indices, old_size, cap);
             } else {
-                compact_shN_swizzled(_splat_data->shN(), cap);
+                compact_shN_swizzled(_splat_data->shN(), cap, -1, "SplatData.shN");
             }
         }
-        compact(_splat_data->scaling_raw());
-        compact(_splat_data->rotation_raw());
-        compact(_splat_data->opacity_raw());
+        compact_param(_splat_data->scaling_raw(), "SplatData.scaling");
+        compact_param(_splat_data->rotation_raw(), "SplatData.rotation");
+        compact_param(_splat_data->opacity_raw(), "SplatData.opacity");
 
         static constexpr ParamType ALL_PARAMS[] = {
             ParamType::Means, ParamType::Sh0, ParamType::ShN,

@@ -36,12 +36,14 @@
 #include "core/cuda/sh_layout.cuh"
 #include "core/event_bridge/control_boundary.hpp"
 #include "core/events.hpp"
+#include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/native_fs.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data.hpp"
+#include "core/splat_exportable_storage.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include "core/uuid.hpp"
@@ -3392,6 +3394,97 @@ namespace {
         EXPECT_EQ(outside->sum_scalar(), 0);
         trainer->shutdown();
         std::filesystem::remove_all(output_path, ec);
+    }
+
+    TEST_F(ProjectCheckpointTrainerInstall,
+           CropToCropPolygonWithMrnfAndExportableStoragePreservesExternalStorageAndTopology) {
+        for (const int sh_degree : {0, 3}) {
+            SCOPED_TRACE(::testing::Message() << "sh_degree=" << sh_degree);
+            const auto output_path = std::filesystem::temp_directory_path() /
+                                     std::format("lfs_test_mrnf_crop_exportable_sh{}", sh_degree);
+            std::error_code ec;
+            std::filesystem::remove_all(output_path, ec);
+            std::filesystem::create_directories(output_path);
+
+            const auto image_path = output_path / "camera.png";
+            lfs::core::save_image(
+                image_path,
+                lfs::core::Tensor::full({size_t{3}, size_t{64}, size_t{64}}, 0.5f, lfs::core::Device::CPU));
+
+            auto params = make_tiny_headless_params(output_path, 2);
+            params.dataset.data_path = output_path;
+            params.dataset.images.clear();
+            params.optimization.strategy = "mrnf";
+            params.optimization.sh_degree = sh_degree;
+            params.optimization.max_cap = 2048;
+            params.optimization.refine_every = 100;
+            params.optimization.start_refine = 100;
+            params.optimization.stop_refine = 100;
+            params.optimization.crop_to_cropbox = true;
+
+            lfs::core::Scene scene;
+            const auto cameras = scene.addGroup("Cameras");
+            auto camera = std::make_shared<lfs::core::Camera>(
+                lfs::core::Tensor::eye(3, lfs::core::Device::CPU),
+                lfs::core::Tensor::from_vector(
+                    std::vector<float>{0.0f, 0.0f, 4.0f}, {size_t{3}}, lfs::core::Device::CPU),
+                100.0f, 100.0f, 32.0f, 32.0f,
+                lfs::core::Tensor(), lfs::core::Tensor(),
+                lfs::core::CameraModelType::PINHOLE,
+                "camera.png", image_path, std::filesystem::path{},
+                64, 64, 0);
+            scene.addCamera("camera.png", cameras, std::move(camera));
+            scene.addSplat("Model", make_checkpoint_test_splat(32, lfs::core::Device::CUDA, sh_degree));
+            scene.setTrainingModelNode("Model");
+            ASSERT_NO_FATAL_FAILURE(add_half_training_crop_polygon(scene));
+
+            const size_t initial = scene.getTrainingModel()->visible_count();
+            auto storage_result = lfs::core::SplatExportableStorage::create(
+                1024, sh_degree, /*device=*/0,
+                static_cast<size_t>(params.optimization.max_cap));
+            if (!storage_result) {
+                std::filesystem::remove_all(output_path, ec);
+                GTEST_SKIP() << "SplatExportableStorage::create failed: " << storage_result.error();
+            }
+            auto storage = std::make_shared<lfs::core::SplatExportableStorage>(std::move(*storage_result));
+
+            auto trainer = std::make_unique<lfs::training::Trainer>(scene);
+            trainer->setSplatTensorAllocator(storage->make_allocator());
+            ASSERT_TRUE(trainer->initialize(params));
+            lfs::training::grant_headless_project_saves(*trainer, params);
+            auto train = trainer->train();
+            ASSERT_TRUE(train) << lfs::format_for_developer(train.error());
+
+            const auto& model = trainer->get_strategy().get_model();
+            const auto outside = lfs::training::compute_training_cropbox_remove_mask(scene, model);
+            ASSERT_TRUE(outside);
+            EXPECT_GT(static_cast<size_t>(model.visible_count()), size_t{0});
+            EXPECT_LT(static_cast<size_t>(model.visible_count()), initial);
+            EXPECT_EQ(outside->sum_scalar(), 0);
+            EXPECT_EQ(scene.getTrainingModelGaussianCount(), static_cast<size_t>(model.visible_count()));
+
+            EXPECT_TRUE(model.means_raw().is_external_storage());
+            EXPECT_EQ(model.means_raw().external_storage_kind(), "splat.exportable");
+            EXPECT_TRUE(model.sh0_raw().is_external_storage());
+            EXPECT_EQ(model.sh0_raw().external_storage_kind(), "splat.exportable");
+            EXPECT_TRUE(model.scaling_raw().is_external_storage());
+            EXPECT_EQ(model.scaling_raw().external_storage_kind(), "splat.exportable");
+            EXPECT_TRUE(model.rotation_raw().is_external_storage());
+            EXPECT_EQ(model.rotation_raw().external_storage_kind(), "splat.exportable");
+            EXPECT_TRUE(model.opacity_raw().is_external_storage());
+            EXPECT_EQ(model.opacity_raw().external_storage_kind(), "splat.exportable");
+            if (sh_degree > 0 && model.shN_raw().is_valid() && model.shN_raw().numel() > 0) {
+                EXPECT_TRUE(model.shN_raw().is_external_storage());
+                EXPECT_EQ(model.shN_raw().external_storage_kind(), "splat.exportable");
+                if (model.shN_value_quantized()) {
+                    EXPECT_TRUE(model.shN_value_bounds().is_external_storage());
+                    EXPECT_EQ(model.shN_value_bounds().external_storage_kind(), "splat.exportable");
+                }
+            }
+
+            trainer->shutdown();
+            std::filesystem::remove_all(output_path, ec);
+        }
     }
 
     TEST_F(ProjectCheckpointTrainerInstall,

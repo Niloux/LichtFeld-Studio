@@ -2475,16 +2475,49 @@ namespace lfs::training {
         lfs::core::Tensor::trim_memory_pool();
         std::unique_lock render_lock(render_mutex_);
         std::unique_lock model_lock(model_access_mutex_);
+        std::unique_lock<std::mutex> combined_model_lock;
+        if (scene_) {
+            combined_model_lock = scene_->acquireCombinedModelExclusive();
+        }
         waitForModelReaders();
-        const auto& model = strategy_->get_model();
+        auto& model = strategy_->get_model();
         if (model.size() == 0)
             return;
         const auto before = model.visible_count();
         const auto outside = training_cropbox_crop_mask(model, *cropbox_);
         LFS_ASSERT_MSG(outside && outside->numel() == model.size(), "crop selection must cover every splat");
         // Removed through the strategy so the optimizer state shrinks with the model and the project stays resumable.
-        if (outside->sum_scalar() > 0)
+        if (outside->sum_scalar() > 0) {
+            const auto barrier = beginExportableDensifyBarrier();
+            if (barrier == ExportableDensifyBarrierBegin::Failed) {
+                LOG_ERROR("Failed to acquire exportable densify barrier before crop_to_training_cropbox");
+                return;
+            }
+            struct CropMutationGuard {
+                Trainer* self;
+                bool barrier_acquired;
+                explicit CropMutationGuard(Trainer* trainer, bool acquired)
+                    : self(trainer), barrier_acquired(acquired) {
+                    mark_live_model_mutation_lock_held(true);
+                }
+                ~CropMutationGuard() {
+                    mark_live_model_mutation_lock_held(false);
+                    if (barrier_acquired && self) {
+                        (void)self->endExportableDensifyBarrier();
+                    }
+                }
+                CropMutationGuard(const CropMutationGuard&) = delete;
+                CropMutationGuard& operator=(const CropMutationGuard&) = delete;
+            } mutation_guard(this, barrier == ExportableDensifyBarrierBegin::Acquired);
+            ++mutation_epoch_;
             strategy_->remove_gaussians(*outside);
+            if (auto storage_result = ensureModelTensorAllocatorStorage(model, "crop to cropbox");
+                !storage_result) {
+                LOG_ERROR("{}", storage_result.error());
+            }
+            syncTrainingSceneTopology(scene_, model);
+            recordParamsReady();
+        }
         // MCMC soft-deletes removed splats, so count the live ones.
         LOG_INFO("Cropped the trained model to its crop {}: {} of {} splats kept",
                  cropbox_->is_polygon() ? "polygon" : "box", strategy_->get_model().visible_count(), before);
@@ -11289,10 +11322,43 @@ namespace lfs::training {
                                                 with_noise_outside_cap(params_.optimization, &strategy_->get_model()).max_cap)) {
                 LOG_WARN("Max cap ({}) is less than the {} splats of the checkpoint, randomly removing the rest",
                          params_.optimization.max_cap, strategy_->get_model().visible_count());
-                std::unique_lock model_lock(model_access_mutex_);
+                std::unique_lock<std::shared_mutex> render_lock(render_mutex_);
+                std::unique_lock<std::shared_mutex> model_lock(model_access_mutex_);
+                std::unique_lock<std::mutex> combined_model_lock;
+                if (scene_) {
+                    combined_model_lock = scene_->acquireCombinedModelExclusive();
+                }
                 waitForModelReaders();
+                const auto barrier = beginExportableDensifyBarrier();
+                if (barrier == ExportableDensifyBarrierBegin::Failed) {
+                    return std::unexpected(
+                        "Failed to acquire exportable densify barrier before checkpoint max_cap trim");
+                }
+                struct CheckpointTrimMutationGuard {
+                    Trainer* self;
+                    bool barrier_acquired;
+                    explicit CheckpointTrimMutationGuard(Trainer* trainer, bool acquired)
+                        : self(trainer), barrier_acquired(acquired) {
+                        mark_live_model_mutation_lock_held(true);
+                    }
+                    ~CheckpointTrimMutationGuard() {
+                        mark_live_model_mutation_lock_held(false);
+                        if (barrier_acquired && self) {
+                            (void)self->endExportableDensifyBarrier();
+                        }
+                    }
+                    CheckpointTrimMutationGuard(const CheckpointTrimMutationGuard&) = delete;
+                    CheckpointTrimMutationGuard& operator=(const CheckpointTrimMutationGuard&) = delete;
+                } mutation_guard(this, barrier == ExportableDensifyBarrierBegin::Acquired);
+                ++mutation_epoch_;
                 strategy_->remove_gaussians(*over);
+                if (auto storage_result = ensureModelTensorAllocatorStorage(
+                        strategy_->get_model(), "checkpoint max_cap trim");
+                    !storage_result) {
+                    return std::unexpected(storage_result.error());
+                }
                 syncTrainingSceneTopology(scene_, strategy_->get_model());
+                recordParamsReady();
             }
         }
 

@@ -336,8 +336,37 @@ namespace lfs::training::sh_value {
             std::size_t n_dst,
             std::size_t dest_cap_prims,
             cudaStream_t stream) {
-            std::tie(splat.shN(), splat.shN_value_bounds()) =
-                gathered_q16(splat, perm, n_src, n_dst, dest_cap_prims, stream);
+            if (!splat.has_tensor_allocator()) {
+                std::tie(splat.shN(), splat.shN_value_bounds()) =
+                    gathered_q16(splat, perm, n_src, n_dst, dest_cap_prims, stream);
+                return;
+            }
+            const auto rest = layout_rest(splat);
+            auto [tmp_u16, tmp_bounds] = gathered_q16(splat, perm, n_src, n_dst, 0, stream);
+            const std::size_t cap_prims =
+                dest_cap_prims > 0 ? dest_cap_prims : std::max(n_dst, prim_capacity(splat));
+            const std::size_t cap_cells = std::max(
+                static_cast<std::size_t>(tmp_u16.numel()),
+                core::sh_value_quant::sh_value_u16_count(cap_prims, rest));
+            const std::size_t cap_bounds = std::max(
+                static_cast<std::size_t>(tmp_bounds.numel()),
+                core::sh_value_quant::n_bounds_for_prims(cap_prims) * 2);
+
+            Tensor dest_u16 = splat.allocate_named_param(
+                tmp_u16.shape(), cap_cells, DataType::Float16, "SplatData.shN");
+            dest_u16.set_stream(stream);
+            dest_u16.set_name("splat.shN");
+            dest_u16.copy_from(tmp_u16);
+
+            Tensor dest_bounds = splat.allocate_named_param(
+                tmp_bounds.shape(), cap_bounds, DataType::Float32, "SplatData.shN_value_bounds");
+            dest_bounds.set_stream(stream);
+            dest_bounds.set_name("splat.shN_value_bounds");
+            dest_bounds.copy_from(tmp_bounds);
+
+            sync_codec_stream(stream);
+            splat.shN() = std::move(dest_u16);
+            splat.shN_value_bounds() = std::move(dest_bounds);
         }
 
         void reencode_touched_q16_blocks(
@@ -981,21 +1010,51 @@ namespace lfs::training::sh_value {
         const cudaStream_t stream = core::getCurrentCUDAStream();
         const std::size_t n_dst = keep_indices.is_valid() ? keep_indices.numel() : 0;
         if (n_dst == 0) {
-            const std::size_t cap_prims = dest_cap_prims > 0 ? dest_cap_prims : 0;
+            const std::size_t cap_prims =
+                dest_cap_prims > 0 ? dest_cap_prims
+                                   : (splat.has_tensor_allocator() ? prim_capacity(splat) : 0);
             const std::size_t cap_cells = core::sh_value_quant::sh_value_u16_count(cap_prims, rest);
             const std::size_t cap_bounds =
                 core::sh_value_quant::n_bounds_for_prims(cap_prims) * 2;
             if (splat.shN_value_quantized()) {
-                splat.shN() = Tensor::zeros_direct(
-                    TensorShape({std::size_t{0}}), cap_cells, Device::CUDA, DataType::Float16);
-                splat.shN_value_bounds() = Tensor::zeros_direct(
-                    TensorShape({std::size_t{0}}), cap_bounds, Device::CUDA, DataType::Float32);
+                if (splat.has_tensor_allocator()) {
+                    splat.shN() = splat.allocate_named_param(
+                        TensorShape({std::size_t{0}}), cap_cells, DataType::Float16, "SplatData.shN");
+                    splat.shN_value_bounds() = splat.allocate_named_param(
+                        TensorShape({std::size_t{0}}),
+                        cap_bounds,
+                        DataType::Float32,
+                        "SplatData.shN_value_bounds");
+                } else {
+                    splat.shN() = Tensor::zeros_direct(
+                        TensorShape({std::size_t{0}}), cap_cells, Device::CUDA, DataType::Float16);
+                    splat.shN_value_bounds() = Tensor::zeros_direct(
+                        TensorShape({std::size_t{0}}), cap_bounds, Device::CUDA, DataType::Float32);
+                }
+                splat.shN_value_bounds().set_name("splat.shN_value_bounds");
+                splat.shN_value_bounds().set_stream(stream);
             } else {
                 const std::size_t cap_floats = core::sh_swizzled_float_count(cap_prims, rest);
-                splat.shN() = Tensor::zeros_direct(
-                    TensorShape({std::size_t{0}}), cap_floats, Device::CUDA, DataType::Float32);
+                Tensor fresh;
+                if (splat.has_tensor_allocator() && !core::sh_value_quant::enabled()) {
+                    try {
+                        fresh = splat.allocate_named_param(
+                            TensorShape({std::size_t{0}}), cap_floats, DataType::Float32, "SplatData.shN");
+                    } catch (const std::exception&) {
+                        fresh = {};
+                    }
+                    if (!fresh.is_valid() || fresh.dtype() != DataType::Float32) {
+                        fresh = {};
+                    }
+                }
+                if (!fresh.is_valid()) {
+                    fresh = Tensor::zeros_direct(
+                        TensorShape({std::size_t{0}}), cap_floats, Device::CUDA, DataType::Float32);
+                }
+                splat.shN() = std::move(fresh);
             }
             splat.shN().set_name("splat.shN");
+            splat.shN().set_stream(stream);
             return;
         }
         Tensor keep = as_i64_indices(keep_indices, stream);
@@ -1008,9 +1067,48 @@ namespace lfs::training::sh_value {
             throw std::runtime_error("compact_shN_gather: expected q16 or fp32 swizzled shN");
         }
         Tensor idx_i32 = keep.to(DataType::Int32);
-        const std::size_t cap_rows = dest_cap_prims > 0 ? dest_cap_prims : n_dst;
+        const std::size_t cap_rows =
+            dest_cap_prims > 0 ? dest_cap_prims
+                               : (splat.has_tensor_allocator() ? std::max(n_dst, prim_capacity(splat)) : n_dst);
         const std::size_t cap_floats = core::sh_swizzled_float_count(cap_rows, rest);
         const std::size_t logical_floats = core::sh_swizzled_float_count(n_dst, rest);
+        if (splat.has_tensor_allocator() && !core::sh_value_quant::enabled()) {
+            Tensor dest;
+            try {
+                dest = splat.allocate_named_param(
+                    TensorShape({logical_floats}), cap_floats, DataType::Float32, "SplatData.shN");
+            } catch (const std::exception&) {
+                dest = {};
+            }
+            if (dest.is_valid() && dest.dtype() == DataType::Float32 &&
+                dest.capacity() >= logical_floats) {
+                dest.set_stream(stream);
+                if (dest.data_ptr() == splat.shN().data_ptr()) {
+                    auto tmp = Tensor::zeros_direct(
+                        TensorShape({logical_floats}), logical_floats, Device::CUDA, DataType::Float32);
+                    core::shN_swizzled_gather_self(
+                        splat.shN().ptr<float>(),
+                        tmp.ptr<float>(),
+                        idx_i32.ptr<int>(),
+                        n_dst,
+                        0,
+                        rest);
+                    dest.copy_from(tmp);
+                    sync_codec_stream(stream);
+                } else {
+                    core::shN_swizzled_gather_self(
+                        splat.shN().ptr<float>(),
+                        dest.ptr<float>(),
+                        idx_i32.ptr<int>(),
+                        n_dst,
+                        0,
+                        rest);
+                }
+                dest.set_name("splat.shN");
+                splat.shN() = std::move(dest);
+                return;
+            }
+        }
         auto fresh = Tensor::zeros_direct(
             TensorShape({logical_floats}), cap_floats, Device::CUDA, DataType::Float32);
         core::shN_swizzled_gather_self(
