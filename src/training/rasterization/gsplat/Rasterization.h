@@ -115,7 +115,8 @@ namespace gsplat_lfs {
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const ScreenFootprint& footprint = {}, // lets the per-splat backward cull sub-tiles
-        const ColorVarianceRender& color_variance = {});
+        const ColorVarianceRender& color_variance = {},
+        float* blend_peak_out = nullptr);
 
     /////////////////////////////////////////////////
     // rasterize_to_indices_3dgs

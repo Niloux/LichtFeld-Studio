@@ -81,9 +81,9 @@ namespace gsplat_lfs {
                     atomicAdd(gq + 4 * g + c, grad[c]);
             }
         }
-        __global__ void flatten_kernel(const float* s, float* gs, uint32_t N, float weight) {
+        __global__ void flatten_kernel(const float* s, float* gs, uint32_t N, float weight, const float* blend_peak) {
             const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i >= N)
+            if (i >= N || (blend_peak && blend_peak[i] <= 0.0f))
                 return;
             const int a = min_axis(s + 3 * i);
             gs[3 * i + a] += weight * expf(s[3 * i + a]) / N;
@@ -106,10 +106,11 @@ namespace gsplat_lfs {
         features_kernel<true><<<(N * C + 255) / 256, 256, 0, stream>>>(m, q, s, v, nullptr, gf, gm, gq, N, C, channels, model, nullptr);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.geometry.backward");
     }
-    void flatten_scale_grad(const float* s, float* gs, uint32_t N, float weight, cudaStream_t stream) {
+    void flatten_scale_grad(const float* s, float* gs, uint32_t N, float weight, cudaStream_t stream,
+                            const float* blend_peak) {
         if (!N || weight <= 0.f)
             return;
-        flatten_kernel<<<(N + 255) / 256, 256, 0, stream>>>(s, gs, N, weight);
+        flatten_kernel<<<(N + 255) / 256, 256, 0, stream>>>(s, gs, N, weight, blend_peak);
         LFS_CUDA_LAUNCH_CHECK(stream, "gut.geometry.flatten");
     }
     void geometry_camera_rays(float* rays, uint32_t w, uint32_t h, const float* K,

@@ -15,6 +15,7 @@
 #include "gsplat/Intersect.h"
 #include "gsplat/Ops.h"
 #include "lfs/training/splat_dilation.hpp"
+#include "phase_arena.hpp"
 #include "training/components/rolling_shutter.hpp"
 #include "training/kernels/densification_kernels.hpp"
 #include "training/kernels/grad_alpha.hpp"
@@ -773,6 +774,14 @@ namespace lfs::training {
         }
     }
 
+    std::function<char*(size_t)> begin_gsplat_loss_phase(GsplatRasterizeContext& ctx) {
+        auto& arena = core::GlobalArenaManager::instance().get_arena();
+        ctx.phase_arena = std::make_shared<RasterizerPhaseArena>(
+            arena.get_allocator(ctx.frame_id, "gsplat.loss_backward"), ctx.stream);
+        ctx.phase_arena->begin_phase(RasterizerPhaseArena::Phase::Loss, 0);
+        return ctx.phase_arena->allocator(RasterizerPhaseArena::Phase::Loss);
+    }
+
     void gsplat_rasterize_backward(
         const GsplatRasterizeContext& ctx,
         const core::Tensor& grad_image,
@@ -785,11 +794,11 @@ namespace lfs::training {
         const core::Tensor& grad_depth,
         const core::Tensor& grad_normal,
         float flatten_weight,
-        const GsplatColorVarianceLoss& color_variance) {
+        const GsplatColorVarianceLoss& color_variance,
+        core::Tensor blend_peak_out) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
-        auto arena_allocator = arena.get_allocator(ctx.frame_id, "gsplat.backward");
         // Run the backward work + arena frame release on the exact stream the
         // forward began the frame on (ctx.stream), so begin_frame and end_frame
         // chain on the same stream rather than relying on the caller's guard
@@ -800,6 +809,11 @@ namespace lfs::training {
                                                ? core::getCurrentCUDAStream()
                                                : ctx.means.stream());
         try {
+            auto arena_allocator = arena.get_allocator(ctx.frame_id, "gsplat.backward");
+            if (ctx.phase_arena) {
+                ctx.phase_arena->begin_phase(RasterizerPhaseArena::Phase::Backward, 0);
+                arena_allocator = ctx.phase_arena->allocator(RasterizerPhaseArena::Phase::Backward);
+            }
             // A caller may produce loss gradients on a different stream from
             // the saved forward context. Order every raw-pointer read explicitly.
             for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal}) {
@@ -854,13 +868,16 @@ namespace lfs::training {
 
             size_t total_bwd_size = v_render_colors_size + v_render_alphas_size + v_means_size;
 
-            char* bwd_blob = total_bwd_size > 0 ? arena_allocator(total_bwd_size) : nullptr;
-            if (total_bwd_size > 0 && bwd_blob == nullptr) {
+            // The trainer can reuse the loss phase's memory for the temporary RGB/geometry gradients.
+            const size_t color_grad_bytes = ctx.phase_arena ? static_cast<size_t>(N) * channels * sizeof(float) : 0;
+            const size_t bwd_bytes = total_bwd_size + color_grad_bytes;
+            char* bwd_blob = bwd_bytes > 0 ? arena_allocator(bwd_bytes) : nullptr;
+            if (bwd_bytes > 0 && bwd_blob == nullptr) {
                 throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
                     .code = lfs::ErrorCode::ResourceExhausted,
                     .domain = lfs::ErrorDomain::CUDA,
                     .user_message = "Ran out of GPU memory during training backward.",
-                    .detail = std::format("gsplat backward arena allocation failed ({} bytes)", total_bwd_size),
+                    .detail = std::format("gsplat backward arena allocation failed ({} bytes)", bwd_bytes),
                     .detection = LFS_SOURCE_SITE_CURRENT(),
                 }));
             }
@@ -1003,6 +1020,10 @@ namespace lfs::training {
                 }
             }
 
+            if (blend_peak_out.is_valid()) {
+                blend_peak_out.sync_to_stream(stream);
+                blend_peak_out.set_stream(stream);
+            }
             // Call backward with raw pointers
             gsplat_lfs::rasterize_from_world_with_sh_bwd(
                 ctx.means.ptr<float>(),
@@ -1066,7 +1087,9 @@ namespace lfs::training {
                 ctx.tile_sub_masks.is_valid()
                     ? reinterpret_cast<const uint32_t*>(ctx.tile_sub_masks.ptr<int32_t>())
                     : nullptr,
-                gsplat_color_variance);
+                gsplat_color_variance,
+                blend_peak_out.is_valid() ? blend_peak_out.ptr<float>() : nullptr,
+                color_grad_bytes > 0 ? reinterpret_cast<float*>(bwd_blob + total_bwd_size) : nullptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);

@@ -345,7 +345,8 @@ namespace gsplat_lfs {
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const ScreenFootprint& footprint = {},
-        const ColorVarianceRender& color_variance = {});
+        const ColorVarianceRender& color_variance = {},
+        float* blend_peak_out = nullptr);
 
     //=========================================================================
     // High-level API: Fully fused rasterization with SH evaluation
@@ -492,6 +493,8 @@ namespace gsplat_lfs {
         const float* conics = nullptr,             // [C, N, 3] the forward's, so tile batches re-cull alike
         const int64_t* tile_keys = nullptr,        // the forward's keys when they hold sub-tile masks
         const uint32_t* tile_sub_masks = nullptr,  // the forward's, so tile batches re-cull alike
-        const ColorVarianceRender& color_variance = {});
+        const ColorVarianceRender& color_variance = {},
+        float* blend_peak_out = nullptr,
+        float* color_grad_workspace = nullptr); // [C, N, channels]
 
 } // namespace gsplat_lfs

@@ -26,6 +26,11 @@ namespace gsplat_lfs {
     constexpr uint32_t kBwdDualThreads = 128;
     constexpr uint32_t kBwdDualBatch = 256;
 
+    __device__ __forceinline__ void record_blend_peak(float* out, int32_t g, float peak) {
+        if (out && peak > 0.0f)
+            atomicMax(reinterpret_cast<int*>(out + g), __float_as_int(peak));
+    }
+
     struct PixelBwd {
         bool active;
         int32_t pix_id;
@@ -125,6 +130,7 @@ namespace gsplat_lfs {
         float& dens_e,
         const float* edge_weight_map,
         float& edge_score,
+        float& blend_peak,
         mat3& R,
         bool& have_R) {
         bool valid = pix.active;
@@ -148,6 +154,7 @@ namespace gsplat_lfs {
         const float ra = 1.0f / (1.0f - alpha);
         pix.T *= ra;
         const float fac = alpha * pix.T;
+        blend_peak = fmaxf(blend_peak, fac);
         if constexpr (kEdgeScoring) {
             const float edge_weight = edge_weight_map[pix.pix_id];
             const float edge_contribution = fac * edge_weight;
@@ -219,6 +226,7 @@ namespace gsplat_lfs {
         float& dens_e,
         const float* edge_weight_map,
         float& edge_score,
+        float& blend_peak,
         bool& hit0,
         bool& hit1) {
         const float opac = xyz_opac[3];
@@ -241,11 +249,11 @@ namespace gsplat_lfs {
         hit0 = contribute_pixel<kEdgeScoring>(
             pix0, isect_idx, opac, Mt, gro0, o_minus_mu0, scale_act, quat,
             rgb0, rgb1, rgb2, have_bg, do_dens, v_rgb, v_mean, v_scale, v_quat,
-            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, R, have_R);
+            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, blend_peak, R, have_R);
         hit1 = contribute_pixel<kEdgeScoring>(
             pix1, isect_idx, opac, Mt, gro1, o_minus_mu1, scale_act, quat,
             rgb0, rgb1, rgb2, have_bg, do_dens, v_rgb, v_mean, v_scale, v_quat,
-            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, R, have_R);
+            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, blend_peak, R, have_R);
     }
 
     __device__ __forceinline__ float reduce_field(float v, const unsigned n_contrib, const int src_lane) {
@@ -360,7 +368,7 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map,
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const ColorVarianceRender) {
+        const ColorVarianceRender, float* __restrict__ blend_peak_out) {
         auto block = cg::this_thread_block();
         const uint32_t cid = block.group_index().x;
         const uint32_t tile_id =
@@ -497,6 +505,7 @@ namespace gsplat_lfs {
                 float densification_weight_local = 0.f;
                 float densification_error_weighted_local = 0.f;
                 float edge_score_local = 0.f;
+                float blend_peak = 0.f;
 
                 bool hit0 = false;
                 bool hit1 = false;
@@ -504,7 +513,7 @@ namespace gsplat_lfs {
                     pix0, pix1, isect_idx, xyz_opac, Mt, scale_act, quat, rgb0, rgb1, rgb2,
                     have_bg, do_dens, v_rgb_local, v_mean_local, v_scale_local, v_quat_local,
                     v_opacity_local, densification_weight_local, densification_error_weighted_local,
-                    edge_weight_map, edge_score_local, hit0, hit1);
+                    edge_weight_map, edge_score_local, blend_peak, hit0, hit1);
 
                 const unsigned valid_mask = __ballot_sync(0xffffffffu, hit0 || hit1);
                 if (valid_mask == 0u) {
@@ -532,7 +541,10 @@ namespace gsplat_lfs {
                 if constexpr (kEdgeScoring) {
                     edge_score_local = reduce_field(edge_score_local, n_contrib, src_lane);
                 }
+                if (blend_peak_out)
+                    warpMax(blend_peak, warp);
                 if (warp.thread_rank() == 0) {
+                    record_blend_peak(blend_peak_out, id_batch[t], blend_peak);
                     // The compensation scales the opacity gradient only and stays detached from the
                     // covariance: feeding this determinant ratio into the scale and rotation gradients
                     // creates long splats.
@@ -613,7 +625,7 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ densification_error_map, // [H, W] or nullptr
         const float* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
-        const ColorVarianceRender color_variance) {
+        const ColorVarianceRender color_variance, float* __restrict__ blend_peak_out) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
         uint32_t tile_id =
@@ -877,11 +889,13 @@ namespace gsplat_lfs {
                 float densification_weight_local = 0.f;
                 float densification_error_weighted_local = 0.f;
                 float edge_score_local = 0.f;
+                float blend_peak = 0.f;
                 if (valid_mask != 0u) {
                     const float ra = 1.0f / (1.0f - alpha);
                     if (valid) {
                         T *= ra;
                         const float fac = alpha * T;
+                        blend_peak = fac;
                         float v_depth = 0.f;
                         float v_alpha = 0.f;
 #pragma unroll
@@ -972,8 +986,11 @@ namespace gsplat_lfs {
                     warpSum(v_opacity_local, warp);
                     warpSum(densification_weight_local, warp);
                     warpSum(densification_error_weighted_local, warp);
+                    if (blend_peak_out)
+                        warpMax(blend_peak, warp);
                     if (warp.thread_rank() == 0) {
                         const int32_t g = id_batch[t];
+                        record_blend_peak(blend_peak_out, g, blend_peak);
                         float* v_rgb_ptr = (float*)(v_colors) + CDIM * g;
 #pragma unroll
                         for (uint32_t k = 0; k < CDIM; ++k) {
@@ -1092,7 +1109,7 @@ namespace gsplat_lfs {
         float* __restrict__ edge_score_out,
         const TileRange tiles,
         const ScreenFootprint footprint,
-        const ColorVarianceRender color_variance) {
+        const ColorVarianceRender color_variance, float* __restrict__ blend_peak_out) {
         const uint32_t cid = blockIdx.x;
         const uint32_t subs = tile_size / kSplatBwdSub;
         const uint32_t sub_y = blockIdx.y;
@@ -1188,7 +1205,7 @@ namespace gsplat_lfs {
             }
             // These auxiliary paths can contribute even when the image loss has no gradient.
             if constexpr (!kUseCv && !kEdgeScoring) {
-                if (!do_dens && !has_gradient)
+                if (!do_dens && !has_gradient && !blend_peak_out)
                     continue;
             }
 
@@ -1345,6 +1362,7 @@ namespace gsplat_lfs {
                 float dens_w = 0.f;
                 float dens_e = 0.f;
                 float edge_score = 0.f;
+                float blend_peak = 0.f;
                 bool touched = false;
 
                 constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
@@ -1382,6 +1400,8 @@ namespace gsplat_lfs {
                             const float ra = 1.0f / (1.0f - alpha);
                             const float T = s_T[p] * ra;
                             const float fac = alpha * T;
+                            if (blend_peak_out)
+                                blend_peak = fmaxf(blend_peak, fac);
                             const float T_final = s_T_final[p];
                             float v_depth = 0.f;
                             float color_dot = 0.f;
@@ -1468,6 +1488,7 @@ namespace gsplat_lfs {
                 }
 
                 if (touched) {
+                    record_blend_peak(blend_peak_out, g, blend_peak);
                     const vec3 v_mean = -(glm::transpose(Mt) * v_gro_sum);
                     vec3 v_scale{0.f};
                     vec4 v_quat{0.f};
@@ -1587,7 +1608,8 @@ namespace gsplat_lfs {
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
         const ScreenFootprint& footprint,
-        const ColorVarianceRender& color_variance) {
+        const ColorVarianceRender& color_variance,
+        float* blend_peak_out) {
         const bool packed = false; // Only support non-packed for now
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
@@ -1648,7 +1670,7 @@ namespace gsplat_lfs {
                 densification_error,
                 densification_error_map,
                 edge_weight_map,
-                edge_score_out, tiles, color_variance);
+                edge_score_out, tiles, color_variance, blend_peak_out);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
         };
 
@@ -1674,7 +1696,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec4*>(v_quats),
                             reinterpret_cast<vec3*>(v_scales),
                             v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
-                            edge_weight_map, edge_score_out, tiles, footprint, color_variance);
+                            edge_weight_map, edge_score_out, tiles, footprint, color_variance, blend_peak_out);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
@@ -1840,7 +1862,8 @@ namespace gsplat_lfs {
         float* edge_score_out,                                                 \
         cudaStream_t stream, TileRange tiles,                                  \
         const ScreenFootprint& footprint,                                      \
-        const ColorVarianceRender& color_variance);
+        const ColorVarianceRender& color_variance,                            \
+        float* blend_peak_out);
 
     __INS__(1)
     __INS__(2)

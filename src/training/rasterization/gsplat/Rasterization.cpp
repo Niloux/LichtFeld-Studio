@@ -163,7 +163,8 @@ namespace gsplat_lfs {
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
         const ScreenFootprint& footprint,
-        const ColorVarianceRender& color_variance) {
+        const ColorVarianceRender& color_variance,
+        float* blend_peak_out) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -194,7 +195,10 @@ namespace gsplat_lfs {
             render_alphas, last_ids,                                 \
             v_render_colors, v_render_alphas,                        \
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
-            densification_weight, densification_error,                           densification_error_map,                                             edge_weight_map, edge_score_out, stream, tiles,                      footprint, color_variance);                          break;
+            densification_weight, densification_error, densification_error_map,    \
+            edge_weight_map, edge_score_out, stream, tiles, footprint,             \
+            color_variance, blend_peak_out);                                      \
+        break;
 
         switch (channels) {
             __LAUNCH_KERNEL__(1)
@@ -458,7 +462,9 @@ namespace gsplat_lfs {
         const float* conics,
         const int64_t* tile_keys,
         const uint32_t* tile_sub_masks,
-        const ColorVarianceRender& color_variance) {
+        const ColorVarianceRender& color_variance,
+        float* blend_peak_out,
+        float* color_grad_workspace) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -479,9 +485,9 @@ namespace gsplat_lfs {
             static_cast<size_t>(channels), "gsplat backward color elements");
         const size_t color_bytes = checked_bytes(
             color_values, sizeof(float), "gsplat backward color gradients");
-        // Grow-only TLS high-water — replaces per-backward cudaMallocAsync/Free.
-        float* const v_colors =
-            static_cast<float*>(ensure_gsplat_color_grad_workspace(color_bytes, stream));
+        float* const v_colors = color_grad_workspace
+                                    ? color_grad_workspace
+                                    : static_cast<float*>(ensure_gsplat_color_grad_workspace(color_bytes, stream));
         LFS_CUDA_CHECK_MSG(
             cudaMemsetAsync(v_colors, 0, color_bytes, stream),
             "gsplat backward color-gradient initialization");
@@ -503,7 +509,7 @@ namespace gsplat_lfs {
                 edge_weight_map, edge_score_out,
                 stream, tiles,
                 ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys},
-                color_variance);
+                color_variance, blend_peak_out);
         };
         if (batches.empty()) {
             render_backward({});

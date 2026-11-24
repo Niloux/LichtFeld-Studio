@@ -136,6 +136,33 @@ TEST_F(GutRegularizationTest, ZeroWeightsLeaveGradientsUntouched) {
         EXPECT_EQ(g, 0.0f);
 }
 
+TEST_F(GutRegularizationTest, ShapeTermsUseTheCurrentViewsBlendPeak) {
+    const Params p;
+    constexpr float erank_weight = 0.3f;
+    constexpr float dc_weight = 0.4f;
+    constexpr float scale_weight = 0.6f;
+    const auto full = evaluate(p, erank_weight, dc_weight);
+    const auto scales = Tensor::from_vector(p.log_scales, {kN, 3}, Device::CUDA);
+    const auto sh0 = Tensor::from_vector(p.sh0, {kN, 1, 3}, Device::CUDA);
+    auto grad_scale = Tensor::zeros({kN, 3}, Device::CUDA);
+    auto grad_sh0 = Tensor::zeros({kN, 1, 3}, Device::CUDA);
+    auto scale_loss = Tensor::zeros({1}, Device::CUDA);
+    std::vector<float> visible(kN, 0.0f);
+    visible.front() = 0.1f;
+    const auto peak = Tensor::from_vector(visible, {kN}, Device::CUDA);
+    kernels::launch_gut_param_regularization(
+        scales.ptr<float>(), grad_scale.ptr<float>(), sh0.ptr<float>(), grad_sh0.ptr<float>(),
+        3, kN, erank_weight, dc_weight, nullptr, nullptr, nullptr,
+        {.blend_peak = peak.ptr<float>(), .log_scale_weight = scale_weight, .scale_loss_out = scale_loss.ptr<float>()});
+    const auto actual = grad_scale.cpu().to_vector();
+    const float coef = scale_weight / (3.0f * kN);
+    for (int axis = 0; axis < 3; ++axis)
+        EXPECT_NEAR(actual[axis], full.scales_grad[axis] + coef, 1e-7f);
+    EXPECT_TRUE(std::all_of(actual.begin() + 3, actual.end(), [](float g) { return g == 0.0f; }));
+    EXPECT_EQ(grad_sh0.cpu().to_vector(), full.sh0_grad);
+    EXPECT_NEAR(scale_loss.item<float>(), coef * (p.log_scales[0] + p.log_scales[1] + p.log_scales[2]), 1e-7f);
+}
+
 TEST_F(GutRegularizationTest, ShRestRegularizerEqualsItsGradientInTheShNStep) {
     // A step with the regularizer and a zero gradient equals a step whose gradient is the
     // regularizer's own: 2 w / (N * 3 * rest) * value per rest coefficient.

@@ -759,6 +759,61 @@ TEST_F(GsplatRasterizerTest, InferenceWrapper) {
     });
 }
 
+TEST_F(GsplatRasterizerTest, GutBlendPeakMatchesCompositedWeightsAcrossTiles) {
+    constexpr int tile_width = 32;
+    constexpr int height = 48;
+    auto camera = make_camera(2 * tile_width, height);
+    auto splats = make_visible_splat(3);
+    splats->means_raw().copy_(Tensor::from_vector(
+        {-0.06f, 0.0f, 0.0f, -0.03f, 0.0f, 0.4f, 0.0f, 0.0f, -8.0f}, {3, 3}, Device::CUDA));
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+    auto front = make_visible_splat(1);
+    front->means_raw().copy_(splats->means_raw().slice(0, 0, 1));
+    auto rear = make_visible_splat(1);
+    rear->means_raw().copy_(splats->means_raw().slice(0, 1, 2));
+    AdamConfig cfg;
+    AdamOptimizer optimizer(*splats, cfg);
+    optimizer.allocate_gradients(3);
+
+    for (const auto mode : {GsplatRenderMode::RGB, GsplatRenderMode::RGB_D_N}) {
+        auto peaks = Tensor::zeros({3}, Device::CUDA);
+        std::array<float, 2> expected{};
+        for (const int x : {0, tile_width}) {
+            const auto isolated_alpha = [&](SplatData& model) {
+                auto result = gsplat_rasterize_forward(
+                    camera, model, bg, x, 0, tile_width, height, 1.0f, false, mode, true);
+                auto& [output, ctx] = result.value();
+                auto alpha = output.alpha.cpu().to_vector();
+                release_ctx_arena(ctx);
+                return alpha;
+            };
+            const auto front_alpha = isolated_alpha(*front);
+            const auto rear_alpha = isolated_alpha(*rear);
+            for (size_t i = 0; i < front_alpha.size(); ++i) {
+                expected[0] = std::max(expected[0], front_alpha[i]);
+                expected[1] = std::max(expected[1], (1.0f - front_alpha[i]) * rear_alpha[i]);
+            }
+            auto result = gsplat_rasterize_forward(
+                camera, *splats, bg, x, 0, tile_width, height, 1.0f, false, mode, true);
+            ASSERT_TRUE(result.has_value()) << result.error();
+            auto& [output, ctx] = *result;
+            auto scratch = begin_gsplat_loss_phase(ctx);
+            auto* temporary = scratch(8192);
+            ASSERT_NE(temporary, nullptr);
+            ASSERT_EQ(cudaMemsetAsync(temporary, 0xff, 8192, ctx.stream), cudaSuccess);
+            scratch = {};
+            gsplat_rasterize_backward(ctx, Tensor::zeros_like(output.image), Tensor::zeros_like(output.alpha),
+                                      *splats, optimizer, {}, {}, {}, {}, {}, 0.0f, {}, peaks);
+        }
+        ASSERT_GT(expected[0], 0.5f);
+        ASSERT_GT(expected[1], 0.01f);
+        const auto actual = peaks.cpu().to_vector();
+        EXPECT_NEAR(actual[0], expected[0], 1e-5f);
+        EXPECT_NEAR(actual[1], expected[1], 1e-5f);
+        EXPECT_EQ(actual[2], 0.0f);
+    }
+}
+
 // The gsplat intersection buffers are grow-only thread-local storage; a second
 // same-size forward must not allocate them again.
 TEST_F(GsplatRasterizerTest, SteadyStateSecondForwardHasZeroIsectAllocs) {

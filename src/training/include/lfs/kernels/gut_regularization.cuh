@@ -8,6 +8,12 @@
 
 namespace lfs::training::kernels {
 
+    struct GutShapeRegularization {
+        const float* blend_peak = nullptr; // [N], zero for splats absent from the view
+        float log_scale_weight = 0.0f;
+        float* scale_loss_out = nullptr;
+    };
+
     // The per-splat regularizers that FastGS folds into its fused Adam, for the GUT path, whose backward leaves
     // plain optimizer gradients: the spike-shape (effective rank) penalty on the log scales and the base-colour
     // range penalty on sh0. Same terms, normalization and loss reporting as the fused kernel; the colour gate is
@@ -24,6 +30,7 @@ namespace lfs::training::kernels {
         float dc_weight,
         float* erank_loss_out,
         float* dc_loss_out,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr,
+        const GutShapeRegularization& shape = {});
 
 } // namespace lfs::training::kernels

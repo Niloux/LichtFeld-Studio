@@ -15,10 +15,14 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <expected>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace lfs::training {
+
+    class RasterizerPhaseArena;
 
     // Render modes for gsplat rasterizer
     enum class GsplatRenderMode {
@@ -111,6 +115,7 @@ namespace lfs::training {
 
         // Memory arena frame ID (for releasing arena memory in backward)
         uint64_t frame_id = 0;
+        std::shared_ptr<RasterizerPhaseArena> phase_arena;
         // Stream the forward chained the arena frame on; release/backward match.
         cudaStream_t stream = nullptr;
 
@@ -157,6 +162,9 @@ namespace lfs::training {
         lfs::core::Tensor pixel_weight;
     };
 
+    // Temporary storage for loss work consumed before rasterizer backward.
+    std::function<char*(size_t)> begin_gsplat_loss_phase(GsplatRasterizeContext& ctx);
+
     // Explicit backward pass - computes gradients and accumulates into optimizer
     void gsplat_rasterize_backward(
         const GsplatRasterizeContext& ctx,
@@ -170,7 +178,8 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_depth = {},
         const lfs::core::Tensor& grad_normal = {},
         float flatten_weight = 0.f,
-        const GsplatColorVarianceLoss& color_variance = {});
+        const GsplatColorVarianceLoss& color_variance = {},
+        core::Tensor blend_peak_out = {}); // [N], raised to max(alpha * T) across the view's tiles
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;

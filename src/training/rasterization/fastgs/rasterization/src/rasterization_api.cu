@@ -12,8 +12,11 @@
 #include "lfs/cuda_scratch.hpp"
 #include "rasterization_api.h"
 #include "rasterization_config.h"
+#include "training/rasterization/phase_arena.hpp"
 #include "utils.h"
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <functional>
@@ -24,12 +27,25 @@
 
 namespace fast_lfs::rasterization {
 
+    using lfs::training::RasterizerPhaseArena;
+
     namespace {
         thread_local std::string last_forward_error;
         thread_local std::string last_backward_error;
 
         // count cudaPointerGetAttributes preflight calls (test/telemetry).
         std::atomic<std::uint64_t> g_preflight_pointer_attr_calls{0};
+
+        // Backward helpers are compact: blend only ever contributes for visible
+        // primitives, while the full-N backward preprocess uses the
+        // original->workset map to apply Adam/momentum to invisible rows.
+        // Phase allocations start on 256-byte boundaries.
+        size_t backward_helper_bytes(const int n_visible) {
+            const size_t n = static_cast<size_t>(std::max(n_visible, 0));
+            const auto aligned = [n](const size_t element_bytes) { return (n * element_bytes + 255) & ~size_t{255}; };
+            return aligned(sizeof(float2)) + aligned(sizeof(float3)) + 2 * aligned(sizeof(float)) +
+                   aligned(3 * sizeof(float));
+        }
 
         void free_sorted_primitive_indices(void* ptr, cudaStream_t stream) noexcept {
             // The pointer belongs to the active rasterizer arena frame; the
@@ -303,11 +319,12 @@ namespace fast_lfs::rasterization {
                 arena->get_allocator(frame_id, "fastgs.per_tile");
             auto sort_phase_allocator =
                 arena->get_allocator(frame_id, "fastgs.sort_phase");
-            auto phase_arena = std::make_shared<FastGSPhaseArena>(sort_phase_allocator, stream);
+            auto phase_arena = std::make_shared<RasterizerPhaseArena>(
+                sort_phase_allocator, stream, std::getenv("LFS_FASTGS_PHASE_POISON") != nullptr);
             auto phase_forward_allocator =
-                phase_arena->allocator(FastGSPhaseArena::Phase::Forward);
+                phase_arena->allocator(RasterizerPhaseArena::Phase::Forward);
             auto phase_backward_allocator =
-                phase_arena->allocator(FastGSPhaseArena::Phase::Backward);
+                phase_arena->allocator(RasterizerPhaseArena::Phase::Backward);
 
             // The tile buffers remain image-sized.  FastGS allocates its
             // visibility bookkeeping and compact primitive buffers through the
@@ -330,7 +347,7 @@ namespace fast_lfs::rasterization {
 
             // Call the actual forward implementation
             ForwardResult forward_result = forward(per_primitive_buffers_func, [phase_arena](size_t size) { phase_arena->begin_phase(
-                                                                                                                FastGSPhaseArena::Phase::Forward, size); }, phase_forward_allocator, [phase_arena](const void* source, size_t size) { return phase_arena->retain_prefix(source, size); }, per_tile_buffers_func, reinterpret_cast<const float3*>(means_ptr), reinterpret_cast<const float3*>(scales_raw_ptr), reinterpret_cast<const float4*>(rotations_raw_ptr), opacities_raw_ptr, reinterpret_cast<const float3*>(sh_coefficients_0_ptr), reinterpret_cast<const float4*>(sh_coefficients_rest_ptr), reinterpret_cast<const float2*>(sh_value_bounds_ptr), sh_value_n_cells, sh_value_bits, reinterpret_cast<const float4*>(w2c_ptr), reinterpret_cast<const float3*>(cam_position_ptr), image_ptr, alpha_ptr, depth_ptr, normal_ptr, bg_color_ptr, bg_image_ptr, n_primitives, active_sh_bases, sh_layout_bases, width, height, focal_x, focal_y, center_x, center_y, near_plane, far_plane, mip_filter, stream, max_screen_share_ptr, dilation_scale);
+                                                                                                                RasterizerPhaseArena::Phase::Forward, size); }, phase_forward_allocator, [phase_arena](const void* source, size_t size) { return phase_arena->retain_prefix(source, size); }, per_tile_buffers_func, reinterpret_cast<const float3*>(means_ptr), reinterpret_cast<const float3*>(scales_raw_ptr), reinterpret_cast<const float4*>(rotations_raw_ptr), opacities_raw_ptr, reinterpret_cast<const float3*>(sh_coefficients_0_ptr), reinterpret_cast<const float4*>(sh_coefficients_rest_ptr), reinterpret_cast<const float2*>(sh_value_bounds_ptr), sh_value_n_cells, sh_value_bits, reinterpret_cast<const float4*>(w2c_ptr), reinterpret_cast<const float3*>(cam_position_ptr), image_ptr, alpha_ptr, depth_ptr, normal_ptr, bg_color_ptr, bg_image_ptr, n_primitives, active_sh_bases, sh_layout_bases, width, height, focal_x, focal_y, center_x, center_y, near_plane, far_plane, mip_filter, stream, max_screen_share_ptr, dilation_scale);
 
             // Verify allocations happened
             if (forward_result.n_instances > 0 && !forward_result.sorted_primitive_indices) {
@@ -340,36 +357,11 @@ namespace fast_lfs::rasterization {
                 return fail("OUT_OF_MEMORY: Sorted primitive indices were not allocated despite n_instances > 0", false);
             }
 
-            // Backward helpers are compact too: blend only ever contributes for
-            // visible primitives, while the full-N backward preprocess uses the
-            // original->workset map to apply Adam/momentum to invisible rows.
-            const size_t n_visible = static_cast<size_t>(forward_result.n_visible);
-            const size_t backward_phase_bytes = n_visible > 0
-                                                    ? n_visible * (sizeof(float2) + sizeof(float3) +
-                                                                   sizeof(float) + sizeof(float) +
-                                                                   3 * sizeof(float))
-                                                    : 0;
-            phase_arena->begin_phase(FastGSPhaseArena::Phase::Backward, backward_phase_bytes);
-            char* grad_mean2d_helper = n_visible > 0
-                                           ? phase_backward_allocator(n_visible * sizeof(float2))
-                                           : nullptr;
-            char* grad_conic_helper = n_visible > 0
-                                          ? phase_backward_allocator(n_visible * sizeof(float3))
-                                          : nullptr;
-            char* grad_depth_helper = n_visible > 0
-                                          ? phase_backward_allocator(n_visible * sizeof(float))
-                                          : nullptr;
-            char* grad_opacity_helper = n_visible > 0
-                                            ? phase_backward_allocator(n_visible * sizeof(float))
-                                            : nullptr;
-            char* grad_color_helper = n_visible > 0
-                                          ? phase_backward_allocator(n_visible * 3 * sizeof(float))
-                                          : nullptr;
-            if (n_visible > 0 && (!grad_mean2d_helper || !grad_conic_helper ||
-                                  !grad_depth_helper || !grad_opacity_helper ||
-                                  !grad_color_helper)) {
-                return fail("OUT_OF_MEMORY: Failed to allocate compact backward helpers from arena", true);
-            }
+            // Reserve the backward helpers' room now, where a shortage is still a
+            // retryable forward failure. backward_raw allocates them inside it, so
+            // the loss phase in between can use the whole slice above the prefix.
+            phase_arena->begin_phase(RasterizerPhaseArena::Phase::Backward,
+                                     backward_helper_bytes(forward_result.n_visible));
             // Create and return context
             ForwardContext ctx;
             ctx.per_primitive_buffers = forward_result.per_primitive_buffers;
@@ -392,11 +384,6 @@ namespace fast_lfs::rasterization {
             ctx.dilation_scale = dilation_scale;
             ctx.frame_id = frame_id;
             ctx.stream = stream;
-            ctx.grad_mean2d_helper = grad_mean2d_helper;
-            ctx.grad_conic_helper = grad_conic_helper;
-            ctx.grad_depth_helper = grad_depth_helper;
-            ctx.grad_opacity_helper = grad_opacity_helper;
-            ctx.grad_color_helper = grad_color_helper;
             ctx.primitive_normals = forward_result.primitive_normals;
             ctx.primitive_work_indices = forward_result.primitive_work_indices;
             ctx.phase_allocator = phase_backward_allocator;
@@ -449,6 +436,13 @@ namespace fast_lfs::rasterization {
         arena.end_frame(forward_ctx.frame_id, forward_ctx.stream);
     }
 
+    std::function<char*(size_t)> begin_loss_phase(const ForwardContext& forward_ctx) {
+        LFS_ASSERT_MSG(forward_ctx.success && forward_ctx.phase_arena,
+                       "FastGS loss phase requires a live forward context");
+        forward_ctx.phase_arena->begin_phase(RasterizerPhaseArena::Phase::Loss, 0);
+        return forward_ctx.phase_arena->allocator(RasterizerPhaseArena::Phase::Loss);
+    }
+
     ForwardCaptureView forward_capture_view(const ForwardContext& context, const int width, const int height) {
         if (!context.success || !context.per_tile_buffers || width <= 0 || height <= 0)
             throw std::invalid_argument("Invalid context for forward capture");
@@ -499,8 +493,6 @@ namespace fast_lfs::rasterization {
         unsigned shN_value_bits,
         const float* edge_weight_map,
         float* edge_score_out,
-        float* impact_sum_out,
-        float* impact_peak_out,
         const ColorVarianceLoss& color_variance) {
 
         // The forward chose the stream and chained the arena frame on it; the
@@ -537,11 +529,6 @@ namespace fast_lfs::rasterization {
             outputs.error_message = "Invalid edge-score inputs in backward_raw";
             return outputs;
         }
-        if ((impact_sum_out == nullptr) != (impact_peak_out == nullptr)) {
-            release_forward_context(forward_ctx);
-            outputs.error_message = "Invalid impact-score outputs in backward_raw";
-            return outputs;
-        }
 
         try {
             // Validate required inputs using pure CUDA validation
@@ -574,8 +561,6 @@ namespace fast_lfs::rasterization {
                 throw std::runtime_error("grad_w2c_ptr and grad_cam_position_ptr must be given together");
             LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(edge_weight_map, "edge_weight_map");
             LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(edge_score_out, "edge_score_out");
-            LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(impact_sum_out, "impact_sum_out");
-            LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(impact_peak_out, "impact_peak_out");
         } catch (const std::exception& e) {
             release_forward_context(forward_ctx);
             last_backward_error = e.what();
@@ -596,26 +581,36 @@ namespace fast_lfs::rasterization {
             return outputs;
         }
 
-        // Use compact helper buffers from the forward context.
-        if (forward_ctx.n_visible > 0 &&
-            (!forward_ctx.grad_mean2d_helper || !forward_ctx.grad_conic_helper ||
-             !forward_ctx.grad_depth_helper || !forward_ctx.grad_opacity_helper ||
-             !forward_ctx.grad_color_helper || !forward_ctx.primitive_work_indices)) {
+        if (forward_ctx.n_visible > 0 && (!forward_ctx.primitive_work_indices || !forward_ctx.phase_arena)) {
             release_forward_context(forward_ctx);
-            outputs.error_message = "Missing pre-allocated helper buffers in forward context";
+            outputs.error_message = "Missing backward phase state in forward context";
             return outputs;
         }
-        float* grad_mean2d_helper = static_cast<float*>(forward_ctx.grad_mean2d_helper);
-        float3* grad_conic_helper = static_cast<float3*>(forward_ctx.grad_conic_helper);
-        float* grad_depth_helper = static_cast<float*>(forward_ctx.grad_depth_helper);
+        float* grad_mean2d_helper = nullptr;
+        float3* grad_conic_helper = nullptr;
+        float* grad_depth_helper = nullptr;
         float* grad_opacity_helper = nullptr;
         float* grad_color_helper = nullptr;
         float3* grad_normal_helper = nullptr;
         const float3* primitive_normals = nullptr;
         const size_t visible_count = static_cast<size_t>(forward_ctx.n_visible);
         try {
-            grad_opacity_helper = static_cast<float*>(forward_ctx.grad_opacity_helper);
-            grad_color_helper = static_cast<float*>(forward_ctx.grad_color_helper);
+            // The forward reserved this room; the loss scratch above the prefix is dead now.
+            if (visible_count > 0) {
+                forward_ctx.phase_arena->begin_phase(RasterizerPhaseArena::Phase::Backward,
+                                                     backward_helper_bytes(forward_ctx.n_visible));
+                const auto take = [&](const size_t element_bytes) {
+                    char* const helper = forward_ctx.phase_allocator(visible_count * element_bytes);
+                    if (!helper)
+                        throw std::runtime_error("OUT_OF_MEMORY: Failed to allocate compact backward helpers from arena");
+                    return helper;
+                };
+                grad_mean2d_helper = reinterpret_cast<float*>(take(sizeof(float2)));
+                grad_conic_helper = reinterpret_cast<float3*>(take(sizeof(float3)));
+                grad_depth_helper = reinterpret_cast<float*>(take(sizeof(float)));
+                grad_opacity_helper = reinterpret_cast<float*>(take(sizeof(float)));
+                grad_color_helper = reinterpret_cast<float*>(take(3 * sizeof(float)));
+            }
             if (grad_normal_ptr != nullptr) {
                 primitive_normals = static_cast<const float3*>(forward_ctx.primitive_normals);
                 if (visible_count > 0 && !primitive_normals) {
@@ -714,8 +709,6 @@ namespace fast_lfs::rasterization {
                 shN_value_bits,
                 edge_weight_map,
                 edge_score_out,
-                impact_sum_out,
-                impact_peak_out,
                 stream,
                 color_variance);
 

@@ -19,7 +19,7 @@ namespace gsplat_lfs {
                                uint32_t N, uint32_t C, uint32_t channels,
                                CameraModelType model, cudaStream_t stream);
     void flatten_scale_grad(const float* scales, float* grad_scales, uint32_t N,
-                            float weight, cudaStream_t stream);
+                            float weight, cudaStream_t stream, const float* blend_peak = nullptr);
     void geometry_camera_rays(float* rays, uint32_t width, uint32_t height,
                               const float* K, CameraModelType model, const float* radial,
                               const float* tangential, const float* thin_prism, cudaStream_t stream);
