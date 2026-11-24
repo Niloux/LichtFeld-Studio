@@ -306,7 +306,7 @@ public:
     [[nodiscard]] std::optional<PrimitiveVisibilityStats> pollDeferredPrimitiveVisibilityStats();
     [[nodiscard]] std::optional<LodSelectionStats> pollDeferredLodSelectionStats();
     [[nodiscard]] std::optional<TileInstanceStats> pollDeferredTileInstanceStats();
-    // Export-only exact gate. Records the raw count/sentinel, submits
+    // Records the raw tile-instance count or overflow sentinel, submits
     // and fence-waits batch A, invalidates the mapped allocation, then starts
     // batch B before returning the raw count/sentinel result.
     [[nodiscard]] TileInstanceGate synchronizeTileInstanceGate(

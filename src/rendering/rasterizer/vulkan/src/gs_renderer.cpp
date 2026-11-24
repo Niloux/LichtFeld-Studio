@@ -469,7 +469,7 @@ void VulkanGSRenderer::ensureInstanceGateReadback() {
             create_result,
             "vmaCreateBuffer",
             std::format(
-                "Export tile-instance gate allocation failed (requested_bytes={}, allocator={:#x}, result={}({}))",
+                "Tile-instance gate allocation failed (requested_bytes={}, allocator={:#x}, result={}({}))",
                 info.size,
                 lfs::rendering::vkHandleValue(allocator),
                 lfs::rendering::vkResultToString(create_result),
@@ -486,13 +486,13 @@ void VulkanGSRenderer::ensureInstanceGateReadback() {
                          instance_gate_readback_buffer_.allocation);
         instance_gate_readback_buffer_ = {};
         lfs::rendering::throw_renderer_contract(
-            "Export tile-instance gate allocation was not persistently mapped",
+            "Tile-instance gate allocation was not persistently mapped",
             LFS_SOURCE_SITE_CURRENT());
     }
     instance_gate_readback_mapped_[0] = 0;
     setDebugObjectName(VK_OBJECT_TYPE_BUFFER,
                        instance_gate_readback_buffer_.buffer,
-                       "vksplat.readback.export_tile_instance_gate");
+                       "vksplat.readback.tile_instance_gate");
     instance_gate_readback_initialized_ = true;
 }
 
@@ -513,7 +513,7 @@ VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::synchronizeTileInstanceGate
     VulkanGSPipelineBuffers& buffers) {
     if (!commandBatchInProgress) {
         lfs::rendering::throw_renderer_contract(
-            "Export tile-instance gate requires active batch A",
+            "Tile-instance gate requires active batch A",
             LFS_SOURCE_SITE_CURRENT());
     }
     ensureInstanceGateReadback();
@@ -521,7 +521,7 @@ VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::synchronizeTileInstanceGate
     if (count.buffer == VK_NULL_HANDLE || count.size != sizeof(uint32_t)) {
         lfs::rendering::throw_renderer_contract(
             std::format(
-                "Export tile-instance gate requires the raw-count word (buffer={:#x}, bytes={})",
+                "Tile-instance gate requires the raw-count word (buffer={:#x}, bytes={})",
                 lfs::rendering::vkHandleValue(count.buffer),
                 count.size),
             LFS_SOURCE_SITE_CURRENT());
@@ -541,11 +541,11 @@ VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::synchronizeTileInstanceGate
         .dstOffset = 0,
         .size = sizeof(uint32_t),
     };
-    validateBufferRange(count, 0, copy.size, "export tile-instance gate source");
+    validateBufferRange(count, 0, copy.size, "tile-instance gate source");
     validateBufferRange(instance_gate_readback_buffer_,
                         0,
                         copy.size,
-                        "export tile-instance gate destination");
+                        "tile-instance gate destination");
     if (vulkan_dispatch_.cmd_copy_buffer == nullptr) {
         lfs::rendering::throw_renderer_contract(
             "synchronizeTileInstanceGate requires VulkanDispatch::cmd_copy_buffer",
@@ -562,13 +562,13 @@ VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::synchronizeTileInstanceGate
     };
     planTransfer(std::span{&host_read, 1});
 
-    // This is the single intentional export stall: batch A has produced the
+    // Wait once between batches: the first batch has produced the
     // exact raw count. The dedicated gate has no deferred never-stomp state.
     endCommandBatch(/*use_fence=*/true);
     waitForPendingBatch();
     if (!invalidateReadbackBuffer(instance_gate_readback_buffer_, copy.size)) {
         lfs::rendering::throw_renderer_contract(
-            "Export tile-instance gate mapped allocation invalidation failed",
+            "Tile-instance gate mapped allocation invalidation failed",
             LFS_SOURCE_SITE_CURRENT());
     }
 

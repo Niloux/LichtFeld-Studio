@@ -1138,7 +1138,9 @@ namespace gsplat_lfs {
 
         constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
         __shared__ float s_T[kSplatBwdPixels];
-        __shared__ float s_buffer[kSplatBwdPixels * kUsed];
+        // Each pixel uses the same color gradient for every splat. Store the
+        // dot product with its accumulated color instead of all channels.
+        __shared__ float s_buffer_dot[kSplatBwdPixels];
         __shared__ float s_v_c[kSplatBwdPixels * kUsed];
         __shared__ float s_v_a[kSplatBwdPixels];
         __shared__ float s_T_final[kSplatBwdPixels];
@@ -1162,33 +1164,64 @@ namespace gsplat_lfs {
             }
         }
 
+        const int32_t range_start = tile_offsets[tile_id];
+        const int32_t range_end = tile_offsets[tile_id + 1];
+        if (range_start >= range_end)
+            return;
+
         int32_t bin_max = -1;
         for (uint32_t p = lane; p < kSplatBwdPixels; p += 32) {
             const uint32_t x = sub_x * kSplatBwdSub + p % kSplatBwdSub;
             const uint32_t y = sub_y * kSplatBwdSub + p / kSplatBwdSub;
-            const bool inside = x < image_width && y < image_height;
-            const uint32_t pix = min(y * image_width + x, pixels - 1);
+            s_bin[p] = -1;
+            if constexpr (kUseCv)
+                s_cv_buf[p] = 0.f;
+            if (x >= image_width || y >= image_height)
+                continue;
+
+            const uint32_t pix = y * image_width + x;
+            const float render_alpha = render_alphas[pix];
+            const int32_t last_id = last_ids[pix];
+            if (render_alpha == 0.f || last_id < range_start)
+                continue;
+
+            const float v_a = v_render_alphas[pix];
+            float v_color[kUsed];
+            bool has_gradient = v_a != 0.f;
+#pragma unroll
+            for (uint32_t k = 0; k < kUsed; ++k) {
+                v_color[k] = v_render_colors[chw_pix(k, pix, image_height, image_width)];
+                has_gradient |= v_color[k] != 0.f;
+            }
+            // These auxiliary paths can contribute even when the image loss has no gradient.
+            if constexpr (!kUseCv && !kEdgeScoring) {
+                if (!do_dens && !has_gradient)
+                    continue;
+            }
+
             const WorldRay ray = from_world_pixel_ray<kPerfectPinhole>(
                 camera_model_type, rs_type, image_width, image_height,
                 static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
                 viewmats0, viewmats1, Ks, cid, radial_coeffs, tangential_coeffs, thin_prism_coeffs);
-            const bool active = inside && ray.valid_flag;
-            s_bin[p] = active ? last_ids[pix] : -1;
-            bin_max = max(bin_max, s_bin[p]);
+            if (!ray.valid_flag)
+                continue;
+
+            s_bin[p] = last_id;
+            bin_max = max(bin_max, last_id);
             const float depth_scale =
                 (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
             s_ray_o[p] = make_float3(ray.ray_org.x, ray.ray_org.y, ray.ray_org.z);
             s_ray_d[p] = make_float4(ray.ray_dir.x, ray.ray_dir.y, ray.ray_dir.z, depth_scale);
-            const float T_final = 1.0f - render_alphas[pix];
+            const float T_final = 1.0f - render_alpha;
             s_T[p] = T_final;
             s_T_final[p] = T_final;
-            s_v_a[p] = v_render_alphas[pix];
+            s_v_a[p] = v_a;
+            s_buffer_dot[p] = 0.f;
             float bg = 0.f;
 #pragma unroll
             for (uint32_t k = 0; k < kUsed; ++k) {
-                const float v_c = v_render_colors[chw_pix(k, pix, image_height, image_width)];
+                const float v_c = v_color[k];
                 s_v_c[p * kUsed + k] = v_c;
-                s_buffer[p * kUsed + k] = 0.f;
                 // Geometry channels have a zero background; only RGB contributes.
                 if (have_bg && k < 3u) {
                     bg += (bg_images != nullptr ? bg_images[k * pixels + pix] : backgrounds[k]) * v_c;
@@ -1201,7 +1234,7 @@ namespace gsplat_lfs {
             }
             if constexpr (kUseCv) {
                 float4 cv_t = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (active && color_variance.enabled()) {
+                if (color_variance.enabled()) {
                     const float cov = 1.0f - T_final;
                     if (cov >= 0.5f / 255.f) {
                         float pw_scale = 0.f;
@@ -1229,7 +1262,7 @@ namespace gsplat_lfs {
                     }
                 }
                 s_cv_target[p] = cv_t;
-                s_cv_buf[p] = 0.f;
+
             }
         }
         for (int offset = 16; offset > 0; offset /= 2) {
@@ -1237,8 +1270,6 @@ namespace gsplat_lfs {
         }
         __syncwarp();
 
-        const int32_t range_start = tile_offsets[tile_id];
-        const int32_t range_end = tile_offsets[tile_id + 1];
         const float sub_x0 = static_cast<float>(sub_x * kSplatBwdSub);
         const float sub_y0 = static_cast<float>(sub_y * kSplatBwdSub);
         const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
@@ -1360,11 +1391,10 @@ namespace gsplat_lfs {
                             const float fac = alpha * T;
                             const float T_final = s_T_final[p];
                             float v_depth = 0.f;
-                            float v_alpha = 0.f;
+                            float color_dot = 0.f;
 #pragma unroll
                             for (uint32_t k = 0; k < kUsed; ++k) {
                                 const float v_c = s_v_c[p * kUsed + k];
-                                const float buffer = s_buffer[p * kUsed + k];
                                 float c_val;
                                 if constexpr (kHasRayDepth) {
                                     if (k == kDepthChannel) {
@@ -1378,9 +1408,11 @@ namespace gsplat_lfs {
                                     c_val = rgb[k];
                                     v_rgb[k] += fac * v_c;
                                 }
-                                v_alpha += (c_val * T - buffer * ra) * v_c;
-                                s_buffer[p * kUsed + k] = buffer + c_val * fac;
+                                color_dot += c_val * v_c;
                             }
+                            const float buffer_dot = s_buffer_dot[p];
+                            s_buffer_dot[p] = buffer_dot + color_dot * fac;
+                            float v_alpha = color_dot * T - buffer_dot * ra;
                             v_alpha += T_final * ra * s_v_a[p];
                             if (have_bg) {
                                 v_alpha += -T_final * ra * s_bg[p];

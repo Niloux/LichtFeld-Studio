@@ -9797,11 +9797,23 @@ namespace lfs::vis {
                              HIGS_DEPTH_WAVE_INSTANCES,
                              id_count);
                 } else {
+                    const std::size_t max_preview_waves = renderer_.supportsConditionalRendering()
+                                                              ? HIGS_DEPTH_MAX_WAVES
+                                                              : HIGS_DEPTH_MAX_WAVES_FALLBACK;
                     armed_depth_waves = reuse_stochastic_projection && projection_cache.wave_count != 0u
                                             ? projection_cache.wave_count
-                                            : (renderer_.supportsConditionalRendering()
-                                                   ? HIGS_DEPTH_MAX_WAVES
-                                                   : HIGS_DEPTH_MAX_WAVES_FALLBACK);
+                                            : max_preview_waves;
+                    // A live preview holds the training scratch while recording.
+                    // Use the current count to avoid recording empty depth waves.
+                    if (synchronize_input_upload && !reuse_stochastic_projection &&
+                        id_count <= HIGS_DEPTH_WAVE_INSTANCES / 2u) {
+                        const auto gate = renderer_.synchronizeTileInstanceGate(buffers_);
+                        if (!gate.count_overflow) {
+                            armed_depth_waves = std::min(
+                                max_preview_waves,
+                                indirect::depthWaveRecordUpperBound(gate.raw_count, id_count));
+                        }
+                    }
                 }
 
                 if (!reuse_stochastic_tiles)

@@ -80,6 +80,7 @@ namespace gsplat_lfs {
             uint32_t cub_sort_end_bit = 0;
             RollingPeak cum_tiles_peak;
             RollingPeak isect_peak;
+            double mean_intersection_count = 0.0;
             size_t call_count = 0;
             bool trim_used_in_window = false;
             cudaStream_t bound_stream = nullptr;
@@ -285,6 +286,10 @@ namespace gsplat_lfs {
             void finish_call(const int64_t n_isects) {
                 if (n_isects >= 0) {
                     isect_peak.observe(static_cast<size_t>(n_isects));
+                    const double count = static_cast<double>(n_isects);
+                    mean_intersection_count = isect_peak.samples == 1
+                                                  ? count
+                                                  : 0.9 * mean_intersection_count + 0.1 * count;
                 }
             }
 
@@ -437,6 +442,7 @@ namespace gsplat_lfs {
                 pair_budget = 0;
                 cum_tiles_peak = {};
                 isect_peak = {};
+                mean_intersection_count = 0.0;
                 call_count = 0;
                 trim_used_in_window = false;
                 bound_stream = nullptr;
@@ -634,13 +640,23 @@ namespace gsplat_lfs {
                 "gsplat n_isects event record");
         }
 
+        // A speculative sort overlaps count readback with the fill and sort,
+        // but processes sentinel padding up to the resident sort size. Read
+        // the count first when recent views leave at least a quarter unused.
+        const size_t resident_sort_size = intersection_sort_capacity(cache.isect_capacity, budget);
+        constexpr double kMinSpeculativeOccupancy = 0.75;
+        const bool exact_sort = resident_sort_size == 0 ||
+                                (cache.isect_peak.has_samples() &&
+                                 cache.mean_intersection_count < kMinSpeculativeOccupancy * resident_sort_size);
         auto fill_and_sort_capacity = [&](const size_t cap) {
             cache.ensure_isect_buffers(cap);
-            const size_t sort_n = intersection_sort_capacity(cache.isect_capacity, budget);
+            const size_t sort_n = exact_sort ? cap : intersection_sort_capacity(cache.isect_capacity, budget);
             cache.ensure_sort_buffers(sort_n, stream);
-            launch_fill_isect_sentinels_kernel(
-                cache.isect_ids(), cache.flatten_ids(),
-                static_cast<int64_t>(sort_n), sentinel_key, stream);
+            if (!exact_sort) {
+                launch_fill_isect_sentinels_kernel(
+                    cache.isect_ids(), cache.flatten_ids(),
+                    static_cast<int64_t>(sort_n), sentinel_key, stream);
+            }
             launch_intersect_tile_kernel(
                 means2d, radii, depths,
                 nullptr, nullptr,
@@ -687,7 +703,7 @@ namespace gsplat_lfs {
                 isect_offsets, stream);
         };
 
-        if (cache.isect_capacity == 0) {
+        if (exact_sort) {
             const int64_t n_isects = drain_count();
             result.n_isects = n_isects;
             if (n_isects > static_cast<int64_t>(budget)) {
