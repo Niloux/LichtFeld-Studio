@@ -322,7 +322,7 @@ namespace gsplat_lfs {
     // last_ids still index the tile's list, so the backward replays the same splats.
     constexpr uint32_t kMicroSub = kCullSubTile;
     constexpr uint32_t kMicroThreads = kMicroSub * kMicroSub;
-    constexpr uint32_t kMicroStage = 2 * kMicroThreads;
+    constexpr uint32_t kMicroStage = kMicroThreads + kMicroThreads / 2;
 
     bool use_micro_forward() {
         static const bool enabled = [] {
@@ -638,7 +638,8 @@ namespace gsplat_lfs {
             n_stage *
             (sizeof(vec4) + sizeof(mat3) + sizeof(float) * CDIM);
 
-        if (n_isects == 0 && tiles.end == UINT32_MAX) {
+        if (n_isects == 0 && tiles.end == UINT32_MAX &&
+            backgrounds == nullptr && bg_images == nullptr) {
             // Skip kernel launch if no intersections
             // Still need to clear output buffers
             LFS_CUDA_CHECK_MSG(

@@ -508,51 +508,44 @@ namespace gsplat_lfs {
 
                 const unsigned valid_mask = __ballot_sync(0xffffffffu, hit0 || hit1);
                 if (valid_mask == 0u) {
-                    if constexpr (!kEdgeScoring) {
-                        continue;
-                    }
+                    continue;
                 }
-                if (valid_mask != 0u) {
-                    const unsigned n_contrib = __popc(valid_mask);
-                    const int src_lane = __ffs(valid_mask) - 1;
-                    v_rgb_local[0] = reduce_field(v_rgb_local[0], n_contrib, src_lane);
-                    v_rgb_local[1] = reduce_field(v_rgb_local[1], n_contrib, src_lane);
-                    v_rgb_local[2] = reduce_field(v_rgb_local[2], n_contrib, src_lane);
-                    v_mean_local.x = reduce_field(v_mean_local.x, n_contrib, src_lane);
-                    v_mean_local.y = reduce_field(v_mean_local.y, n_contrib, src_lane);
-                    v_mean_local.z = reduce_field(v_mean_local.z, n_contrib, src_lane);
-                    v_scale_local.x = reduce_field(v_scale_local.x, n_contrib, src_lane);
-                    v_scale_local.y = reduce_field(v_scale_local.y, n_contrib, src_lane);
-                    v_scale_local.z = reduce_field(v_scale_local.z, n_contrib, src_lane);
-                    v_quat_local.x = reduce_field(v_quat_local.x, n_contrib, src_lane);
-                    v_quat_local.y = reduce_field(v_quat_local.y, n_contrib, src_lane);
-                    v_quat_local.z = reduce_field(v_quat_local.z, n_contrib, src_lane);
-                    v_quat_local.w = reduce_field(v_quat_local.w, n_contrib, src_lane);
-                    v_opacity_local = reduce_field(v_opacity_local, n_contrib, src_lane);
-                    densification_weight_local = reduce_field(densification_weight_local, n_contrib, src_lane);
-                    densification_error_weighted_local =
-                        reduce_field(densification_error_weighted_local, n_contrib, src_lane);
-                    if constexpr (kEdgeScoring) {
-                        edge_score_local = reduce_field(edge_score_local, n_contrib, src_lane);
-                    }
-                    if (warp.thread_rank() == 0) {
-                        // The compensation scales the opacity gradient only and stays detached from the
-                        // covariance: feeding this determinant ratio into the scale and rotation gradients
-                        // creates long splats.
-                        if (compensations != nullptr)
-                            v_opacity_local *= compensations[id_batch[t]];
-                        flush_splat_grads(
-                            id_batch[t], N, do_dens, v_rgb_local, v_mean_local, v_scale_local,
-                            v_quat_local, v_opacity_local, densification_weight_local,
-                            densification_error_weighted_local,
-                            log_scale_chain(scale_act, scales, dilations, id_batch[t]), opacities[id_batch[t]],
-                            v_means, v_quats, v_scales, v_colors, v_opacities, densification_weight,
-                            densification_error);
-                    }
-                }
+                const unsigned n_contrib = __popc(valid_mask);
+                const int src_lane = __ffs(valid_mask) - 1;
+                v_rgb_local[0] = reduce_field(v_rgb_local[0], n_contrib, src_lane);
+                v_rgb_local[1] = reduce_field(v_rgb_local[1], n_contrib, src_lane);
+                v_rgb_local[2] = reduce_field(v_rgb_local[2], n_contrib, src_lane);
+                v_mean_local.x = reduce_field(v_mean_local.x, n_contrib, src_lane);
+                v_mean_local.y = reduce_field(v_mean_local.y, n_contrib, src_lane);
+                v_mean_local.z = reduce_field(v_mean_local.z, n_contrib, src_lane);
+                v_scale_local.x = reduce_field(v_scale_local.x, n_contrib, src_lane);
+                v_scale_local.y = reduce_field(v_scale_local.y, n_contrib, src_lane);
+                v_scale_local.z = reduce_field(v_scale_local.z, n_contrib, src_lane);
+                v_quat_local.x = reduce_field(v_quat_local.x, n_contrib, src_lane);
+                v_quat_local.y = reduce_field(v_quat_local.y, n_contrib, src_lane);
+                v_quat_local.z = reduce_field(v_quat_local.z, n_contrib, src_lane);
+                v_quat_local.w = reduce_field(v_quat_local.w, n_contrib, src_lane);
+                v_opacity_local = reduce_field(v_opacity_local, n_contrib, src_lane);
+                densification_weight_local = reduce_field(densification_weight_local, n_contrib, src_lane);
+                densification_error_weighted_local =
+                    reduce_field(densification_error_weighted_local, n_contrib, src_lane);
                 if constexpr (kEdgeScoring) {
-                    warpSum(edge_score_local, warp);
-                    if (warp.thread_rank() == 0) {
+                    edge_score_local = reduce_field(edge_score_local, n_contrib, src_lane);
+                }
+                if (warp.thread_rank() == 0) {
+                    // The compensation scales the opacity gradient only and stays detached from the
+                    // covariance: feeding this determinant ratio into the scale and rotation gradients
+                    // creates long splats.
+                    if (compensations != nullptr)
+                        v_opacity_local *= compensations[id_batch[t]];
+                    flush_splat_grads(
+                        id_batch[t], N, do_dens, v_rgb_local, v_mean_local, v_scale_local,
+                        v_quat_local, v_opacity_local, densification_weight_local,
+                        densification_error_weighted_local,
+                        log_scale_chain(scale_act, scales, dilations, id_batch[t]), opacities[id_batch[t]],
+                        v_means, v_quats, v_scales, v_colors, v_opacities, densification_weight,
+                        densification_error);
+                    if constexpr (kEdgeScoring) {
                         gpuAtomicAdd(&edge_score_batch[t], edge_score_local);
                     }
                 }

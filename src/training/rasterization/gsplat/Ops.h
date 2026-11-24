@@ -77,7 +77,8 @@ namespace gsplat_lfs {
         uint32_t N,
         float* colors, // [C, N, color_stride]
         uint32_t color_stride,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const int32_t* radii = nullptr); // [C, N, 2] optional: skip invisible elements
 
     // Adds dL/d(sh0) and the swizzled dL/d(shN) straight into the optimizer's gradient
     // buffers, summing the C cameras. One thread per splat; v_shN may be null.

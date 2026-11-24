@@ -1115,10 +1115,12 @@ namespace lfs::training {
         gsplat_thread_caches.camera_rays = {};
         gsplat_thread_caches.geometry_bg = {};
         gsplat_thread_caches.geometry_bg_image = {};
+        gsplat_thread_caches.tile_sub_masks = {};
         return !gsplat_thread_caches.K.is_valid() &&
                !gsplat_thread_caches.image_chw.is_valid() &&
                !gsplat_thread_caches.alpha_chw.is_valid() &&
-               !gsplat_thread_caches.depth_chw.is_valid();
+               !gsplat_thread_caches.depth_chw.is_valid() &&
+               !gsplat_thread_caches.tile_sub_masks.is_valid();
     }
 
     namespace {

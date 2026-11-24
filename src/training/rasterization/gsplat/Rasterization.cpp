@@ -310,11 +310,11 @@ namespace gsplat_lfs {
             }
             spherical_harmonics_streamed_fwd(
                 sh_degree, sh_layout_degree, sh_degree > 0 ? result.dirs : nullptr,
-                sh0, shN, C, N, result.colors, channels, stream);
+                sh0, shN, C, N, result.colors, channels, stream, result.radii);
         }
         if (channels == 8) {
             geometry_features_fwd(means, quats, scales, reference, result.colors,
-                                  N, C, channels, camera_model, stream);
+                                  N, C, channels, camera_model, stream, result.radii);
         }
 
         const float* render_backgrounds = (render_mode == 1 || render_mode == 2) ? nullptr : backgrounds;

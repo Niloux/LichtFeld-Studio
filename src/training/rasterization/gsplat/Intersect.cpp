@@ -220,6 +220,10 @@ namespace gsplat_lfs {
                                               ? checked_bytes(isect_peak.peak(), sizeof(int32_t),
                                                               "gsplat flatten-id trim")
                                               : 0;
+                const size_t depth_order_need = cum_tiles_peak.has_samples()
+                                                    ? checked_bytes(cum_tiles_peak.peak(), 4 * sizeof(uint32_t),
+                                                                    "gsplat depth order trim")
+                                                    : 0;
                 const bool should_trim =
                     exceeds_hysteresis(cum_tiles, cum_need) ||
                     (isect_ids_storage && exceeds_hysteresis(*isect_ids_storage, isect_need)) ||
@@ -227,7 +231,9 @@ namespace gsplat_lfs {
                      exceeds_hysteresis(*isect_values_storage, value_need)) ||
                     (sort_ids_storage && exceeds_hysteresis(*sort_ids_storage, isect_need)) ||
                     (sort_values_storage &&
-                     exceeds_hysteresis(*sort_values_storage, value_need));
+                     exceeds_hysteresis(*sort_values_storage, value_need)) ||
+                    (depth_order_storage &&
+                     exceeds_hysteresis(*depth_order_storage, depth_order_need));
                 if (!should_trim) {
                     return;
                 }
@@ -260,6 +266,9 @@ namespace gsplat_lfs {
                 }
                 if (sort_values_storage) {
                     decommit_vmm_buffer(*sort_values_storage, value_need);
+                }
+                if (depth_order_storage) {
+                    decommit_vmm_buffer(*depth_order_storage, depth_order_need);
                 }
                 update_capacities();
                 cub_sort_ws_bytes = 0;
@@ -581,9 +590,10 @@ namespace gsplat_lfs {
                                                               ? std::max<size_t>(n_elements, cache.pair_budget)
                                                               : cache.pair_budget);
 
-        // Two-stage sort: order the elements by depth once, emit their pairs in
-        // that order, then sort the pairs by camera and tile only. The radix sort
-        // is stable, so each tile keeps the depth order the full key would give.
+        // Two-stage sort: order the elements by depth once, emit their pairs
+        // in that order, then sort the pairs by camera and tile only. The
+        // radix sort is stable, so each tile keeps the depth order the full key
+        // would give.
         const int32_t* depth_order = nullptr;
         if (sort && !packed) {
             uint32_t* buffers = cache.depth_order_buffers(n_elements);
@@ -648,11 +658,11 @@ namespace gsplat_lfs {
         const bool exact_sort = resident_sort_size == 0 ||
                                 (cache.isect_peak.has_samples() &&
                                  cache.mean_intersection_count < kMinSpeculativeOccupancy * resident_sort_size);
-        auto fill_and_sort_capacity = [&](const size_t cap) {
+        auto fill_and_sort_capacity = [&](const size_t cap, const bool exact) {
             cache.ensure_isect_buffers(cap);
-            const size_t sort_n = exact_sort ? cap : intersection_sort_capacity(cache.isect_capacity, budget);
+            const size_t sort_n = exact ? cap : intersection_sort_capacity(cache.isect_capacity, budget);
             cache.ensure_sort_buffers(sort_n, stream);
-            if (!exact_sort) {
+            if (!exact) {
                 launch_fill_isect_sentinels_kernel(
                     cache.isect_ids(), cache.flatten_ids(),
                     static_cast<int64_t>(sort_n), sentinel_key, stream);
@@ -719,13 +729,13 @@ namespace gsplat_lfs {
                 launch_offsets();
                 return result;
             }
-            fill_and_sort_capacity(static_cast<size_t>(n_isects));
+            fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
             launch_offsets();
             cache.finish_call(n_isects);
             return result;
         }
 
-        fill_and_sort_capacity(cache.isect_capacity);
+        fill_and_sort_capacity(cache.isect_capacity, false);
         launch_offsets();
         if (before_count_wait && isect_offsets) {
             before_count_wait(result);
@@ -745,7 +755,7 @@ namespace gsplat_lfs {
         if (n_isects > static_cast<int64_t>(result.n_sort)) {
             LFS_CUDA_CHECK_MSG(cudaStreamSynchronize(stream),
                                "gsplat intersection overflow drain");
-            fill_and_sort_capacity(static_cast<size_t>(n_isects));
+            fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
             launch_offsets();
         }
 

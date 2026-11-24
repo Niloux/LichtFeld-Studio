@@ -1112,14 +1112,25 @@ namespace lfs::training::kernels {
         const int py1 = min(py0 + kBwdTileY, h);
 
         __shared__ BwdTileFootprint fp;
-        __shared__ float s_dL[9][kGatherChunk];
-        __shared__ float s_fx[kGatherChunk];
-        __shared__ float s_fy[kGatherChunk];
-        __shared__ float s_fz[kGatherChunk];
-        // Cell offsets inside the footprint and the guidance levels, packed as
-        // x0 | x1 << 2 | y0 << 4 | y1 << 6 | z0 << 8 | z1 << 12; ~0u marks no pixel.
-        __shared__ uint32_t s_cell[kGatherChunk];
-        __shared__ float s_partial[kGatherThreads * kGatherMaxL];
+        // s_partial is only written and read after the dy staging loop completes.
+        __shared__ union {
+            struct {
+                float dL[9][kGatherChunk];
+                float fx[kGatherChunk];
+                float fy[kGatherChunk];
+                float fz[kGatherChunk];
+                // Cell offsets inside the footprint and the guidance levels, packed as
+                // x0 | x1 << 2 | y0 << 4 | y1 << 6 | z0 << 8 | z1 << 12; ~0u marks no pixel.
+                uint32_t cell[kGatherChunk];
+            } stage;
+            float partial[kGatherThreads * kGatherMaxL];
+        } smem_u;
+        float (&s_dL)[9][kGatherChunk] = smem_u.stage.dL;
+        float (&s_fx)[kGatherChunk] = smem_u.stage.fx;
+        float (&s_fy)[kGatherChunk] = smem_u.stage.fy;
+        float (&s_fz)[kGatherChunk] = smem_u.stage.fz;
+        uint32_t (&s_cell)[kGatherChunk] = smem_u.stage.cell;
+        float (&s_partial)[kGatherThreads * kGatherMaxL] = smem_u.partial;
         if (tid == 0) {
             compute_bwd_tile_footprint(fp, px0, py0, px1, py1, h, w, H, W);
         }

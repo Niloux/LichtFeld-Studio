@@ -42,9 +42,10 @@ namespace gsplat_lfs {
         const uint32_t* __restrict__ tile_sub_masks) {
         // Thread k handles element order[k], so the pairs come out in that order;
         // counts and offsets are indexed by k.
+        const uint32_t n_elements = packed ? nnz : C * N;
         const uint32_t k = cg::this_grid().thread_rank();
         bool first_pass = cum_tiles_per_gauss == nullptr;
-        if (k >= (packed ? nnz : C * N)) {
+        if (k >= n_elements) {
             return;
         }
         const uint32_t idx = order != nullptr ? static_cast<uint32_t>(order[k]) : k;
@@ -269,7 +270,7 @@ namespace gsplat_lfs {
         cudaStream_t stream,
         int64_t max_isects, TileRange tiles, const int32_t* order, const float* conics,
         const uint32_t* tile_sub_masks) {
-        int64_t n_elements = packed ? nnz : C * N;
+        const uint32_t n_elements = packed ? nnz : C * N;
 
         uint32_t n_tiles = tile_width * tile_height;
         uint32_t tile_n_bits = static_cast<uint32_t>(floor(log2(n_tiles))) + 1;

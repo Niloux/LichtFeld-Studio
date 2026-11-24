@@ -718,9 +718,13 @@ namespace gsplat_lfs {
         const vec3* __restrict__ dirs,
         const float* __restrict__ sh0,
         const ShRestSource src,
-        float* __restrict__ colors) {
+        float* __restrict__ colors,
+        const int32_t* __restrict__ radii) {
         const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= C * N) {
+            return;
+        }
+        if (radii != nullptr && (radii[2u * idx] <= 0 || radii[2u * idx + 1u] <= 0)) {
             return;
         }
         const uint32_t p = idx % N;
@@ -783,10 +787,15 @@ namespace gsplat_lfs {
         for (uint32_t i = 0; i < kCells; ++i) {
             g[i] = 0.f;
         }
+        bool any = false;
         for (uint32_t cam = 0; cam < C; ++cam) {
             const uint32_t idx = cam * N + p;
             const float* const v = v_colors + static_cast<size_t>(idx) * color_stride;
             const float v0 = v[0], v1 = v[1], v2 = v[2];
+            if (v0 == 0.f && v1 == 0.f && v2 == 0.f) {
+                continue;
+            }
+            any = true;
             g0[0] += SH_C0 * v0;
             g0[1] += SH_C0 * v1;
             g0[2] += SH_C0 * v2;
@@ -800,6 +809,9 @@ namespace gsplat_lfs {
                     g[k * 3u + 2u] += b[k + 1u] * v2;
                 }
             }
+        }
+        if (!any) {
+            return;
         }
 
         v_sh0[p * 3u + 0u] += g0[0];
@@ -849,7 +861,8 @@ namespace gsplat_lfs {
         const uint32_t N,
         float* colors,
         const uint32_t color_stride,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const int32_t* radii) {
         const uint64_t total = static_cast<uint64_t>(C) * N;
         if (total == 0) {
             return;
@@ -866,10 +879,10 @@ namespace gsplat_lfs {
             constexpr uint32_t D = decltype(deg)::value;
             if (q16) {
                 spherical_harmonics_streamed_fwd_kernel<D, true><<<blocks, kShStreamThreads, 0, stream>>>(
-                    C, N, units, color_stride, reinterpret_cast<const vec3*>(dirs), sh0, sh_rest, colors);
+                    C, N, units, color_stride, reinterpret_cast<const vec3*>(dirs), sh0, sh_rest, colors, radii);
             } else {
                 spherical_harmonics_streamed_fwd_kernel<D, false><<<blocks, kShStreamThreads, 0, stream>>>(
-                    C, N, units, color_stride, reinterpret_cast<const vec3*>(dirs), sh0, sh_rest, colors);
+                    C, N, units, color_stride, reinterpret_cast<const vec3*>(dirs), sh0, sh_rest, colors, radii);
             }
         });
         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.sh_streamed_fwd");

@@ -8917,20 +8917,27 @@ namespace lfs::training {
                             if (dc_weight > 0.0f)
                                 fused_dc_reg_loss_gpu = device_scalar(fused_dc_reg_loss_);
                             auto& sh0 = model.sh0();
+                            auto& scaling_grad = gaussian_optimizer.get_grad(ParamType::Scaling);
+                            auto& sh0_grad = gaussian_optimizer.get_grad(ParamType::Sh0);
+                            const cudaStream_t reg_stream = lfs::core::getCurrentCUDAStream();
+                            scaling_grad.sync_to_stream(reg_stream);
+                            sh0_grad.sync_to_stream(reg_stream);
                             lfs::training::kernels::launch_gut_param_regularization(
                                 model.scaling_raw().ptr<float>(),
-                                gaussian_optimizer.get_grad(ParamType::Scaling).ptr<float>(),
+                                scaling_grad.ptr<float>(),
                                 sh0.ptr<float>(),
-                                gaussian_optimizer.get_grad(ParamType::Sh0).ptr<float>(),
+                                sh0_grad.ptr<float>(),
                                 static_cast<int>(sh0.numel() / static_cast<size_t>(n)), n,
                                 erank_weight, dc_weight,
                                 erank_weight > 0.0f ? fused_erank_reg_loss_gpu.ptr<float>() : nullptr,
-                                dc_weight > 0.0f ? fused_dc_reg_loss_gpu.ptr<float>() : nullptr);
+                                dc_weight > 0.0f ? fused_dc_reg_loss_gpu.ptr<float>() : nullptr,
+                                reg_stream);
                         }
                     }
                     // The shN step applies SH-rest regularization on the GUT path; its loss is not reported.
                     gaussian_optimizer.set_sh_rest_regularization(
-                        !fastgs_path && !in_popspa && strategy_->get_model().get_active_sh_degree() > 0
+                        !fastgs_path && !in_popspa && update_gaussians_this_iter &&
+                                strategy_->get_model().get_active_sh_degree() > 0
                             ? step_params.sh_rest_reg
                             : 0.0f);
                     if (fused_erank_reg_loss_gpu.is_valid())

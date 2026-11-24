@@ -3261,3 +3261,67 @@ TEST(RasterizerBackgroundImage, RejectsBackgroundOfAnotherSize) {
         release_ctx_arena(ok->second);
     }
 }
+
+TEST(GsplatRasterizerEdgeScores, DualBackwardEdgeScoresMatchSplatBackward) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    constexpr int width = 64;
+    constexpr int height = 64;
+    constexpr int count = 64;
+    auto camera = make_camera(width, height);
+    const auto edge_map = Tensor::full({height, width}, 0.75f, Device::CUDA);
+    auto background = Tensor::zeros({3}, Device::CUDA);
+
+    auto run = [&](const bool force_dual) {
+        auto model = make_visible_splat(count);
+        AdamConfig cfg;
+        cfg.lr = 1e-3f;
+        cfg.initial_capacity = count;
+        AdamOptimizer optimizer(*model, cfg);
+        optimizer.allocate_gradients(count);
+        auto scores = Tensor::zeros({count}, Device::CUDA);
+        auto result = gsplat_rasterize_forward(
+            camera, *model, background, 0, 0, 0, 0, 1.0f, false, GsplatRenderMode::RGB, true);
+        EXPECT_TRUE(result.has_value());
+        auto output = std::move(result->first);
+        auto ctx = std::move(result->second);
+        if (force_dual) {
+            ctx.conics_ptr = nullptr;
+        }
+        gsplat_rasterize_backward(
+            ctx, Tensor::ones_like(output.image), Tensor::zeros_like(output.alpha),
+            *model, optimizer, Tensor{}, edge_map, scores);
+        return scores.cpu();
+    };
+
+    const auto splat_scores = run(false);
+    const auto dual_scores = run(true);
+    bool any_nonzero = false;
+    for (int i = 0; i < count; ++i) {
+        const float s = splat_scores.ptr<float>()[i];
+        const float d = dual_scores.ptr<float>()[i];
+        any_nonzero |= s > 1e-3f;
+        EXPECT_NEAR(d, s, std::max(1e-4f, 1e-5f * std::abs(s))) << "splat=" << i;
+    }
+    EXPECT_TRUE(any_nonzero);
+}
+
+TEST_F(GsplatRasterizerTest, ReleaseThreadLocalCachesClearsTileSubMasks) {
+    constexpr int width = 64;
+    constexpr int height = 64;
+    auto camera = make_camera(width, height);
+    auto model = make_visible_splat(16);
+    auto background = Tensor::zeros({3}, Device::CUDA);
+    auto pixel_weights = Tensor::ones({height, width}, Device::CUDA);
+
+    auto result = gsplat_rasterize_forward(
+        camera, *model, background, 0, 0, 0, 0, 1.0f, false,
+        GsplatRenderMode::RGB, true, Tensor{}, pixel_weights);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_TRUE(result->second.tile_sub_masks.is_valid());
+    release_ctx_arena(result->second);
+    EXPECT_TRUE(release_gsplat_rasterizer_thread_local_caches());
+}
