@@ -81,6 +81,7 @@
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mask_preprocess.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
+#include "training/kernels/depth_distortion_loss.hpp"
 #include "training/kernels/normal_consistency_loss.hpp"
 #include "training/kernels/normal_loss.hpp"
 #include "training/kernels/roi_weight_map.hpp"
@@ -1215,6 +1216,7 @@ namespace lfs::training {
         normal_loss_scalar_ = {};
         normal_loss_grad_ = {};
         normal_loss_partials_ = {};
+        depth_distortion_grad_ = {};
         normal_consistency_scalar_ = {};
         normal_consistency_partials_ = {};
         normal_prior_depth_scalar_ = {};
@@ -2191,6 +2193,7 @@ namespace lfs::training {
         const bool normal_terms_on =
             (opt_params.use_normal_loss && opt_params.normal_loss_weight > 0.0f) ||
             opt_params.normal_consistency_weight > 0.0f ||
+            opt_params.depth_distortion_weight > 0.0f ||
             (opt_params.gut && opt_params.color_variance_weight > 0.0f);
 
         // Fused mask preprocess: SegmentAndIgnore band remap + optional ROI → one kernel.
@@ -4316,6 +4319,7 @@ namespace lfs::training {
         normal_loss_scalar_ = {};
         normal_loss_grad_ = {};
         normal_loss_partials_ = {};
+        depth_distortion_grad_ = {};
         normal_consistency_scalar_ = {};
         normal_consistency_partials_ = {};
         normal_prior_depth_scalar_ = {};
@@ -7470,7 +7474,8 @@ namespace lfs::training {
                                         1.0f, step_params.mip_filter,
                                         (normal_loss_weight_now > 0.f ||
                                          (normal_supervision_started &&
-                                          step_params.normal_consistency_weight > 0.f))
+                                          (step_params.normal_consistency_weight > 0.f ||
+                                           step_params.depth_distortion_weight > 0.f)))
                                             ? GsplatRenderMode::RGB_D_N
                                         : ((step_params.use_depth_loss && step_params.depth_loss_weight > 0.f) ||
                                            roi_surface_weights)
@@ -8018,6 +8023,7 @@ namespace lfs::training {
                         std::optional<RawGradientResidual> tile_raw_residual;
                         lfs::core::Tensor tile_grad_alpha;
                         lfs::core::Tensor tile_grad_depth;
+                        lfs::core::Tensor tile_grad_depth_sq;
                         lfs::core::Tensor tile_grad_normal;
                         lfs::core::Tensor tile_error_map;
                         lfs::core::Tensor mask_tile;
@@ -8611,6 +8617,36 @@ namespace lfs::training {
                             }
                         }
 
+                        if (gsplat_ctx && normal_supervision_started &&
+                            step_params.depth_distortion_weight > 0.0f &&
+                            output.depth_sq.is_valid() && output.depth_sq.numel() > 0) {
+                            LFS_VRAM_SCOPE("train.depth_distortion_loss");
+                            lfs::core::Tensor rendered_depth = output.depth.squeeze(0).contiguous();
+                            lfs::core::Tensor rendered_depth_sq = output.depth_sq.squeeze(0).contiguous();
+                            lfs::core::Tensor rendered_alpha = output.alpha.squeeze(0).contiguous();
+                            const cudaStream_t distortion_stream = rendered_depth.stream();
+                            ensure_depth_grad_buffers(rendered_depth, distortion_stream, !depth_grad_buffers_active);
+                            if (!depth_distortion_grad_.is_valid() ||
+                                depth_distortion_grad_.shape() != rendered_depth.shape()) {
+                                depth_distortion_grad_ = lfs::core::Tensor::empty(rendered_depth.shape(), lfs::core::Device::CUDA);
+                            }
+                            depth_distortion_grad_.set_stream(distortion_stream);
+                            lfs::core::pin_operands({&rendered_depth, &rendered_depth_sq, &rendered_alpha});
+                            lfs::training::kernels::launch_depth_distortion_loss(
+                                rendered_depth.ptr<float>(),
+                                rendered_depth_sq.ptr<float>(),
+                                rendered_alpha.ptr<float>(),
+                                depth_loss_grad_.ptr<float>(),
+                                depth_distortion_grad_.ptr<float>(),
+                                depth_loss_grad_alpha_.ptr<float>(),
+                                static_cast<int>(rendered_depth.shape()[1]),
+                                static_cast<int>(rendered_depth.shape()[0]),
+                                step_params.depth_distortion_weight,
+                                distortion_stream,
+                                normal_weight_ptr_on_stream(distortion_stream));
+                            tile_grad_depth_sq = depth_distortion_grad_;
+                        }
+
                         merge_depth_grad_buffers();
 
                         // 2) Extract error map from workspace's ssim_map
@@ -8880,7 +8916,8 @@ namespace lfs::training {
                                                               color_variance.loss,
                                                               color_variance.weight,
                                                               normal_terms_weight.is_valid() ? normal_terms_weight : color_variance.pixel_weight},
-                                                          blend_peak_rows);
+                                                          blend_peak_rows,
+                                                          tile_grad_depth_sq);
                                 if (edge_weight_scoring_active_) {
                                     strategy_->on_edge_score_accumulated(iter);
                                 }

@@ -105,6 +105,8 @@ namespace gsplat_lfs {
             (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
         constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
         constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
 
         // return if out of bounds
         // keep not rasterizing threads around for reading data
@@ -278,7 +280,9 @@ namespace gsplat_lfs {
                     for (uint32_t k = 0; k < CDIM; ++k) {
                         const float c_val = (kHasRayDepth && k == kDepthChannel)
                                                 ? depth
-                                                : rgbs_batch[t * CDIM + k];
+                                                : ((kHasDepthSq && k == kDepthSqChannel)
+                                                       ? depth * depth
+                                                       : rgbs_batch[t * CDIM + k]);
                         pix_out[k] += c_val * vis;
                     }
                 }
@@ -409,6 +413,8 @@ namespace gsplat_lfs {
             (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
         constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
         constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
 
         const bool inside = i < image_height && j < image_width;
         bool done = !inside || !ray.valid_flag;
@@ -542,7 +548,9 @@ namespace gsplat_lfs {
                 for (uint32_t k = 0; k < CDIM; ++k) {
                     const float c_val = (kHasRayDepth && k == kDepthChannel)
                                             ? depth
-                                            : s_rgbs[t * CDIM + k];
+                                            : ((kHasDepthSq && k == kDepthSqChannel)
+                                                   ? depth * depth
+                                                   : s_rgbs[t * CDIM + k]);
                     pix_out[k] += c_val * vis;
                 }
                 cur_idx = static_cast<uint32_t>(s_bin[t]);

@@ -678,7 +678,9 @@ namespace gsplat_lfs {
             (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
         constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
         constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
-        constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
+        constexpr uint32_t kUsed = CDIM;
 
         // keep not rasterizing threads around for reading data
         const bool active = (i < image_height && j < image_width) && ray.valid_flag;
@@ -906,6 +908,14 @@ namespace gsplat_lfs {
                                 if (k == kDepthChannel) {
                                     c_val = depth;
                                     v_depth += fac * v_c;
+                                } else if constexpr (kHasDepthSq) {
+                                    if (k == kDepthSqChannel) {
+                                        c_val = depth * depth;
+                                        v_depth += fac * (2.0f * depth) * v_c;
+                                    } else {
+                                        c_val = rgbs_batch[t * CDIM + k];
+                                        v_rgb_local[k] = fac * v_c;
+                                    }
                                 } else {
                                     c_val = rgbs_batch[t * CDIM + k];
                                     v_rgb_local[k] = fac * v_c;
@@ -995,7 +1005,7 @@ namespace gsplat_lfs {
 #pragma unroll
                         for (uint32_t k = 0; k < CDIM; ++k) {
                             if constexpr (kHasRayDepth) {
-                                if (k == kDepthChannel || (CDIM == 8 && k == 7u))
+                                if (k == kDepthChannel || (kHasDepthSq && k == kDepthSqChannel))
                                     continue;
                             }
                             gpuAtomicAdd(v_rgb_ptr + k, v_rgb_local[k]);
@@ -1146,7 +1156,7 @@ namespace gsplat_lfs {
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         constexpr bool kUseCv = kColorVariance && (CDIM >= 3);
 
-        constexpr uint32_t kUsed = (CDIM == 8) ? 7u : CDIM;
+        constexpr uint32_t kUsed = CDIM;
         __shared__ float s_T[kSplatBwdPixels];
         // Each pixel uses the same color gradient for every splat. Store the
         // dot product with its accumulated color instead of all channels.
@@ -1367,6 +1377,8 @@ namespace gsplat_lfs {
 
                 constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
                 constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+                constexpr bool kHasDepthSq = (CDIM == 8);
+                constexpr uint32_t kDepthSqChannel = 7u;
 
                 for (int t = 0; t < batch + static_cast<int>(kSplatBwdPixels) - 1; ++t) {
                     const int p = t - static_cast<int>(lane);
@@ -1413,6 +1425,14 @@ namespace gsplat_lfs {
                                     if (k == kDepthChannel) {
                                         c_val = depth;
                                         v_depth += fac * v_c;
+                                    } else if constexpr (kHasDepthSq) {
+                                        if (k == kDepthSqChannel) {
+                                            c_val = depth * depth;
+                                            v_depth += fac * (2.0f * depth) * v_c;
+                                        } else {
+                                            c_val = rgb[k];
+                                            v_rgb[k] += fac * v_c;
+                                        }
                                     } else {
                                         c_val = rgb[k];
                                         v_rgb[k] += fac * v_c;
@@ -1498,7 +1518,7 @@ namespace gsplat_lfs {
 #pragma unroll
                     for (uint32_t k = 0; k < kUsed; ++k) {
                         if constexpr (kHasRayDepth) {
-                            if (k == kDepthChannel)
+                            if (k == kDepthChannel || (kHasDepthSq && k == kDepthSqChannel))
                                 continue;
                         }
                         gpuAtomicAdd(v_rgb_ptr + k, v_rgb[k]);

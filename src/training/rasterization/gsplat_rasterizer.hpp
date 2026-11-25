@@ -31,7 +31,7 @@ namespace lfs::training {
         ED = 2,     // Expected depth
         RGB_D = 3,  // RGB + depth
         RGB_ED = 4, // RGB + expected depth
-        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals
+        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals + accumulated squared depth
     };
 
     // Forward pass context - holds raw pointers needed for backward (arena allocated)
@@ -179,7 +179,8 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_normal = {},
         float flatten_weight = 0.f,
         const GsplatColorVarianceLoss& color_variance = {},
-        core::Tensor blend_peak_out = {}); // [N], raised to max(alpha * T) across the view's tiles
+        core::Tensor blend_peak_out = {}, // [N], raised to max(alpha * T) across the view's tiles
+        const lfs::core::Tensor& grad_depth_sq = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;

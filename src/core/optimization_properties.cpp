@@ -450,6 +450,14 @@ namespace lfs::core::param {
             .precision(3)
             .ui_step(0.01)
             .all_strategies()
+            .float_prop(&OptimizationParameters::depth_distortion_weight,
+                        "depth_distortion_weight", "Depth Distortion Weight", d.depth_distortion_weight, 0.0f, 100.0f,
+                        "Weight for the spread of depth along each ray, which thins layered surfaces (--gut)")
+            .locale("training_params.depth_distortion_weight")
+            .tooltip("training.tooltip.depth_distortion_weight")
+            .precision(3)
+            .ui_step(0.01)
+            .all_strategies()
             .float_prop(&OptimizationParameters::normal_flatten_weight,
                         "normal_flatten_weight", "Normal Flatten Weight", d.normal_flatten_weight, 0.0f, 1000.0f,
                         "Min-axis scale flattening weight while normal supervision is active")
