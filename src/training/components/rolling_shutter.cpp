@@ -14,8 +14,8 @@
 namespace lfs::training {
 
     namespace {
-        // GeosunPre's operating range for the linear model, in radians and seconds.
-        constexpr double MAX_ROTATION = 0.05;
+        // GeosunPre's operating range for the SO(3) rolling-shutter model, in radians and seconds.
+        constexpr double MAX_ROTATION = 0.10;
         constexpr double MAX_READOUT = 0.05;
         constexpr double TRANSLATION_TOLERANCE = 1e-8;
 
@@ -85,11 +85,9 @@ namespace lfs::training {
         }
 
         // World-to-camera of readout coordinate s for gsplat, which slerps the rotation and
-        // lerps the translation between two such poses. The model's translation
-        //   (I + s [w]x)(t - s d) = t + s ([w]x t - d) - s^2 [w]x d
-        // keeps its linear part, and s^2 its best constant on [-1/2, 1/2], 1/8. The rotation
-        // is exp(s [w]x) R: (I + s [w]x) is not a rotation, and the two differ in direction
-        // by at most (s |w|)^2 / 2.
+        // lerps the translation between two such poses. GeosunPre's SO(3) model is
+        //   exp(s [w]x) (R X + t - s d)
+        // so the exact translation at readout coordinate s is exp(s [w]x) (t - s d).
         std::array<float, 16> readout_pose(const core::RollingShutterMotion& motion,
                                            const std::array<float, 9>& rotation,
                                            const std::array<float, 3>& translation,
@@ -97,24 +95,19 @@ namespace lfs::training {
             const std::array<double, 3> w = {motion.rotation[0], motion.rotation[1], motion.rotation[2]};
             const std::array<double, 3> d = {motion.displacement[0], motion.displacement[1], motion.displacement[2]};
             const std::array<double, 3> t = {translation[0], translation[1], translation[2]};
-            const auto cross = [](const std::array<double, 3>& a, const std::array<double, 3>& b) {
-                return std::array<double, 3>{a[1] * b[2] - a[2] * b[1],
-                                             a[2] * b[0] - a[0] * b[2],
-                                             a[0] * b[1] - a[1] * b[0]};
-            };
-            const auto wt = cross(w, t);
-            const auto wd = cross(w, d);
 
             const Mat3 Q = rotation_from_vector({s * w[0], s * w[1], s * w[2]});
             Mat3 R{};
             for (int i = 0; i < 9; ++i)
                 R[i] = rotation[i];
             const Mat3 QR = multiply(Q, R);
+            const std::array<double, 3> shifted = {t[0] - s * d[0], t[1] - s * d[1], t[2] - s * d[2]};
             std::array<float, 16> out{};
             for (int r = 0; r < 3; ++r) {
                 for (int c = 0; c < 3; ++c)
                     out[r * 4 + c] = static_cast<float>(QR[r * 3 + c]);
-                out[r * 4 + 3] = static_cast<float>(t[r] + s * (wt[r] - d[r]) - wd[r] / 8.0);
+                out[r * 4 + 3] = static_cast<float>(
+                    Q[r * 3] * shifted[0] + Q[r * 3 + 1] * shifted[1] + Q[r * 3 + 2] * shifted[2]);
             }
             out[15] = 1.0f;
             return out;

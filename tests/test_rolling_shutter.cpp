@@ -56,17 +56,26 @@ namespace {
         return out;
     }
 
-    // GeosunPre's first-order model: (I + s [w]x) (R X + t - s d).
-    std::array<double, 3> first_order(const lfs::core::RollingShutterMotion& motion,
-                                      const std::array<float, 9>& R, const std::array<float, 3>& t,
-                                      const double s, const std::array<double, 3>& x) {
+    // GeosunPre's exact SO(3) model: exp(s [w]x) (R X + t - s d).
+    std::array<double, 3> exact_so3(const lfs::core::RollingShutterMotion& motion,
+                                    const std::array<float, 9>& R, const std::array<float, 3>& t,
+                                    const double s, const std::array<double, 3>& x) {
         std::array<double, 3> p{};
         for (int r = 0; r < 3; ++r)
             p[r] = R[r * 3] * x[0] + R[r * 3 + 1] * x[1] + R[r * 3 + 2] * x[2] + t[r] - s * motion.displacement[r];
         const std::array<double, 3> w = {s * motion.rotation[0], s * motion.rotation[1], s * motion.rotation[2]};
-        return {p[0] + w[1] * p[2] - w[2] * p[1],
-                p[1] + w[2] * p[0] - w[0] * p[2],
-                p[2] + w[0] * p[1] - w[1] * p[0]};
+        const double theta = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        const double a = theta < 1e-4 ? 1.0 - theta * theta / 6.0 : std::sin(theta) / theta;
+        const double b = theta < 1e-4 ? 0.5 - theta * theta / 24.0 : (1.0 - std::cos(theta)) / (theta * theta);
+        const std::array<double, 3> k = {w[1] * p[2] - w[2] * p[1],
+                                         w[2] * p[0] - w[0] * p[2],
+                                         w[0] * p[1] - w[1] * p[0]};
+        const std::array<double, 3> kk = {w[1] * k[2] - w[2] * k[1],
+                                          w[2] * k[0] - w[0] * k[2],
+                                          w[0] * k[1] - w[1] * k[0]};
+        return {p[0] + a * k[0] + b * kk[0],
+                p[1] + a * k[1] + b * kk[1],
+                p[2] + a * k[2] + b * kk[2]};
     }
 
     double angle_between(const std::array<double, 3>& a, const std::array<double, 3>& b) {
@@ -154,8 +163,9 @@ TEST(RollingShutterSidecar, ParsesVersionOne) {
 }
 
 TEST(RollingShutterSidecar, RejectsUnsupportedOrInconsistentFiles) {
+    EXPECT_TRUE(parse_rolling_shutter(replaced(kSidecar, "[0.01, -0.02, 0.005]", "[0.08, 0.0, 0.0]")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"rows\"", "\"diagonal\"")));
-    EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "[0.01, -0.02, 0.005]", "[0.06, 0.0, 0.0]")));
+    EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "[0.01, -0.02, 0.005]", "[0.11, 0.0, 0.0]")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"readout_s\": 0.03", "\"readout_s\": 0.08")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"cam2/b.jpg\"", "\"cam1/a.jpg\"")));
     EXPECT_FALSE(parse_rolling_shutter(replaced(kSidecar, "\"camera_id\": 1,", "\"camera_id\": 3,")));
@@ -218,10 +228,11 @@ TEST(RollingShutterPoses, GsplatInterpolationFollowsTheFirstOrderModel) {
         for (int line = 0; line < N; line += 17) {
             const double s = (line + 0.5) / N - 0.5;
             const auto ours = transform_point(gsplat_interpolate(poses, static_cast<double>(line) / (N - 1)), x);
-            const auto reference = first_order(motion, kR, kT, s, x);
-            // The rotation differs by (s |w|)^2 / 2 and the translation by
-            // |s^2 - 1/8| |w x d| <= |w x d| / 8.
-            const double bound = 0.5 * (s * w) * (s * w) + norm(wd) / 8.0 / norm(reference);
+            const auto reference = exact_so3(motion, kR, kT, s, x);
+            // Rotation matches exact SO(3) via slerp; translation lerp differs from exp(s[w]x)(t - s d)
+            // by at most second-order terms O(|w|^2 |t| / 8 + |w| |d| / 4).
+            const double t_norm = norm(as_double(kT));
+            const double bound = (0.125 * w * w * t_norm + 0.25 * norm(wd)) / norm(reference);
             EXPECT_LT(angle_between(ours, reference), bound + 1e-6) << "line " << line;
         }
     }
