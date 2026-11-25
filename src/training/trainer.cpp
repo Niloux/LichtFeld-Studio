@@ -6492,8 +6492,24 @@ namespace lfs::training {
         bg_image_cache_clock_ = 0;
     }
 
+    size_t Trainer::map_cache_budget_bytes() const {
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+            return EDGE_WEIGHT_CACHE_BUDGET_BYTES;
+        }
+        const size_t cached_bytes = edge_weight_cache_bytes_ + thin_structure_cache_bytes_;
+        const size_t usable = free_bytes + cached_bytes;
+        if (usable <= MAP_CACHE_MIN_FREE_VRAM_BYTES) {
+            return 0;
+        }
+        return std::min(MAP_CACHE_MAX_BUDGET_BYTES, (usable - MAP_CACHE_MIN_FREE_VRAM_BYTES) / 2);
+    }
+
     void Trainer::clear_thin_structure_cache() {
-        thin_structure_map_key_.reset();
+        thin_structure_cache_.clear();
+        thin_structure_cache_bytes_ = 0;
+        thin_structure_cache_clock_ = 0;
         thin_structure_workspace_ = {};
         thin_structure_map_buffer_ = {};
         thin_structure_weight_buffer_ = {};
@@ -6510,23 +6526,73 @@ namespace lfs::training {
         const auto mask_mode = masked && params_.optimization.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore
                                    ? kernels::MaskPhotoMode::SegmentAndIgnore
                                    : kernels::MaskPhotoMode::BinaryGt0;
-        const ThinStructureMapKey key{camera_uid, height, width, edge_weight_preprocessing_generation_,
-                                      masked ? photometric_mask.data_ptr() : nullptr, mask_mode,
+        const ThinStructureMapKey key{camera_uid,
+                                      height,
+                                      width,
+                                      edge_weight_preprocessing_generation_,
+                                      masked,
+                                      composite_target_alpha_,
+                                      mask_mode,
                                       masked ? params_.optimization.mask_threshold : 0.0f,
                                       masked && params_.optimization.invert_masks};
-        if (thin_structure_map_key_ == key) {
-            thin_structure_map_buffer_.sync_to_stream(image.stream());
-            return thin_structure_map_buffer_;
+        if (auto it = thin_structure_cache_.find(camera_uid);
+            it != thin_structure_cache_.end() && it->second.key == key &&
+            it->second.tensor.dtype() == DataType::Float32) {
+            it->second.last_used = ++thin_structure_cache_clock_;
+            it->second.tensor.sync_to_stream(image.stream());
+            return it->second.tensor;
         }
-        if (!thin_structure_map_buffer_.is_valid() || thin_structure_map_buffer_.shape() != TensorShape{height, width})
-            thin_structure_map_buffer_ = Tensor::empty({height, width}, Device::CUDA);
+        if (auto it = thin_structure_cache_.find(camera_uid); it != thin_structure_cache_.end()) {
+            thin_structure_cache_bytes_ -= std::min(thin_structure_cache_bytes_, it->second.allocation_bytes);
+            thin_structure_cache_.erase(it);
+        }
+
+        const size_t map_bytes = height * width * sizeof(float);
+        const size_t budget_bytes = map_cache_budget_bytes();
+        const bool cacheable = map_bytes <= budget_bytes;
+        Tensor map;
+        while (!thin_structure_cache_.empty() &&
+               (!cacheable || thin_structure_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES ||
+                thin_structure_cache_bytes_ > budget_bytes - map_bytes)) {
+            const auto lru = std::min_element(
+                thin_structure_cache_.begin(), thin_structure_cache_.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.last_used < right.second.last_used;
+                });
+            if (cacheable && !map.is_valid() && lru->second.key.height == height && lru->second.key.width == width &&
+                lru->second.tensor.dtype() == DataType::Float32) {
+                map = std::move(lru->second.tensor);
+            }
+            thin_structure_cache_bytes_ -= std::min(thin_structure_cache_bytes_, lru->second.allocation_bytes);
+            thin_structure_cache_.erase(lru);
+        }
+
+        Tensor target;
+        if (cacheable) {
+            if (!map.is_valid()) {
+                map = Tensor::empty({height, width}, Device::CUDA, DataType::Float32);
+            }
+            map.set_stream(image.stream());
+            target = map;
+        } else {
+            if (!thin_structure_map_buffer_.is_valid() || thin_structure_map_buffer_.shape() != TensorShape{height, width})
+                thin_structure_map_buffer_ = Tensor::empty({height, width}, Device::CUDA);
+            thin_structure_map_buffer_.set_stream(image.stream());
+            target = thin_structure_map_buffer_;
+        }
+
         if (masked)
-            kernels::ridge_structure_map(image, thin_structure_map_buffer_, thin_structure_workspace_,
-                                         photometric_mask, mask_mode);
+            kernels::ridge_structure_map(image, target, thin_structure_workspace_, photometric_mask, mask_mode);
         else
-            kernels::ridge_structure_map(image, thin_structure_map_buffer_, thin_structure_workspace_);
-        thin_structure_map_key_ = key;
-        return thin_structure_map_buffer_;
+            kernels::ridge_structure_map(image, target, thin_structure_workspace_);
+
+        if (cacheable) {
+            thin_structure_cache_.insert_or_assign(
+                camera_uid,
+                ThinStructureCacheEntry{target, key, map_bytes, ++thin_structure_cache_clock_});
+            thin_structure_cache_bytes_ += map_bytes;
+        }
+        return target;
     }
 
     void Trainer::clearEdgeWeightCache() {
@@ -6572,29 +6638,18 @@ namespace lfs::training {
             edge_weight_cache_.erase(it);
         }
 
-        if (!edge_map_buffer_.is_valid() || edge_map_buffer_.shape() != map_shape ||
-            edge_map_buffer_.dtype() != lfs::core::DataType::Float32) {
-            edge_map_buffer_ = lfs::core::Tensor::empty_exact(map_shape, lfs::core::DataType::Float32);
-        }
-        edge_map_buffer_.set_stream(stream);
-        kernels::compute_edge_weight_map(
-            gt_image, photometric_mask,
-            params_.optimization.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore
-                ? kernels::MaskPhotoMode::SegmentAndIgnore
-                : kernels::MaskPhotoMode::BinaryGt0,
-            edge_map_buffer_, stream);
-
+        const size_t budget_bytes = map_cache_budget_bytes();
+        const bool cacheable = map_bytes <= budget_bytes;
         lfs::core::Tensor map;
-        const bool cacheable = map_bytes <= EDGE_WEIGHT_CACHE_BUDGET_BYTES;
-        while (!edge_weight_cache_.empty() && cacheable &&
-               (edge_weight_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES ||
-                edge_weight_cache_bytes_ > EDGE_WEIGHT_CACHE_BUDGET_BYTES - map_bytes)) {
+        while (!edge_weight_cache_.empty() &&
+               (!cacheable || edge_weight_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES ||
+                edge_weight_cache_bytes_ > budget_bytes - map_bytes)) {
             const auto lru = std::min_element(
                 edge_weight_cache_.begin(), edge_weight_cache_.end(),
                 [](const auto& left, const auto& right) {
                     return left.second.last_used < right.second.last_used;
                 });
-            if (!map.is_valid() && lru->second.height == height && lru->second.width == width &&
+            if (cacheable && !map.is_valid() && lru->second.height == height && lru->second.width == width &&
                 lru->second.tensor.dtype() == lfs::core::DataType::Float32) {
                 map = std::move(lru->second.tensor);
             }
@@ -6603,26 +6658,43 @@ namespace lfs::training {
             edge_weight_cache_.erase(lru);
         }
 
-        if (!cacheable) {
-            return edge_map_buffer_;
+        lfs::core::Tensor target;
+        if (cacheable) {
+            if (!map.is_valid()) {
+                // Pooled, not direct: evicting a map of another resolution would
+                // otherwise cudaFree, a device-wide sync that stalls every thread.
+                map = lfs::core::Tensor::empty(map_shape, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+            }
+            map.set_stream(stream);
+            target = map;
+        } else {
+            if (!edge_map_buffer_.is_valid() || edge_map_buffer_.shape() != map_shape ||
+                edge_map_buffer_.dtype() != lfs::core::DataType::Float32) {
+                edge_map_buffer_ = lfs::core::Tensor::empty_exact(map_shape, lfs::core::DataType::Float32);
+            }
+            edge_map_buffer_.set_stream(stream);
+            target = edge_map_buffer_;
         }
-        if (!map.is_valid()) {
-            // Pooled, not direct: evicting a map of another resolution would
-            // otherwise cudaFree, a device-wide sync that stalls every thread.
-            map = lfs::core::Tensor::empty(map_shape, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-        }
-        map.set_stream(stream);
-        map.copy_(edge_map_buffer_);
 
+        kernels::compute_edge_weight_map(
+            gt_image, photometric_mask,
+            params_.optimization.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore
+                ? kernels::MaskPhotoMode::SegmentAndIgnore
+                : kernels::MaskPhotoMode::BinaryGt0,
+            target, stream);
+
+        if (!cacheable) {
+            return target;
+        }
         auto [it, inserted] = edge_weight_cache_.insert_or_assign(
             camera_uid,
             EdgeWeightCacheEntry{
-                map, height, width, map_bytes, edge_weight_preprocessing_generation_,
+                target, height, width, map_bytes, edge_weight_preprocessing_generation_,
                 ++edge_weight_cache_clock_});
         (void)it;
         (void)inserted;
         edge_weight_cache_bytes_ += map_bytes;
-        return map;
+        return target;
     }
 
     lfs::core::Tensor Trainer::get_background_image_for_camera(int width, int height) {
@@ -6804,6 +6876,8 @@ namespace lfs::training {
                 std::move(typed).error().with_suppressed(cause));
         }
 
+        clearEdgeWeightCache();
+        clear_thin_structure_cache();
         lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
         if (auto loader = getActiveImageLoader())
             loader->reclaim_idle_decoded_frames();
@@ -7454,13 +7528,20 @@ namespace lfs::training {
                                 return value == nullptr || value[0] != '0';
                             }();
                             lfs::core::Tensor cull_weights;
-                            if (mask_cull_enabled && step_params.mask_mode == lfs::core::param::MaskMode::Ignore &&
+                            if (mask_cull_enabled &&
+                                (step_params.mask_mode == lfs::core::param::MaskMode::Ignore ||
+                                 step_params.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore) &&
                                 !composite_target_alpha_ && pipelined_mask_.is_valid() &&
                                 pipelined_mask_.dtype() == lfs::core::DataType::Float32 &&
                                 pipelined_mask_.is_contiguous() &&
                                 pipelined_mask_.numel() == static_cast<size_t>(cam->image_width()) * cam->image_height()) {
                                 cull_weights = pipelined_mask_;
                             }
+                            const uint32_t cull_margin =
+                                (calibration_correction_ && step_params.calibration_correction &&
+                                 iter >= step_params.calibration_correction_start_iteration())
+                                    ? 16u
+                                    : 8u;
                             const MutationStamp forward_stamp{
                                 static_cast<std::uint64_t>(iter), mutation_epoch_,
                                 StepPhase::Forward, fastgs_strategy_hooks_at_start};
@@ -7481,7 +7562,7 @@ namespace lfs::training {
                                            roi_surface_weights)
                                             ? GsplatRenderMode::RGB_D
                                             : GsplatRenderMode::RGB,
-                                        true, bg_tile, cull_weights);
+                                        true, bg_tile, cull_weights, nullptr, cull_margin);
                                     if (!rasterize_result) {
                                         auto typed = lfs::from_legacy_expected<
                                             std::pair<RenderOutput, GsplatRasterizeContext>>(
@@ -7686,7 +7767,7 @@ namespace lfs::training {
 
                     lfs::core::Tensor roi_weight;
                     lfs::core::Tensor roi_report_weight;
-                    if (strategy_)
+                    if (strategy_ && (fastgs_path || in_popspa))
                         install_cropbox_view_damping(strategy_->get_model(), gaussian_optimizer, *cam);
                     const bool roi_loss_weighting = cropbox_ && step_params.cropbox_loss_weight < 1.0f;
                     const bool roi_loss_report = cropbox_ && is_loss_readback_iteration(iter);
@@ -10270,9 +10351,9 @@ namespace lfs::training {
                 cam = example.data.camera;
                 gt_image = std::move(example.data.image);
 
-                // Loss, edge weighting and MRNF accept the decoded uint8 image.
+                // Loss, edge weighting and MRNF accept the decoded image.
                 // Keep the decoder lease alive until train_step has consumed it.
-                if (gt_image.dtype() == lfs::core::DataType::UInt8) {
+                if (gt_image.is_valid()) {
                     gt_image.sync_to_stream(training_stream_);
                 }
 
@@ -10322,6 +10403,7 @@ namespace lfs::training {
                     gt_image.set_stream(training_stream_);
                 }
                 if (pipelined_mask_.is_valid()) {
+                    pipelined_mask_.sync_to_stream(training_stream_);
                     pipelined_mask_.set_stream(training_stream_);
                 }
 

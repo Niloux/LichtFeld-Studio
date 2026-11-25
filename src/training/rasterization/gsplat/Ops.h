@@ -292,6 +292,20 @@ namespace gsplat_lfs {
         [[nodiscard]] bool enabled() const { return weight > 0.0f && render_colors != nullptr; }
     };
 
+    struct RenderGradPlanes {
+        const float* v_rgb = nullptr;      // [3, H, W] CHW
+        const float* v_depth = nullptr;    // [1, H, W]
+        const float* v_normal = nullptr;   // [3, H, W] CHW
+        const float* v_depth_sq = nullptr; // [1, H, W]
+
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        [[nodiscard]] bool enabled() const {
+            return v_rgb != nullptr || v_depth != nullptr || v_normal != nullptr || v_depth_sq != nullptr;
+        }
+    };
+
     void rasterize_to_pixels_from_world_3dgs_bwd(
         // Gaussian parameters
         const float* means,       // [N, 3]
@@ -346,7 +360,8 @@ namespace gsplat_lfs {
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const ScreenFootprint& footprint = {},
         const ColorVarianceRender& color_variance = {},
-        float* blend_peak_out = nullptr);
+        float* blend_peak_out = nullptr,
+        const RenderGradPlanes& grad_planes = {});
 
     //=========================================================================
     // High-level API: Fully fused rasterization with SH evaluation
@@ -422,7 +437,8 @@ namespace gsplat_lfs {
         const float* reference_viewmats = nullptr,
         float* median_depth = nullptr,
         // [C, tile_height, tile_width] live sub-tile bits; pairs only reach those sub-tiles.
-        const uint32_t* tile_sub_masks = nullptr);
+        const uint32_t* tile_sub_masks = nullptr,
+        const float* cached_unit_rays = nullptr);
 
     void rasterize_from_world_with_sh_bwd(
         // Gaussian parameters
@@ -495,6 +511,8 @@ namespace gsplat_lfs {
         const uint32_t* tile_sub_masks = nullptr,  // the forward's, so tile batches re-cull alike
         const ColorVarianceRender& color_variance = {},
         float* blend_peak_out = nullptr,
-        float* color_grad_workspace = nullptr); // [C, N, channels]
+        float* color_grad_workspace = nullptr, // [C, N, channels]
+        const float* cached_unit_rays = nullptr,
+        const RenderGradPlanes& grad_planes = {});
 
 } // namespace gsplat_lfs

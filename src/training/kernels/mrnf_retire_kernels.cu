@@ -23,7 +23,8 @@ namespace lfs::training::mrnf_strategy {
         if (idx >= N)
             return;
         const float step = step_peak[idx];
-        step_peak[idx] = 0.0f;
+        if (step != 0.0f)
+            step_peak[idx] = 0.0f;
         if (step > 0.0f) {
             renders[idx] += 1.0f;
             if (rendered_count)
@@ -31,14 +32,70 @@ namespace lfs::training::mrnf_strategy {
         }
         peak[idx] = fmaxf(peak[idx] * peak_decay, step);
     }
+    __global__ void blend_peak_update_vec4_kernel(float* __restrict__ step_peak, float* __restrict__ peak,
+                                                  float* __restrict__ renders, const float peak_decay, const size_t N,
+                                                  float* __restrict__ rendered_count) {
+        const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
+        const size_t idx4 = idx * 4;
+        if (idx4 + 3 < N) {
+            const float4 s = reinterpret_cast<const float4*>(step_peak)[idx];
+            if (s.x != 0.0f || s.y != 0.0f || s.z != 0.0f || s.w != 0.0f) {
+                reinterpret_cast<float4*>(step_peak)[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                float4 r = reinterpret_cast<const float4*>(renders)[idx];
+                if (s.x > 0.0f) r.x += 1.0f;
+                if (s.y > 0.0f) r.y += 1.0f;
+                if (s.z > 0.0f) r.z += 1.0f;
+                if (s.w > 0.0f) r.w += 1.0f;
+                reinterpret_cast<float4*>(renders)[idx] = r;
+                if (rendered_count) {
+                    float4 rc = reinterpret_cast<const float4*>(rendered_count)[idx];
+                    if (s.x > 0.0f) rc.x += 1.0f;
+                    if (s.y > 0.0f) rc.y += 1.0f;
+                    if (s.z > 0.0f) rc.z += 1.0f;
+                    if (s.w > 0.0f) rc.w += 1.0f;
+                    reinterpret_cast<float4*>(rendered_count)[idx] = rc;
+                }
+            }
+            float4 p = reinterpret_cast<const float4*>(peak)[idx];
+            p.x = fmaxf(p.x * peak_decay, s.x);
+            p.y = fmaxf(p.y * peak_decay, s.y);
+            p.z = fmaxf(p.z * peak_decay, s.z);
+            p.w = fmaxf(p.w * peak_decay, s.w);
+            reinterpret_cast<float4*>(peak)[idx] = p;
+            return;
+        }
+        for (size_t i = idx4; i < N; ++i) {
+            const float step = step_peak[i];
+            if (step != 0.0f)
+                step_peak[i] = 0.0f;
+            if (step > 0.0f) {
+                renders[i] += 1.0f;
+                if (rendered_count)
+                    rendered_count[i] += 1.0f;
+            }
+            peak[i] = fmaxf(peak[i] * peak_decay, step);
+        }
+    }
     void launch_blend_peak_update(float* step_peak, float* peak, float* renders, const float peak_decay,
                                   const size_t N, void* stream, float* rendered_count) {
         if (N == 0)
             return;
         constexpr int threads = 256;
-        const int blocks = static_cast<int>((N + threads - 1) / threads);
         cudaStream_t s = resolve_stream(stream);
-        blend_peak_update_kernel<<<blocks, threads, 0, s>>>(step_peak, peak, renders, peak_decay, N, rendered_count);
+        const bool aligned16 =
+            ((reinterpret_cast<uintptr_t>(step_peak) | reinterpret_cast<uintptr_t>(peak) |
+              reinterpret_cast<uintptr_t>(renders) | reinterpret_cast<uintptr_t>(rendered_count)) &
+             15u) == 0;
+        if (aligned16 && N >= 4) {
+            const size_t n4 = (N + 3) / 4;
+            const int blocks = static_cast<int>((n4 + threads - 1) / threads);
+            blend_peak_update_vec4_kernel<<<blocks, threads, 0, s>>>(
+                step_peak, peak, renders, peak_decay, N, rendered_count);
+        } else {
+            const int blocks = static_cast<int>((N + threads - 1) / threads);
+            blend_peak_update_kernel<<<blocks, threads, 0, s>>>(
+                step_peak, peak, renders, peak_decay, N, rendered_count);
+        }
         LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.blend_peak_update");
     }
     __global__ void mrnf_covered_factor_kernel(

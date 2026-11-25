@@ -160,6 +160,7 @@ namespace lfs::core {
 
         const Tensor& R() const { return _R; }
         const Tensor& T() const { return _T; }
+        [[nodiscard]] std::uint64_t pose_version() const noexcept { return _pose_version; }
 
         Tensor K() const;
 
@@ -322,6 +323,7 @@ namespace lfs::core {
         const std::optional<RollingShutterMotion>& rolling_shutter() const noexcept { return _rolling_shutter; }
         void set_rolling_shutter(std::optional<RollingShutterMotion> motion) noexcept {
             _rolling_shutter = motion;
+            ++_pose_version;
         }
 
     private:
@@ -340,6 +342,7 @@ namespace lfs::core {
         // redundancy with _world_view_transform, but save calculation and passing from GPU 2 CPU
         Tensor _R;
         Tensor _T;
+        std::uint64_t _pose_version = 1;
 
         Tensor _radial_distortion;
         Tensor _tangential_distortion;

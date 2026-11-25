@@ -164,7 +164,8 @@ namespace gsplat_lfs {
         cudaStream_t stream, TileRange tiles,
         const ScreenFootprint& footprint,
         const ColorVarianceRender& color_variance,
-        float* blend_peak_out) {
+        float* blend_peak_out,
+        const RenderGradPlanes& grad_planes) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -197,7 +198,7 @@ namespace gsplat_lfs {
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
             densification_weight, densification_error, densification_error_map,    \
             edge_weight_map, edge_score_out, stream, tiles, footprint,             \
-            color_variance, blend_peak_out);                                      \
+            color_variance, blend_peak_out, grad_planes);                         \
         break;
 
         switch (channels) {
@@ -269,7 +270,8 @@ namespace gsplat_lfs {
         cudaStream_t stream,
         const float* reference_viewmats,
         float* median_depth,
-        const uint32_t* tile_sub_masks) {
+        const uint32_t* tile_sub_masks,
+        const float* cached_unit_rays) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -345,7 +347,9 @@ namespace gsplat_lfs {
                 stream, tiles, median_depth,
                 ScreenFootprint{.means2d = result.means2d, .conics = result.conics, .radii = result.radii,
                                 .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr,
-                                .prune_tile_keys = prune ? batch.isect_ids : nullptr});
+                                .prune_tile_keys = prune ? batch.isect_ids : nullptr,
+                                .tile_sub_masks = tile_sub_masks,
+                                .unit_rays = cached_unit_rays});
         };
 
         // Step 3: Tile intersection. The first call retains the existing speculative warm-cache path.
@@ -464,7 +468,9 @@ namespace gsplat_lfs {
         const uint32_t* tile_sub_masks,
         const ColorVarianceRender& color_variance,
         float* blend_peak_out,
-        float* color_grad_workspace) {
+        float* color_grad_workspace,
+        const float* cached_unit_rays,
+        const RenderGradPlanes& grad_planes) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -508,8 +514,11 @@ namespace gsplat_lfs {
                 densification_weight, densification_error, densification_error_map,
                 edge_weight_map, edge_score_out,
                 stream, tiles,
-                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii, .tile_keys = tile_keys},
-                color_variance, blend_peak_out);
+                ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii,
+                                .tile_keys = tile_keys,
+                                .tile_sub_masks = tile_sub_masks,
+                                .unit_rays = cached_unit_rays},
+                color_variance, blend_peak_out, grad_planes);
         };
         if (batches.empty()) {
             render_backward({});

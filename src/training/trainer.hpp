@@ -1108,8 +1108,10 @@ namespace lfs::training {
             uint64_t preprocessing_generation = 0;
             uint64_t last_used = 0;
         };
-        static constexpr size_t EDGE_WEIGHT_CACHE_MAX_ENTRIES = 32;
+        static constexpr size_t EDGE_WEIGHT_CACHE_MAX_ENTRIES = 512;
         static constexpr size_t EDGE_WEIGHT_CACHE_BUDGET_BYTES = 40ULL * 1024 * 1024;
+        static constexpr size_t MAP_CACHE_MAX_BUDGET_BYTES = 2048ULL * 1024 * 1024;
+        static constexpr size_t MAP_CACHE_MIN_FREE_VRAM_BYTES = 2560ULL * 1024 * 1024;
         std::unordered_map<int, EdgeWeightCacheEntry> edge_weight_cache_;
         size_t edge_weight_cache_bytes_ = 0;
         uint64_t edge_weight_cache_clock_ = 0;
@@ -1117,23 +1119,32 @@ namespace lfs::training {
         bool edge_weight_scoring_active_ = false;
         bool composite_target_alpha_ = false;
 
-        // Cameras arrive shuffled, so only the photometric and densification lookups of one step share a map.
         struct ThinStructureMapKey {
-            int camera_uid;
-            size_t height;
-            size_t width;
-            uint64_t preprocessing_generation;
-            const void* mask_data;
-            kernels::MaskPhotoMode mask_mode;
-            float mask_threshold;
-            bool invert_masks;
+            int camera_uid = -1;
+            size_t height = 0;
+            size_t width = 0;
+            uint64_t preprocessing_generation = 0;
+            bool has_mask = false;
+            bool composite_target_alpha = false;
+            kernels::MaskPhotoMode mask_mode = kernels::MaskPhotoMode::BinaryGt0;
+            float mask_threshold = 0.0f;
+            bool invert_masks = false;
             bool operator==(const ThinStructureMapKey&) const = default;
         };
-        std::optional<ThinStructureMapKey> thin_structure_map_key_;
+        struct ThinStructureCacheEntry {
+            core::Tensor tensor;
+            ThinStructureMapKey key;
+            size_t allocation_bytes = 0;
+            uint64_t last_used = 0;
+        };
+        std::unordered_map<int, ThinStructureCacheEntry> thin_structure_cache_;
+        size_t thin_structure_cache_bytes_ = 0;
+        uint64_t thin_structure_cache_clock_ = 0;
         kernels::RidgeWorkspace thin_structure_workspace_;
         kernels::GradientResidualWorkspace gradient_residual_workspace_;
         core::Tensor thin_structure_map_buffer_;
         core::Tensor thin_structure_weight_buffer_;
+        size_t map_cache_budget_bytes() const;
 
         // Metrics evaluator - handles all evaluation logic
         std::unique_ptr<lfs::training::MetricsEvaluator> evaluator_;

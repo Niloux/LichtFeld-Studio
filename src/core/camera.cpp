@@ -243,6 +243,7 @@ namespace lfs::core {
           _center_y(other._center_y),
           _R(std::move(other._R)),
           _T(std::move(other._T)),
+          _pose_version(other._pose_version),
           _radial_distortion(std::move(other._radial_distortion)),
           _tangential_distortion(std::move(other._tangential_distortion)),
           _camera_model_type(other._camera_model_type),
@@ -322,6 +323,7 @@ namespace lfs::core {
             _center_y = other._center_y;
             _R = std::move(other._R);
             _T = std::move(other._T);
+            _pose_version = other._pose_version;
             _radial_distortion = std::move(other._radial_distortion);
             _tangential_distortion = std::move(other._tangential_distortion);
             _camera_model_type = other._camera_model_type;
@@ -1169,6 +1171,7 @@ namespace lfs::core {
             observation.y += t_acc(1);
             observation.z += t_acc(2);
         }
+        ++_pose_version;
     }
 
     void Camera::set_pose(const Tensor& R, const Tensor& T, cudaStream_t stream) {
@@ -1199,6 +1202,7 @@ namespace lfs::core {
         LFS_CUDA_TRY(cudaStreamSynchronize(stream), stream, "camera pose upload sync");
         _R = R_cpu.reshape({3, 3});
         _T = T_cpu.reshape({3});
+        ++_pose_version;
     }
 
     void Camera::set_device_pose(const float* w2c, const float* cam_position, cudaStream_t stream) {
@@ -1208,6 +1212,7 @@ namespace lfs::core {
         LFS_CUDA_TRY(cudaMemcpyAsync(_cam_position.ptr<float>(), cam_position, 3 * sizeof(float),
                                      cudaMemcpyDeviceToDevice, stream),
                      stream, "camera device position");
+        ++_pose_version;
     }
 
     bool Camera::has_distortion() const noexcept {

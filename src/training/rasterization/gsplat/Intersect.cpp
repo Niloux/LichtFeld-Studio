@@ -70,6 +70,7 @@ namespace gsplat_lfs {
             size_t isect_capacity = 0;
             size_t sort_capacity = 0;
             size_t pair_budget = 0;
+            size_t raw_pair_budget = 0;
             cudaEvent_t sort_reuse_event = nullptr;
             bool sort_reuse_event_recorded = false;
             int64_t* h_n_isects_pinned = nullptr;
@@ -81,6 +82,8 @@ namespace gsplat_lfs {
             RollingPeak cum_tiles_peak;
             RollingPeak isect_peak;
             double mean_intersection_count = 0.0;
+            double dev_intersection_count = 0.0;
+            double spec_headroom = 1.0;
             size_t call_count = 0;
             bool trim_used_in_window = false;
             cudaStream_t bound_stream = nullptr;
@@ -296,9 +299,14 @@ namespace gsplat_lfs {
                 if (n_isects >= 0) {
                     isect_peak.observe(static_cast<size_t>(n_isects));
                     const double count = static_cast<double>(n_isects);
-                    mean_intersection_count = isect_peak.samples == 1
-                                                  ? count
-                                                  : 0.9 * mean_intersection_count + 0.1 * count;
+                    if (isect_peak.samples == 1) {
+                        mean_intersection_count = count;
+                        dev_intersection_count = 0.0;
+                    } else {
+                        const double err = std::abs(count - mean_intersection_count);
+                        mean_intersection_count = 0.9 * mean_intersection_count + 0.1 * count;
+                        dev_intersection_count = 0.9 * dev_intersection_count + 0.1 * err;
+                    }
                 }
             }
 
@@ -565,7 +573,7 @@ namespace gsplat_lfs {
 
         auto& cache = get_cache();
         cache.begin_call(n_elements, stream);
-        {
+        if (cache.raw_pair_budget == 0 || ((cache.call_count - 1) & 31u) == 0) {
             // Training state grows in place as the model densifies, so the
             // budget follows current free VRAM (plus the pair buffers this
             // cache already holds) instead of the first call's.
@@ -573,13 +581,14 @@ namespace gsplat_lfs {
             LFS_CUDA_CHECK_MSG(cudaMemGetInfo(&free_bytes, &total_bytes), "gsplat pair budget");
             // 24 bytes/pair for the two key/value sets; reserve additional
             // space for CUB, forward/backward tensors and the optimizer.
-            cache.pair_budget = std::max<size_t>(
+            cache.raw_pair_budget = std::max<size_t>(
                 1, std::min<size_t>(INT32_MAX, (free_bytes + cache.pair_committed_bytes()) / 64));
-            if (const auto value = lfs::core::environment::value("LFS_GSPLAT_PAIR_BUDGET")) {
-                const auto requested = lfs::core::environment::unsigned_integer<size_t>(*value);
-                if (requested && *requested > 0) {
-                    cache.pair_budget = std::min(cache.pair_budget, *requested);
-                }
+        }
+        cache.pair_budget = cache.raw_pair_budget;
+        if (const auto value = lfs::core::environment::value("LFS_GSPLAT_PAIR_BUDGET")) {
+            const auto requested = lfs::core::environment::unsigned_integer<size_t>(*value);
+            if (requested && *requested > 0) {
+                cache.pair_budget = std::min(cache.pair_budget, *requested);
             }
         }
         // A whole tile is indivisible and has at most C*N pairs. Only a
@@ -653,14 +662,19 @@ namespace gsplat_lfs {
         // A speculative sort overlaps count readback with the fill and sort,
         // but processes sentinel padding up to the resident sort size. Read
         // the count first when recent views leave at least a quarter unused.
-        const size_t resident_sort_size = intersection_sort_capacity(cache.isect_capacity, budget);
-        constexpr double kMinSpeculativeOccupancy = 0.75;
-        const bool exact_sort = resident_sort_size == 0 ||
-                                (cache.isect_peak.has_samples() &&
-                                 cache.mean_intersection_count < kMinSpeculativeOccupancy * resident_sort_size);
+        const size_t max_sort = intersection_sort_capacity(budget, budget);
+        const bool exact_sort = max_sort == 0 || !cache.isect_peak.has_samples() ||
+                                cache.mean_intersection_count > static_cast<double>(max_sort);
+        const double raw_spec =
+            std::max(cache.mean_intersection_count + 3.0 * cache.dev_intersection_count,
+                     1.35 * cache.mean_intersection_count) *
+            cache.spec_headroom;
+        const size_t aligned_spec =
+            ((static_cast<size_t>(std::ceil(std::max(1.0, raw_spec))) + 65535u) / 65536u) * 65536u;
+        const size_t spec_cap = std::min(max_sort, std::max<size_t>(aligned_spec, 65536u));
         auto fill_and_sort_capacity = [&](const size_t cap, const bool exact) {
             cache.ensure_isect_buffers(cap);
-            const size_t sort_n = exact ? cap : intersection_sort_capacity(cache.isect_capacity, budget);
+            const size_t sort_n = exact ? cap : std::min(cap, max_sort);
             cache.ensure_sort_buffers(sort_n, stream);
             if (!exact) {
                 launch_fill_isect_sentinels_kernel(
@@ -735,7 +749,7 @@ namespace gsplat_lfs {
             return result;
         }
 
-        fill_and_sort_capacity(cache.isect_capacity, false);
+        fill_and_sort_capacity(spec_cap, false);
         launch_offsets();
         if (before_count_wait && isect_offsets) {
             before_count_wait(result);
@@ -753,10 +767,13 @@ namespace gsplat_lfs {
             return result;
         }
         if (n_isects > static_cast<int64_t>(result.n_sort)) {
+            cache.spec_headroom = std::min(cache.spec_headroom * 1.20, 2.0);
             LFS_CUDA_CHECK_MSG(cudaStreamSynchronize(stream),
                                "gsplat intersection overflow drain");
             fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
             launch_offsets();
+        } else {
+            cache.spec_headroom = std::max(1.0, cache.spec_headroom * 0.999);
         }
 
         cache.finish_call(n_isects);

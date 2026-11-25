@@ -218,6 +218,13 @@ namespace gsplat_lfs {
         return d_out;
     }
 
+    inline __device__ __forceinline__ vec3 safe_normalize_bw_precomp(
+        const vec3& v_n, const float inv_len, const vec3& d_out) {
+        return inv_len > 0.0f
+                   ? inv_len * (d_out - glm::dot(d_out, v_n) * v_n)
+                   : d_out;
+    }
+
     // Evaluates ray-Gaussian log-density exponent `power` and per-pixel closest-approach depth.
     inline __device__ __forceinline__ void ray_gaussian_eval(
         const vec3 gro,
@@ -243,6 +250,27 @@ namespace gsplat_lfs {
         }
         gcrod = glm::cross(grd_n, gro);
         power = -0.5f * glm::dot(gcrod, gcrod);
+    }
+
+    // Evaluates only ray-Gaussian Mahalanobis squared distance and normalized direction;
+    // defers t_hit/depth projection until after opacity culling.
+    inline __device__ __forceinline__ void ray_gaussian_power(
+        const vec3 gro,
+        const vec3 grd,
+        vec3& grd_n,
+        vec3& gcrod,
+        float& inv_grd_len,
+        float& grayDist) {
+        const float l2 = grd.x * grd.x + grd.y * grd.y + grd.z * grd.z;
+        if (l2 > 0.0f) {
+            inv_grd_len = rsqrtf(l2);
+            grd_n = grd * inv_grd_len;
+        } else {
+            inv_grd_len = 0.0f;
+            grd_n = grd;
+        }
+        gcrod = glm::cross(grd_n, gro);
+        grayDist = glm::dot(gcrod, gcrod);
     }
 
     // Accumulates gradients from per-pixel ray-Gaussian depth into local origin/direction vectors.
@@ -319,24 +347,50 @@ namespace gsplat_lfs {
         return true;
     }
 
+    struct EllipseBandCache {
+        float qa = 0.f;
+        float qb = 0.f;
+        float qc = 0.f;
+        float det = 0.f;
+        float inv_a = 0.f;
+        float a_level = 0.f;
+        float y_extent = 0.f;
+        float y_right = 0.f;
+
+        __device__ __forceinline__ void init(
+            const float a, const float b, const float c, const float level) {
+            qa = a;
+            qb = b;
+            qc = c;
+            det = a * c - b * b;
+            inv_a = 1.0f / a;
+            a_level = a * level;
+            y_extent = sqrtf(a_level / det);
+            y_right = -b * sqrtf(c * level / det) / c;
+        }
+    };
+
     // The x-interval [lo, hi] that q(d) <= level covers within the band y in [y0, y1]
     // (offsets from the ellipse centre), or false when the band misses the ellipse.
     // The extreme x of a band lies where the band meets the ellipse's x-extreme points.
+    __device__ __forceinline__ bool ellipse_band_span_cached(
+        const EllipseBandCache& ec, const float y0, const float y1, float& lo, float& hi) {
+        if (y1 < -ec.y_extent || y0 > ec.y_extent) {
+            return false;
+        }
+        const float v_hi = fminf(fmaxf(ec.y_right, y0), y1);
+        const float v_lo = fminf(fmaxf(-ec.y_right, y0), y1);
+        hi = ec.inv_a * (-ec.qb * v_hi + sqrtf(fmaxf(ec.a_level - ec.det * v_hi * v_hi, 0.f)));
+        lo = ec.inv_a * (-ec.qb * v_lo - sqrtf(fmaxf(ec.a_level - ec.det * v_lo * v_lo, 0.f)));
+        return true;
+    }
+
     __device__ __forceinline__ bool ellipse_band_span(
         const float a, const float b, const float c, const float level,
         const float y0, const float y1, float& lo, float& hi) {
-        const float det = a * c - b * b;
-        const float y_extent = sqrtf(a * level / det);
-        if (y1 < -y_extent || y0 > y_extent) {
-            return false;
-        }
-        const float y_right = -b * sqrtf(c * level / det) / c;
-        const float v_hi = fminf(fmaxf(y_right, y0), y1);
-        const float v_lo = fminf(fmaxf(-y_right, y0), y1);
-        const float inv_a = 1.0f / a;
-        hi = inv_a * (-b * v_hi + sqrtf(fmaxf(a * level - det * v_hi * v_hi, 0.f)));
-        lo = inv_a * (-b * v_lo - sqrtf(fmaxf(a * level - det * v_lo * v_lo, 0.f)));
-        return true;
+        EllipseBandCache ec;
+        ec.init(a, b, c, level);
+        return ellipse_band_span_cached(ec, y0, y1, lo, hi);
     }
 
     // Whether projected element g's footprint ellipse may touch the square of side

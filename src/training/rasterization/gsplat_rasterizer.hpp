@@ -129,6 +129,7 @@ namespace lfs::training {
         lfs::core::Tensor bg_image;
 
         lfs::core::Tensor tile_sub_masks; // [tile_height, tile_width] live sub-tiles, or empty for all
+        const float* unit_rays_ptr = nullptr;
     };
 
     // Accumulates FP64 removal energy into aligned CUDA UInt8 [N, sizeof(double)] storage.
@@ -154,7 +155,8 @@ namespace lfs::training {
         // [H, W] Float32 pixel weights: pixels farther than one 8 px sub-tile from any
         // weight > 0 are not rasterized and stay background with zero alpha.
         const lfs::core::Tensor& pixel_weights = {},
-        float* median_depth = nullptr);
+        float* median_depth = nullptr,
+        uint32_t cull_margin = 8);
 
     struct GsplatColorVarianceLoss {
         lfs::core::Tensor loss;

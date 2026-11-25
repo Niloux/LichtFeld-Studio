@@ -100,23 +100,37 @@ namespace lfs::training {
         // Catmull-Rom through the 4 x 4 taps, clamped to the range of the 2 x 2 cell around the sample: past a hard
         // edge the spline overshoots to values that no render can match.
         template <class Read>
-        __device__ float sample_cubic(Source s, Tile t, Read read) {
+        __device__ __forceinline__ float sample_cubic(Source s, Tile t, Read read) {
             if (s.u == 0 && s.v == 0)
                 return read(s.y * t.width + s.x);
-            float taps[4][4], lines[4];
+            const int x0 = column(t, s.x - 1);
+            const int x1 = column(t, s.x);
+            const int x2 = column(t, s.x + 1);
+            const int x3 = column(t, s.x + 2);
+            float lines[4];
+            float low = 0.0f;
+            float high = 0.0f;
+#pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int row = line(t, s.y + j - 1) * t.width;
-                for (int k = 0; k < 4; ++k)
-                    taps[j][k] = read(row + column(t, s.x + k - 1));
-                lines[j] = cubic(taps[j][0], taps[j][1], taps[j][2], taps[j][3], s.u);
+                const float t0 = read(row + x0);
+                const float t1 = read(row + x1);
+                const float t2 = read(row + x2);
+                const float t3 = read(row + x3);
+                if (j == 1) {
+                    low = fminf(t1, t2);
+                    high = fmaxf(t1, t2);
+                } else if (j == 2) {
+                    low = fminf(low, fminf(t1, t2));
+                    high = fmaxf(high, fmaxf(t1, t2));
+                }
+                lines[j] = cubic(t0, t1, t2, t3, s.u);
             }
             const float value = cubic(lines[0], lines[1], lines[2], lines[3], s.v);
-            const float low = fminf(fminf(taps[1][1], taps[1][2]), fminf(taps[2][1], taps[2][2]));
-            const float high = fmaxf(fmaxf(taps[1][1], taps[1][2]), fmaxf(taps[2][1], taps[2][2]));
             return fminf(fmaxf(value, low), high);
         }
         template <class Pixel>
-        __global__ void sample(Tile t, const Pixel* src, const float* render, const float2* row, float* output, Maps maps) {
+        __global__ __launch_bounds__(256, 3) void sample(Tile t, const Pixel* src, const float* render, const float2* row, float* output, Maps maps) {
             const int n = t.w * t.h, a = blockIdx.x * blockDim.x + threadIdx.x;
             if (a >= n)
                 return;

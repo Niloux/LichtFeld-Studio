@@ -46,7 +46,8 @@ namespace gsplat_lfs {
         uint32_t tile_width,
         uint32_t tile_height,
         uint32_t* tile_sub_masks, // [tile_height, tile_width]
-        cudaStream_t stream);
+        cudaStream_t stream,
+        uint32_t margin = kCullSubTile);
 
     void launch_fill_isect_sentinels_kernel(
         int64_t* isect_ids,

@@ -86,11 +86,15 @@ namespace gsplat_lfs {
         // With conics, tiles of the rectangle that the splat's ellipse misses get no pair.
         float qa = 0.f, qb = 0.f, qc = 0.f, level = 0.f;
         bool cull = false;
+        EllipseBandCache band_cache;
         if (conics != nullptr) {
             qa = conics[idx * 3];
             qb = conics[idx * 3 + 1];
             qc = conics[idx * 3 + 2];
             cull = footprint_level(qa, qb, qc, radius_x, radius_y, level);
+            if (cull) {
+                band_cache.init(qa, qb, qc, level);
+            }
         }
         auto tile_hit = [&](const uint32_t tx, const uint32_t ty) {
             if (live_subs != nullptr && live_subs[ty * tile_width + tx] == 0) {
@@ -122,8 +126,44 @@ namespace gsplat_lfs {
         const bool sub_masks = order != nullptr && conics != nullptr && tile_keys_fit_sub_masks(tile_size);
         const uint32_t subs = tile_size / kCullSubTile;
         constexpr uint32_t kMaxSubs = 5; // tile_keys_fit_sub_masks caps subs * subs at 32
+        const float inv_sub = 1.0f / static_cast<float>(kCullSubTile);
+
+        auto compute_single_tile_mask = [&](const uint32_t row, const uint32_t col) -> uint32_t {
+            const uint32_t live = live_subs != nullptr ? live_subs[row * tile_width + col] : ~0u;
+            if (live == 0u) {
+                return 0u;
+            }
+            if (!cull) {
+                const uint32_t all_bits = (subs * subs >= 32u) ? ~0u : ((1u << (subs * subs)) - 1u);
+                return all_bits & live;
+            }
+            const int32_t first = static_cast<int32_t>(col * subs);
+            const int32_t last = first + static_cast<int32_t>(subs) - 1;
+            uint32_t mask = 0;
+            for (uint32_t sy = 0; sy < subs; ++sy) {
+                const float y0 = static_cast<float>(row * tile_size + sy * kCullSubTile) - mean2d.y;
+                float x_lo, x_hi;
+                if (!ellipse_band_span_cached(band_cache, y0, y0 + static_cast<float>(kCullSubTile), x_lo, x_hi)) {
+                    continue;
+                }
+                const int32_t lo = static_cast<int32_t>(fmaxf(floorf((mean2d.x + x_lo) * inv_sub), static_cast<float>(first)));
+                const int32_t hi = static_cast<int32_t>(fminf(floorf((mean2d.x + x_hi) * inv_sub), static_cast<float>(last)));
+                if (lo <= hi) {
+                    mask |= ((1u << (hi - lo + 1)) - 1u) << (sy * subs + (lo - first));
+                }
+            }
+            return mask & live;
+        };
+
         auto for_each_masked_tile = [&](const uint32_t row, const uint32_t x_begin, const uint32_t x_end,
                                         auto&& visit) {
+            if (x_begin + 1u == x_end) {
+                const uint32_t mask = compute_single_tile_mask(row, x_begin);
+                if (mask != 0) {
+                    (void)visit(x_begin, mask);
+                }
+                return;
+            }
             // Inclusive sub-tile column span of each band of the row; lo > hi is empty.
             int32_t lo[kMaxSubs], hi[kMaxSubs];
             for (uint32_t sy = 0; sy < subs; ++sy) {
@@ -134,11 +174,10 @@ namespace gsplat_lfs {
                 }
                 const float y0 = static_cast<float>(row * tile_size + sy * kCullSubTile) - mean2d.y;
                 float x_lo, x_hi;
-                if (!ellipse_band_span(qa, qb, qc, level, y0, y0 + static_cast<float>(kCullSubTile), x_lo, x_hi)) {
+                if (!ellipse_band_span_cached(band_cache, y0, y0 + static_cast<float>(kCullSubTile), x_lo, x_hi)) {
                     hi[sy] = lo[sy] - 1;
                     continue;
                 }
-                const float inv_sub = 1.0f / static_cast<float>(kCullSubTile);
                 // Clamp in float: off-screen spans may exceed the int range.
                 lo[sy] = static_cast<int32_t>(fmaxf(floorf((mean2d.x + x_lo) * inv_sub), static_cast<float>(lo[sy])));
                 hi[sy] = static_cast<int32_t>(fminf(floorf((mean2d.x + x_hi) * inv_sub), static_cast<float>(hi[sy])));
@@ -162,6 +201,35 @@ namespace gsplat_lfs {
                 }
             }
         };
+
+        if (tile_min.y + 1u == tile_max.y && tile_min.x + 1u == tile_max.x) {
+            uint32_t x_begin, x_end;
+            row_span(tile_min.y, x_begin, x_end);
+            uint32_t single_mask = 0;
+            bool hit = false;
+            if (x_begin < x_end) {
+                if (sub_masks) {
+                    single_mask = compute_single_tile_mask(tile_min.y, x_begin);
+                    hit = single_mask != 0;
+                } else {
+                    hit = tile_hit(x_begin, tile_min.y);
+                }
+            }
+            if (first_pass) {
+                tiles_per_gauss[k] = hit ? 1 : 0;
+            } else if (hit) {
+                const int64_t cur_idx = (k == 0) ? 0 : cum_tiles_per_gauss[k - 1];
+                if (max_isects < 0 || cur_idx < max_isects) {
+                    const int64_t cid = packed ? static_cast<int64_t>(camera_ids[idx]) : static_cast<int64_t>(idx / N);
+                    const int64_t tile_id = static_cast<int64_t>(tile_min.y) * tile_width + x_begin;
+                    const int64_t low = sub_masks ? static_cast<int64_t>(single_mask)
+                                                  : static_cast<int64_t>(*reinterpret_cast<const uint32_t*>(&depths[idx]));
+                    isect_ids[cur_idx] = (cid << (32 + tile_n_bits)) | (tile_id << 32) | low;
+                    flatten_ids[cur_idx] = static_cast<int32_t>(idx);
+                }
+            }
+            return;
+        }
 
         if (first_pass && (cull || live_subs != nullptr)) {
             int32_t count = 0;
@@ -540,40 +608,66 @@ namespace gsplat_lfs {
         const uint32_t tile_size,
         const uint32_t tile_width,
         const uint32_t tile_height,
+        const int32_t margin,
         uint32_t* __restrict__ tile_sub_masks) {
-        const uint32_t tile = cg::this_grid().thread_rank();
+        const uint32_t tile = blockIdx.x;
         if (tile >= tile_width * tile_height) {
             return;
         }
+        const uint32_t tid = threadIdx.x;
         const uint32_t subs = tile_size / kCullSubTile;
         const int32_t x0 = static_cast<int32_t>((tile % tile_width) * tile_size);
         const int32_t y0 = static_cast<int32_t>((tile / tile_width) * tile_size);
-        constexpr int32_t margin = static_cast<int32_t>(kCullSubTile);
-        uint32_t mask = 0;
-        for (uint32_t sy = 0; sy < subs; ++sy) {
-            for (uint32_t sx = 0; sx < subs; ++sx) {
-                const int32_t bx = x0 + static_cast<int32_t>(sx * kCullSubTile);
+        const int32_t tx_begin = max(x0 - margin, 0);
+        const int32_t tx_end = min(x0 + static_cast<int32_t>(tile_size) + margin, static_cast<int32_t>(width));
+        const int32_t ty_begin = max(y0 - margin, 0);
+        const int32_t ty_end = min(y0 + static_cast<int32_t>(tile_size) + margin, static_cast<int32_t>(height));
+        const uint32_t full_mask = (subs * subs >= 32u) ? ~0u : ((1u << (subs * subs)) - 1u);
+
+        uint32_t local_mask = 0;
+        for (int32_t gy = ty_begin; gy < ty_end; ++gy) {
+            uint32_t row_rep = 0;
+            for (uint32_t sy = 0; sy < subs; ++sy) {
                 const int32_t by = y0 + static_cast<int32_t>(sy * kCullSubTile);
-                const int32_t x_begin = max(bx - margin, 0);
-                const int32_t x_end = min(bx + static_cast<int32_t>(kCullSubTile) + margin, static_cast<int32_t>(width));
-                const int32_t y_begin = max(by - margin, 0);
-                const int32_t y_end = min(by + static_cast<int32_t>(kCullSubTile) + margin, static_cast<int32_t>(height));
-                bool live = false;
-                for (int32_t y = y_begin; y < y_end && !live; ++y) {
-                    const float* const row = pixel_weights + static_cast<size_t>(y) * width;
-                    for (int32_t x = x_begin; x < x_end; ++x) {
-                        if (row[x] > 0.0f) {
-                            live = true;
-                            break;
-                        }
-                    }
-                }
-                if (live) {
-                    mask |= 1u << (sy * subs + sx);
+                if (gy >= by - margin && gy < by + static_cast<int32_t>(kCullSubTile) + margin) {
+                    row_rep |= 1u << (sy * subs);
                 }
             }
+            if (row_rep == 0) {
+                continue;
+            }
+            const float* const row = pixel_weights + static_cast<size_t>(gy) * width;
+            for (int32_t gx = tx_begin + static_cast<int32_t>(tid); gx < tx_end; gx += 64) {
+                if (row[gx] > 0.0f) {
+                    uint32_t col_mask = 0;
+                    for (uint32_t sx = 0; sx < subs; ++sx) {
+                        const int32_t bx = x0 + static_cast<int32_t>(sx * kCullSubTile);
+                        if (gx >= bx - margin && gx < bx + static_cast<int32_t>(kCullSubTile) + margin) {
+                            col_mask |= 1u << sx;
+                        }
+                    }
+                    local_mask |= col_mask * row_rep;
+                    if (local_mask == full_mask) {
+                        break;
+                    }
+                }
+            }
+            if (local_mask == full_mask) {
+                break;
+            }
         }
-        tile_sub_masks[tile] = mask;
+
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local_mask |= __shfl_xor_sync(0xffffffffu, local_mask, offset);
+        }
+        __shared__ uint32_t s_warp_masks[2];
+        if ((tid & 31u) == 0u) {
+            s_warp_masks[tid >> 5] = local_mask;
+        }
+        __syncthreads();
+        if (tid == 0u) {
+            tile_sub_masks[tile] = s_warp_masks[0] | s_warp_masks[1];
+        }
     }
 
     void launch_tile_sub_masks_from_pixels(
@@ -584,14 +678,16 @@ namespace gsplat_lfs {
         const uint32_t tile_width,
         const uint32_t tile_height,
         uint32_t* tile_sub_masks,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint32_t margin) {
         const uint32_t n_tiles = tile_width * tile_height;
         if (n_tiles == 0) {
             return;
         }
-        constexpr uint32_t threads = 128;
-        tile_sub_masks_from_pixels_kernel<<<(n_tiles + threads - 1) / threads, threads, 0, stream>>>(
-            pixel_weights, width, height, tile_size, tile_width, tile_height, tile_sub_masks);
+        constexpr uint32_t threads = 64;
+        tile_sub_masks_from_pixels_kernel<<<n_tiles, threads, 0, stream>>>(
+            pixel_weights, width, height, tile_size, tile_width, tile_height,
+            static_cast<int32_t>(margin), tile_sub_masks);
         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.tile_sub_masks_from_pixels");
     }
 

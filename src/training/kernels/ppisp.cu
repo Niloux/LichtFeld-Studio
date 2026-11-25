@@ -105,8 +105,15 @@ namespace lfs::training::kernels {
                                               ColorPPISPParams* __restrict__ grad_color_params,
                                               CRFPPISPChannelParams* __restrict__ grad_crf_params,
                                               float* grad_rgb_in, int camera_idx, int frame_idx) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        int num_pixels = height * width;
+        constexpr int WARP_SIZE = 32;
+        constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+        static_assert(BLOCK_SIZE % WARP_SIZE == 0, "BLOCK_SIZE must be a multiple of 32");
+
+        const int num_pixels = height * width;
+        const int tid = static_cast<int>(threadIdx.x);
+        const int lane = tid & (WARP_SIZE - 1);
+        const int warp = tid / WARP_SIZE;
+        const int stride = static_cast<int>(gridDim.x) * BLOCK_SIZE;
 
         // Per-thread gradient accumulators
         float grad_exposure_local = 0.0f;
@@ -114,14 +121,23 @@ namespace lfs::training::kernels {
         ColorPPISPParams grad_color_local = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
         CRFPPISPChannelParams grad_crf_local[3] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
 
-        if (idx < num_pixels) {
-            int y = idx / width;
-            int x = idx % width;
+        for (int idx = static_cast<int>(blockIdx.x) * BLOCK_SIZE + tid; idx < num_pixels; idx += stride) {
+            float3 grad_rgb = make_float3(grad_rgb_out[0 * num_pixels + idx], grad_rgb_out[1 * num_pixels + idx],
+                                          grad_rgb_out[2 * num_pixels + idx]);
+            if (grad_rgb.x == 0.0f && grad_rgb.y == 0.0f && grad_rgb.z == 0.0f) {
+                grad_rgb_in[0 * num_pixels + idx] = 0.0f;
+                grad_rgb_in[1 * num_pixels + idx] = 0.0f;
+                grad_rgb_in[2 * num_pixels + idx] = 0.0f;
+                continue;
+            }
+
+            const int y = idx / width;
+            const int x = idx % width;
 
             // Load input from CHW
-            float3 rgb_input = make_float3(rgb_in[0 * num_pixels + idx], rgb_in[1 * num_pixels + idx],
-                                           rgb_in[2 * num_pixels + idx]);
-            float2 pixel_coord = make_float2(x + 0.5f, y + 0.5f);
+            const float3 rgb_input = make_float3(rgb_in[0 * num_pixels + idx], rgb_in[1 * num_pixels + idx],
+                                                 rgb_in[2 * num_pixels + idx]);
+            const float2 pixel_coord = make_float2(x + 0.5f, y + 0.5f);
 
             // Recompute forward pass
             float3 rgb = rgb_input;
@@ -150,9 +166,6 @@ namespace lfs::training::kernels {
             }
 
             // Backward pass (reverse order)
-            float3 grad_rgb = make_float3(grad_rgb_out[0 * num_pixels + idx], grad_rgb_out[1 * num_pixels + idx],
-                                          grad_rgb_out[2 * num_pixels + idx]);
-
             if (camera_idx != -1) {
                 ppisp_apply_crf_bwd(rgb_after_color, &crf_params[camera_idx * 3], grad_rgb, grad_rgb, grad_crf_local);
             }
@@ -177,115 +190,88 @@ namespace lfs::training::kernels {
             grad_rgb_in[2 * num_pixels + idx] = grad_rgb.z;
         }
 
-        // Block-level reduction
-        typedef cub::BlockReduce<float, BLOCK_SIZE> BlockReduceFloat;
-        typedef cub::BlockReduce<float2, BLOCK_SIZE> BlockReduceFloat2;
-
-        if (frame_idx != -1) {
-            // Exposure
-            {
-                __shared__ typename BlockReduceFloat::TempStorage temp;
-                float val = BlockReduceFloat(temp).Sum(grad_exposure_local);
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_exposure_params[frame_idx], val);
-            }
-
-            // Color params
-            {
-                __shared__ typename BlockReduceFloat2::TempStorage temp;
-                ColorPPISPParams* grad_color_out = &grad_color_params[frame_idx];
-
-                float2 val_b = BlockReduceFloat2(temp).Sum(grad_color_local.b);
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    atomicAdd(&grad_color_out->b.x, val_b.x);
-                    atomicAdd(&grad_color_out->b.y, val_b.y);
-                }
-
-                float2 val_r = BlockReduceFloat2(temp).Sum(grad_color_local.r);
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    atomicAdd(&grad_color_out->r.x, val_r.x);
-                    atomicAdd(&grad_color_out->r.y, val_r.y);
-                }
-
-                float2 val_g = BlockReduceFloat2(temp).Sum(grad_color_local.g);
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    atomicAdd(&grad_color_out->g.x, val_g.x);
-                    atomicAdd(&grad_color_out->g.y, val_g.y);
-                }
-
-                float2 val_n = BlockReduceFloat2(temp).Sum(grad_color_local.n);
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    atomicAdd(&grad_color_out->n.x, val_n.x);
-                    atomicAdd(&grad_color_out->n.y, val_n.y);
-                }
-            }
+        // Single-barrier warp-shuffle block reduction over active parameter accumulators.
+        float acc[36];
+        acc[0] = grad_exposure_local;
+        acc[1] = grad_color_local.b.x;
+        acc[2] = grad_color_local.b.y;
+        acc[3] = grad_color_local.r.x;
+        acc[4] = grad_color_local.r.y;
+        acc[5] = grad_color_local.g.x;
+        acc[6] = grad_color_local.g.y;
+        acc[7] = grad_color_local.n.x;
+        acc[8] = grad_color_local.n.y;
+#pragma unroll
+        for (int ch = 0; ch < 3; ++ch) {
+            acc[9 + ch * 5 + 0] = grad_vignetting_local[ch].cx;
+            acc[9 + ch * 5 + 1] = grad_vignetting_local[ch].cy;
+            acc[9 + ch * 5 + 2] = grad_vignetting_local[ch].alpha0;
+            acc[9 + ch * 5 + 3] = grad_vignetting_local[ch].alpha1;
+            acc[9 + ch * 5 + 4] = grad_vignetting_local[ch].alpha2;
+        }
+#pragma unroll
+        for (int ch = 0; ch < 3; ++ch) {
+            acc[24 + ch * 4 + 0] = grad_crf_local[ch].toe;
+            acc[24 + ch * 4 + 1] = grad_crf_local[ch].shoulder;
+            acc[24 + ch * 4 + 2] = grad_crf_local[ch].gamma;
+            acc[24 + ch * 4 + 3] = grad_crf_local[ch].center;
         }
 
-        if (camera_idx != -1) {
-            // Vignetting params
-            {
-                __shared__ typename BlockReduceFloat::TempStorage temp;
-                VignettingChannelParams* grad_vig_out = &grad_vignetting_params[camera_idx * 3];
-
+        __shared__ float warp_sums[36 * NUM_WARPS];
+        const int k_begin = (frame_idx != -1) ? 0 : 9;
+        const int k_end = (camera_idx != -1) ? 36 : 9;
+        for (int k = k_begin; k < k_end; ++k) {
+            float val = acc[k];
 #pragma unroll
-                for (int ch = 0; ch < 3; ch++) {
-                    float val_cx = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].cx);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_vig_out[ch].cx, val_cx);
-
-                    float val_cy = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].cy);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_vig_out[ch].cy, val_cy);
-
-                    float val_a0 = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].alpha0);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_vig_out[ch].alpha0, val_a0);
-
-                    float val_a1 = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].alpha1);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_vig_out[ch].alpha1, val_a1);
-
-                    float val_a2 = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].alpha2);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_vig_out[ch].alpha2, val_a2);
-                }
+            for (int offset = WARP_SIZE >> 1; offset > 0; offset >>= 1) {
+                val += __shfl_down_sync(0xffffffffu, val, offset);
             }
+            if (lane == 0) {
+                warp_sums[k * NUM_WARPS + warp] = val;
+            }
+        }
+        __syncthreads();
 
-            // CRF params
-            {
-                __shared__ typename BlockReduceFloat::TempStorage temp;
-                CRFPPISPChannelParams* grad_crf_out = &grad_crf_params[camera_idx * 3];
-
+        if (tid >= k_begin && tid < k_end) {
+            float sum = 0.0f;
 #pragma unroll
-                for (int ch = 0; ch < 3; ch++) {
-                    float val_toe = BlockReduceFloat(temp).Sum(grad_crf_local[ch].toe);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_crf_out[ch].toe, val_toe);
-
-                    float val_shoulder = BlockReduceFloat(temp).Sum(grad_crf_local[ch].shoulder);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_crf_out[ch].shoulder, val_shoulder);
-
-                    float val_gamma = BlockReduceFloat(temp).Sum(grad_crf_local[ch].gamma);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_crf_out[ch].gamma, val_gamma);
-
-                    float val_center = BlockReduceFloat(temp).Sum(grad_crf_local[ch].center);
-                    __syncthreads();
-                    if (threadIdx.x == 0)
-                        atomicAdd(&grad_crf_out[ch].center, val_center);
+            for (int w = 0; w < NUM_WARPS; ++w) {
+                sum += warp_sums[tid * NUM_WARPS + w];
+            }
+            if (sum != 0.0f) {
+                if (tid == 0) {
+                    atomicAdd(&grad_exposure_params[frame_idx], sum);
+                } else if (tid < 9) {
+                    ColorPPISPParams* out_c = &grad_color_params[frame_idx];
+                    switch (tid) {
+                    case 1: atomicAdd(&out_c->b.x, sum); break;
+                    case 2: atomicAdd(&out_c->b.y, sum); break;
+                    case 3: atomicAdd(&out_c->r.x, sum); break;
+                    case 4: atomicAdd(&out_c->r.y, sum); break;
+                    case 5: atomicAdd(&out_c->g.x, sum); break;
+                    case 6: atomicAdd(&out_c->g.y, sum); break;
+                    case 7: atomicAdd(&out_c->n.x, sum); break;
+                    default: atomicAdd(&out_c->n.y, sum); break;
+                    }
+                } else if (tid < 24) {
+                    const int v = tid - 9;
+                    VignettingChannelParams* out_v = &grad_vignetting_params[camera_idx * 3 + (v / 5)];
+                    switch (v % 5) {
+                    case 0: atomicAdd(&out_v->cx, sum); break;
+                    case 1: atomicAdd(&out_v->cy, sum); break;
+                    case 2: atomicAdd(&out_v->alpha0, sum); break;
+                    case 3: atomicAdd(&out_v->alpha1, sum); break;
+                    default: atomicAdd(&out_v->alpha2, sum); break;
+                    }
+                } else {
+                    const int c = tid - 24;
+                    CRFPPISPChannelParams* out_crf = &grad_crf_params[camera_idx * 3 + (c / 4)];
+                    switch (c % 4) {
+                    case 0: atomicAdd(&out_crf->toe, sum); break;
+                    case 1: atomicAdd(&out_crf->shoulder, sum); break;
+                    case 2: atomicAdd(&out_crf->gamma, sum); break;
+                    default: atomicAdd(&out_crf->center, sum); break;
+                    }
                 }
             }
         }
@@ -557,8 +543,10 @@ namespace lfs::training::kernels {
                                    int camera_idx, int frame_idx, cudaStream_t stream) {
         stream = resolve_stream(stream);
         int num_pixels = height * width;
+        if (num_pixels <= 0)
+            return;
         int threads = PPISP_BLOCK_SIZE;
-        int blocks = divUp(num_pixels, threads);
+        int blocks = min(divUp(num_pixels, threads), 512);
 
         ppisp_backward_chw_kernel<PPISP_BLOCK_SIZE><<<blocks, threads, 0, stream>>>(
             height, width, num_cameras, num_frames, exposure_params,

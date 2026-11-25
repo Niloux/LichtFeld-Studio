@@ -85,7 +85,7 @@ namespace gsplat_lfs {
             backgrounds += cid * CDIM;
         }
         if (bg_images != nullptr) {
-            bg_images += cid * CDIM * image_height * image_width;
+            bg_images += cid * 3u * image_height * image_width;
         }
         if (masks != nullptr) {
             masks += cid * tile_height * tile_width;
@@ -336,7 +336,33 @@ namespace gsplat_lfs {
         return enabled;
     }
 
-    template <uint32_t CDIM, bool kPerfectPinhole, bool kBatched, bool kMipFilter>
+    template <uint32_t CDIM>
+    constexpr uint32_t fwd_splat_color_count() {
+        if constexpr (CDIM == 1)
+            return 0u;
+        if constexpr (CDIM == 4)
+            return 3u;
+        if constexpr (CDIM == 8)
+            return 6u;
+        return CDIM;
+    }
+
+    template <uint32_t CDIM>
+    __device__ __forceinline__ constexpr uint32_t fwd_splat_channel(const uint32_t s) {
+        if constexpr (CDIM == 8)
+            return s < 3u ? s : s + 1u;
+        return s;
+    }
+
+    template <uint32_t CDIM>
+    __device__ __forceinline__ constexpr uint32_t fwd_channel_to_slot(const uint32_t k) {
+        if constexpr (CDIM == 8)
+            return k < 3u ? k : k - 1u;
+        return k;
+    }
+
+    template <uint32_t CDIM, bool kPerfectPinhole, bool kBatched, bool kMipFilter, bool kCachedRays = false,
+              bool kGlobalShutter = false>
     __global__ void __launch_bounds__(kMicroThreads) rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel(
         const uint32_t C,
         const vec3* __restrict__ means,
@@ -379,6 +405,7 @@ namespace gsplat_lfs {
             if (tile_id < tiles.begin || tile_id >= tiles.end)
                 return;
         }
+        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
         const uint32_t tr = threadIdx.x;
         const uint32_t lane = tr & 31u;
         const uint32_t warp = tr >> 5;
@@ -395,32 +422,18 @@ namespace gsplat_lfs {
             backgrounds += cid * CDIM;
         }
         if (bg_images != nullptr) {
-            bg_images += cid * CDIM * image_height * image_width;
+            bg_images += cid * 3u * image_height * image_width;
         }
         if (masks != nullptr) {
             masks += cid * tile_height * tile_width;
         }
 
         const int32_t pix_id = i * image_width + j;
-        const WorldRay ray = from_world_pixel_ray<kPerfectPinhole>(
-            camera_model_type, rs_type, image_width, image_height,
-            static_cast<float>(j) + 0.5f, static_cast<float>(i) + 0.5f,
-            viewmats0, viewmats1, Ks, cid,
-            radial_coeffs, tangential_coeffs, thin_prism_coeffs);
-        const vec3 ray_d = ray.ray_dir;
-        const vec3 ray_o = ray.ray_org;
-        const float depth_scale =
-            (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
-        constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
-        constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
-        constexpr bool kHasDepthSq = (CDIM == 8);
-        constexpr uint32_t kDepthSqChannel = 7u;
-
         const bool inside = i < image_height && j < image_width;
-        bool done = !inside || !ray.valid_flag;
-
-        // A masked-out tile renders its background; the mask is uniform per block.
-        if (masks != nullptr && !masks[tile_id]) {
+        const bool sub_culled =
+            (masks != nullptr && !masks[tile_id]) ||
+            (footprint.tile_sub_masks != nullptr && !((footprint.tile_sub_masks[tile_id] >> sub_bit) & 1u));
+        if (sub_culled) {
             if (!inside)
                 return;
 #pragma unroll
@@ -433,14 +446,104 @@ namespace gsplat_lfs {
                 }
                 render_colors[chw_pix(k, pix_id, image_height, image_width)] = bg_val;
             }
+            render_alphas[pix_id] = 0.0f;
+            last_ids[pix_id] = 0;
             if (median_out != nullptr)
                 median_out[pix_id] = 0.0f;
             return;
         }
 
+        vec3 ray_d{0.f};
+        vec3 ray_o{0.f};
+        float depth_scale = 1.0f;
+        bool valid_ray = false;
+        if constexpr (kCachedRays) {
+            __shared__ float3 s_ray_o[kMicroSub];
+            __shared__ float s_R_inv[kMicroSub][9];
+            const bool row_shutter = (rs_type != ShutterType::ROLLING_LEFT_TO_RIGHT &&
+                                      rs_type != ShutterType::ROLLING_RIGHT_TO_LEFT);
+            if constexpr (kGlobalShutter) {
+                if (tr == 0) {
+                    const RollingShutterParameters rs_params(viewmats0 + cid * 16, nullptr);
+                    const ShutterPose pose = interpolate_shutter_pose(0.f, rs_params);
+                    const mat3 R_inv = glm::mat3_cast(glm::inverse(pose.q));
+                    const vec3 org = -(R_inv * pose.t);
+                    s_ray_o[0] = make_float3(org.x, org.y, org.z);
+#pragma unroll
+                    for (int c = 0; c < 3; ++c) {
+#pragma unroll
+                        for (int r = 0; r < 3; ++r)
+                            s_R_inv[0][c * 3 + r] = R_inv[c][r];
+                    }
+                }
+            } else if (tr < kMicroSub) {
+                const uint32_t coord = row_shutter ? (sub_y * kMicroSub + tr) : (sub_x * kMicroSub + tr);
+                const uint32_t extent = row_shutter ? image_height : image_width;
+                float t_shutter = 0.f;
+                if (viewmats1 != nullptr && rs_type != ShutterType::GLOBAL && extent > 1u) {
+                    const float clamped = static_cast<float>(min(coord, extent - 1u));
+                    const float denom = static_cast<float>(extent - 1u);
+                    t_shutter = (rs_type == ShutterType::ROLLING_BOTTOM_TO_TOP ||
+                                 rs_type == ShutterType::ROLLING_RIGHT_TO_LEFT)
+                                    ? (denom - clamped) / denom
+                                    : clamped / denom;
+                }
+                const RollingShutterParameters rs_params(
+                    viewmats0 + cid * 16,
+                    viewmats1 == nullptr ? nullptr : viewmats1 + cid * 16);
+                const ShutterPose pose = interpolate_shutter_pose(t_shutter, rs_params);
+                const mat3 R_inv = glm::mat3_cast(glm::inverse(pose.q));
+                const vec3 org = -(R_inv * pose.t);
+                s_ray_o[tr] = make_float3(org.x, org.y, org.z);
+#pragma unroll
+                for (int c = 0; c < 3; ++c) {
+#pragma unroll
+                    for (int r = 0; r < 3; ++r)
+                        s_R_inv[tr][c * 3 + r] = R_inv[c][r];
+                }
+            }
+            __syncthreads();
+            const uint32_t u = kGlobalShutter ? 0u : (row_shutter ? (tr / kMicroSub) : (tr % kMicroSub));
+            const float3 org3 = s_ray_o[u];
+            ray_o = {org3.x, org3.y, org3.z};
+            if (inside) {
+                const float* const ur =
+                    footprint.unit_rays + (static_cast<size_t>(cid) * image_height * image_width + pix_id) * 3u;
+                const float cx = ur[0];
+                const float cy = ur[1];
+                const float cz = ur[2];
+                valid_ray = isfinite(cx) && isfinite(cy) && isfinite(cz);
+                if (valid_ray) {
+                    const float* const Rm = s_R_inv[u];
+                    ray_d = {
+                        Rm[0] * cx + Rm[3] * cy + Rm[6] * cz,
+                        Rm[1] * cx + Rm[4] * cy + Rm[7] * cz,
+                        Rm[2] * cx + Rm[5] * cy + Rm[8] * cz};
+                }
+            }
+        } else {
+            const WorldRay ray = from_world_pixel_ray<kPerfectPinhole>(
+                camera_model_type, rs_type, image_width, image_height,
+                static_cast<float>(j) + 0.5f, static_cast<float>(i) + 0.5f,
+                viewmats0, viewmats1, Ks, cid,
+                radial_coeffs, tangential_coeffs, thin_prism_coeffs);
+            ray_d = ray.ray_dir;
+            ray_o = ray.ray_org;
+            depth_scale = (camera_model_type == CameraModelType::PINHOLE) ? ray.cam_ray_z : 1.0f;
+            valid_ray = ray.valid_flag;
+        }
+        constexpr bool kHasRayDepth = (CDIM == 1 || CDIM == 4 || CDIM == 8);
+        constexpr uint32_t kDepthChannel = (CDIM == 1) ? 0u : 3u;
+        constexpr bool kHasDepthSq = (CDIM == 8);
+        constexpr uint32_t kDepthSqChannel = 7u;
+        constexpr uint32_t kSplatColors = fwd_splat_color_count<CDIM>();
+        constexpr uint32_t kSmemColors = kSplatColors > 0u ? kSplatColors : 1u;
+
+        bool done = !inside || !valid_ray;
+
         __shared__ vec4 s_xyz_opacity[kMicroStage];
         __shared__ mat3 s_iscl_rot[kMicroStage];
-        __shared__ float s_rgbs[kMicroStage * CDIM];
+        __shared__ float s_rgbs[kMicroStage * kSmemColors];
         __shared__ int32_t s_bin[kMicroStage]; // the survivor's position in the tile's list
         __shared__ uint8_t s_hit[kMicroStage]; // whether the survivor blended any pixel
         __shared__ uint32_t s_warp_count[kMicroThreads / 32];
@@ -450,7 +553,6 @@ namespace gsplat_lfs {
         int32_t cursor = tile_offsets[tile_id];
         const float sub_x0 = static_cast<float>(sub_x * kMicroSub);
         const float sub_y0 = static_cast<float>(sub_y * kMicroSub);
-        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
 
         float T = 1.0f;
         uint32_t cur_idx = 0;
@@ -496,11 +598,17 @@ namespace gsplat_lfs {
                         opacity *= compensations[g];
                         scale = dilated_scale(scale, dilations[g]);
                     }
-                    s_xyz_opacity[slot] = {xyz_f.x, xyz_f.y, xyz_f.z, opacity};
-                    s_iscl_rot[slot] = inverse_scale_matrix(scale) * glm::transpose(quat_to_rotmat(quats[g]));
+                    const mat3 iscl_rot = inverse_scale_matrix(scale) * glm::transpose(quat_to_rotmat(quats[g]));
+                    s_iscl_rot[slot] = iscl_rot;
+                    if constexpr (kGlobalShutter) {
+                        const vec3 gro = iscl_rot * (ray_o - vec3{xyz_f.x, xyz_f.y, xyz_f.z});
+                        s_xyz_opacity[slot] = {gro.x, gro.y, gro.z, opacity};
+                    } else {
+                        s_xyz_opacity[slot] = {xyz_f.x, xyz_f.y, xyz_f.z, opacity};
+                    }
 #pragma unroll
-                    for (uint32_t k = 0; k < CDIM; ++k) {
-                        s_rgbs[slot * CDIM + k] = colors[g * CDIM + k];
+                    for (uint32_t s = 0; s < kSplatColors; ++s) {
+                        s_rgbs[slot * kSmemColors + s] = colors[g * CDIM + fwd_splat_channel<CDIM>(s)];
                     }
                 }
                 count += s_warp_count[0] + s_warp_count[1];
@@ -511,26 +619,21 @@ namespace gsplat_lfs {
 
             for (uint32_t t = 0; t < count && !done; ++t) {
                 const float4 xyz_opac = load_float4(reinterpret_cast<const float*>(&s_xyz_opacity[t]));
-                const vec3 xyz = {xyz_opac.x, xyz_opac.y, xyz_opac.z};
                 const mat3 iscl_rot = s_iscl_rot[t];
 
-                const vec3 gro = iscl_rot * (ray_o - xyz);
+                const vec3 gro = kGlobalShutter
+                                     ? vec3{xyz_opac.x, xyz_opac.y, xyz_opac.z}
+                                     : iscl_rot * (ray_o - vec3{xyz_opac.x, xyz_opac.y, xyz_opac.z});
                 vec3 grd_n;
                 vec3 gcrod;
-                float power;
-                float depth = 0.0f;
-                if constexpr (kHasRayDepth) {
-                    float inv_grd_len = 0.0f;
-                    float t_hit = 0.0f;
-                    ray_gaussian_eval(gro, iscl_rot * ray_d, depth_scale,
-                                      grd_n, gcrod, inv_grd_len, t_hit, depth, power);
-                } else {
-                    grd_n = safe_normalize(iscl_rot * ray_d);
-                    gcrod = glm::cross(grd_n, gro);
-                    power = -0.5f * glm::dot(gcrod, gcrod);
+                float inv_grd_len = 0.0f;
+                float grayDist = 0.0f;
+                ray_gaussian_power(gro, iscl_rot * ray_d, grd_n, gcrod, inv_grd_len, grayDist);
+                if (!(grayDist <= 11.09f)) {
+                    continue;
                 }
 
-                const float alpha = min(0.999f, xyz_opac.w * __expf(power));
+                const float alpha = min(0.999f, xyz_opac.w * __expf(-0.5f * grayDist));
                 if (alpha < 1.f / 255.f) {
                     continue;
                 }
@@ -539,6 +642,11 @@ namespace gsplat_lfs {
                     done = true;
                     break;
                 }
+                float depth = 0.0f;
+                if constexpr (kHasRayDepth) {
+                    const float t_hit = inv_grd_len > 0.0f ? (-glm::dot(grd_n, gro) * inv_grd_len) : 0.0f;
+                    depth = t_hit > 0.0f ? t_hit * depth_scale : 0.0f;
+                }
                 const float splat_depth = kHasRayDepth ? depth : 0.0f;
                 if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
                     median = splat_depth;
@@ -546,11 +654,21 @@ namespace gsplat_lfs {
                 const float vis = alpha * T;
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    const float c_val = (kHasRayDepth && k == kDepthChannel)
-                                            ? depth
-                                            : ((kHasDepthSq && k == kDepthSqChannel)
-                                                   ? depth * depth
-                                                   : s_rgbs[t * CDIM + k]);
+                    float c_val;
+                    if constexpr (kHasRayDepth) {
+                        if (k == kDepthChannel)
+                            c_val = depth;
+                        else if constexpr (kHasDepthSq) {
+                            if (k == kDepthSqChannel)
+                                c_val = depth * depth;
+                            else
+                                c_val = s_rgbs[t * kSmemColors + fwd_channel_to_slot<CDIM>(k)];
+                        } else {
+                            c_val = s_rgbs[t * kSmemColors + fwd_channel_to_slot<CDIM>(k)];
+                        }
+                    } else {
+                        c_val = s_rgbs[t * kSmemColors + k];
+                    }
                     pix_out[k] += c_val * vis;
                 }
                 cur_idx = static_cast<uint32_t>(s_bin[t]);
@@ -717,6 +835,8 @@ namespace gsplat_lfs {
                     const uint32_t subs = tile_size / kMicroSub;
                     const dim3 micro_grid = {C, tile_height * subs, tile_width * subs};
                     auto launch_micro = [&](auto kernel) {
+                        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                             cudaSharedmemCarveoutMaxShared);
                         kernel<<<micro_grid, kMicroThreads, 0, stream>>>(
                             C,
                             reinterpret_cast<const vec3*>(means),
@@ -731,9 +851,15 @@ namespace gsplat_lfs {
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd_micro");
                     };
                     if (global_shutter && perfect_pinhole)
-                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, true, kBatched, kMipFilter>);
-                    else
-                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, false, kBatched, kMipFilter>);
+                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, true, kBatched, kMipFilter, false, true>);
+                    else if (!perfect_pinhole && footprint.unit_rays != nullptr &&
+                             camera_model != CameraModelType::PINHOLE && camera_model != CameraModelType::ORTHO) {
+                        if (global_shutter)
+                            launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, false, kBatched, kMipFilter, true, true>);
+                        else
+                            launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, false, kBatched, kMipFilter, true, false>);
+                    } else
+                        launch_micro(rasterize_to_pixels_from_world_3dgs_fwd_micro_kernel<CDIM, false, kBatched, kMipFilter, false, false>);
                     return;
                 }
             }

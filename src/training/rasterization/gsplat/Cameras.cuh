@@ -352,7 +352,9 @@ struct BaseCameraModel {
     inline __device__ auto world_point_to_image_point_shutter_pose(
         glm::fvec3 const& world_point,
         RollingShutterParameters const& rolling_shutter_parameters,
-        float margin_factor) const -> ImagePointReturn {
+        float margin_factor,
+        float* out_relative_time = nullptr,
+        float init_relative_time = -1.f) const -> ImagePointReturn {
         // Perform rolling-shutter-based world point to image point projection /
         // optimization
 
@@ -363,55 +365,77 @@ struct BaseCameraModel {
         auto const t_end = rolling_shutter_parameters.t_end;
         auto const q_end = rolling_shutter_parameters.q_end;
 
-        // Always perform transformation using start pose
-        auto const projection_start = derived->camera_ray_to_image_point(
-            glm::rotate(q_start, world_point) + t_start, margin_factor);
-        auto const& image_point_start = projection_start.imagePoint;
-        auto const valid_start = projection_start.valid_flag;
-
         if (derived->parameters.shutter_type == ShutterType::GLOBAL) {
-            // Exit early if we have a global shutter sensor
-            return {{image_point_start.x, image_point_start.y}, valid_start};
+            auto const projection_start = derived->camera_ray_to_image_point(
+                glm::rotate(q_start, world_point) + t_start, margin_factor);
+            if (out_relative_time != nullptr) {
+                *out_relative_time = 0.f;
+            }
+            return {{projection_start.imagePoint.x, projection_start.imagePoint.y}, projection_start.valid_flag};
         }
 
-        // Do initial transformations using both start and end poses to
-        // determine all candidate points and take union of valid projections as
-        // iteration starting points
-        auto const projection_end = derived->camera_ray_to_image_point(
-            glm::rotate(q_end, world_point) + t_end, margin_factor);
-        auto const& image_point_end = projection_end.imagePoint;
-        auto const valid_end = projection_end.valid_flag;
+        auto image_points_rs_prev = glm::fvec2{};
+        auto prev_t = -1.f;
+        uint32_t start_iter = 0;
 
-        // This selection prefers points at the start-of-frame pose over
-        // end-of-frame points
-        auto init_image_point = glm::fvec2{};
-        if (valid_start) {
-            init_image_point = image_point_start;
-        } else if (valid_end) {
-            init_image_point = image_point_end;
-        } else {
-            // No valid projection at start or finish -> mark point as invalid.
-            // Still return projection result at end of frame
-            return {{image_point_end.x, image_point_end.y}, false};
+        if (init_relative_time >= 0.f) {
+            auto const t_init = (1.f - init_relative_time) * t_start + init_relative_time * t_end;
+            auto const q_init = glm::slerp(q_start, q_end, init_relative_time);
+            auto const proj_init = derived->camera_ray_to_image_point(
+                glm::rotate(q_init, world_point) + t_init, margin_factor);
+            if (proj_init.valid_flag) {
+                image_points_rs_prev = proj_init.imagePoint;
+                prev_t = init_relative_time;
+                start_iter = 1;
+            }
+        }
+
+        if (start_iter == 0) {
+            // Always perform transformation using start pose
+            auto const projection_start = derived->camera_ray_to_image_point(
+                glm::rotate(q_start, world_point) + t_start, margin_factor);
+            auto const& image_point_start = projection_start.imagePoint;
+            auto const valid_start = projection_start.valid_flag;
+
+            // Do initial transformations using both start and end poses to
+            // determine all candidate points and take union of valid projections as
+            // iteration starting points
+            auto const projection_end = derived->camera_ray_to_image_point(
+                glm::rotate(q_end, world_point) + t_end, margin_factor);
+            auto const& image_point_end = projection_end.imagePoint;
+            auto const valid_end = projection_end.valid_flag;
+
+            if (valid_start) {
+                image_points_rs_prev = image_point_start;
+            } else if (valid_end) {
+                image_points_rs_prev = image_point_end;
+            } else {
+                // No valid projection at start or finish -> mark point as invalid.
+                // Still return projection result at end of frame
+                return {{image_point_end.x, image_point_end.y}, false};
+            }
         }
 
         // Compute the new timestamp and project again
-        auto image_points_rs_prev = init_image_point;
-        auto relative_frame_time = float{};
-        auto t_rs = glm::fvec3{};
-        auto q_rs = glm::fquat{};
-#pragma unroll
-        for (auto j = 0; j < N_ROLLING_SHUTTER_ITERATIONS; ++j) {
+        auto relative_frame_time = prev_t >= 0.f ? prev_t : 0.f;
+        for (size_t j = start_iter; j < N_ROLLING_SHUTTER_ITERATIONS; ++j) {
             relative_frame_time =
                 shutter_relative_frame_time(image_points_rs_prev);
+            if (prev_t >= 0.f && fabsf(relative_frame_time - prev_t) < 1e-4f) {
+                break;
+            }
+            prev_t = relative_frame_time;
 
-            t_rs = (1.f - relative_frame_time) * t_start +
-                   relative_frame_time * t_end;
-            q_rs = glm::slerp(q_start, q_end, relative_frame_time);
+            auto const t_rs = (1.f - relative_frame_time) * t_start +
+                              relative_frame_time * t_end;
+            auto const q_rs = glm::slerp(q_start, q_end, relative_frame_time);
 
             auto const projection_rs = derived->camera_ray_to_image_point(
                 glm::rotate(q_rs, world_point) + t_rs, margin_factor);
             image_points_rs_prev = projection_rs.imagePoint;
+        }
+        if (out_relative_time != nullptr) {
+            *out_relative_time = relative_frame_time;
         }
 
         return {{image_points_rs_prev.x, image_points_rs_prev.y}, true};
@@ -1331,13 +1355,16 @@ world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
     auto image_points = std::array<glm::fvec2, 2 * 3 + 1>{};
     auto image_mean = glm::fvec2{0};
     auto image_covariance = glm::fmat2{0};
+    float mean_relative_time = -1.f;
 #pragma unroll
     for (auto i = 0u; i < std::size(image_points); ++i) {
         // Annotate with 'template' to avoid warning #174-D: expression has no effect.
         auto const projection =
             camera_model.template world_point_to_image_point_shutter_pose<>(
                 sigma_points.points[i], rolling_shutter_parameters,
-                unscented_transform_parameters.in_image_margin_factor);
+                unscented_transform_parameters.in_image_margin_factor,
+                i == 0u ? &mean_relative_time : nullptr,
+                i == 0u ? -1.f : mean_relative_time);
         auto const& image_point = projection.imagePoint;
         auto const point_valid = projection.valid_flag;
 

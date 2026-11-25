@@ -29,6 +29,10 @@ namespace gsplat_lfs {
         // The same keys, writable: the micro-tile forward clears the sub-tile bit of each
         // pair that blends no pixel of that sub-tile, so the backward never walks it.
         int64_t* prune_tile_keys = nullptr;
+        // [C, tile_height, tile_width] bitmask of live 8x8 sub-tiles.
+        const uint32_t* tile_sub_masks = nullptr;
+        // Optional [H, W, 3] cached unit camera-space rays (NaN marks invalid pixels).
+        const float* unit_rays = nullptr;
         [[nodiscard]] bool valid() const { return means2d && conics && radii; }
     };
     struct TileBatch {

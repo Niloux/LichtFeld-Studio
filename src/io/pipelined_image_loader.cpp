@@ -3262,6 +3262,7 @@ namespace lfs::io {
             }
 
             try {
+                const lfs::core::CUDAStreamGuard worker_stream_guard(sidecar_stream);
                 // Wait before acquiring a decoder: with one cold worker/decoder,
                 // the sidecar queued ahead of this image must remain runnable.
                 if (item.rgb_mask_source.valid()) {
@@ -3274,24 +3275,25 @@ namespace lfs::io {
                 auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
 
                 if (item.alpha_as_mask) {
+                    item.params.cuda_stream = sidecar_stream;
                     const MaskedImageFill fill{.alpha = true, .invert = item.alpha_mask_params.invert, .threshold = item.alpha_mask_params.threshold, .keep_high_band = item.mask_keep_high_band};
                     const auto rgba = load_rgba_image_cpu_decoded(
                         item.path,
                         item.undistort ? 1 : item.params.resize_factor,
                         item.undistort ? 0 : item.params.max_width,
-                        nullptr,
+                        sidecar_stream,
                         config_.use_16bit_color, !item.alpha_is_transparency, item.fill_masked_rgb ? &fill : nullptr);
                     const size_t H = rgba.shape()[1];
                     const size_t W = rgba.shape()[2];
                     auto rgb = rgba.slice(0, 0, 3).contiguous();
                     auto alpha = rgba.slice(0, 3, 4).squeeze(0).contiguous();
-                    rgb.sync_to_stream(nullptr);
-                    alpha.sync_to_stream(nullptr);
+                    rgb.sync_to_stream(sidecar_stream);
+                    alpha.sync_to_stream(sidecar_stream);
                     if (item.params.output_uint8) {
                         auto rgb_uint8 = lfs::core::Tensor::empty(
                             rgb.shape(), lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
                         cuda::launch_float32_chw_to_uint8_chw(
-                            rgb.ptr<float>(), rgb_uint8.ptr<uint8_t>(), H, W, 3, nullptr);
+                            rgb.ptr<float>(), rgb_uint8.ptr<uint8_t>(), H, W, 3, sidecar_stream);
                         rgb = std::move(rgb_uint8);
                     }
 
@@ -3302,7 +3304,7 @@ namespace lfs::io {
                             item.params.max_width);
                         apply_requested_undistort(rgb, item.params);
                         const UndistortSlotGuard slot;
-                        alpha = lfs::core::undistort_mask_area(alpha, scaled, nullptr);
+                        alpha = lfs::core::undistort_mask_area(alpha, scaled, sidecar_stream);
                     }
                     apply_requested_sharpen(rgb, item.params);
 
@@ -3314,24 +3316,24 @@ namespace lfs::io {
                             alpha.shape(), lfs::core::Device::CUDA, lfs::core::DataType::Float16);
                         cuda::launch_float32_hwc_to_uint16_hwc(
                             alpha.ptr<float>(), reinterpret_cast<uint16_t*>(alpha_u16.data_ptr()),
-                            alpha_h, alpha_w, 1, nullptr);
+                            alpha_h, alpha_w, 1, sidecar_stream);
                         if (item.alpha_is_transparency) {
                             cuda::launch_uint16_hwc_to_float32_hwc(
                                 reinterpret_cast<const uint16_t*>(alpha_u16.data_ptr()), alpha.ptr<float>(),
-                                alpha_h, alpha_w, 1, nullptr);
+                                alpha_h, alpha_w, 1, sidecar_stream);
                         } else {
                             lfs::core::cuda::normalize_mask_u16(
                                 reinterpret_cast<const uint16_t*>(alpha_u16.data_ptr()), alpha.ptr<float>(),
-                                alpha_h * alpha_w, nullptr);
+                                alpha_h * alpha_w, sidecar_stream);
                         }
                     }
 
                     if (is_nvcodec_available()) {
                         try {
-                            write_derived_cache(*nvcodec, rgb, item.cache_key, nullptr, item.params);
+                            write_derived_cache(*nvcodec, rgb, item.cache_key, sidecar_stream, item.params);
 
                             const auto alpha_key = make_mask_cache_key(item.path, item.params) + (item.alpha_is_transparency ? "_transparency" : "");
-                            auto alpha_jpeg = nvcodec->encode_grayscale_to_jpeg2k(alpha, nullptr, true, false);
+                            auto alpha_jpeg = nvcodec->encode_grayscale_to_jpeg2k(alpha, sidecar_stream, true, false);
                             put_in_jpeg_cache(alpha_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(alpha_jpeg)));
                         } catch (...) {
@@ -3342,16 +3344,16 @@ namespace lfs::io {
                     const size_t alpha_h = alpha.shape()[0];
                     const size_t alpha_w = alpha.shape()[1];
                     if (item.alpha_mask_params.invert)
-                        cuda::launch_mask_invert(alpha_ptr, alpha_h, alpha_w, nullptr);
+                        cuda::launch_mask_invert(alpha_ptr, alpha_h, alpha_w, sidecar_stream);
                     if (item.alpha_mask_params.threshold > 0)
-                        cuda::launch_mask_threshold(alpha_ptr, alpha_h, alpha_w, item.alpha_mask_params.threshold, nullptr);
+                        cuda::launch_mask_threshold(alpha_ptr, alpha_h, alpha_w, item.alpha_mask_params.threshold, sidecar_stream);
                     alpha = process_mask(std::move(alpha), item.alpha_mask_params.threshold);
 
                     try_complete_pair(item.sequence_id, item.loader_generation,
                                       std::move(rgb), std::move(alpha), nullptr);
 
                 } else if (item.is_mask || item.is_depth) {
-                    const cudaStream_t aux_stream = item.is_depth ? sidecar_stream : nullptr;
+                    const cudaStream_t aux_stream = sidecar_stream;
                     const lfs::core::CUDAStreamGuard stream_guard(aux_stream);
                     lfs::core::Tensor aux_tensor;
                     lfs::core::Tensor depth_samples_u8; // an 8-bit depth file's samples, for the cache
@@ -3529,7 +3531,7 @@ namespace lfs::io {
                         }
                     } else if (item.is_mask && is_nvcodec_available()) {
                         try {
-                            auto jpeg_bytes = nvcodec->encode_grayscale_to_jpeg2k(mask_bytes, nullptr, true, true);
+                            auto jpeg_bytes = nvcodec->encode_grayscale_to_jpeg2k(mask_bytes, aux_stream, true, true);
                             put_in_jpeg_cache(item.cache_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(jpeg_bytes)));
                         } catch (...) {
@@ -3724,6 +3726,7 @@ namespace lfs::io {
                         ready_event);
 
                 } else {
+                    item.params.cuda_stream = sidecar_stream;
                     std::optional<MaskedImageFill> fill;
                     if (item.fill_masked_rgb && (item.rgb_mask_path || item.rgb_mask)) {
                         lfs::core::Tensor mask;
@@ -3739,13 +3742,13 @@ namespace lfs::io {
                             if (is_nvcodec_available() && !tiff_sidecar) {
                                 try {
                                     const NvcodecSlotGuard slot;
-                                    mask = nvcodec->load_image_gpu(*item.rgb_mask_path, 1, 0, nullptr, DecodeFormat::Mask);
+                                    mask = nvcodec->load_image_gpu(*item.rgb_mask_path, 1, 0, sidecar_stream, DecodeFormat::Mask);
                                 } catch (...) {
                                     LOG_DEBUG("Mask GPU decode unavailable for image fill; using CPU grayscale");
                                 }
                             }
                             if (!mask.is_valid())
-                                mask = load_mask_image_cpu_decoded(*item.rgb_mask_path, {}).squeeze(0);
+                                mask = load_mask_image_cpu_decoded(*item.rgb_mask_path, item.params).squeeze(0);
                         }
                         if (from_sidecar && tiff_sidecar && mask.dtype() == lfs::core::DataType::Float32)
                             mask = lfs::core::cuda::mask_values_to_byte_grid(mask);
@@ -3760,14 +3763,14 @@ namespace lfs::io {
                             const NvcodecSlotGuard slot;
                             if (item.undistort) {
                                 decoded = nvcodec->load_image_from_memory_gpu(
-                                    read_file(item.path), 1, 0, nullptr,
+                                    read_file(item.path), 1, 0, sidecar_stream,
                                     DecodeFormat::RGB, item.params.output_uint8, item.params.masked_fill);
                             } else {
                                 decoded = nvcodec->load_image_gpu(
                                     item.path,
                                     item.params.resize_factor,
                                     item.params.max_width,
-                                    nullptr, DecodeFormat::RGB, item.params.output_uint8, item.params.masked_fill);
+                                    sidecar_stream, DecodeFormat::RGB, item.params.output_uint8, item.params.masked_fill);
                             }
                             used_gpu = true;
                         } catch (...) {
@@ -3782,7 +3785,7 @@ namespace lfs::io {
                     apply_requested_sharpen(decoded, item.params);
 
                     if (is_nvcodec_available()) {
-                        write_derived_cache(*nvcodec, decoded, item.cache_key, nullptr, item.params);
+                        write_derived_cache(*nvcodec, decoded, item.cache_key, sidecar_stream, item.params);
                     }
 
                     try_complete_pair(item.sequence_id, item.loader_generation,
