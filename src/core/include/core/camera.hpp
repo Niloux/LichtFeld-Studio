@@ -304,6 +304,7 @@ namespace lfs::core {
         // Moves only the device transform (float [16], row-major) and position (float [3]), ordered on `stream`
         // without a host sync. R() and T() keep the previous pose until set_pose.
         void set_device_pose(const float* w2c, const float* cam_position, cudaStream_t stream);
+        void sync_pose_to_stream(cudaStream_t stream);
 
         void precompute_undistortion(float blank_pixels = 0.0f);
         enum class UndistortDestination { Calibration,

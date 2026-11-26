@@ -506,7 +506,8 @@ namespace gsplat_lfs {
         const RenderGradPlanes& grad_planes,
         const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready,
         const uint32_t* tile_keys32,
-        const bool edge_weight_fp16) {
+        const bool edge_weight_fp16,
+        const int32_t* tile_order) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -555,7 +556,8 @@ namespace gsplat_lfs {
                                 .tile_keys = tile_keys,
                                 .tile_keys32 = tile_keys32_ptr,
                                 .tile_sub_masks = tile_sub_masks,
-                                .unit_rays = cached_unit_rays},
+                                .unit_rays = cached_unit_rays,
+                                .tile_order = (batches.empty() && C == 1) ? tile_order : nullptr},
                 color_variance, blend_peak_out, grad_planes, edge_weight_fp16);
         };
         GutSubstageProfiler::instance().begin_bwd(stream);

@@ -521,6 +521,7 @@ namespace gsplat_lfs {
         const RenderGradPlanes& grad_planes = {},
         const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready = {},
         const uint32_t* tile_keys32 = nullptr,
-        bool edge_weight_fp16 = false);
+        bool edge_weight_fp16 = false,
+        const int32_t* tile_order = nullptr);
 
 } // namespace gsplat_lfs

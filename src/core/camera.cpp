@@ -1212,7 +1212,20 @@ namespace lfs::core {
         LFS_CUDA_TRY(cudaMemcpyAsync(_cam_position.ptr<float>(), cam_position, 3 * sizeof(float),
                                      cudaMemcpyDeviceToDevice, stream),
                      stream, "camera device position");
+        _world_view_transform.set_stream(stream);
+        _cam_position.set_stream(stream);
         ++_pose_version;
+    }
+
+    void Camera::sync_pose_to_stream(cudaStream_t stream) {
+        if (_world_view_transform.is_valid() && _world_view_transform.stream() != stream) {
+            _world_view_transform.sync_to_stream(stream);
+            _world_view_transform.set_stream(stream);
+        }
+        if (_cam_position.is_valid() && _cam_position.stream() != stream) {
+            _cam_position.sync_to_stream(stream);
+            _cam_position.set_stream(stream);
+        }
     }
 
     bool Camera::has_distortion() const noexcept {

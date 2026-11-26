@@ -7852,8 +7852,7 @@ namespace lfs::training {
                             static_cast<size_t>(output.width)};
                         const cudaStream_t roi_stream = output.image.stream();
 
-                        cam->world_view_transform().sync_to_stream(roi_stream);
-                        cam->cam_position().sync_to_stream(roi_stream);
+                        cam->sync_pose_to_stream(roi_stream);
                         const auto [fx, fy, cx, cy] = cam->get_intrinsics();
                         // Lens-distorted, fisheye and panoramic GUT cameras weight the pixels
                         // through their real rays; plain pinholes use the closed form.

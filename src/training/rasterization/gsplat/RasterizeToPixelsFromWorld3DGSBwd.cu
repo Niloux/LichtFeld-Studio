@@ -1202,11 +1202,21 @@ namespace gsplat_lfs {
         const RenderGradPlanes grad_planes,
         const bool edge_weight_fp16) {
         const uint32_t subs = tile_size / kSplatBwdSub;
-        const uint32_t cid = blockIdx.x;
-        const uint32_t sub_y = blockIdx.y;
-        const uint32_t sub_x = blockIdx.z;
-        const uint32_t tile_id = (sub_y / subs) * tile_width + sub_x / subs;
-        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
+        uint32_t cid = 0, tile_id = 0, sub_bit = 0, sub_y = 0, sub_x = 0;
+        if (footprint.tile_order != nullptr) {
+            cid = blockIdx.y;
+            const uint32_t tile_rank = blockIdx.x / (subs * subs);
+            sub_bit = blockIdx.x % (subs * subs);
+            tile_id = static_cast<uint32_t>(footprint.tile_order[tile_rank]);
+            sub_y = (tile_id / tile_width) * subs + (sub_bit / subs);
+            sub_x = (tile_id % tile_width) * subs + (sub_bit % subs);
+        } else {
+            cid = blockIdx.x;
+            sub_y = blockIdx.y;
+            sub_x = blockIdx.z;
+            tile_id = (sub_y / subs) * tile_width + sub_x / subs;
+            sub_bit = (sub_y % subs) * subs + sub_x % subs;
+        }
         if constexpr (kBatched) {
             if (tile_id < tiles.begin || tile_id >= tiles.end)
                 return;
@@ -1889,7 +1899,9 @@ namespace gsplat_lfs {
                     camera_model != CameraModelType::ORTHO) {
                     const uint32_t subs = tile_size / kSplatBwdSub;
                     const dim3 threads = {32, 1, 1};
-                    const dim3 grid = {C, tile_height * subs, tile_width * subs};
+                    const dim3 grid = (footprint.tile_order != nullptr && C == 1 && !kBatched)
+                                          ? dim3{tile_height * tile_width * subs * subs, 1u, 1u}
+                                          : dim3{C, tile_height * subs, tile_width * subs};
                     auto launch_splat = [&](auto kernel) {
                         cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                              cudaSharedmemCarveoutMaxShared);

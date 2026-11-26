@@ -5,6 +5,7 @@
 #include "config_serialization.hpp"
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include <algorithm>
 #include <array>
@@ -329,7 +330,7 @@ namespace lfs::training {
 
         kernels::launch_ppisp_init_identity(exposure_params_.ptr<float>(), vignetting_params_.ptr<float>(),
                                             color_params_.ptr<float>(), crf_params_.ptr<float>(), num_cameras_,
-                                            num_frames_, nullptr);
+                                            num_frames_, lfs::core::getCurrentCUDAStream());
 
         init_color_pinv_block_diag();
     }
@@ -372,7 +373,7 @@ namespace lfs::training {
         kernels::launch_ppisp_forward_chw_region(exposure, vignetting_params_.ptr<float>(), color,
                                                  crf_params_.ptr<float>(), rgb.ptr<float>(), output.ptr<float>(), h, w,
                                                  region.y_offset, full_h, num_cameras_, num_frames, camera_idx,
-                                                 frame_idx, nullptr);
+                                                 frame_idx, lfs::core::getCurrentCUDAStream());
 
         return output;
     }
@@ -497,7 +498,7 @@ namespace lfs::training {
         kernels::launch_ppisp_forward_chw_region(override_exposure_.ptr<float>(), vignetting_modified.ptr<float>(),
                                                  override_color_.ptr<float>(), crf_modified.ptr<float>(),
                                                  rgb.ptr<float>(), output.ptr<float>(), h, w, region.y_offset, full_h,
-                                                 num_cameras_, 1, camera_idx, 0, nullptr);
+                                                 num_cameras_, 1, camera_idx, 0, lfs::core::getCurrentCUDAStream());
         return output;
     }
 
@@ -527,7 +528,7 @@ namespace lfs::training {
         kernels::launch_ppisp_forward_chw_region(exposure_temp.ptr<float>(), vignetting_params_.ptr<float>(),
                                                  color_temp.ptr<float>(), crf_params_.ptr<float>(), rgb.ptr<float>(),
                                                  output.ptr<float>(), h, w, region.y_offset, full_h, num_cameras_, 1,
-                                                 camera_idx, 0, nullptr);
+                                                 camera_idx, 0, lfs::core::getCurrentCUDAStream());
 
         return output;
     }
@@ -619,7 +620,7 @@ namespace lfs::training {
         kernels::launch_ppisp_forward_chw_region(exposure_temp.ptr<float>(), vignetting_modified.ptr<float>(),
                                                  color_temp.ptr<float>(), crf_modified.ptr<float>(), rgb.ptr<float>(),
                                                  output.ptr<float>(), h, w, region.y_offset, full_h, num_cameras_, 1,
-                                                 camera_idx, 0, nullptr);
+                                                 camera_idx, 0, lfs::core::getCurrentCUDAStream());
 
         return output;
     }
@@ -707,10 +708,11 @@ namespace lfs::training {
                 cudaMemcpyHostToDevice));
         }
 
+        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
         kernels::launch_ppisp_forward_chw_region(exposure_modified.ptr<float>(), vignetting_modified.ptr<float>(),
                                                  color_modified.ptr<float>(), crf_modified.ptr<float>(),
                                                  rgb.ptr<float>(), output.ptr<float>(), h, w, region.y_offset, full_h,
-                                                 num_cameras_, num_frames_, camera_idx, frame_idx, nullptr);
+                                                 num_cameras_, num_frames_, camera_idx, frame_idx, stream);
 
         return output;
     }
@@ -733,7 +735,7 @@ namespace lfs::training {
             exposure_params_.ptr<float>(), vignetting_params_.ptr<float>(), color_params_.ptr<float>(),
             crf_params_.ptr<float>(), rgb.ptr<float>(), grad_output.ptr<float>(), exposure_grad_.ptr<float>(),
             vignetting_grad_.ptr<float>(), color_grad_.ptr<float>(), crf_grad_.ptr<float>(), grad_rgb.ptr<float>(), h,
-            w, num_cameras_, num_frames_, camera_idx, frame_idx, nullptr);
+            w, num_cameras_, num_frames_, camera_idx, frame_idx, lfs::core::getCurrentCUDAStream());
 
         return grad_rgb;
     }
@@ -752,7 +754,7 @@ namespace lfs::training {
             crf_params_.ptr<float>(), rgb.ptr<float>(), grad.ptr<float>(), exposure_grad_.ptr<float>(),
             vignetting_grad_.ptr<float>(), color_grad_.ptr<float>(), crf_grad_.ptr<float>(), grad.ptr<float>(),
             static_cast<int>(shape[1]), static_cast<int>(shape[2]), num_cameras_, num_frames_, camera_idx, frame_idx,
-            nullptr);
+            lfs::core::getCurrentCUDAStream());
     }
 
     lfs::core::Tensor PPISP::backward_with_controller_params(const lfs::core::Tensor& rgb,
@@ -781,12 +783,13 @@ namespace lfs::training {
         auto color_temp = controller_params.slice(1, 1, 9).reshape({8});
 
         // Zero preallocated gradient scratch buffers
-        LFS_CUDA_CHECK(cudaMemsetAsync(ctrl_bwd_exposure_.ptr<float>(), 0, sizeof(float), nullptr));
-        LFS_CUDA_CHECK(cudaMemsetAsync(ctrl_bwd_color_.ptr<float>(), 0, 8 * sizeof(float), nullptr));
+        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+        LFS_CUDA_CHECK(cudaMemsetAsync(ctrl_bwd_exposure_.ptr<float>(), 0, sizeof(float), stream));
+        LFS_CUDA_CHECK(cudaMemsetAsync(ctrl_bwd_color_.ptr<float>(), 0, 8 * sizeof(float), stream));
         LFS_CUDA_CHECK(cudaMemsetAsync(
-            ctrl_bwd_vignetting_.ptr<float>(), 0, ctrl_bwd_vignetting_.numel() * sizeof(float), nullptr));
+            ctrl_bwd_vignetting_.ptr<float>(), 0, ctrl_bwd_vignetting_.numel() * sizeof(float), stream));
         LFS_CUDA_CHECK(cudaMemsetAsync(
-            ctrl_bwd_crf_.ptr<float>(), 0, ctrl_bwd_crf_.numel() * sizeof(float), nullptr));
+            ctrl_bwd_crf_.ptr<float>(), 0, ctrl_bwd_crf_.numel() * sizeof(float), stream));
 
         kernels::launch_ppisp_backward_chw(exposure_temp.ptr<float>(), vignetting_params_.ptr<float>(),
                                            color_temp.ptr<float>(), crf_params_.ptr<float>(), rgb.ptr<float>(),
@@ -794,15 +797,15 @@ namespace lfs::training {
                                            ctrl_bwd_vignetting_.ptr<float>(), ctrl_bwd_color_.ptr<float>(),
                                            ctrl_bwd_crf_.ptr<float>(), ctrl_bwd_rgb_.ptr<float>(),
                                            static_cast<int>(h), static_cast<int>(w), num_cameras_, 1, camera_idx, 0,
-                                           nullptr);
+                                           stream);
 
         // Assemble [exposure(1), color(8)] -> [9] via D2D copy into preallocated output
         LFS_CUDA_CHECK(cudaMemcpyAsync(
             ctrl_bwd_output_.ptr<float>(), ctrl_bwd_exposure_.ptr<float>(), sizeof(float),
-            cudaMemcpyDeviceToDevice, nullptr));
+            cudaMemcpyDeviceToDevice, stream));
         LFS_CUDA_CHECK(cudaMemcpyAsync(
             ctrl_bwd_output_.ptr<float>() + 1, ctrl_bwd_color_.ptr<float>(), 8 * sizeof(float),
-            cudaMemcpyDeviceToDevice, nullptr));
+            cudaMemcpyDeviceToDevice, stream));
 
         return ctrl_bwd_output_.reshape({1, 9});
     }
@@ -831,12 +834,13 @@ namespace lfs::training {
         const bool skip_mean = config_.exposure_mean <= 0.0f && config_.color_mean <= 0.0f;
         const bool skip_crf = !config_.train_crf || config_.crf_channel <= 0.0f;
         if (skip_mean && skip_crf) {
+            const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
             LFS_CUDA_CHECK(cudaMemsetAsync(
-                vig_reg_loss_.ptr<float>(), 0, sizeof(float), nullptr));
+                vig_reg_loss_.ptr<float>(), 0, sizeof(float), stream));
             kernels::launch_ppisp_vignetting_reg(
                 vignetting_params_.ptr<float>(), nullptr, vig_reg_loss_.ptr<float>(),
                 num_cameras_, config_.vig_center, config_.vig_channel, config_.vig_non_pos,
-                nullptr);
+                stream);
             return vig_reg_loss_;
         }
 
@@ -986,7 +990,7 @@ namespace lfs::training {
             kernels::launch_ppisp_vignetting_reg(
                 vignetting_params_.ptr<float>(), vignetting_grad_.ptr<float>(), nullptr,
                 num_cameras_, config_.vig_center, config_.vig_channel, config_.vig_non_pos,
-                nullptr);
+                lfs::core::getCurrentCUDAStream());
             return;
         }
 
@@ -1156,6 +1160,7 @@ namespace lfs::training {
             crf_group = {crf_params_.ptr<float>(), crf_exp_avg_.ptr<float>(), crf_exp_avg_sq_.ptr<float>(),
                          crf_grad_.ptr<float>(), static_cast<int>(crf_params_.numel())};
         }
+        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
         kernels::launch_ppisp_adam_update_batched(
             {exposure_params_.ptr<float>(), exposure_exp_avg_.ptr<float>(), exposure_exp_avg_sq_.ptr<float>(),
              exposure_grad_.ptr<float>(), static_cast<int>(exposure_params_.numel())},
@@ -1164,18 +1169,19 @@ namespace lfs::training {
              static_cast<int>(vignetting_params_.numel())},
             {color_params_.ptr<float>(), color_exp_avg_.ptr<float>(), color_exp_avg_sq_.ptr<float>(),
              color_grad_.ptr<float>(), static_cast<int>(color_params_.numel())},
-            crf_group, lr, beta1, beta2, bc1_rcp, bc2_sqrt_rcp, eps, nullptr);
+            crf_group, lr, beta1, beta2, bc1_rcp, bc2_sqrt_rcp, eps, stream);
     }
 
     void PPISP::zero_grad() {
+        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
         LFS_CUDA_CHECK(cudaMemsetAsync(
-            exposure_grad_.ptr<float>(), 0, exposure_grad_.numel() * sizeof(float), nullptr));
+            exposure_grad_.ptr<float>(), 0, exposure_grad_.numel() * sizeof(float), stream));
         LFS_CUDA_CHECK(cudaMemsetAsync(
-            vignetting_grad_.ptr<float>(), 0, vignetting_grad_.numel() * sizeof(float), nullptr));
+            vignetting_grad_.ptr<float>(), 0, vignetting_grad_.numel() * sizeof(float), stream));
         LFS_CUDA_CHECK(cudaMemsetAsync(
-            color_grad_.ptr<float>(), 0, color_grad_.numel() * sizeof(float), nullptr));
+            color_grad_.ptr<float>(), 0, color_grad_.numel() * sizeof(float), stream));
         LFS_CUDA_CHECK(cudaMemsetAsync(
-            crf_grad_.ptr<float>(), 0, crf_grad_.numel() * sizeof(float), nullptr));
+            crf_grad_.ptr<float>(), 0, crf_grad_.numel() * sizeof(float), stream));
     }
 
     void PPISP::scheduler_step() {
@@ -1203,7 +1209,8 @@ namespace lfs::training {
             return;
 
         kernels::launch_ppisp_project_mean(
-            exposure_params_.ptr<float>(), color_params_.ptr<float>(), num_frames_, nullptr);
+            exposure_params_.ptr<float>(), color_params_.ptr<float>(), num_frames_,
+            lfs::core::getCurrentCUDAStream());
     }
 
     float PPISP::mean_exposure_ev() const {

@@ -146,9 +146,9 @@ namespace lfs::training {
         lfs::core::Tensor channel_mean_of_image(int image_idx);
 
         // Per-image grids and Adam moments [N, C, L, H, W] live in pinned host
-        // memory; only the images being trained are staged on the device. Each
-        // step touches one image, so VRAM stays independent of the image count.
-        static constexpr int kResidentSlots = 2;
+        // memory; a VRAM-budgeted LRU pool caches slices on the device so
+        // moderate image counts stay resident without per-step D2H/H2D thrashing.
+        static constexpr size_t kMaxResidentBytes = 128ull * 1024ull * 1024ull;
         struct ResidentSlot {
             int image = -1;
             bool dirty = false;
@@ -157,10 +157,13 @@ namespace lfs::training {
         lfs::core::Tensor grids_;
         lfs::core::Tensor exp_avg_;
         lfs::core::Tensor exp_avg_sq_;
-        lfs::core::Tensor resident_grids_; // [kResidentSlots, C, L, H, W]
+        lfs::core::Tensor resident_grids_; // [resident_slot_count_, C, L, H, W]
         lfs::core::Tensor resident_exp_avg_;
         lfs::core::Tensor resident_exp_avg_sq_;
-        mutable std::array<ResidentSlot, kResidentSlots> slots_{};
+        int resident_slot_count_ = 0;
+        mutable std::vector<ResidentSlot> slots_;
+        mutable std::vector<int> image_to_slot_;
+        int next_free_slot_ = 0;
         uint64_t slot_clock_ = 0;
         // Stream of the latest slice copy; the legacy default stream is a null handle.
         mutable std::optional<cudaStream_t> copy_stream_;
@@ -170,6 +173,7 @@ namespace lfs::training {
         lfs::core::Tensor identity_mean_;  // [C]
         lfs::core::Tensor shared_offset_;  // [C]
         lfs::core::Tensor channel_sum_;    // [C]
+        lfs::core::Tensor zeros_channels_; // [C] persistent CUDA zeros
 
         Config config_;
         int64_t step_ = 0;

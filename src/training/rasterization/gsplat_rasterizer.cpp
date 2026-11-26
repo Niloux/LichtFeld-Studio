@@ -1236,7 +1236,8 @@ namespace lfs::training {
                 grad_planes,
                 on_sh_colors_ready,
                 ctx.sub_tile_masks ? ctx.isect_keys32_ptr : nullptr,
-                edge_weight_fp16);
+                edge_weight_fp16,
+                ctx.tile_order_ptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);
