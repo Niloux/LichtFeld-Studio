@@ -94,7 +94,8 @@ namespace lfs::training {
         static bool allocated(const Trainer& trainer) {
             return trainer.thin_structure_workspace_.horizontal.is_valid() ||
                    trainer.thin_structure_weight_buffer_.is_valid() ||
-                   trainer.thin_structure_map_key_.has_value();
+                   trainer.thin_structure_map_buffer_.is_valid() ||
+                   !trainer.thin_structure_cache_.empty();
         }
         struct FinishedLoss {
             core::Tensor loss;
