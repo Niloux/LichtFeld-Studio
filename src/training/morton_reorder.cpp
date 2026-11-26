@@ -540,6 +540,9 @@ namespace lfs::training::morton {
             splat.means().set_stream(stream);
         }
 
+        if (optimizer != nullptr) {
+            optimizer->flush_lazy_steps();
+        }
         const auto row_bytes = row_scratch_bytes(splat, optimizer, extra_rows);
         if (!row_bytes) {
             LOG_DEBUG("Skipping Morton reorder: a row tensor is not contiguous");

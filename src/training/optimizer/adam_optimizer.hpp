@@ -53,6 +53,7 @@ namespace lfs::training {
         //   joint_bounds holds float4 per 256-splat block.
         lfs::core::Tensor exp_avg;
         lfs::core::Tensor joint_bounds; // [n_bounds, 4] fp32; joint codec only
+        lfs::core::Tensor lazy_step;    // [n_bounds] int32; last materialized step per 256-splat block
         int joint_bits = 0;             // 0=legacy, 8=SH, 16=non-SH
         int64_t step_count = 0;
         size_t capacity = 0; // Primitive rows, or float-layout cells for SH-rest (never packed bytes)
@@ -144,6 +145,7 @@ namespace lfs::training {
 
         // Post-training refinement can update resident SH coefficients immediately.
         void step(int iteration, bool apply_sh_warmup = true);
+        void flush_lazy_steps();
         FastGSFusedAdamState prepare_fastgs_fused_adam(int iteration, cudaStream_t execution_stream = nullptr);
         void commit_fastgs_fused_adam(int iteration);
         void set_frozen_mask(lfs::core::Tensor mask);
@@ -295,6 +297,7 @@ namespace lfs::training {
         bool last_step_zeroed_gradients_ = false;
         int64_t fused_shN_iteration_ = -1;
         uint8_t zeroed_in_step_mask_ = 0;
+        bool has_lazy_pending_ = false;
         GutRegularizationConfig gut_reg_{};
 
         lfs::core::Tensor& get_param(ParamType type);

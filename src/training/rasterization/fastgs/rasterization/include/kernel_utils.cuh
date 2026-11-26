@@ -974,6 +974,146 @@ namespace fast_lfs::rasterization::kernels {
         constexpr uint N_SLOTS = (ACTIVE_SH_BASES > 9) ? 12u : (ACTIVE_SH_BASES > 4) ? 6u
                                                                                      : 3u;
 
+        if constexpr (ACTIVE_SH_BASES == 4) {
+            if (sh_layout_slots <= 3u) {
+                float reg_u[12];
+                float reg_s[12];
+                float reg_v[9];
+                if (touch) {
+#pragma unroll
+                    for (uint k = 0; k < 3u; ++k) {
+                        if (k >= sh_layout_slots)
+                            break;
+                        const uint slot = shAt(primitive_idx, k, sh_layout_slots);
+                        const bool active_slot = k < N_SLOTS;
+                        const float4 gk = grad_source(primitive_idx, k, slot, active_slot);
+                        float4 pc = load_shN_param_slot(value_q16, value_f16, param_u16, param_h, param4,
+                                                        primitive_idx, k, slot, n_value_cells, old_vmm);
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            const uint cell_lin = k * 4u + static_cast<uint>(c);
+                            float pci = (c == 0) ? pc.x : (c == 1) ? pc.y
+                                                      : (c == 2)   ? pc.z
+                                                                   : pc.w;
+                            float gci = (c == 0) ? gk.x : (c == 1) ? gk.y
+                                                      : (c == 2)   ? gk.z
+                                                                   : gk.w;
+                            const int64_t cell = static_cast<int64_t>(slot) * 4 + c;
+                            if constexpr (SEPT_REGULARIZERS && ACTIVE_SH_BASES > 1)
+                                local_sh_rest_loss += add_sh_rest_regularization<ACTIVE_SH_BASES>(
+                                    fused_adam, p.n_primitives, cell_lin, colour_reg_mask, pci, gci);
+                            const float2 prim = shN_adam_moment_us<C>(
+                                gci, cell, p.joint_packed, old_mm, apply_step, active_slot,
+                                beta1, beta2, row_step_size, eps, p.bias_correction2_sqrt_rcp, pci);
+                            if (c == 0)
+                                pc.x = pci;
+                            else if (c == 1)
+                                pc.y = pci;
+                            else if (c == 2)
+                                pc.z = pci;
+                            else
+                                pc.w = pci;
+                            reg_u[cell_lin] = prim.x;
+                            reg_s[cell_lin] = prim.y;
+                            if (value_q16 && cell_lin < 9u && cell_lin < n_value_cells) {
+                                reg_v[cell_lin] = pci;
+                                local_v_min = fminf(local_v_min, pci);
+                                local_v_max = fmaxf(local_v_max, pci);
+                            }
+                            local_u_min = fminf(local_u_min, prim.x);
+                            local_u_max = fmaxf(local_u_max, prim.x);
+                            local_s_min = fminf(local_s_min, prim.y);
+                            local_s_max = fmaxf(local_s_max, prim.y);
+                        }
+                        if (apply_step && active_slot) {
+                            if (value_f16) {
+                                const uint base = slot * 4u;
+                                param_h[base + 0] = __float2half(pc.x);
+                                param_h[base + 1] = __float2half(pc.y);
+                                param_h[base + 2] = __float2half(pc.z);
+                                param_h[base + 3] = __float2half(pc.w);
+                            } else if (!value_q16) {
+                                param4[slot] = pc;
+                            }
+                        }
+                    }
+                }
+
+                const float4 red = lfs::core::warp_ops::block_reduce_min4(
+                    make_float4(local_u_min, -local_u_max, local_s_min, -local_s_max));
+                const float u_min = red.x;
+                const float u_max = -red.y;
+                const float s_min = red.z;
+                const float s_max = -red.w;
+                float v_min = 0.0f;
+                float v_max = 0.0f;
+                if (value_q16) {
+                    const float2 r = lfs::core::warp_ops::block_reduce_min2(
+                        make_float2(local_v_min, -local_v_max));
+                    v_min = r.x;
+                    v_max = -r.y;
+                }
+
+                __shared__ float4 sm_bounds_fast;
+                __shared__ float2 sm_vbounds_fast;
+                if (threadIdx.x == 0) {
+                    const float4 nb = (u_min > u_max) ? make_float4(0.0f, 0.0f, 0.0f, 0.0f)
+                                                      : make_float4(u_min, u_max, s_min, s_max);
+                    sm_bounds_fast = nb;
+                    if (p.enabled && p.joint_bounds != nullptr) {
+                        *reinterpret_cast<float4*>(p.joint_bounds + 4 * bidx) = nb;
+                    }
+                    if (value_q16) {
+                        const float2 vb = (v_min > v_max) ? make_float2(0.0f, 0.0f)
+                                                          : make_float2(v_min, v_max);
+                        sm_vbounds_fast = vb;
+                        *reinterpret_cast<float2*>(p.sh_value_bounds + 2 * bidx) = vb;
+                    }
+                }
+                __syncthreads();
+                const float4 new_mm = sm_bounds_fast;
+                const float2 new_vmm = value_q16 ? sm_vbounds_fast : make_float2(0.0f, 0.0f);
+                const float inv_u_range = 1.0f / fmaxf(new_mm.y - new_mm.x, lfs::training::joint_adam::kEpsDevice);
+                const float inv_s_range = 1.0f / fmaxf(new_mm.w - new_mm.z, lfs::training::joint_adam::kEpsDevice);
+
+                if (touch) {
+#pragma unroll
+                    for (uint k = 0; k < 3u; ++k) {
+                        if (k >= sh_layout_slots)
+                            break;
+                        const uint slot = shAt(primitive_idx, k, sh_layout_slots);
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            const uint cell_lin = k * 4u + static_cast<uint>(c);
+                            const int64_t cell = static_cast<int64_t>(slot) * 4 + c;
+                            C::encode_us_sr(p.joint_packed, cell, reg_u[cell_lin], reg_s[cell_lin],
+                                            new_mm.x, new_mm.z, inv_u_range, inv_s_range, p.sr_seed);
+                            if (value_q16 && cell_lin < 9u && cell_lin < n_value_cells) {
+                                const uint u16_idx = lfs::core::sh_value::shAtU16(
+                                    primitive_idx, cell_lin, n_value_cells);
+                                if (p.sr_seed != 0u) {
+                                    const float r = lfs::training::joint_adam::sr_uniform01(
+                                        static_cast<uint64_t>(primitive_idx) * n_value_cells + cell_lin,
+                                        p.sr_seed);
+                                    param_u16[u16_idx] = VC::encode_sr(reg_v[cell_lin], new_vmm.x, new_vmm.y, r);
+                                } else {
+                                    param_u16[u16_idx] = VC::encode(reg_v[cell_lin], new_vmm.x, new_vmm.y);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if constexpr (SEPT_REGULARIZERS)
+                    if (fused_adam.sh_rest_reg_loss_out != nullptr) {
+                        const float block_sum = lfs::core::warp_ops::block_reduce_sum(local_sh_rest_loss);
+                        if (threadIdx.x == 0 && block_sum != 0.0f)
+                            atomicAdd(fused_adam.sh_rest_reg_loss_out, block_sum);
+                    }
+                return;
+            }
+        }
+
         if (touch) {
 #pragma unroll
             for (uint k = 0; k < 12u; ++k) {

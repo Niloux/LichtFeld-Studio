@@ -8,11 +8,14 @@
  * optimizer-step trajectory error vs fp32 reference (joint <= legacy).
  */
 
+#include "adam_api.h"
+#include "core/tensor.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <random>
 #include <vector>
@@ -380,4 +383,119 @@ TEST(JointAdamCodecTest, StochasticRoundingTracksDecayAndPreservesEndpoints) {
     EXPECT_EQ(endpoint_packed[1], 0u);
     EXPECT_EQ(endpoint_packed[2], 255u);
     EXPECT_EQ(endpoint_packed[3], 255u);
+}
+
+TEST(JointAdamCodecTest, PerBlockLazyStepAndFlushMatchDenseJointAdam) {
+    using lfs::core::DataType;
+    using lfs::core::Device;
+    using lfs::core::Tensor;
+
+    constexpr int kN = 512; // Two 256-splat blocks: block 0 active, block 1 intermittently inactive.
+    constexpr int kAttr = 3;
+    constexpr int kBlocks = 2;
+    constexpr int kTotalSteps = 12;
+    constexpr float kLr = 1e-3f;
+    constexpr float kBeta1 = 0.9f;
+    constexpr float kBeta2 = 0.999f;
+    constexpr float kEps = 1e-15f;
+
+    std::vector<float> init_param(kN * kAttr);
+    for (int i = 0; i < kN * kAttr; ++i) {
+        init_param[i] = 0.1f * std::sin(0.07f * static_cast<float>(i + 1));
+    }
+
+    auto make_buf = [&](const std::vector<float>& vals) {
+        return Tensor::from_vector(vals, {static_cast<size_t>(kN), static_cast<size_t>(kAttr)}, Device::CUDA);
+    };
+
+    Tensor p_dense = make_buf(init_param);
+    Tensor m_dense = Tensor::zeros({static_cast<size_t>(kN), static_cast<size_t>(kAttr * 4)}, Device::CUDA, DataType::UInt8);
+    Tensor b_dense = Tensor::zeros({static_cast<size_t>(kBlocks), size_t{4}}, Device::CUDA);
+
+    Tensor p_lazy = make_buf(init_param);
+    Tensor m_lazy = Tensor::zeros({static_cast<size_t>(kN), static_cast<size_t>(kAttr * 4)}, Device::CUDA, DataType::UInt8);
+    Tensor b_lazy = Tensor::zeros({static_cast<size_t>(kBlocks), size_t{4}}, Device::CUDA);
+    Tensor lazy_step = Tensor::zeros({static_cast<size_t>(kBlocks)}, Device::CUDA, DataType::Int32);
+
+    std::vector<float> host_grad(kN * kAttr);
+    std::vector<float> host_bp(kN);
+
+    for (int step = 1; step <= kTotalSteps; ++step) {
+        const bool block1_active = (step <= 5) || (step == 11);
+        for (int prim = 0; prim < kN; ++prim) {
+            const bool active = (prim < 256) || block1_active;
+            host_bp[prim] = active ? 0.25f : 0.0f;
+            for (int a = 0; a < kAttr; ++a) {
+                host_grad[prim * kAttr + a] =
+                    active ? (0.01f * std::cos(0.11f * static_cast<float>(prim + step * 7 + a))) : 0.0f;
+            }
+        }
+        Tensor g_dense = make_buf(host_grad);
+        Tensor g_lazy = make_buf(host_grad);
+        Tensor bp = Tensor::from_vector(host_bp, {static_cast<size_t>(kN)}, Device::CUDA);
+
+        const float bc1_rcp = 1.0f / (1.0f - std::pow(kBeta1, step));
+        const float bc2_sqrt_rcp = 1.0f / std::sqrt(1.0f - std::pow(kBeta2, step));
+
+        fast_lfs::optimizer::JointContiguousBatchEntry e_dense{};
+        e_dense.param = p_dense.ptr<float>();
+        e_dense.packed = m_dense.ptr<uint8_t>();
+        e_dense.bounds = b_dense.ptr<float>();
+        e_dense.grad = g_dense.ptr<float>();
+        e_dense.n_prims = kN;
+        e_dense.n_attr = kAttr;
+        e_dense.lr = kLr;
+        e_dense.bias_correction1_rcp = bc1_rcp;
+        e_dense.bias_correction2_sqrt_rcp = bc2_sqrt_rcp;
+        e_dense.zero_grad = 1;
+        e_dense.step_count = step;
+
+        fast_lfs::optimizer::JointContiguousBatchEntry e_lazy = e_dense;
+        e_lazy.param = p_lazy.ptr<float>();
+        e_lazy.packed = m_lazy.ptr<uint8_t>();
+        e_lazy.bounds = b_lazy.ptr<float>();
+        e_lazy.grad = g_lazy.ptr<float>();
+        e_lazy.lazy_step = lazy_step.ptr<int32_t>();
+        e_lazy.allow_lazy = 1;
+
+        fast_lfs::optimizer::GutRegularizationArgs gut_reg{};
+        gut_reg.blend_peak = bp.ptr<float>();
+
+        fast_lfs::optimizer::adam_step_joint_contiguous_batched(
+            &e_dense, 1, nullptr, 0, 0.0f, nullptr, 0, 1.0f, kBeta1, kBeta2, kEps, nullptr,
+            nullptr, 0, 0.0f, nullptr, 0, nullptr, 0, 0.0f, 0.0f, gut_reg, false);
+        fast_lfs::optimizer::adam_step_joint_contiguous_batched(
+            &e_lazy, 1, nullptr, 0, 0.0f, nullptr, 0, 1.0f, kBeta1, kBeta2, kEps, nullptr,
+            nullptr, 0, 0.0f, nullptr, 0, nullptr, 0, 0.0f, 0.0f, gut_reg, false);
+    }
+
+    fast_lfs::optimizer::JointContiguousBatchEntry e_flush{};
+    e_flush.param = p_lazy.ptr<float>();
+    e_flush.packed = m_lazy.ptr<uint8_t>();
+    e_flush.bounds = b_lazy.ptr<float>();
+    e_flush.n_prims = kN;
+    e_flush.n_attr = kAttr;
+    e_flush.lr = kLr;
+    e_flush.bias_correction1_rcp = 1.0f / (1.0f - std::pow(kBeta1, kTotalSteps));
+    e_flush.bias_correction2_sqrt_rcp = 1.0f / std::sqrt(1.0f - std::pow(kBeta2, kTotalSteps));
+    e_flush.lazy_step = lazy_step.ptr<int32_t>();
+    e_flush.step_count = kTotalSteps;
+    fast_lfs::optimizer::adam_step_joint_contiguous_batched(
+        &e_flush, 1, nullptr, 0, 0.0f, nullptr, 0, 1.0f, kBeta1, kBeta2, kEps, nullptr,
+        nullptr, 0, 0.0f, nullptr, 0, nullptr, 0, 0.0f, 0.0f, {}, /*flush_only=*/true);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    const auto out_dense = p_dense.cpu().to_vector();
+    const auto out_lazy = p_lazy.cpu().to_vector();
+    const auto steps_cpu = lazy_step.cpu().to_vector_int();
+    ASSERT_EQ(steps_cpu.size(), 2u);
+    EXPECT_EQ(steps_cpu[0], kTotalSteps);
+    EXPECT_EQ(steps_cpu[1], kTotalSteps);
+
+    float max_abs_diff = 0.0f;
+    for (size_t i = 0; i < out_dense.size(); ++i) {
+        ASSERT_TRUE(std::isfinite(out_lazy[i])) << "i=" << i;
+        max_abs_diff = std::max(max_abs_diff, std::abs(out_dense[i] - out_lazy[i]));
+    }
+    EXPECT_LT(max_abs_diff, 5e-4f) << "max_abs_diff=" << max_abs_diff;
 }

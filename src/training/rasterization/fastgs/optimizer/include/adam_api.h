@@ -30,6 +30,11 @@ namespace fast_lfs::optimizer {
         int apply_gut_dc_reg = 0;
         // stochastic rounding seed (0 = round-to-nearest)
         std::uint32_t sr_seed = 0;
+        // Per-256-splat-block lazy update tracking
+        std::int32_t* lazy_step = nullptr;
+        int step_count = 0;
+        int allow_lazy = 0;
+        int check_grad_for_active = 0;
     };
 
     struct GutRegularizationArgs {
@@ -130,7 +135,8 @@ namespace fast_lfs::optimizer {
         int screen_share_n = 0,
         float screen_share_limit = 0.0f,
         float screen_share_penalty = 0.0f,
-        const GutRegularizationArgs& gut_reg = {});
+        const GutRegularizationArgs& gut_reg = {},
+        bool flush_only = false);
 
     // Standalone joint 8-bit shN Adam over a swizzled fp32 gradient buffer.
     // Reuses apply_shN_grads_packed_joint (same device code as fused FastGS).

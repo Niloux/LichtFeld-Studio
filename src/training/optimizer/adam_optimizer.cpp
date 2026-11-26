@@ -201,6 +201,64 @@ namespace lfs::training {
         }
     }
 
+    void ensure_lazy_step_capacity(lfs::core::Tensor& lazy_step,
+                                   const size_t n_prims,
+                                   const size_t capacity_prims,
+                                   const lfs::core::Device device,
+                                   const int32_t init_step,
+                                   const bool reset_all) {
+        using namespace joint_adam;
+        const size_t nb = n_bounds_for_prims(n_prims);
+        const size_t nb_cap = n_bounds_for_prims(std::max(n_prims, capacity_prims));
+        if (nb == 0) {
+            lazy_step = {};
+            return;
+        }
+        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+        if (lazy_step.is_valid() && lazy_step.ndim() == 1 &&
+            lazy_step.dtype() == lfs::core::DataType::Int32 &&
+            lazy_step.capacity() >= nb) {
+            const size_t cur = lazy_step.shape()[0];
+            if (cur < nb) {
+                lazy_step.append_zeros(nb - cur);
+                if (init_step != 0) {
+                    auto tail = lazy_step.slice(0, cur, nb);
+                    tail.sync_to_stream(stream);
+                    tail.fill_(static_cast<float>(init_step), stream);
+                    tail.set_stream(stream);
+                }
+            }
+            if (reset_all) {
+                lazy_step.sync_to_stream(stream);
+                lazy_step.fill_(static_cast<float>(init_step), stream);
+                lazy_step.set_stream(stream);
+            }
+            return;
+        }
+        lfs::core::Tensor fresh =
+            (nb_cap > nb && nb_cap > 0)
+                ? lfs::core::Tensor::zeros_direct({nb}, nb_cap, device, lfs::core::DataType::Int32)
+                : lfs::core::Tensor::zeros({nb}, device, lfs::core::DataType::Int32);
+        if (init_step != 0) {
+            fresh.sync_to_stream(stream);
+            fresh.fill_(static_cast<float>(init_step), stream);
+            fresh.set_stream(stream);
+        }
+        if (!reset_all && lazy_step.is_valid() && lazy_step.numel() > 0) {
+            lfs::core::waitForCUDAStream(stream, lazy_step.stream());
+            lfs::core::waitForCUDAStream(stream, fresh.stream());
+            const size_t copy_n = std::min(lazy_step.numel(), fresh.numel());
+            auto old_steps = std::move(lazy_step);
+            LFS_CUDA_CHECK(cudaMemcpyAsync(
+                fresh.ptr<int32_t>(), old_steps.ptr<int32_t>(),
+                copy_n * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+            lazy_step = std::move(fresh);
+        } else {
+            lazy_step = std::move(fresh);
+        }
+    }
+
     uint64_t AdamOptimizer::slow_path_grow_count() noexcept {
         return g_adam_slow_path_grow_count.load(std::memory_order_relaxed);
     }
@@ -417,6 +475,7 @@ namespace lfs::training {
         const auto gut_cfg = std::exchange(gut_reg_, {});
 
         fast_lfs::optimizer::JointContiguousBatchEntry entries[5];
+        ParamType entry_types[5];
         int n_entries = 0;
         cudaStream_t batch_stream = nullptr;
         const float* batch_mean_step_scale_raw = nullptr;
@@ -445,6 +504,8 @@ namespace lfs::training {
             if (param_size != state.size) {
                 throw std::runtime_error("Optimizer state desync: " + name);
             }
+            ensure_lazy_step_capacity(state.lazy_step, param_size, state.capacity, param_live.device(),
+                                      static_cast<int32_t>(state.step_count), /*reset_all=*/false);
             state.step_count++;
             const double bias_correction1_rcp =
                 1.0 / (1.0 - std::pow(config_.beta1, state.step_count));
@@ -465,7 +526,9 @@ namespace lfs::training {
             lfs::core::waitForCUDAStream(batch_stream, state.exp_avg.stream());
             lfs::core::waitForCUDAStream(batch_stream, state.joint_bounds.stream());
             lfs::core::waitForCUDAStream(batch_stream, state.grad.stream());
+            lfs::core::waitForCUDAStream(batch_stream, state.lazy_step.stream());
             const size_t feature_dim = param_live.numel() / param_size;
+            entry_types[n_entries] = type;
             auto& e = entries[n_entries++];
             e.param = param_live.ptr<float>();
             e.packed = state.exp_avg.ptr<uint8_t>();
@@ -496,11 +559,14 @@ namespace lfs::training {
             e.sr_seed = joint_adam::stochastic_rounding_enabled()
                             ? static_cast<uint32_t>(state.step_count)
                             : 0u;
+            e.lazy_step = state.lazy_step.is_valid() ? state.lazy_step.ptr<int32_t>() : nullptr;
+            e.step_count = static_cast<int>(state.step_count);
             zeroed_in_step_mask_ |= static_cast<uint8_t>(1u << static_cast<int>(type));
             param_live.set_stream(batch_stream);
             state.exp_avg.set_stream(batch_stream);
             state.joint_bounds.set_stream(batch_stream);
             state.grad.set_stream(batch_stream);
+            state.lazy_step.set_stream(batch_stream);
         };
 
         for (const auto type : contiguous) {
@@ -554,6 +620,38 @@ namespace lfs::training {
                 fast_lfs::optimizer::ray_depth_propose(ray_depth, batch_stream);
                 ray_depth_proposed = true;
             }
+            bool any_lazy = false;
+            if (gut_cfg.blend_peak != nullptr && !ray_depth_proposed) {
+                for (int i = 0; i < n_entries; ++i) {
+                    if (entries[i].step_count <= 100 || entries[i].lazy_step == nullptr) {
+                        continue;
+                    }
+                    switch (entry_types[i]) {
+                    case ParamType::Means:
+                    case ParamType::Rotation:
+                    case ParamType::Scaling:
+                        entries[i].allow_lazy = 1;
+                        entries[i].check_grad_for_active = 0;
+                        any_lazy = true;
+                        break;
+                    case ParamType::Opacity:
+                        entries[i].allow_lazy = 1;
+                        entries[i].check_grad_for_active = 1;
+                        any_lazy = true;
+                        break;
+                    case ParamType::Sh0:
+                        if (gut_cfg.dc_weight == 0.0f) {
+                            entries[i].allow_lazy = 1;
+                            entries[i].check_grad_for_active = 0;
+                            any_lazy = true;
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+            has_lazy_pending_ = any_lazy;
             const fast_lfs::optimizer::GutRegularizationArgs gut_reg{
                 gut_cfg.blend_peak,
                 gut_cfg.log_scale_weight,
@@ -577,6 +675,111 @@ namespace lfs::training {
                 fast_lfs::optimizer::ray_depth_commit(ray_depth, batch_stream);
         }
         step_param(ParamType::ShN, iteration, apply_sh_warmup);
+    }
+
+    void AdamOptimizer::flush_lazy_steps() {
+        if (!has_lazy_pending_) {
+            return;
+        }
+        fast_lfs::optimizer::JointContiguousBatchEntry entries[5];
+        int n_entries = 0;
+        cudaStream_t batch_stream = nullptr;
+        const float* batch_mean_step_scale_raw = nullptr;
+        int batch_mean_step_scale_n = 0;
+        bool need_mean_step_far = false;
+        const ParamType contiguous[] = {
+            ParamType::Means, ParamType::Sh0, ParamType::Scaling,
+            ParamType::Rotation, ParamType::Opacity};
+
+        for (const auto type : contiguous) {
+            auto& param_live = get_param(type);
+            if (!param_live.is_valid() || param_live.numel() == 0) {
+                continue;
+            }
+            const auto name = param_name(type);
+            const auto it = states_.find(name);
+            if (it == states_.end()) {
+                continue;
+            }
+            auto& state = it->second;
+            if (!state.is_joint() || !state.exp_avg.is_valid() || !state.joint_bounds.is_valid() ||
+                !state.lazy_step.is_valid() || state.step_count <= 0) {
+                continue;
+            }
+            const size_t param_size = param_live.shape()[0];
+            if (param_size != state.size) {
+                continue;
+            }
+            cudaStream_t execution_stream = state.exp_avg.stream();
+            if (execution_stream == nullptr) {
+                execution_stream = param_live.stream();
+            }
+            if (batch_stream == nullptr) {
+                batch_stream = execution_stream;
+            }
+            lfs::core::waitForCUDAStream(batch_stream, param_live.stream());
+            lfs::core::waitForCUDAStream(batch_stream, state.exp_avg.stream());
+            lfs::core::waitForCUDAStream(batch_stream, state.joint_bounds.stream());
+            lfs::core::waitForCUDAStream(batch_stream, state.lazy_step.stream());
+            const size_t feature_dim = param_live.numel() / param_size;
+            const double bias_correction1_rcp =
+                1.0 / (1.0 - std::pow(config_.beta1, state.step_count));
+            const double bias_correction2_sqrt_rcp =
+                1.0 / std::sqrt(1.0 - std::pow(config_.beta2, state.step_count));
+            auto& e = entries[n_entries++];
+            e.param = param_live.ptr<float>();
+            e.packed = state.exp_avg.ptr<uint8_t>();
+            e.bounds = state.joint_bounds.ptr<float>();
+            e.grad = nullptr;
+            e.n_prims = static_cast<int>(state.size);
+            e.n_attr = static_cast<int>(feature_dim);
+            e.lr = static_cast<float>(get_param_lr(type));
+            e.bias_correction1_rcp = static_cast<float>(bias_correction1_rcp);
+            e.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            if (type == ParamType::Means && per_splat_mean_step_) {
+                auto& scaling = splat_data_.scaling_raw();
+                if (scaling.is_valid() && scaling.numel() > 0) {
+                    lfs::core::waitForCUDAStream(batch_stream, scaling.stream());
+                    batch_mean_step_scale_raw = scaling.ptr<float>();
+                    batch_mean_step_scale_n = static_cast<int>(scaling.numel());
+                    e.apply_mean_step = 1;
+                    need_mean_step_far = true;
+                }
+            }
+            e.sr_seed = joint_adam::stochastic_rounding_enabled()
+                            ? static_cast<uint32_t>(state.step_count)
+                            : 0u;
+            e.lazy_step = state.lazy_step.ptr<int32_t>();
+            e.step_count = static_cast<int>(state.step_count);
+            param_live.set_stream(batch_stream);
+            state.exp_avg.set_stream(batch_stream);
+            state.joint_bounds.set_stream(batch_stream);
+            state.lazy_step.set_stream(batch_stream);
+        }
+        if (n_entries > 0) {
+            if (need_mean_step_far && mean_step_far_mask_storage_.is_valid()) {
+                mean_step_far_mask_storage_.sync_to_stream(batch_stream);
+            }
+            if (frozen_mask_.is_valid()) {
+                lfs::core::waitForCUDAStream(batch_stream, frozen_mask_.stream());
+            }
+            if (crop_damping_mask_.is_valid()) {
+                crop_damping_mask_.sync_to_stream(batch_stream);
+            }
+            fast_lfs::optimizer::adam_step_joint_contiguous_batched(
+                entries, n_entries,
+                frozen_mask_ptr(), frozen_mask_size(), frozen_lr_scale_,
+                crop_damping_mask_ptr(), crop_damping_mask_size(), cropbox_lr_scale_,
+                static_cast<float>(config_.beta1),
+                static_cast<float>(config_.beta2),
+                static_cast<float>(config_.eps),
+                batch_stream,
+                batch_mean_step_scale_raw, batch_mean_step_scale_n,
+                mean_step_median_extent_, mean_step_far_mask_, mean_step_far_mask_n_,
+                nullptr, 0, 0.0f, 0.0f,
+                {}, /*flush_only=*/true);
+        }
+        has_lazy_pending_ = false;
     }
 
     size_t AdamOptimizer::compute_state_growth(ParamType type, size_t n_new) const {
@@ -904,6 +1107,9 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::step_param(ParamType type, const int iteration, const bool apply_sh_warmup) {
+        if (type != ParamType::ShN) {
+            flush_lazy_steps();
+        }
         auto& param = get_param(type);
         if (type == ParamType::ShN && fused_shN_iteration_ == iteration) {
             zeroed_in_step_mask_ |= static_cast<uint8_t>(1u << static_cast<int>(ParamType::ShN));
@@ -1444,6 +1650,7 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::commit_fastgs_fused_adam(const int iteration) {
+        flush_lazy_steps();
         // Only bump step_count for parameters that prepare_fastgs_fused_adam
         // actually enabled this iteration. During SH warmup prepare disables shN
         // but the old commit still advanced its counter → first real shN update
@@ -1473,6 +1680,7 @@ namespace lfs::training {
     void AdamOptimizer::reset_state_at_indices(ParamType type, const std::vector<int64_t>& indices) {
         if (indices.empty())
             return;
+        flush_lazy_steps();
 
         const auto name = param_name(type);
         if (!states_.contains(name))
@@ -1574,6 +1782,7 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::extend_state_by_gather(ParamType type, const lfs::core::Tensor& indices) {
+        flush_lazy_steps();
         const auto name = param_name(type);
         if (!states_.contains(name))
             return;
@@ -1640,6 +1849,11 @@ namespace lfs::training {
                                    : compute_new_capacity(new_size, new_size);
             ensure_joint_bounds_capacity(state.joint_bounds, new_size, prim_cap,
                                          param.device(), /*zero_all=*/false);
+            if (state.lazy_step.is_valid()) {
+                ensure_lazy_step_capacity(state.lazy_step, new_size, prim_cap,
+                                          param.device(), static_cast<int32_t>(state.step_count),
+                                          /*reset_all=*/false);
+            }
             // raw gather copies codes across blocks with different bounds → garbage.
             // Transcode decode(src bounds) → encode(dst bounds) for the new rows.
             if (n_new > 0 && state.joint_bounds.is_valid()) {
@@ -1683,6 +1897,7 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::extend_state_for_new_params(ParamType type, const size_t n_new) {
+        flush_lazy_steps();
         const auto name = param_name(type);
         if (!states_.contains(name)) {
             LOG_DEBUG("extend_state_for_new_params({}): state not found, skipping", name);
@@ -1786,6 +2001,11 @@ namespace lfs::training {
                             : state.capacity);
             ensure_joint_bounds_capacity(state.joint_bounds, prim_n, prim_cap,
                                          param.device(), /*zero_all=*/false);
+            if (type != ParamType::ShN && state.lazy_step.is_valid()) {
+                ensure_lazy_step_capacity(state.lazy_step, prim_n, prim_cap,
+                                          param.device(), static_cast<int32_t>(state.step_count),
+                                          /*reset_all=*/false);
+            }
             state.size = new_size;
             LFS_DEBUG_ASSERT_MSG(state.capacity >= state.size,
                                  "extend_state_for_new_params(joint): capacity < size");
@@ -1912,6 +2132,7 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::add_new_params(ParamType type, const lfs::core::Tensor& new_values, const bool validate) {
+        flush_lazy_steps();
         auto& param = get_param(type);
 
         if (validate) {
@@ -1972,6 +2193,7 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::add_new_params_gather(ParamType type, const lfs::core::Tensor& indices) {
+        flush_lazy_steps();
         auto& param = get_param(type);
 
         // ShN: swizzled 1D buffer. append_gather doesn't apply; do swizzle-aware gather.
@@ -2183,6 +2405,7 @@ namespace lfs::training {
     void AdamOptimizer::relocate_params_at_indices_gpu(ParamType type, const int64_t* indices_device, const size_t n_indices) {
         if (n_indices == 0)
             return;
+        flush_lazy_steps();
 
         const auto name = param_name(type);
         if (!states_.contains(name))
@@ -2509,6 +2732,7 @@ namespace lfs::training {
         loaded_config.sh_warmup = config_.sh_warmup;
         config_ = std::move(loaded_config);
         states_ = std::move(loaded_states);
+        has_lazy_pending_ = false;
 
         // Gradient buffers are transient and allocated lazily by get_grad().
         const auto milliseconds = [](const auto begin, const auto end) {
@@ -2529,10 +2753,12 @@ namespace lfs::training {
         config_ = std::move(loaded.config_);
         states_ = std::move(loaded.states_);
         frozen_lr_scale_ = loaded.frozen_lr_scale_;
+        has_lazy_pending_ = loaded.has_lazy_pending_;
     }
 
     void AdamOptimizer::reserve_capacity(const size_t capacity) {
         using namespace joint_adam;
+        flush_lazy_steps();
 
         for (auto& [name, state] : states_) {
             const bool is_shN = (name == "shN");
@@ -2569,11 +2795,14 @@ namespace lfs::training {
                 const size_t bounds_cap = n_bounds_for_prims(capacity);
                 if (bounds_cap > state.joint_bounds.capacity())
                     reserve_tensor_rows(state.joint_bounds, bounds_cap);
+                if (state.lazy_step.is_valid() && bounds_cap > state.lazy_step.capacity())
+                    reserve_tensor_rows(state.lazy_step, bounds_cap);
             }
         }
     }
 
     void AdamOptimizer::reset_state(const ParamType type) {
+        flush_lazy_steps();
         auto* state = get_state_mutable(type);
         if (!state || !state->exp_avg.is_valid()) {
             return;
@@ -2583,6 +2812,8 @@ namespace lfs::training {
         state->exp_avg.zero_();
         if (state->joint_bounds.is_valid())
             state->joint_bounds.zero_();
+        if (state->lazy_step.is_valid())
+            state->lazy_step.zero_();
         state->step_count = 0;
     }
 

@@ -91,7 +91,10 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float beta2_comp = 1.0f - beta2;
 
         if (in_range) {
-            for (int i = 0; i < row; ++i) {
+#pragma unroll
+            for (int i = 0; i < kMaxAttr; ++i) {
+                if (i >= row)
+                    break;
                 const int64_t cell = static_cast<int64_t>(prim) * n_attr + i;
                 const float2 mv = C::decode_g1g2(packed, cell, old_mm);
                 float m = mv.x;
@@ -145,7 +148,10 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float inv_s = 1.0f / fmaxf(new_mm.w - new_mm.z, lfs::training::joint_adam::kEpsDevice);
 
         if (in_range) {
-            for (int i = 0; i < row; ++i) {
+#pragma unroll
+            for (int i = 0; i < kMaxAttr; ++i) {
+                if (i >= row)
+                    break;
                 C::encode_us_sr(packed, static_cast<int64_t>(prim) * n_attr + i,
                                 us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s, sr_seed);
             }
@@ -173,11 +179,12 @@ namespace fast_lfs::optimizer::kernels::adam {
         const int screen_share_n,
         const float screen_share_limit,
         const float screen_share_penalty,
-        const GutRegularizationArgs gut_reg = {}) {
+        const GutRegularizationArgs gut_reg = {},
+        const bool flush_only = false) {
         using C = lfs::training::joint_adam::DeviceCodec<BITS>;
         constexpr float kInf = 1e30f;
         constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
-        constexpr int kMaxAttr = 16;
+        constexpr int kMaxAttr = 4;
 
         const int e = static_cast<int>(blockIdx.y);
         const JointContiguousBatchEntry& ent = batch.entries[e];
@@ -192,8 +199,59 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float bias_correction2_sqrt_rcp = ent.bias_correction2_sqrt_rcp;
         const uint32_t sr_seed = ent.sr_seed;
 
-        const int prim = static_cast<int>(blockIdx.x) * kBS + static_cast<int>(threadIdx.x);
-        const bool in_range = prim < n_prims && n_attr > 0;
+        const int bidx = static_cast<int>(blockIdx.x);
+        if (bidx * kBS >= n_prims || n_attr <= 0) {
+            return;
+        }
+        const int prim = bidx * kBS + static_cast<int>(threadIdx.x);
+        const bool in_range = prim < n_prims;
+
+        const int last_step = (ent.lazy_step != nullptr) ? ent.lazy_step[bidx] : (ent.step_count - 1);
+        if (flush_only) {
+            if (ent.lazy_step == nullptr || last_step >= ent.step_count) {
+                return;
+            }
+        } else if (ent.allow_lazy && ent.lazy_step != nullptr) {
+            bool prim_active = false;
+            if (in_range) {
+                if (ent.check_grad_for_active && param_grad != nullptr) {
+#pragma unroll
+                    for (int i = 0; i < kMaxAttr; ++i) {
+                        if (i >= n_attr)
+                            break;
+                        if (param_grad[static_cast<int64_t>(prim) * n_attr + i] != 0.0f) {
+                            prim_active = true;
+                        }
+                    }
+                } else if (gut_reg.blend_peak != nullptr) {
+                    prim_active = gut_reg.blend_peak[prim] > 0.0f;
+                }
+                if (!prim_active && ent.apply_screen_share && screen_share_max != nullptr &&
+                    prim < screen_share_n && screen_share_max[prim] > screen_share_limit) {
+                    prim_active = true;
+                }
+            }
+            if (!__syncthreads_or(prim_active)) {
+                return;
+            }
+        }
+
+        const int gap = (ent.lazy_step != nullptr)
+                            ? max(0, flush_only ? (ent.step_count - last_step) : ((ent.step_count - 1) - last_step))
+                            : 0;
+        float catchup_b1 = 1.0f;
+        float catchup_b2 = 1.0f;
+        float catchup_geom = 0.0f;
+        if (gap > 0) {
+            const float gf = static_cast<float>(gap);
+            catchup_b1 = powf(beta1, gf);
+            catchup_b2 = powf(beta2, gf);
+            const float rho = beta1 * rsqrtf(beta2);
+            const float one_minus_rho = 1.0f - rho;
+            catchup_geom = (fabsf(one_minus_rho) > 1e-6f)
+                               ? (rho * (1.0f - powf(rho, gf)) / one_minus_rho)
+                               : gf;
+        }
 
         float row_lr = lr;
         bool apply_step = in_range;
@@ -225,7 +283,6 @@ namespace fast_lfs::optimizer::kernels::adam {
             }
         }
 
-        const int bidx = static_cast<int>(blockIdx.x);
         const float4 old_mm = (bounds != nullptr)
                                   ? *reinterpret_cast<const float4*>(bounds + 4 * bidx)
                                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -241,7 +298,7 @@ namespace fast_lfs::optimizer::kernels::adam {
 
         if (in_range) {
             float extra_grad[3] = {0.0f, 0.0f, 0.0f};
-            if (ent.apply_gut_scale_reg && n_attr == 3) {
+            if (!flush_only && ent.apply_gut_scale_reg && n_attr == 3) {
                 const bool apply_shape = !gut_reg.blend_peak || gut_reg.blend_peak[prim] > 0.0f;
                 if (apply_shape) {
                     const float s0 = param[3 * prim + 0];
@@ -269,7 +326,7 @@ namespace fast_lfs::optimizer::kernels::adam {
                     }
                 }
             }
-            if (ent.apply_gut_dc_reg && n_attr == 3 && gut_reg.dc_weight > 0.0f) {
+            if (!flush_only && ent.apply_gut_dc_reg && n_attr == 3 && gut_reg.dc_weight > 0.0f) {
                 constexpr float kSh0 = 0.28209479177387814f;
                 const float limit = 0.5f / kSh0;
                 const float dc_scale = 2.0f * gut_reg.dc_weight / 3.0f;
@@ -280,30 +337,43 @@ namespace fast_lfs::optimizer::kernels::adam {
                 }
             }
 
-            for (int i = 0; i < row; ++i) {
+#pragma unroll
+            for (int i = 0; i < kMaxAttr; ++i) {
+                if (i >= row)
+                    break;
                 const int64_t cell = static_cast<int64_t>(prim) * n_attr + i;
-                const float2 mv = C::decode_g1g2(packed, cell, old_mm);
+                float2 mv = C::decode_g1g2(packed, cell, old_mm);
+                if (gap > 0) {
+                    if (apply_step && mv.x != 0.0f) {
+                        const float denom_c = sqrtf(mv.y) * bias_correction2_sqrt_rcp + eps;
+                        param[cell] -= (step_size * catchup_geom) * mv.x / denom_c;
+                    }
+                    mv.x *= catchup_b1;
+                    mv.y *= catchup_b2;
+                }
                 float m = mv.x;
                 float v = mv.y;
-                float grad = param_grad[cell];
-                if (ent.zero_grad && grad != 0.0f) {
-                    param_grad[cell] = 0.0f;
-                }
-                if (apply_step) {
-                    if (i < 3) {
-                        grad += extra_grad[i];
+                if (!flush_only && param_grad != nullptr) {
+                    float grad = param_grad[cell];
+                    if (ent.zero_grad && grad != 0.0f) {
+                        param_grad[cell] = 0.0f;
                     }
-                    float hinge = 0.0f;
-                    if (ent.apply_screen_share && screen_share_max != nullptr &&
-                        prim < screen_share_n) {
-                        hinge = lfs::training::screen_share_hinge_extra_grad(
-                            screen_share_max[prim], screen_share_limit, screen_share_penalty,
-                            mv.y, bias_correction2_sqrt_rcp, eps);
+                    if (apply_step) {
+                        if (i < 3) {
+                            grad += extra_grad[i];
+                        }
+                        float hinge = 0.0f;
+                        if (ent.apply_screen_share && screen_share_max != nullptr &&
+                            prim < screen_share_n) {
+                            hinge = lfs::training::screen_share_hinge_extra_grad(
+                                screen_share_max[prim], screen_share_limit, screen_share_penalty,
+                                mv.y, bias_correction2_sqrt_rcp, eps);
+                        }
+                        m = beta1 * mv.x + beta1_comp * (grad + hinge);
+                        v = beta2 * mv.y + beta2_comp * grad * grad;
+                        const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
+                        param[cell] -= step_size * m / denom;
                     }
-                    m = beta1 * mv.x + beta1_comp * (grad + hinge);
-                    v = beta2 * mv.y + beta2_comp * grad * grad;
-                    const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
-                    param[cell] -= step_size * m / denom;
                 }
                 const float2 prim_us = C::g1g2_to_us(m, v);
                 us_u[i] = prim_us.x;
@@ -334,6 +404,9 @@ namespace fast_lfs::optimizer::kernels::adam {
             if (bounds != nullptr) {
                 *reinterpret_cast<float4*>(bounds + 4 * bidx) = nb;
             }
+            if (ent.lazy_step != nullptr) {
+                ent.lazy_step[bidx] = ent.step_count;
+            }
         }
         __syncthreads();
         const float4 new_mm = sm_bounds;
@@ -341,7 +414,10 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float inv_s = 1.0f / fmaxf(new_mm.w - new_mm.z, lfs::training::joint_adam::kEpsDevice);
 
         if (in_range) {
-            for (int i = 0; i < row; ++i) {
+#pragma unroll
+            for (int i = 0; i < kMaxAttr; ++i) {
+                if (i >= row)
+                    break;
                 C::encode_us_sr(packed, static_cast<int64_t>(prim) * n_attr + i,
                                 us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s, sr_seed);
             }

@@ -2501,6 +2501,7 @@ namespace lfs::training {
             combined_model_lock = scene_->acquireCombinedModelExclusive();
         }
         waitForModelReaders();
+        strategy_->get_optimizer().flush_lazy_steps();
         auto& model = strategy_->get_model();
         if (model.size() == 0)
             return;
@@ -5274,6 +5275,9 @@ namespace lfs::training {
             !project_snapshot_service_) {
             return;
         }
+        if (strategy_) {
+            strategy_->get_optimizer().flush_lazy_steps();
+        }
         if (prepared_project_iteration_ != iteration) {
             LOG_WARN(
                 "Prepared .licht snapshot iteration {} reached "
@@ -6887,6 +6891,7 @@ namespace lfs::training {
     // Splits shrink their parents before the children land, so an undone
     // refine is not repeated; the step is dropped and the next refine grows.
     void Trainer::post_backward_or_undo(const int iter, RenderOutput& render_output, bool& refine_undone) {
+        strategy_->get_optimizer().flush_lazy_steps();
         const RefineRowSnapshot rows_before(
             strategy_->get_model(), strategy_->get_optimizer(),
             [this](const std::function<void(lfs::core::Tensor&)>& visit) { strategy_->for_each_gaussian_row(visit); });
@@ -9951,6 +9956,7 @@ namespace lfs::training {
                 refit->restore();
             }
         });
+        strategy_->get_optimizer().flush_lazy_steps();
         return evaluator_->evaluate(iteration, strategy_->get_model(), val_dataset_, background_, image_loader,
                                     std::move(on_view_boundary));
     }

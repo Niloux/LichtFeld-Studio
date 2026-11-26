@@ -93,9 +93,10 @@ namespace fast_lfs::optimizer {
         const int mean_step_far_mask_n,
         const float* screen_share_max,
         const int screen_share_n,
-        const float screen_share_limit,
+        float screen_share_limit,
         const float screen_share_penalty,
-        const GutRegularizationArgs& gut_reg) {
+        const GutRegularizationArgs& gut_reg,
+        const bool flush_only) {
         if (n_entries <= 0) {
             return;
         }
@@ -106,11 +107,17 @@ namespace fast_lfs::optimizer {
         bool mean_step_enabled = false;
         for (int i = 0; i < n_entries; ++i) {
             if (!host_entries[i].param || !host_entries[i].packed ||
-                !host_entries[i].bounds || !host_entries[i].grad) {
+                !host_entries[i].bounds || (!flush_only && !host_entries[i].grad)) {
                 throw std::runtime_error("adam_step_joint_contiguous_batched: null entry");
             }
-            if (host_entries[i].n_prims <= 0 || host_entries[i].n_attr <= 0) {
-                throw std::runtime_error("adam_step_joint_contiguous_batched: n_prims/n_attr");
+            if (flush_only && !host_entries[i].lazy_step) {
+                throw std::runtime_error("adam_step_joint_contiguous_batched: null lazy_step on flush");
+            }
+            if (host_entries[i].lazy_step != nullptr) {
+                LFS_VALIDATE_CUDA_DEVICE_POINTER(host_entries[i].lazy_step, "lazy_step");
+            }
+            if (host_entries[i].n_prims <= 0 || host_entries[i].n_attr <= 0 || host_entries[i].n_attr > 4) {
+                throw std::runtime_error("adam_step_joint_contiguous_batched: n_prims/n_attr (n_attr must be 1..4)");
             }
             max_prims = std::max(max_prims, host_entries[i].n_prims);
             mean_step_enabled = mean_step_enabled || host_entries[i].apply_mean_step != 0;
@@ -142,7 +149,7 @@ namespace fast_lfs::optimizer {
                     mean_step_scale_raw, mean_step_scale_n, mean_step_median_extent,
                     mean_step_far_mask, mean_step_far_mask_n,
                     screen_share_max, screen_share_n, screen_share_limit, screen_share_penalty,
-                    gut_reg);
+                    gut_reg, flush_only);
             LFS_CUDA_LAUNCH_CHECK(stream, "adam_step_joint_contiguous_batched");
         };
         if (mean_step_enabled)
