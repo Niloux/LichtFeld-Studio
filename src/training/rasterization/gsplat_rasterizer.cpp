@@ -797,6 +797,7 @@ namespace lfs::training {
 
             // Borrowed TLS VMM pointers (valid through backward; do not free)
             ctx.isect_ids_ptr = result.isect_ids;
+            ctx.isect_keys32_ptr = result.isect_keys32;
             ctx.sub_tile_masks = result.sub_tile_masks;
             ctx.flatten_ids_ptr = result.flatten_ids;
             ctx.n_isects = result.n_isects;
@@ -804,6 +805,7 @@ namespace lfs::training {
             ctx.tiles_per_gauss_ptr = tiles_per_gauss_ptr;
             ctx.conics_ptr = conics_ptr_out;
             ctx.n_sort = result.n_sort;
+            ctx.tile_order_ptr = result.tile_order;
 
             // Save input tensors for backward (these are references, not copies)
             ctx.means = means;
@@ -899,7 +901,8 @@ namespace lfs::training {
         float flatten_weight,
         const GsplatColorVarianceLoss& color_variance,
         core::Tensor blend_peak_out,
-        const core::Tensor& grad_depth_sq) {
+        const core::Tensor& grad_depth_sq,
+        int fuse_shN_iteration) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -1136,13 +1139,24 @@ namespace lfs::training {
             // The SH backward adds straight into the optimizer's sh0 and swizzled shN gradients.
             auto& sh0_grad = optimizer.get_grad(ParamType::Sh0);
             sh0_grad.set_stream(stream);
+            const bool fuse_shN = fuse_shN_iteration >= 0 && ctx.sh_degree > 0 &&
+                                  optimizer.can_fuse_gut_shN(fuse_shN_iteration);
             float* dst_shN = nullptr;
-            if (ctx.sh_degree > 0) {
+            if (ctx.sh_degree > 0 && !fuse_shN) {
                 auto& shN_grad = optimizer.get_grad(ParamType::ShN);
                 if (shN_grad.is_valid() && shN_grad.numel() > 0) {
                     shN_grad.set_stream(stream);
                     dst_shN = shN_grad.ptr<float>();
                 }
+            }
+            std::function<void(const float*, const float*, uint32_t, cudaStream_t)> on_sh_colors_ready;
+            if (fuse_shN) {
+                on_sh_colors_ready = [&](const float* v_colors_ptr, const float* dirs_ptr,
+                                         const uint32_t color_stride, const cudaStream_t exec_stream) {
+                    (void)optimizer.step_gut_fused_shN(
+                        fuse_shN_iteration, v_colors_ptr, dirs_ptr,
+                        static_cast<int>(color_stride), exec_stream);
+                };
             }
 
             if (blend_peak_out.is_valid()) {
@@ -1216,7 +1230,9 @@ namespace lfs::training {
                 blend_peak_out.is_valid() ? blend_peak_out.ptr<float>() : nullptr,
                 color_grad_bytes > 0 ? reinterpret_cast<float*>(bwd_blob + total_bwd_size) : nullptr,
                 ctx.unit_rays_ptr,
-                grad_planes);
+                grad_planes,
+                on_sh_colors_ready,
+                ctx.sub_tile_masks ? ctx.isect_keys32_ptr : nullptr);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);

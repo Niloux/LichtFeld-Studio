@@ -6,6 +6,7 @@
 
 #include "adam_api.h"
 #include "lfs/core/warp_reduce.cuh"
+#include "lfs/training/effective_rank.cuh"
 #include "lfs/training/joint_adam_codec.cuh"
 #include "lfs/training/mean_step_scale.cuh"
 #include "lfs/training/ray_depth_step.cuh"
@@ -49,7 +50,8 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float* screen_share_max,
         const int screen_share_n,
         const float screen_share_limit,
-        const float screen_share_penalty) {
+        const float screen_share_penalty,
+        const uint32_t sr_seed = 0u) {
         using C = lfs::training::joint_adam::DeviceCodec<BITS>;
         constexpr float kInf = 1e30f;
         constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
@@ -144,8 +146,8 @@ namespace fast_lfs::optimizer::kernels::adam {
 
         if (in_range) {
             for (int i = 0; i < row; ++i) {
-                C::encode_us(packed, static_cast<int64_t>(prim) * n_attr + i,
-                             us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s);
+                C::encode_us_sr(packed, static_cast<int64_t>(prim) * n_attr + i,
+                                us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s, sr_seed);
             }
         }
     }
@@ -170,7 +172,8 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float* screen_share_max,
         const int screen_share_n,
         const float screen_share_limit,
-        const float screen_share_penalty) {
+        const float screen_share_penalty,
+        const GutRegularizationArgs gut_reg = {}) {
         using C = lfs::training::joint_adam::DeviceCodec<BITS>;
         constexpr float kInf = 1e30f;
         constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
@@ -181,12 +184,13 @@ namespace fast_lfs::optimizer::kernels::adam {
         float* const param = ent.param;
         uint8_t* const packed = ent.packed;
         float* const bounds = ent.bounds;
-        const float* const param_grad = ent.grad;
+        float* const param_grad = ent.grad;
         const int n_prims = ent.n_prims;
         const int n_attr = ent.n_attr;
         const float lr = ent.lr;
         const float bias_correction1_rcp = ent.bias_correction1_rcp;
         const float bias_correction2_sqrt_rcp = ent.bias_correction2_sqrt_rcp;
+        const uint32_t sr_seed = ent.sr_seed;
 
         const int prim = static_cast<int>(blockIdx.x) * kBS + static_cast<int>(threadIdx.x);
         const bool in_range = prim < n_prims && n_attr > 0;
@@ -236,13 +240,59 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float beta2_comp = 1.0f - beta2;
 
         if (in_range) {
+            float extra_grad[3] = {0.0f, 0.0f, 0.0f};
+            if (ent.apply_gut_scale_reg && n_attr == 3) {
+                const bool apply_shape = !gut_reg.blend_peak || gut_reg.blend_peak[prim] > 0.0f;
+                if (apply_shape) {
+                    const float s0 = param[3 * prim + 0];
+                    const float s1 = param[3 * prim + 1];
+                    const float s2 = param[3 * prim + 2];
+                    if (gut_reg.log_scale_weight > 0.0f) {
+                        const float coef = gut_reg.log_scale_weight / (3.0f * static_cast<float>(n_prims));
+                        if (s0 > -40.0f)
+                            extra_grad[0] += coef;
+                        if (s1 > -40.0f)
+                            extra_grad[1] += coef;
+                        if (s2 > -40.0f)
+                            extra_grad[2] += coef;
+                    }
+                    if (gut_reg.erank_weight > 0.0f) {
+                        const auto pen = lfs::training::effective_rank_penalty(s0, s1, s2);
+                        const float coef = gut_reg.erank_weight / static_cast<float>(n_prims);
+                        for (int axis = 0; axis < 3; ++axis)
+                            extra_grad[axis] += coef * pen.gradient[axis];
+                    }
+                    if (gut_reg.flatten_weight > 0.0f) {
+                        const int min_a = (s0 <= s1 && s0 <= s2) ? 0 : (s1 <= s2 ? 1 : 2);
+                        const float s_min = (min_a == 0) ? s0 : (min_a == 1 ? s1 : s2);
+                        extra_grad[min_a] += gut_reg.flatten_weight * expf(s_min) / static_cast<float>(n_prims);
+                    }
+                }
+            }
+            if (ent.apply_gut_dc_reg && n_attr == 3 && gut_reg.dc_weight > 0.0f) {
+                constexpr float kSh0 = 0.28209479177387814f;
+                const float limit = 0.5f / kSh0;
+                const float dc_scale = 2.0f * gut_reg.dc_weight / 3.0f;
+                for (int c = 0; c < 3; ++c) {
+                    const float v = param[3 * prim + c];
+                    const float delta = v > limit ? (v - limit) : (v < -limit ? (v + limit) : 0.0f);
+                    extra_grad[c] += dc_scale * delta;
+                }
+            }
+
             for (int i = 0; i < row; ++i) {
                 const int64_t cell = static_cast<int64_t>(prim) * n_attr + i;
                 const float2 mv = C::decode_g1g2(packed, cell, old_mm);
                 float m = mv.x;
                 float v = mv.y;
+                float grad = param_grad[cell];
+                if (ent.zero_grad && grad != 0.0f) {
+                    param_grad[cell] = 0.0f;
+                }
                 if (apply_step) {
-                    float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    if (i < 3) {
+                        grad += extra_grad[i];
+                    }
                     float hinge = 0.0f;
                     if (ent.apply_screen_share && screen_share_max != nullptr &&
                         prim < screen_share_n) {
@@ -253,7 +303,7 @@ namespace fast_lfs::optimizer::kernels::adam {
                     m = beta1 * mv.x + beta1_comp * (grad + hinge);
                     v = beta2 * mv.y + beta2_comp * grad * grad;
                     const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
-                    param[static_cast<int64_t>(prim) * n_attr + i] -= step_size * m / denom;
+                    param[cell] -= step_size * m / denom;
                 }
                 const float2 prim_us = C::g1g2_to_us(m, v);
                 us_u[i] = prim_us.x;
@@ -292,8 +342,8 @@ namespace fast_lfs::optimizer::kernels::adam {
 
         if (in_range) {
             for (int i = 0; i < row; ++i) {
-                C::encode_us(packed, static_cast<int64_t>(prim) * n_attr + i,
-                             us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s);
+                C::encode_us_sr(packed, static_cast<int64_t>(prim) * n_attr + i,
+                                us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s, sr_seed);
             }
         }
     }

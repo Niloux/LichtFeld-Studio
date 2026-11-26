@@ -2414,6 +2414,17 @@ if(COMMAND lfs_enable_fast_cxx_compile)
     lfs_enable_fast_cxx_compile(gsplat_tests)
 endif()
 
+add_executable(gut_adam_tests test_main.cpp test_joint_adam_codec.cpp test_gut_shN_joint_adam.cpp)
+target_compile_features(gut_adam_tests PRIVATE cxx_std_23)
+target_include_directories(gut_adam_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/training
+    ${CMAKE_SOURCE_DIR}/src/training/rasterization/fastgs/optimizer/include
+    ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(gut_adam_tests PRIVATE lfs_training lfs_core fastlfs_backend GTest::gtest CUDA::cudart)
+if(COMMAND lfs_enable_fast_cxx_compile)
+    lfs_enable_fast_cxx_compile(gut_adam_tests)
+endif()
+
 add_executable(opacity_gradient_tests test_main.cpp test_opacity_gradients.cpp test_fused_reg_loss.cpp
     test_gut_regularization.cpp)
 target_compile_features(opacity_gradient_tests PRIVATE cxx_std_23)

@@ -99,12 +99,14 @@ namespace gsplat_lfs {
     //=========================================================================
 
     struct IntersectTileResult {
-        int32_t* tiles_per_gauss; // [C, N] - output buffer provided by caller
-        int64_t* isect_ids;       // [n_sort] sorted keys (sentinel-padded)
-        int32_t* flatten_ids;     // [n_sort] sorted ids (sentinel-padded)
-        int64_t n_isects;         // Exact count, including an over-budget count-only result
-        int32_t n_sort;           // Sorted key count (high-water capacity)
-        bool sub_tile_masks;      // Keys hold sub-tile masks in place of depths
+        int32_t* tiles_per_gauss;        // [C, N] - output buffer provided by caller
+        int64_t* isect_ids;              // [n_sort] sorted keys (sentinel-padded)
+        uint32_t* isect_keys32 = nullptr;// [n_sort] optional 32-bit packed keys
+        int32_t* flatten_ids;            // [n_sort] sorted ids (sentinel-padded)
+        int64_t n_isects;                // Exact count, including an over-budget count-only result
+        int32_t n_sort;                  // Sorted key count (high-water capacity)
+        bool sub_tile_masks;             // Keys hold sub-tile masks in place of depths
+        const int32_t* tile_order = nullptr; // [n_tiles] optional descending LPT tile order
     };
 
     // Called with a pair list that is sorted and has tile offsets but whose count the host has
@@ -383,12 +385,14 @@ namespace gsplat_lfs {
         float* compensations;     // [C, N] optional (can be nullptr)
         float* dilations;         // [C, N] optional (can be nullptr)
         // Borrowed from TLS high-water isect cache — do NOT cudaFree.
-        int64_t* isect_ids;   // [n_isects]
-        int32_t* flatten_ids; // [n_sort]
+        int64_t* isect_ids;                  // [n_isects]
+        uint32_t* isect_keys32 = nullptr;    // [n_sort] optional 32-bit packed keys
+        int32_t* flatten_ids;                // [n_sort]
         int64_t n_isects;
         int32_t n_sort = 0;
-        bool sub_tile_masks = false;    // isect_ids hold sub-tile masks in place of depths
-        std::vector<TileBatch> batches; // Empty on the ordinary single-batch path
+        bool sub_tile_masks = false;         // isect_ids/isect_keys32 hold sub-tile masks
+        const int32_t* tile_order = nullptr; // [n_tiles] optional LPT tile order
+        std::vector<TileBatch> batches;      // Empty on the ordinary single-batch path
     };
 
     void rasterize_from_world_with_sh_fwd(
@@ -513,6 +517,8 @@ namespace gsplat_lfs {
         float* blend_peak_out = nullptr,
         float* color_grad_workspace = nullptr, // [C, N, channels]
         const float* cached_unit_rays = nullptr,
-        const RenderGradPlanes& grad_planes = {});
+        const RenderGradPlanes& grad_planes = {},
+        const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready = {},
+        const uint32_t* tile_keys32 = nullptr);
 
 } // namespace gsplat_lfs

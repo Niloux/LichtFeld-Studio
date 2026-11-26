@@ -38,6 +38,13 @@ namespace lfs::core::sh_value {
             const float qf = fminf(fmaxf(roundf(kQMaxDevice * (v - lo) / range), 0.0f), kQMaxDevice);
             return static_cast<uint16_t>(qf);
         }
+
+        __device__ static inline uint16_t encode_sr(const float v, const float lo, const float hi, const float r) {
+            const float range = fmaxf(hi - lo, kEpsDevice);
+            const float q_scaled = fminf(fmaxf(kQMaxDevice * (v - lo) / range, 0.0f), kQMaxDevice);
+            const float qf = fminf(floorf(q_scaled + r), kQMaxDevice);
+            return static_cast<uint16_t>(qf);
+        }
     };
 #endif
 

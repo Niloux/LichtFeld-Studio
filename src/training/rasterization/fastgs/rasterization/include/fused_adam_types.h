@@ -40,6 +40,7 @@ namespace fast_lfs::rasterization {
         int screen_share_n = 0;
         float screen_share_limit = 0.0f;
         float screen_share_penalty = 0.0f;
+        std::uint32_t sr_seed = 0;
     };
 
     struct FusedAdamSettings {

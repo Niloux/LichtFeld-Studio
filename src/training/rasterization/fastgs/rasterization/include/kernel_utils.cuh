@@ -452,8 +452,8 @@ namespace fast_lfs::rasterization::kernels {
 
         if (touch) {
             for (uint i = 0; i < row; ++i) {
-                C::encode_us(param.joint_packed, static_cast<int64_t>(base + i),
-                             us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u_range, inv_s_range);
+                C::encode_us_sr(param.joint_packed, static_cast<int64_t>(base + i),
+                                us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u_range, inv_s_range, param.sr_seed);
             }
         }
     }
@@ -802,6 +802,62 @@ namespace fast_lfs::rasterization::kernels {
         }
     };
 
+    // Per-cell shN gradient: zero-materialization GUT path reads v_colors [N, color_stride]
+    // and dirs [N] once per primitive, skipping basis math when v_colors == 0.
+    template <int ACTIVE_SH_BASES>
+    struct ShNGradFromColorDir {
+        float3 grad_color;
+        float bx, by, bz, bxx, byy, bzz, bxy, bxz, byz;
+        bool compute;
+
+        __device__ __forceinline__ ShNGradFromColorDir(
+            const uint primitive_idx,
+            const float* __restrict__ v_colors,
+            const float3* __restrict__ dirs,
+            const uint color_stride)
+            : grad_color(make_float3(0.0f, 0.0f, 0.0f)),
+              bx(0.0f),
+              by(0.0f),
+              bz(0.0f),
+              bxx(0.0f),
+              byy(0.0f),
+              bzz(0.0f),
+              bxy(0.0f),
+              bxz(0.0f),
+              byz(0.0f),
+              compute(false) {
+            if (v_colors != nullptr && dirs != nullptr) {
+                const float* const v = v_colors + static_cast<size_t>(primitive_idx) * color_stride;
+                const float3 gc = make_float3(v[0], v[1], v[2]);
+                if (gc.x != 0.0f || gc.y != 0.0f || gc.z != 0.0f) {
+                    grad_color = gc;
+                    const float3 direction = safe_normalize(dirs[primitive_idx]);
+                    bx = direction.x;
+                    by = direction.y;
+                    bz = direction.z;
+                    bxx = bx * bx;
+                    byy = by * by;
+                    bzz = bz * bz;
+                    bxy = bx * by;
+                    bxz = bx * bz;
+                    byz = by * bz;
+                    compute = true;
+                }
+            }
+        }
+
+        __device__ __forceinline__ float4 operator()(
+            const uint /*primitive_idx*/,
+            const uint k,
+            const uint /*slot*/,
+            const bool active_slot) const {
+            if (!compute || !active_slot)
+                return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            return shN_slot_grad_from_basis<ACTIVE_SH_BASES>(
+                k, bx, by, bz, bxx, byy, bzz, bxy, bxz, byz, grad_color);
+        }
+    };
+
     // Per-cell shN gradient: standalone path loads the already-swizzled fp32 grad buffer.
     struct ShNGradFromSwizzle {
         const float4* __restrict__ grad4;
@@ -1046,16 +1102,23 @@ namespace fast_lfs::rasterization::kernels {
                     const float2 prim = shN_adam_moment_us<C>(
                         gci, cell, p.joint_packed, old_mm, apply_step, active_slot,
                         beta1, beta2, row_step_size, eps, p.bias_correction2_sqrt_rcp, pci);
-                    C::encode_us(p.joint_packed, cell, prim.x, prim.y,
-                                 new_mm.x, new_mm.z, inv_u_range, inv_s_range);
+                    C::encode_us_sr(p.joint_packed, cell, prim.x, prim.y,
+                                    new_mm.x, new_mm.z, inv_u_range, inv_s_range, p.sr_seed);
                     // Always re-encode under new block bounds (frozen/crop-damped too),
                     // matching joint-moment encode. apply_step only gates the Adam update.
                     if (value_q16) {
                         const uint cell_lin = k * 4u + static_cast<uint>(c);
                         if (cell_lin < n_value_cells) {
-                            param_u16[lfs::core::sh_value::shAtU16(
-                                primitive_idx, cell_lin, n_value_cells)] =
-                                VC::encode(pci, new_vmm.x, new_vmm.y);
+                            const uint u16_idx = lfs::core::sh_value::shAtU16(
+                                primitive_idx, cell_lin, n_value_cells);
+                            if (p.sr_seed != 0u) {
+                                const float r = lfs::training::joint_adam::sr_uniform01(
+                                    static_cast<uint64_t>(primitive_idx) * n_value_cells + cell_lin,
+                                    p.sr_seed);
+                                param_u16[u16_idx] = VC::encode_sr(pci, new_vmm.x, new_vmm.y, r);
+                            } else {
+                                param_u16[u16_idx] = VC::encode(pci, new_vmm.x, new_vmm.y);
+                            }
                         }
                     }
                 }

@@ -31,9 +31,11 @@ namespace gsplat_lfs {
         int32_t* flatten_ids,     // [n_isects] optional (for second pass)
         cudaStream_t stream = nullptr,
         int64_t max_isects = -1, TileRange tiles = {},
-        const int32_t* order = nullptr,            // [packed ? nnz : C * N] optional: element visited by thread k
-        const float* conics = nullptr,             // [C, N, 3] optional: cull tiles the ellipse misses
-        const uint32_t* tile_sub_masks = nullptr); // [C, tile_height, tile_width] optional: live sub-tiles
+        const int32_t* order = nullptr,           // [packed ? nnz : C * N] optional: element visited by thread k
+        const float* conics = nullptr,            // [C, N, 3] optional: cull tiles the ellipse misses
+        const uint32_t* tile_sub_masks = nullptr, // [C, tile_height, tile_width] optional: live sub-tiles
+        uint32_t* isect_keys32 = nullptr,         // optional 32-bit packed pair output
+        uint32_t mask_bits = 0);                  // sub-tile mask bit count in low bits of isect_keys32
 
     // Per tile, one bit per kCullSubTile sub-tile (row-major) that has a pixel of
     // weight > 0 within one sub-tile of it. The margin keeps windowed losses such as
@@ -56,6 +58,13 @@ namespace gsplat_lfs {
         int64_t sentinel_key,
         cudaStream_t stream);
 
+    void launch_fill_isect_sentinels_u32_kernel(
+        uint32_t* isect_keys32,
+        int32_t* flatten_ids,
+        int64_t n,
+        uint32_t sentinel_key,
+        cudaStream_t stream);
+
     void launch_intersect_offset_kernel(
         // inputs
         const int64_t* isect_ids, // [n_keys] sorted, unused slots hold sentinel keys
@@ -65,6 +74,16 @@ namespace gsplat_lfs {
         uint32_t tile_height,
         // outputs
         int32_t* offsets, // [C * tile_height * tile_width + 1]
+        cudaStream_t stream = nullptr);
+
+    void launch_intersect_offset_u32_kernel(
+        const uint32_t* isect_keys32,
+        uint32_t n_keys,
+        uint32_t C,
+        uint32_t tile_width,
+        uint32_t tile_height,
+        uint32_t mask_bits,
+        int32_t* offsets,
         cudaStream_t stream = nullptr);
 
     void radix_sort_double_buffer(
@@ -83,6 +102,22 @@ namespace gsplat_lfs {
         uint32_t& cub_end_bit,
         cudaStream_t stream = nullptr);
 
+    void radix_sort_double_buffer_u32(
+        int64_t n_isects,
+        uint32_t tile_n_bits,
+        uint32_t cam_n_bits,
+        uint32_t begin_bit,
+        uint32_t* keys,
+        int32_t* vals,
+        uint32_t* keys_sorted,
+        int32_t* vals_sorted,
+        uint32_t** keys_out,
+        int32_t** vals_out,
+        size_t& cub_ws_bytes,
+        int64_t& cub_n,
+        uint32_t& cub_end_bit,
+        cudaStream_t stream = nullptr);
+
     // Stable order of the elements by the depth bits the pair keys carry; returns
     // values or values_alt, whichever holds the sorted indices.
     const int32_t* sort_by_depth(
@@ -92,6 +127,16 @@ namespace gsplat_lfs {
         uint32_t* keys_alt,
         int32_t* values,
         int32_t* values_alt,
+        cudaStream_t stream,
+        const int32_t* radii = nullptr);
+
+    const int32_t* sort_tiles_by_count_descending(
+        const int32_t* tile_offsets,
+        uint32_t n_tiles,
+        uint32_t* keys,
+        uint32_t* keys_alt,
+        int32_t* vals,
+        int32_t* vals_alt,
         cudaStream_t stream);
 
     void compute_cumsum_gpu(

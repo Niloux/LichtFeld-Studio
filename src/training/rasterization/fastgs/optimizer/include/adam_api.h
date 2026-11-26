@@ -13,7 +13,7 @@ namespace fast_lfs::optimizer {
         float* param = nullptr;
         std::uint8_t* packed = nullptr;
         float* bounds = nullptr;
-        const float* grad = nullptr;
+        float* grad = nullptr;
         int n_prims = 0;
         int n_attr = 0;
         float lr = 0.0f;
@@ -23,6 +23,24 @@ namespace fast_lfs::optimizer {
         int apply_mean_step = 0;
         // screen-share hinge applies to this entry (Scaling only)
         int apply_screen_share = 0;
+        // sparse in-place gradient zeroing after reading
+        int zero_grad = 0;
+        // per-splat GUT shape / DC regularization flags (Scaling / Sh0)
+        int apply_gut_scale_reg = 0;
+        int apply_gut_dc_reg = 0;
+        // stochastic rounding seed (0 = round-to-nearest)
+        std::uint32_t sr_seed = 0;
+    };
+
+    struct GutRegularizationArgs {
+        const float* blend_peak = nullptr; // [n_prims], optional rendered-only gate
+        float log_scale_weight = 0.0f;
+        float erank_weight = 0.0f;
+        float flatten_weight = 0.0f;
+        float dc_weight = 0.0f;
+        float* scale_loss_out = nullptr;
+        float* erank_loss_out = nullptr;
+        float* dc_loss_out = nullptr;
     };
 
     // Ray-depth coordinate around the unfused Adam step (lfs/training/ray_depth_step.cuh).
@@ -85,7 +103,8 @@ namespace fast_lfs::optimizer {
         const float* screen_share_max = nullptr,
         int screen_share_n = 0,
         float screen_share_limit = 0.0f,
-        float screen_share_penalty = 0.0f);
+        float screen_share_penalty = 0.0f,
+        std::uint32_t sr_seed = 0);
 
     // One launch over a fixed-size value batch of contiguous joint params
     // (means/sh0/scale/rot/opa).
@@ -110,7 +129,8 @@ namespace fast_lfs::optimizer {
         const float* screen_share_max = nullptr,
         int screen_share_n = 0,
         float screen_share_limit = 0.0f,
-        float screen_share_penalty = 0.0f);
+        float screen_share_penalty = 0.0f,
+        const GutRegularizationArgs& gut_reg = {});
 
     // Standalone joint 8-bit shN Adam over a swizzled fp32 gradient buffer.
     // Reuses apply_shN_grads_packed_joint (same device code as fused FastGS).
@@ -122,7 +142,7 @@ namespace fast_lfs::optimizer {
         std::uint8_t* packed,
         float* bounds,
         float* sh_value_bounds,
-        const float* shN_grad,
+        float* shN_grad,
         const bool* frozen_mask,
         int frozen_mask_size,
         float frozen_lr_scale,
@@ -142,7 +162,40 @@ namespace fast_lfs::optimizer {
         cudaStream_t stream = nullptr,
         // L2 pull of the active rest coefficients toward zero, normalized like the fused FastGS term.
         float sh_rest_reg_weight = 0.0f,
-        float* sh_rest_reg_loss_out = nullptr);
+        float* sh_rest_reg_loss_out = nullptr,
+        bool zero_grad = false,
+        std::uint32_t sr_seed = 0);
+
+    // Zero-materialization GUT shN Adam: derives per-coeff SH-rest gradients directly
+    // from v_colors [N, color_stride] and dirs [N, 3] without materializing v_shN.
+    void adam_step_shN_joint_from_color(
+        float* param,
+        std::uint8_t* packed,
+        float* bounds,
+        float* sh_value_bounds,
+        const float* v_colors,
+        const float* dirs,
+        int color_stride,
+        const bool* frozen_mask,
+        int frozen_mask_size,
+        float frozen_lr_scale,
+        const bool* crop_damping_mask,
+        int crop_damping_mask_size,
+        float cropbox_lr_scale,
+        int n_prims,
+        int sh_layout_slots,
+        int active_sh_bases,
+        int sh_value_bits,
+        int sh_value_n_cells,
+        float step_size,
+        float beta1,
+        float beta2,
+        float eps,
+        float bias_correction2_sqrt_rcp,
+        cudaStream_t stream = nullptr,
+        float sh_rest_reg_weight = 0.0f,
+        float* sh_rest_reg_loss_out = nullptr,
+        std::uint32_t sr_seed = 0);
 
     // Joint (u,log_s) densify reset: encode true (m,v)=(0,0). Widens block
     // bounds to include 0 when needed and re-encodes the block.

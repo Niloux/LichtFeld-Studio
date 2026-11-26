@@ -5,6 +5,8 @@
 #include "Rasterization.h"
 #include "Common.h"
 #include "GeometryFeatures.h"
+#include "GutProfile.h"
+#include "Intersect.h"
 #include "Ops.h"
 
 #include <cassert>
@@ -19,6 +21,14 @@ namespace gsplat_lfs {
     static bool use_contributor_pruning() {
         static const bool enabled = [] {
             const char* value = std::getenv("LFS_GUT_PRUNE");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    static bool use_micro_forward_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LFS_GUT_MICRO_FWD");
             return value == nullptr || value[0] != '0';
         }();
         return enabled;
@@ -296,31 +306,39 @@ namespace gsplat_lfs {
         const float* scaled_scales = scales;
         const float* const reference = reference_viewmats ? reference_viewmats : viewmats0;
 
+        GutSubstageProfiler::instance().begin_fwd(N, stream);
+
         // Step 1: Projection
-        projection_ut_3dgs_fused(
-            means, quats, scaled_scales, opacities,
-            viewmats0, viewmats1, Ks,
-            N, C, image_width, image_height,
-            eps2d, near_plane, far_plane, radius_clip,
-            calc_compensations, camera_model,
-            ut_params, rs_type,
-            radial_coeffs, tangential_coeffs, thin_prism_coeffs,
-            result.radii, result.means2d, result.depths, result.conics,
-            result.compensations, result.dilations, stream);
+        {
+            GutProfScope prof_proj(GutProfStage::ProjUT, stream);
+            projection_ut_3dgs_fused(
+                means, quats, scaled_scales, opacities,
+                viewmats0, viewmats1, Ks,
+                N, C, image_width, image_height,
+                eps2d, near_plane, far_plane, radius_clip,
+                calc_compensations, camera_model,
+                ut_params, rs_type,
+                radial_coeffs, tangential_coeffs, thin_prism_coeffs,
+                result.radii, result.means2d, result.depths, result.conics,
+                result.compensations, result.dilations, stream);
+        }
 
         // Step 2: Compute viewing directions and evaluate SH. Nothing here needs the tile
         // pairs, so it is queued before the intersection waits on the host for their count.
-        if (render_mode == 0 || render_mode >= 3) {
-            if (sh_degree > 0) {
-                compute_view_dirs(means, reference, C, N, result.dirs, stream);
+        {
+            GutProfScope prof_sh(GutProfStage::ShGeomFwd, stream);
+            if (render_mode == 0 || render_mode >= 3) {
+                if (sh_degree > 0) {
+                    compute_view_dirs(means, reference, C, N, result.dirs, stream);
+                }
+                spherical_harmonics_streamed_fwd(
+                    sh_degree, sh_layout_degree, sh_degree > 0 ? result.dirs : nullptr,
+                    sh0, shN, C, N, result.colors, channels, stream, result.radii);
             }
-            spherical_harmonics_streamed_fwd(
-                sh_degree, sh_layout_degree, sh_degree > 0 ? result.dirs : nullptr,
-                sh0, shN, C, N, result.colors, channels, stream, result.radii);
-        }
-        if (channels == 8) {
-            geometry_features_fwd(means, quats, scales, reference, result.colors,
-                                  N, C, channels, camera_model, stream, result.radii);
+            if (channels == 8) {
+                geometry_features_fwd(means, quats, scales, reference, result.colors,
+                                      N, C, channels, camera_model, stream, result.radii);
+            }
         }
 
         const float* render_backgrounds = (render_mode == 1 || render_mode == 2) ? nullptr : backgrounds;
@@ -328,11 +346,18 @@ namespace gsplat_lfs {
 
         // A tile batch is intersected again for its backward, so pruning its keys would be lost.
         auto render = [&](const IntersectTileResult& batch, TileRange tiles) {
+            GutProfScope prof_rfwd(GutProfStage::RasterFwd, stream);
+            const bool use_keys32 = batch.isect_keys32 != nullptr;
             const bool prune = batch.sub_tile_masks && tiles.end == UINT32_MAX && use_contributor_pruning();
+            const bool micro_ok = tiles.end == UINT32_MAX && C == 1 &&
+                                  tile_size % kCullSubTile == 0 && channels <= 8 &&
+                                  use_micro_forward_enabled();
             result.isect_ids = batch.isect_ids;
+            result.isect_keys32 = batch.isect_keys32;
             result.flatten_ids = batch.flatten_ids;
             result.n_sort = batch.n_sort;
             result.sub_tile_masks = batch.sub_tile_masks;
+            result.tile_order = batch.tile_order;
             const uint32_t raster_n_isects = static_cast<uint32_t>(batch.n_sort);
             rasterize_to_pixels_from_world_3dgs_fwd(
                 means, quats, scaled_scales, result.colors, opacities,
@@ -346,10 +371,13 @@ namespace gsplat_lfs {
                 result.render_colors, result.render_alphas, result.last_ids,
                 stream, tiles, median_depth,
                 ScreenFootprint{.means2d = result.means2d, .conics = result.conics, .radii = result.radii,
-                                .tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr,
-                                .prune_tile_keys = prune ? batch.isect_ids : nullptr,
+                                .tile_keys = (!use_keys32 && batch.sub_tile_masks) ? batch.isect_ids : nullptr,
+                                .tile_keys32 = (use_keys32 && batch.sub_tile_masks) ? batch.isect_keys32 : nullptr,
+                                .prune_tile_keys = (!use_keys32 && prune) ? batch.isect_ids : nullptr,
+                                .prune_tile_keys32 = (use_keys32 && prune) ? batch.isect_keys32 : nullptr,
                                 .tile_sub_masks = tile_sub_masks,
-                                .unit_rays = cached_unit_rays});
+                                .unit_rays = cached_unit_rays,
+                                .tile_order = micro_ok ? batch.tile_order : nullptr});
         };
 
         // Step 3: Tile intersection. The first call retains the existing speculative warm-cache path.
@@ -369,7 +397,9 @@ namespace gsplat_lfs {
         result.n_isects = whole.n_isects;
         result.batches.clear();
         if (whole.n_isects == 0 || whole.n_sort > 0) {
-            const bool rendered = speculative.isect_ids != nullptr && speculative.isect_ids == whole.isect_ids &&
+            const bool rendered = (speculative.isect_ids != nullptr || speculative.isect_keys32 != nullptr) &&
+                                  speculative.isect_ids == whole.isect_ids &&
+                                  speculative.isect_keys32 == whole.isect_keys32 &&
                                   speculative.n_sort == whole.n_sort;
             if (!rendered) {
                 render(whole, {});
@@ -395,9 +425,11 @@ namespace gsplat_lfs {
         visit(visit, {mid, tile_width * tile_height});
         // All lists have been consumed. Backward replays the saved leaves.
         result.isect_ids = nullptr;
+        result.isect_keys32 = nullptr;
         result.flatten_ids = nullptr;
         result.n_sort = 0;
         result.sub_tile_masks = false;
+        result.tile_order = nullptr;
     }
 
     //=========================================================================
@@ -470,7 +502,9 @@ namespace gsplat_lfs {
         float* blend_peak_out,
         float* color_grad_workspace,
         const float* cached_unit_rays,
-        const RenderGradPlanes& grad_planes) {
+        const RenderGradPlanes& grad_planes,
+        const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready,
+        const uint32_t* tile_keys32) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -498,6 +532,7 @@ namespace gsplat_lfs {
             cudaMemsetAsync(v_colors, 0, color_bytes, stream),
             "gsplat backward color-gradient initialization");
 
+        const uint32_t* tile_keys32_ptr = tile_keys32;
         auto render_backward = [&](TileRange tiles) {
             rasterize_to_pixels_from_world_3dgs_bwd(
                 means, quats, scales, colors, opacities,
@@ -516,41 +551,54 @@ namespace gsplat_lfs {
                 stream, tiles,
                 ScreenFootprint{.means2d = means2d, .conics = conics, .radii = radii,
                                 .tile_keys = tile_keys,
+                                .tile_keys32 = tile_keys32_ptr,
                                 .tile_sub_masks = tile_sub_masks,
                                 .unit_rays = cached_unit_rays},
                 color_variance, blend_peak_out, grad_planes);
         };
-        if (batches.empty()) {
-            render_backward({});
-        } else {
-            const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
-            const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
-            for (const auto& saved : batches) {
-                if (saved.count == 0)
-                    continue;
-                const auto batch = intersect_tile(means2d, radii, depths, nullptr, nullptr,
-                                                  C, N, tile_size, tile_width, tile_height, true,
-                                                  tiles_per_gauss, stream, const_cast<int32_t*>(tile_offsets), saved.tiles,
-                                                  conics, tile_sub_masks);
-                LFS_ASSERT(batch.n_isects == saved.count && batch.n_sort > 0);
-                flatten_ids = batch.flatten_ids;
-                tile_keys = batch.sub_tile_masks ? batch.isect_ids : nullptr;
-                n_isects = static_cast<uint32_t>(batch.n_sort);
-                render_backward(saved.tiles);
+        GutSubstageProfiler::instance().begin_bwd(stream);
+        {
+            GutProfScope prof_rbwd(GutProfStage::RasterBwd, stream);
+            if (batches.empty()) {
+                render_backward({});
+            } else {
+                const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
+                const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
+                for (const auto& saved : batches) {
+                    if (saved.count == 0)
+                        continue;
+                    const auto batch = intersect_tile(means2d, radii, depths, nullptr, nullptr,
+                                                      C, N, tile_size, tile_width, tile_height, true,
+                                                      tiles_per_gauss, stream, const_cast<int32_t*>(tile_offsets), saved.tiles,
+                                                      conics, tile_sub_masks);
+                    LFS_ASSERT(batch.n_isects == saved.count && batch.n_sort > 0);
+                    flatten_ids = batch.flatten_ids;
+                    tile_keys = (!batch.isect_keys32 && batch.sub_tile_masks) ? batch.isect_ids : nullptr;
+                    tile_keys32_ptr = batch.sub_tile_masks ? batch.isect_keys32 : nullptr;
+                    n_isects = static_cast<uint32_t>(batch.n_sort);
+                    render_backward(saved.tiles);
+                }
             }
         }
 
-        if (channels == 8) {
-            geometry_features_bwd(means, quats, scales, reference, v_colors, v_means, v_quats,
-                                  N, C, channels, camera_model, stream);
-        }
+        {
+            GutProfScope prof_gsh(GutProfStage::GeomShBwd, stream);
+            if (channels == 8) {
+                geometry_features_bwd(means, quats, scales, reference, v_colors, v_means, v_quats,
+                                      N, C, channels, camera_model, stream);
+            }
 
-        // Backward through SH, straight into the optimizer's gradients
-        if (render_mode == 0 || render_mode >= 3) {
-            spherical_harmonics_streamed_bwd(
-                sh_degree, sh_layout_degree, dirs, v_colors, C, N, channels,
-                v_sh0, v_shN, stream);
+            // Backward through SH, straight into the optimizer's gradients
+            if (render_mode == 0 || render_mode >= 3) {
+                spherical_harmonics_streamed_bwd(
+                    sh_degree, sh_layout_degree, dirs, v_colors, C, N, channels,
+                    v_sh0, v_shN, stream);
+                if (on_sh_colors_ready) {
+                    on_sh_colors_ready(v_colors, dirs, channels, stream);
+                }
+            }
         }
+        GutSubstageProfiler::instance().end_bwd();
 
         // Apply scaling modifier to scale gradients
         if (scaling_modifier != 1.0f) {

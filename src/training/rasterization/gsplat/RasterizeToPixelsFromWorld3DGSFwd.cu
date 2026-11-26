@@ -396,16 +396,26 @@ namespace gsplat_lfs {
         const TileRange tiles,
         float* __restrict__ median_depth,
         const ScreenFootprint footprint) {
-        const uint32_t cid = blockIdx.x;
         const uint32_t subs = tile_size / kMicroSub;
-        const uint32_t sub_y = blockIdx.y;
-        const uint32_t sub_x = blockIdx.z;
-        const uint32_t tile_id = (sub_y / subs) * tile_width + sub_x / subs;
+        uint32_t cid = 0, tile_id = 0, sub_bit = 0, sub_y = 0, sub_x = 0;
+        if (footprint.tile_order != nullptr) {
+            cid = blockIdx.y;
+            const uint32_t tile_rank = blockIdx.x / (subs * subs);
+            sub_bit = blockIdx.x % (subs * subs);
+            tile_id = static_cast<uint32_t>(footprint.tile_order[tile_rank]);
+            sub_y = (tile_id / tile_width) * subs + (sub_bit / subs);
+            sub_x = (tile_id % tile_width) * subs + (sub_bit % subs);
+        } else {
+            cid = blockIdx.x;
+            sub_y = blockIdx.y;
+            sub_x = blockIdx.z;
+            tile_id = (sub_y / subs) * tile_width + sub_x / subs;
+            sub_bit = (sub_y % subs) * subs + sub_x % subs;
+        }
         if constexpr (kBatched) {
             if (tile_id < tiles.begin || tile_id >= tiles.end)
                 return;
         }
-        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
         const uint32_t tr = threadIdx.x;
         const uint32_t lane = tr & 31u;
         const uint32_t warp = tr >> 5;
@@ -548,6 +558,7 @@ namespace gsplat_lfs {
         __shared__ uint8_t s_hit[kMicroStage]; // whether the survivor blended any pixel
         __shared__ uint32_t s_warp_count[kMicroThreads / 32];
         auto* const prune = reinterpret_cast<unsigned long long*>(footprint.prune_tile_keys);
+        uint32_t* const prune32 = footprint.prune_tile_keys32;
 
         const int32_t range_end = tile_offsets[tile_id + 1];
         int32_t cursor = tile_offsets[tile_id];
@@ -572,7 +583,11 @@ namespace gsplat_lfs {
                 int32_t g = 0;
                 bool keep = false;
                 if (gi < range_end) {
-                    if (footprint.tile_keys != nullptr) {
+                    if (footprint.tile_keys32 != nullptr) {
+                        keep = (footprint.tile_keys32[gi] >> sub_bit) & 1u;
+                        if (keep)
+                            g = flatten_ids[gi];
+                    } else if (footprint.tile_keys != nullptr) {
                         keep = (static_cast<uint64_t>(footprint.tile_keys[gi]) >> sub_bit) & 1u;
                         if (keep)
                             g = flatten_ids[gi];
@@ -679,11 +694,16 @@ namespace gsplat_lfs {
             // A survivor that blended no pixel of the sub-tile adds nothing to its
             // gradient either, so it loses the sub-tile's bit and the backward skips it.
             // Clearing it cannot change any render: no pixel here blends that pair.
-            if (prune != nullptr) {
+            if (prune32 != nullptr || prune != nullptr) {
                 __syncthreads();
                 for (uint32_t t = tr; t < count; t += kMicroThreads) {
-                    if (!s_hit[t])
-                        atomicAnd(&prune[s_bin[t]], ~(1ull << sub_bit));
+                    if (!s_hit[t]) {
+                        if (prune32 != nullptr) {
+                            atomicAnd(&prune32[s_bin[t]], ~(1u << sub_bit));
+                        } else {
+                            atomicAnd(&prune[s_bin[t]], ~(1ull << sub_bit));
+                        }
+                    }
                 }
             }
         }
@@ -833,7 +853,10 @@ namespace gsplat_lfs {
             if constexpr (CDIM <= 8) {
                 if (use_micro_forward() && footprint.valid() && tile_size % kMicroSub == 0) {
                     const uint32_t subs = tile_size / kMicroSub;
-                    const dim3 micro_grid = {C, tile_height * subs, tile_width * subs};
+                    const dim3 micro_grid =
+                        (footprint.tile_order != nullptr && C == 1 && !kBatched)
+                            ? dim3{tile_height * tile_width * subs * subs, 1u, 1u}
+                            : dim3{C, tile_height * subs, tile_width * subs};
                     auto launch_micro = [&](auto kernel) {
                         cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                              cudaSharedmemCarveoutMaxShared);

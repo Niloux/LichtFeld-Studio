@@ -54,13 +54,15 @@ namespace lfs::training {
         // Valid from forward through backward on this thread; released by the
         // cache release hook or at thread shutdown.
         int64_t* isect_ids_ptr = nullptr;
-        bool sub_tile_masks = false; // isect_ids hold sub-tile masks in place of depths
+        uint32_t* isect_keys32_ptr = nullptr;
+        bool sub_tile_masks = false; // isect_ids/isect_keys32 hold sub-tile masks in place of depths
         int32_t* flatten_ids_ptr = nullptr;
         int64_t n_isects = 0;
         std::vector<gsplat_lfs::TileBatch> batches;
         int32_t* tiles_per_gauss_ptr = nullptr;
         const float* conics_ptr = nullptr; // arena; tile batches re-cull with it in backward
         int32_t n_sort = 0;
+        const int32_t* tile_order_ptr = nullptr;
 
         // Saved input tensors (references, not copies)
         lfs::core::Tensor means;               // [N, 3]
@@ -182,7 +184,8 @@ namespace lfs::training {
         float flatten_weight = 0.f,
         const GsplatColorVarianceLoss& color_variance = {},
         core::Tensor blend_peak_out = {}, // [N], raised to max(alpha * T) across the view's tiles
-        const lfs::core::Tensor& grad_depth_sq = {});
+        const lfs::core::Tensor& grad_depth_sq = {},
+        int fuse_shN_iteration = -1);
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;

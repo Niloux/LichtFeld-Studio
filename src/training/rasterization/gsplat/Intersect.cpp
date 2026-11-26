@@ -4,6 +4,7 @@
 
 #include "Intersect.h"
 #include "Common.h"
+#include "GutProfile.h"
 #include "IntersectionCount.h"
 #include "Ops.h"
 #include "core/cuda/vmm_device_buffer.hpp"
@@ -25,6 +26,22 @@
 namespace gsplat_lfs {
 
     namespace {
+        bool use_packed_keys32() {
+            static const bool enabled = [] {
+                const char* v = std::getenv("LFS_GUT_KEYS32");
+                return v == nullptr || v[0] != '0';
+            }();
+            return enabled;
+        }
+
+        bool use_lpt_tile_order() {
+            static const bool enabled = [] {
+                const char* v = std::getenv("LFS_GUT_LPT");
+                return v == nullptr || v[0] != '0';
+            }();
+            return enabled;
+        }
+
         struct IntersectBufferCache {
             struct RollingPeak {
                 static constexpr size_t kBucketCalls = 256;
@@ -66,9 +83,17 @@ namespace gsplat_lfs {
             std::optional<lfs::core::VmmDeviceBuffer> sort_values_storage;
             // Depth sort of the elements: keys, keys_alt, values, values_alt.
             std::optional<lfs::core::VmmDeviceBuffer> depth_order_storage;
+            // Persistent LPT scheduling buffer (4 * n_tiles u32/i32).
+            std::optional<lfs::core::VmmDeviceBuffer> tile_order_storage;
             size_t cum_tiles_capacity = 0;
             size_t isect_capacity = 0;
+            size_t isect_ids_bytes_cap = 0;
+            size_t isect_vals_cap = 0;
             size_t sort_capacity = 0;
+            size_t sort_ids_bytes_cap = 0;
+            size_t sort_vals_cap = 0;
+            size_t tile_order_capacity = 0;
+            size_t last_key_bytes = sizeof(int64_t);
             size_t pair_budget = 0;
             size_t raw_pair_budget = 0;
             cudaEvent_t sort_reuse_event = nullptr;
@@ -194,16 +219,16 @@ namespace gsplat_lfs {
                 cum_tiles_capacity = cum_tiles
                                          ? cum_tiles.committed_bytes() / sizeof(int64_t)
                                          : 0;
-                isect_capacity = isect_ids_storage && isect_values_storage
-                                     ? std::min(
-                                           isect_ids_storage->committed_bytes() / sizeof(int64_t),
-                                           isect_values_storage->committed_bytes() / sizeof(int32_t))
+                isect_ids_bytes_cap = isect_ids_storage ? isect_ids_storage->committed_bytes() : 0;
+                isect_vals_cap = isect_values_storage
+                                     ? isect_values_storage->committed_bytes() / sizeof(int32_t)
                                      : 0;
-                sort_capacity = sort_ids_storage && sort_values_storage
-                                    ? std::min(
-                                          sort_ids_storage->committed_bytes() / sizeof(int64_t),
-                                          sort_values_storage->committed_bytes() / sizeof(int32_t))
+                isect_capacity = std::min(isect_ids_bytes_cap / sizeof(int64_t), isect_vals_cap);
+                sort_ids_bytes_cap = sort_ids_storage ? sort_ids_storage->committed_bytes() : 0;
+                sort_vals_cap = sort_values_storage
+                                    ? sort_values_storage->committed_bytes() / sizeof(int32_t)
                                     : 0;
+                sort_capacity = std::min(sort_ids_bytes_cap / sizeof(int64_t), sort_vals_cap);
             }
 
             void trim_to_recent_peak() {
@@ -216,7 +241,7 @@ namespace gsplat_lfs {
                                                             "gsplat cumulative tile trim")
                                             : 0;
                 const size_t isect_need = isect_peak.has_samples()
-                                              ? checked_bytes(isect_peak.peak(), sizeof(int64_t),
+                                              ? checked_bytes(isect_peak.peak(), last_key_bytes,
                                                               "gsplat intersection trim")
                                               : 0;
                 const size_t value_need = isect_peak.has_samples()
@@ -314,6 +339,10 @@ namespace gsplat_lfs {
                 return isect_ids_storage ? isect_ids_storage->as<int64_t>() : nullptr;
             }
 
+            uint32_t* isect_keys32() const {
+                return isect_ids_storage ? isect_ids_storage->as<uint32_t>() : nullptr;
+            }
+
             int32_t* flatten_ids() const {
                 return isect_values_storage ? isect_values_storage->as<int32_t>() : nullptr;
             }
@@ -322,8 +351,25 @@ namespace gsplat_lfs {
                 return sort_ids_storage ? sort_ids_storage->as<int64_t>() : nullptr;
             }
 
+            uint32_t* sorted_isect_keys32() const {
+                return sort_ids_storage ? sort_ids_storage->as<uint32_t>() : nullptr;
+            }
+
             int32_t* sorted_flatten_ids() const {
                 return sort_values_storage ? sort_values_storage->as<int32_t>() : nullptr;
+            }
+
+            uint32_t* tile_order_buffers(const size_t n_tiles) {
+                const size_t bytes = checked_bytes(n_tiles, 4 * sizeof(uint32_t), "gsplat LPT tile order");
+                if (!tile_order_storage) {
+                    tile_order_storage = create_vmm_buffer(
+                        pair_reservation_bytes(sizeof(int32_t)), "rasterizer.gsplat.lpt_tile_order");
+                }
+                if (tile_order_storage->committed_bytes() < bytes) {
+                    commit_vmm_buffer(*tile_order_storage, bytes);
+                    tile_order_capacity = tile_order_storage->committed_bytes() / (4 * sizeof(uint32_t));
+                }
+                return tile_order_storage->as<uint32_t>();
             }
 
             void ensure_cum_tiles(size_t n_elements) {
@@ -356,11 +402,15 @@ namespace gsplat_lfs {
                 return depth_order_storage->as<uint32_t>();
             }
 
-            void ensure_isect_buffers(size_t n_isects) {
+            void ensure_isect_buffers(size_t n_isects, size_t key_bytes = sizeof(int64_t)) {
                 if (n_isects == 0) {
                     return;
                 }
-                if (n_isects <= isect_capacity) {
+                const size_t need_key_bytes =
+                    checked_bytes(n_isects, key_bytes, "gsplat intersection ids");
+                const size_t need_val_bytes =
+                    checked_bytes(n_isects, sizeof(int32_t), "gsplat intersection flatten ids");
+                if (need_key_bytes <= isect_ids_bytes_cap && n_isects <= isect_vals_cap) {
                     return;
                 }
                 if (!isect_ids_storage) {
@@ -373,21 +423,17 @@ namespace gsplat_lfs {
                         pair_reservation_bytes(sizeof(int32_t)),
                         "rasterizer.gsplat.intersection_flatten_ids");
                 }
-                commit_vmm_buffer(
-                    *isect_ids_storage,
-                    checked_bytes(n_isects, sizeof(int64_t), "gsplat intersection ids"));
-                commit_vmm_buffer(
-                    *isect_values_storage,
-                    checked_bytes(n_isects, sizeof(int32_t),
-                                  "gsplat intersection flatten ids"));
-                isect_capacity = std::min(
-                    isect_ids_storage->committed_bytes() / sizeof(int64_t),
-                    isect_values_storage->committed_bytes() / sizeof(int32_t));
+                commit_vmm_buffer(*isect_ids_storage, need_key_bytes);
+                commit_vmm_buffer(*isect_values_storage, need_val_bytes);
+                isect_ids_bytes_cap = isect_ids_storage->committed_bytes();
+                isect_vals_cap = isect_values_storage->committed_bytes() / sizeof(int32_t);
+                isect_capacity = std::min(isect_ids_bytes_cap / sizeof(int64_t), isect_vals_cap);
                 cub_sort_ws_bytes = 0;
                 cub_sort_n = 0;
             }
 
-            void ensure_sort_buffers(size_t n_isects, cudaStream_t stream) {
+            void ensure_sort_buffers(size_t n_isects, cudaStream_t stream,
+                                     size_t key_bytes = sizeof(int64_t)) {
                 if (!sort_reuse_event) {
                     LFS_CUDA_CHECK_MSG(
                         cudaEventCreateWithFlags(&sort_reuse_event, cudaEventDisableTiming),
@@ -398,7 +444,11 @@ namespace gsplat_lfs {
                         cudaStreamWaitEvent(stream, sort_reuse_event, 0),
                         "gsplat sort-cache stream handoff");
                 }
-                if (n_isects > sort_capacity) {
+                const size_t need_key_bytes =
+                    checked_bytes(n_isects, key_bytes, "gsplat sorted intersection ids");
+                const size_t need_val_bytes =
+                    checked_bytes(n_isects, sizeof(int32_t), "gsplat sorted intersection flatten ids");
+                if (need_key_bytes > sort_ids_bytes_cap || n_isects > sort_vals_cap) {
                     if (!sort_ids_storage) {
                         sort_ids_storage = create_vmm_buffer(
                             pair_reservation_bytes(sizeof(int64_t)),
@@ -409,17 +459,11 @@ namespace gsplat_lfs {
                             pair_reservation_bytes(sizeof(int32_t)),
                             "rasterizer.gsplat.sorted_intersection_flatten_ids");
                     }
-                    commit_vmm_buffer(
-                        *sort_ids_storage,
-                        checked_bytes(n_isects, sizeof(int64_t),
-                                      "gsplat sorted intersection ids"));
-                    commit_vmm_buffer(
-                        *sort_values_storage,
-                        checked_bytes(n_isects, sizeof(int32_t),
-                                      "gsplat sorted intersection flatten ids"));
-                    sort_capacity = std::min(
-                        sort_ids_storage->committed_bytes() / sizeof(int64_t),
-                        sort_values_storage->committed_bytes() / sizeof(int32_t));
+                    commit_vmm_buffer(*sort_ids_storage, need_key_bytes);
+                    commit_vmm_buffer(*sort_values_storage, need_val_bytes);
+                    sort_ids_bytes_cap = sort_ids_storage->committed_bytes();
+                    sort_vals_cap = sort_values_storage->committed_bytes() / sizeof(int32_t);
+                    sort_capacity = std::min(sort_ids_bytes_cap / sizeof(int64_t), sort_vals_cap);
                     cub_sort_ws_bytes = 0;
                     cub_sort_n = 0;
                 }
@@ -453,9 +497,16 @@ namespace gsplat_lfs {
                 sort_ids_storage.reset();
                 sort_values_storage.reset();
                 depth_order_storage.reset();
+                tile_order_storage.reset();
                 cum_tiles_capacity = 0;
                 isect_capacity = 0;
+                isect_ids_bytes_cap = 0;
+                isect_vals_cap = 0;
                 sort_capacity = 0;
+                sort_ids_bytes_cap = 0;
+                sort_vals_cap = 0;
+                tile_order_capacity = 0;
+                last_key_bytes = sizeof(int64_t);
                 pair_budget = 0;
                 cum_tiles_peak = {};
                 isect_peak = {};
@@ -484,6 +535,7 @@ namespace gsplat_lfs {
                 const bool color_grad_released = release_gsplat_color_grad_workspace();
                 return !cum_tiles && !isect_ids_storage && !isect_values_storage &&
                        !sort_ids_storage && !sort_values_storage && !depth_order_storage &&
+                       !tile_order_storage &&
                        sort_reuse_event == nullptr && cub_released &&
                        color_grad_released;
             }
@@ -605,30 +657,51 @@ namespace gsplat_lfs {
         // would give.
         const int32_t* depth_order = nullptr;
         if (sort && !packed) {
+            GutProfScope prof_depth(GutProfStage::IsectDepthSort, stream);
             uint32_t* buffers = cache.depth_order_buffers(n_elements);
             depth_order = sort_by_depth(
                 depths, n_elements, buffers, buffers + n_elements,
                 reinterpret_cast<int32_t*>(buffers + 2 * size_t{n_elements}),
-                reinterpret_cast<int32_t*>(buffers + 3 * size_t{n_elements}), stream);
+                reinterpret_cast<int32_t*>(buffers + 3 * size_t{n_elements}), stream,
+                radii);
         }
 
-        launch_intersect_tile_kernel(
-            means2d, radii, depths,
-            nullptr, nullptr,
-            C, N, nnz, packed,
-            tile_size, tile_width, tile_height,
-            nullptr,
-            tiles_per_gauss_out,
-            nullptr, nullptr,
-            stream, -1, tiles, depth_order, conics, tile_sub_masks);
+        int64_t* d_cum_tiles = nullptr;
+        {
+            GutProfScope prof_count(GutProfStage::IsectCountScan, stream);
+            launch_intersect_tile_kernel(
+                means2d, radii, depths,
+                nullptr, nullptr,
+                C, N, nnz, packed,
+                tile_size, tile_width, tile_height,
+                nullptr,
+                tiles_per_gauss_out,
+                nullptr, nullptr,
+                stream, -1, tiles, depth_order, conics, tile_sub_masks);
 
-        cache.ensure_cum_tiles(n_elements);
-        int64_t* d_cum_tiles = cache.cum_tiles.as<int64_t>();
-        compute_cumsum_gpu(tiles_per_gauss_out, d_cum_tiles, n_elements, stream);
+            cache.ensure_cum_tiles(n_elements);
+            d_cum_tiles = cache.cum_tiles.as<int64_t>();
+            compute_cumsum_gpu(tiles_per_gauss_out, d_cum_tiles, n_elements, stream);
+        }
 
         LFS_ASSERT_MSG(cache.h_n_isects_pinned != nullptr,
                        "gsplat intersection cache missing pinned n_isects slot");
 
+        const uint32_t subs =
+            (tile_size % kCullSubTile == 0) ? (tile_size / kCullSubTile) : 0u;
+        const uint32_t mask_bits = subs * subs;
+        const bool want_sub_masks = depth_order != nullptr && conics != nullptr &&
+                                    tile_keys_fit_sub_masks(tile_size);
+        const bool use_keys32 = want_sub_masks && use_packed_keys32() && mask_bits > 0u &&
+                                (mask_bits + tile_n_bits + cam_n_bits <= 32u);
+        const size_t key_bytes = use_keys32 ? sizeof(uint32_t) : sizeof(int64_t);
+        cache.last_key_bytes = key_bytes;
+
+        const uint32_t sentinel_key32 =
+            use_keys32
+                ? ((static_cast<uint32_t>(C - 1) << (mask_bits + tile_n_bits)) |
+                   (static_cast<uint32_t>(n_tiles) << mask_bits))
+                : 0u;
         const int64_t sentinel_key =
             (static_cast<int64_t>(C - 1) << (32 + tile_n_bits)) |
             (static_cast<int64_t>(n_tiles) << 32);
@@ -673,13 +746,19 @@ namespace gsplat_lfs {
             ((static_cast<size_t>(std::ceil(std::max(1.0, raw_spec))) + 65535u) / 65536u) * 65536u;
         const size_t spec_cap = std::min(max_sort, std::max<size_t>(aligned_spec, 65536u));
         auto fill_and_sort_capacity = [&](const size_t cap, const bool exact) {
-            cache.ensure_isect_buffers(cap);
+            cache.ensure_isect_buffers(cap, key_bytes);
             const size_t sort_n = exact ? cap : std::min(cap, max_sort);
-            cache.ensure_sort_buffers(sort_n, stream);
+            cache.ensure_sort_buffers(sort_n, stream, key_bytes);
             if (!exact) {
-                launch_fill_isect_sentinels_kernel(
-                    cache.isect_ids(), cache.flatten_ids(),
-                    static_cast<int64_t>(sort_n), sentinel_key, stream);
+                if (use_keys32) {
+                    launch_fill_isect_sentinels_u32_kernel(
+                        cache.isect_keys32(), cache.flatten_ids(),
+                        static_cast<int64_t>(sort_n), sentinel_key32, stream);
+                } else {
+                    launch_fill_isect_sentinels_kernel(
+                        cache.isect_ids(), cache.flatten_ids(),
+                        static_cast<int64_t>(sort_n), sentinel_key, stream);
+                }
             }
             launch_intersect_tile_kernel(
                 means2d, radii, depths,
@@ -688,8 +767,38 @@ namespace gsplat_lfs {
                 tile_size, tile_width, tile_height,
                 d_cum_tiles,
                 nullptr,
-                cache.isect_ids(), cache.flatten_ids(),
-                stream, static_cast<int64_t>(sort_n), tiles, depth_order, conics, tile_sub_masks);
+                use_keys32 ? nullptr : cache.isect_ids(),
+                cache.flatten_ids(),
+                stream, static_cast<int64_t>(sort_n), tiles, depth_order, conics,
+                tile_sub_masks,
+                use_keys32 ? cache.isect_keys32() : nullptr,
+                mask_bits);
+
+            if (use_keys32) {
+                uint32_t* keys32_out = cache.isect_keys32();
+                int32_t* vals_out = cache.flatten_ids();
+                if (sort && sort_n > 0) {
+                    try {
+                        radix_sort_double_buffer_u32(
+                            static_cast<int64_t>(sort_n), tile_n_bits, cam_n_bits, mask_bits,
+                            cache.isect_keys32(), cache.flatten_ids(),
+                            cache.sorted_isect_keys32(), cache.sorted_flatten_ids(),
+                            &keys32_out, &vals_out,
+                            cache.cub_sort_ws_bytes, cache.cub_sort_n, cache.cub_sort_end_bit,
+                            stream);
+                    } catch (...) {
+                        cache.record_sort_use(stream);
+                        throw;
+                    }
+                    cache.record_sort_use(stream);
+                }
+                result.isect_keys32 = keys32_out;
+                result.isect_ids = nullptr;
+                result.flatten_ids = vals_out;
+                result.n_sort = static_cast<int32_t>(sort_n);
+                result.sub_tile_masks = true;
+                return;
+            }
 
             int64_t* keys_out = cache.isect_ids();
             int32_t* vals_out = cache.flatten_ids();
@@ -709,6 +818,7 @@ namespace gsplat_lfs {
                 }
                 cache.record_sort_use(stream);
             }
+            result.isect_keys32 = nullptr;
             result.isect_ids = keys_out;
             result.flatten_ids = vals_out;
             result.n_sort = static_cast<int32_t>(sort_n);
@@ -718,13 +828,32 @@ namespace gsplat_lfs {
         };
 
         auto launch_offsets = [&]() {
+            result.tile_order = nullptr;
             if (!isect_offsets) {
                 return;
             }
-            intersect_offset(
-                result.isect_ids, result.n_sort,
-                C, tile_width, tile_height,
-                isect_offsets, stream);
+            if (result.isect_keys32 != nullptr) {
+                launch_intersect_offset_u32_kernel(
+                    result.isect_keys32,
+                    result.n_sort < 0 ? 0u : static_cast<uint32_t>(result.n_sort),
+                    C, tile_width, tile_height, mask_bits,
+                    isect_offsets, stream);
+            } else {
+                intersect_offset(
+                    result.isect_ids, result.n_sort,
+                    C, tile_width, tile_height,
+                    isect_offsets, stream);
+            }
+            if (use_lpt_tile_order() && C == 1 && tiles.end == UINT32_MAX &&
+                n_tiles > 1 && result.n_sort > 0) {
+                uint32_t* t_buf = cache.tile_order_buffers(n_tiles);
+                result.tile_order = sort_tiles_by_count_descending(
+                    isect_offsets, n_tiles,
+                    t_buf, t_buf + n_tiles,
+                    reinterpret_cast<int32_t*>(t_buf + 2 * size_t{n_tiles}),
+                    reinterpret_cast<int32_t*>(t_buf + 3 * size_t{n_tiles}),
+                    stream);
+            }
         };
 
         if (exact_sort) {
@@ -734,8 +863,10 @@ namespace gsplat_lfs {
                 // The caller subdivides whole tiles. Never accept a truncated
                 // speculative fill or allocate the full-frame pair list.
                 result.isect_ids = nullptr;
+                result.isect_keys32 = nullptr;
                 result.flatten_ids = nullptr;
                 result.n_sort = 0;
+                result.tile_order = nullptr;
                 return result;
             }
             if (n_isects == 0) {
@@ -743,14 +874,21 @@ namespace gsplat_lfs {
                 launch_offsets();
                 return result;
             }
-            fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
-            launch_offsets();
+            {
+                GutProfScope prof_fill(GutProfStage::IsectFillSort, stream);
+                fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
+                launch_offsets();
+            }
+            GutSubstageProfiler::instance().sample_tiles(isect_offsets, n_tiles, n_isects, stream);
             cache.finish_call(n_isects);
             return result;
         }
 
-        fill_and_sort_capacity(spec_cap, false);
-        launch_offsets();
+        {
+            GutProfScope prof_fill(GutProfStage::IsectFillSort, stream);
+            fill_and_sort_capacity(spec_cap, false);
+            launch_offsets();
+        }
         if (before_count_wait && isect_offsets) {
             before_count_wait(result);
         }
@@ -762,19 +900,25 @@ namespace gsplat_lfs {
             // The caller subdivides whole tiles. Never accept a truncated
             // speculative fill or allocate the full-frame pair list.
             result.isect_ids = nullptr;
+            result.isect_keys32 = nullptr;
             result.flatten_ids = nullptr;
             result.n_sort = 0;
+            result.tile_order = nullptr;
             return result;
         }
         if (n_isects > static_cast<int64_t>(result.n_sort)) {
             cache.spec_headroom = std::min(cache.spec_headroom * 1.20, 2.0);
             LFS_CUDA_CHECK_MSG(cudaStreamSynchronize(stream),
                                "gsplat intersection overflow drain");
-            fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
-            launch_offsets();
+            {
+                GutProfScope prof_fill(GutProfStage::IsectFillSort, stream);
+                fill_and_sort_capacity(static_cast<size_t>(n_isects), true);
+                launch_offsets();
+            }
         } else {
             cache.spec_headroom = std::max(1.0, cache.spec_headroom * 0.999);
         }
+        GutSubstageProfiler::instance().sample_tiles(isect_offsets, n_tiles, n_isects, stream);
 
         cache.finish_call(n_isects);
         return result;

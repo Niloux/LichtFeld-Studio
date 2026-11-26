@@ -17,7 +17,7 @@ namespace gsplat_lfs {
 
     namespace cg = cooperative_groups;
 
-    template <typename scalar_t, bool kBatched>
+    template <typename scalar_t, bool kBatched, bool kKeys32>
     __global__ void intersect_tile_kernel(
         const bool packed,
         const uint32_t C,
@@ -39,7 +39,9 @@ namespace gsplat_lfs {
         const int64_t max_isects, const TileRange tiles,
         const int32_t* __restrict__ order,
         const scalar_t* __restrict__ conics,
-        const uint32_t* __restrict__ tile_sub_masks) {
+        const uint32_t* __restrict__ tile_sub_masks,
+        uint32_t* __restrict__ isect_keys32,
+        const uint32_t mask_bits) {
         // Thread k handles element order[k], so the pairs come out in that order;
         // counts and offsets are indexed by k.
         const uint32_t n_elements = packed ? nnz : C * N;
@@ -220,11 +222,20 @@ namespace gsplat_lfs {
             } else if (hit) {
                 const int64_t cur_idx = (k == 0) ? 0 : cum_tiles_per_gauss[k - 1];
                 if (max_isects < 0 || cur_idx < max_isects) {
-                    const int64_t cid = packed ? static_cast<int64_t>(camera_ids[idx]) : static_cast<int64_t>(idx / N);
-                    const int64_t tile_id = static_cast<int64_t>(tile_min.y) * tile_width + x_begin;
-                    const int64_t low = sub_masks ? static_cast<int64_t>(single_mask)
-                                                  : static_cast<int64_t>(*reinterpret_cast<const uint32_t*>(&depths[idx]));
-                    isect_ids[cur_idx] = (cid << (32 + tile_n_bits)) | (tile_id << 32) | low;
+                    if constexpr (kKeys32) {
+                        const uint32_t cid_u = packed ? static_cast<uint32_t>(camera_ids[idx])
+                                                      : static_cast<uint32_t>(idx / N);
+                        const uint32_t tile_id_u = static_cast<uint32_t>(tile_min.y) * tile_width + x_begin;
+                        const uint32_t low_mask = (mask_bits >= 32u) ? ~0u : ((1u << mask_bits) - 1u);
+                        isect_keys32[cur_idx] = (cid_u << (mask_bits + tile_n_bits)) |
+                                                (tile_id_u << mask_bits) | (single_mask & low_mask);
+                    } else {
+                        const int64_t cid = packed ? static_cast<int64_t>(camera_ids[idx]) : static_cast<int64_t>(idx / N);
+                        const int64_t tile_id = static_cast<int64_t>(tile_min.y) * tile_width + x_begin;
+                        const int64_t low = sub_masks ? static_cast<int64_t>(single_mask)
+                                                      : static_cast<int64_t>(*reinterpret_cast<const uint32_t*>(&depths[idx]));
+                        isect_ids[cur_idx] = (cid << (32 + tile_n_bits)) | (tile_id << 32) | low;
+                    }
                     flatten_ids[cur_idx] = static_cast<int32_t>(idx);
                 }
             }
@@ -277,6 +288,8 @@ namespace gsplat_lfs {
             cid = idx / N;
         }
         const int64_t cid_enc = cid << (32 + tile_n_bits);
+        const uint32_t cid_enc32 = kKeys32 ? (static_cast<uint32_t>(cid) << (mask_bits + tile_n_bits)) : 0u;
+        const uint32_t low_mask32 = kKeys32 ? ((mask_bits >= 32u) ? ~0u : ((1u << mask_bits) - 1u)) : 0u;
 
         int32_t depth_i32 = *(int32_t*)&(depths[idx]);
         int64_t depth_id_enc = static_cast<uint32_t>(depth_i32);
@@ -292,8 +305,13 @@ namespace gsplat_lfs {
                         full = true;
                         return false;
                     }
-                    const int64_t tile_id = i * tile_width + j;
-                    isect_ids[cur_idx] = cid_enc | (tile_id << 32) | static_cast<int64_t>(mask);
+                    if constexpr (kKeys32) {
+                        const uint32_t tile_id_u = i * tile_width + j;
+                        isect_keys32[cur_idx] = cid_enc32 | (tile_id_u << mask_bits) | (mask & low_mask32);
+                    } else {
+                        const int64_t tile_id = i * tile_width + j;
+                        isect_ids[cur_idx] = cid_enc | (tile_id << 32) | static_cast<int64_t>(mask);
+                    }
                     flatten_ids[cur_idx] = static_cast<int32_t>(idx);
                     ++cur_idx;
                     return true;
@@ -337,7 +355,7 @@ namespace gsplat_lfs {
         int32_t* flatten_ids,
         cudaStream_t stream,
         int64_t max_isects, TileRange tiles, const int32_t* order, const float* conics,
-        const uint32_t* tile_sub_masks) {
+        const uint32_t* tile_sub_masks, uint32_t* isect_keys32, const uint32_t mask_bits) {
         const uint32_t n_elements = packed ? nnz : C * N;
 
         uint32_t n_tiles = tile_width * tile_height;
@@ -350,21 +368,29 @@ namespace gsplat_lfs {
         dim3 threads(256);
         dim3 grid((n_elements + threads.x - 1) / threads.x);
 
-        auto launch = [&]<bool kBatched>() {
-            intersect_tile_kernel<float, kBatched><<<grid, threads, 0, stream>>>(
+        auto launch = [&]<bool kBatched, bool kKeys32>() {
+            intersect_tile_kernel<float, kBatched, kKeys32><<<grid, threads, 0, stream>>>(
                 packed,
                 C, N, nnz,
                 camera_ids, gaussian_ids,
                 means2d, radii, depths,
                 cum_tiles_per_gauss,
                 tile_size, tile_width, tile_height, tile_n_bits,
-                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order, conics, tile_sub_masks);
+                tiles_per_gauss, isect_ids, flatten_ids, max_isects, tiles, order, conics,
+                tile_sub_masks, isect_keys32, mask_bits);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.intersect_tile");
         };
-        if (tiles.end == UINT32_MAX)
-            launch.template operator()<false>();
-        else
-            launch.template operator()<true>();
+        if (tiles.end == UINT32_MAX) {
+            if (isect_keys32 != nullptr)
+                launch.template operator()<false, true>();
+            else
+                launch.template operator()<false, false>();
+        } else {
+            if (isect_keys32 != nullptr)
+                launch.template operator()<true, true>();
+            else
+                launch.template operator()<true, false>();
+        }
     }
 
     __global__ void fill_isect_sentinels_kernel(
@@ -394,6 +420,35 @@ namespace gsplat_lfs {
         fill_isect_sentinels_kernel<<<grid, threads, 0, stream>>>(
             isect_ids, flatten_ids, n, sentinel_key);
         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.fill_isect_sentinels");
+    }
+
+    __global__ void fill_isect_sentinels_u32_kernel(
+        uint32_t* __restrict__ isect_keys32,
+        int32_t* __restrict__ flatten_ids,
+        const int64_t n,
+        const uint32_t sentinel_key) {
+        const int64_t idx = static_cast<int64_t>(cg::this_grid().thread_rank());
+        if (idx >= n) {
+            return;
+        }
+        isect_keys32[idx] = sentinel_key;
+        flatten_ids[idx] = -1;
+    }
+
+    void launch_fill_isect_sentinels_u32_kernel(
+        uint32_t* isect_keys32,
+        int32_t* flatten_ids,
+        int64_t n,
+        uint32_t sentinel_key,
+        cudaStream_t stream) {
+        if (n <= 0) {
+            return;
+        }
+        dim3 threads(256);
+        dim3 grid(static_cast<unsigned>((n + 255) / 256));
+        fill_isect_sentinels_u32_kernel<<<grid, threads, 0, stream>>>(
+            isect_keys32, flatten_ids, n, sentinel_key);
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.fill_isect_sentinels_u32");
     }
 
     __global__ void intersect_offset_kernel(
@@ -482,6 +537,87 @@ namespace gsplat_lfs {
         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.intersect_offset");
     }
 
+    __global__ void intersect_offset_u32_kernel(
+        const uint32_t n_keys,
+        const uint32_t* __restrict__ isect_keys32,
+        const uint32_t C,
+        const uint32_t n_tiles,
+        const uint32_t tile_n_bits,
+        const uint32_t mask_bits,
+        int32_t* __restrict__ offsets) {
+        const uint32_t idx = cg::this_grid().thread_rank();
+        if (idx >= n_keys)
+            return;
+
+        const uint32_t tile_mask = (tile_n_bits >= 32u) ? ~0u : ((1u << tile_n_bits) - 1u);
+        const uint32_t isect_id_curr = isect_keys32[idx] >> mask_bits;
+        const uint32_t cid_curr = isect_id_curr >> tile_n_bits;
+        const uint32_t tid_curr = isect_id_curr & tile_mask;
+        const bool sentinel = tid_curr >= n_tiles || cid_curr >= C;
+        const int64_t n_slots = static_cast<int64_t>(C) * static_cast<int64_t>(n_tiles);
+        const int64_t id_curr = sentinel
+                                    ? n_slots
+                                    : static_cast<int64_t>(cid_curr) * static_cast<int64_t>(n_tiles) +
+                                          static_cast<int64_t>(tid_curr);
+
+        auto fill_range = [&](int64_t begin, int64_t end, int32_t value) {
+            if (begin < 0)
+                begin = 0;
+            if (end > n_slots)
+                end = n_slots;
+            for (int64_t i = begin; i <= end; ++i)
+                offsets[i] = value;
+        };
+
+        if (idx == 0) {
+            fill_range(0, id_curr, 0);
+        }
+        if (idx == n_keys - 1 && !sentinel) {
+            fill_range(id_curr + 1, n_slots, static_cast<int32_t>(n_keys));
+        }
+
+        if (idx > 0) {
+            const uint32_t isect_id_prev = isect_keys32[idx - 1] >> mask_bits;
+            if (isect_id_prev == isect_id_curr)
+                return;
+
+            const uint32_t cid_prev = isect_id_prev >> tile_n_bits;
+            const uint32_t tid_prev = isect_id_prev & tile_mask;
+            const bool prev_sentinel = tid_prev >= n_tiles || cid_prev >= C;
+            const int64_t id_prev = prev_sentinel
+                                        ? n_slots
+                                        : static_cast<int64_t>(cid_prev) * static_cast<int64_t>(n_tiles) +
+                                              static_cast<int64_t>(tid_prev);
+            fill_range(id_prev + 1, id_curr, static_cast<int32_t>(idx));
+        }
+    }
+
+    void launch_intersect_offset_u32_kernel(
+        const uint32_t* isect_keys32,
+        uint32_t n_keys,
+        uint32_t C,
+        uint32_t tile_width,
+        uint32_t tile_height,
+        uint32_t mask_bits,
+        int32_t* offsets,
+        cudaStream_t stream) {
+        const uint32_t n_tiles = tile_width * tile_height;
+        const size_t offset_count =
+            static_cast<size_t>(C) * static_cast<size_t>(n_tiles) + 1u;
+        if (n_keys == 0) {
+            LFS_CUDA_CHECK_MSG(
+                cudaMemsetAsync(offsets, 0, offset_count * sizeof(int32_t), stream),
+                "gsplat empty u32 intersection-offset kernel output");
+            return;
+        }
+        dim3 threads(256);
+        dim3 grid((n_keys + threads.x - 1) / threads.x);
+        const uint32_t tile_n_bits = static_cast<uint32_t>(floor(log2(n_tiles))) + 1;
+        intersect_offset_u32_kernel<<<grid, threads, 0, stream>>>(
+            n_keys, isect_keys32, C, n_tiles, tile_n_bits, mask_bits, offsets);
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.intersect_offset_u32");
+    }
+
     void radix_sort_double_buffer(
         int64_t n_isects,
         uint32_t tile_n_bits,
@@ -543,8 +679,64 @@ namespace gsplat_lfs {
         }
     }
 
+    void radix_sort_double_buffer_u32(
+        int64_t n_isects,
+        uint32_t tile_n_bits,
+        uint32_t cam_n_bits,
+        uint32_t begin_bit,
+        uint32_t* keys,
+        int32_t* vals,
+        uint32_t* keys_sorted,
+        int32_t* vals_sorted,
+        uint32_t** keys_out,
+        int32_t** vals_out,
+        size_t& cub_ws_bytes,
+        int64_t& cub_n,
+        uint32_t& cub_end_bit,
+        cudaStream_t stream) {
+        if (n_isects <= 0) {
+            if (keys_out)
+                *keys_out = keys;
+            if (vals_out)
+                *vals_out = vals;
+            return;
+        }
+
+        const uint32_t end_bit = begin_bit + tile_n_bits + cam_n_bits;
+        const uint32_t bit_range = end_bit | (begin_bit << 8) | (1u << 16);
+        if (n_isects != cub_n || bit_range != cub_end_bit || cub_ws_bytes == 0) {
+            cub::DoubleBuffer<uint32_t> query_keys(keys, keys_sorted);
+            cub::DoubleBuffer<int32_t> query_vals(vals, vals_sorted);
+            size_t ws = 0;
+            LFS_CUDA_CHECK_MSG(
+                cub::DeviceRadixSort::SortPairs(
+                    nullptr, ws, query_keys, query_vals, n_isects,
+                    begin_bit, end_bit, stream),
+                "cub::DeviceRadixSort::SortPairs(u32) workspace query");
+            LFS_ASSERT_MSG(ws > 0, "gsplat CUB u32 radix sort returned an empty workspace");
+            cub_ws_bytes = ws;
+            cub_n = n_isects;
+            cub_end_bit = bit_range;
+        }
+
+        cub::DoubleBuffer<uint32_t> d_keys(keys, keys_sorted);
+        cub::DoubleBuffer<int32_t> d_values(vals, vals_sorted);
+        void* const workspace = ensure_gsplat_cub_workspace(cub_ws_bytes, stream);
+        size_t storage_bytes = cub_ws_bytes;
+        LFS_CUDA_CHECK_MSG(
+            cub::DeviceRadixSort::SortPairs(
+                workspace, storage_bytes, d_keys, d_values, n_isects,
+                begin_bit, end_bit, stream),
+            "cub::DeviceRadixSort::SortPairs(u32)");
+        if (keys_out)
+            *keys_out = d_keys.Current();
+        if (vals_out)
+            *vals_out = d_values.Current();
+    }
+
     __global__ void depth_order_keys_kernel(
         const float* __restrict__ depths,
+        const int32_t* __restrict__ radii,
         const uint32_t n,
         uint32_t* __restrict__ keys,
         int32_t* __restrict__ values) {
@@ -552,8 +744,9 @@ namespace gsplat_lfs {
         if (i >= n) {
             return;
         }
-        // Same bit pattern the pair key carries in its low 32 bits.
-        keys[i] = __float_as_uint(depths[i]);
+        const bool culled = radii != nullptr && (radii[i * 2] <= 0 || radii[i * 2 + 1] <= 0);
+        // Same bit pattern the pair key carries in its low 32 bits; culled splats cluster at the end.
+        keys[i] = culled ? 0xffffffffu : __float_as_uint(depths[i]);
         values[i] = static_cast<int32_t>(i);
     }
 
@@ -564,11 +757,12 @@ namespace gsplat_lfs {
         uint32_t* keys_alt,
         int32_t* values,
         int32_t* values_alt,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const int32_t* radii) {
         if (n == 0) {
             return values;
         }
-        depth_order_keys_kernel<<<(n + 255) / 256, 256, 0, stream>>>(depths, n, keys, values);
+        depth_order_keys_kernel<<<(n + 255) / 256, 256, 0, stream>>>(depths, radii, n, keys, values);
         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.depth_order_keys");
         cub::DoubleBuffer<uint32_t> d_keys(keys, keys_alt);
         cub::DoubleBuffer<int32_t> d_values(values, values_alt);
@@ -577,6 +771,43 @@ namespace gsplat_lfs {
             [&](void* workspace, size_t& workspace_bytes) {
                 return cub::DeviceRadixSort::SortPairs(
                     workspace, workspace_bytes, d_keys, d_values, n, 0, 32, stream);
+            });
+        return d_values.Current();
+    }
+
+    __global__ void tile_count_keys_kernel(
+        const int32_t* __restrict__ tile_offsets,
+        const uint32_t n_tiles,
+        uint32_t* __restrict__ keys,
+        int32_t* __restrict__ vals) {
+        const uint32_t t = cg::this_grid().thread_rank();
+        if (t >= n_tiles)
+            return;
+        const int32_t c = tile_offsets[t + 1] - tile_offsets[t];
+        keys[t] = static_cast<uint32_t>(c > 0 ? min(c, 65535) : 0);
+        vals[t] = static_cast<int32_t>(t);
+    }
+
+    const int32_t* sort_tiles_by_count_descending(
+        const int32_t* tile_offsets,
+        const uint32_t n_tiles,
+        uint32_t* keys,
+        uint32_t* keys_alt,
+        int32_t* vals,
+        int32_t* vals_alt,
+        cudaStream_t stream) {
+        if (n_tiles == 0)
+            return vals;
+        tile_count_keys_kernel<<<(n_tiles + 255) / 256, 256, 0, stream>>>(
+            tile_offsets, n_tiles, keys, vals);
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.tile_count_keys");
+        cub::DoubleBuffer<uint32_t> d_keys(keys, keys_alt);
+        cub::DoubleBuffer<int32_t> d_values(vals, vals_alt);
+        run_cub_operation(
+            "cub::DeviceRadixSort::SortPairsDescending (LPT tiles)", stream,
+            [&](void* workspace, size_t& workspace_bytes) {
+                return cub::DeviceRadixSort::SortPairsDescending(
+                    workspace, workspace_bytes, d_keys, d_values, n_tiles, 0, 16, stream);
             });
         return d_values.Current();
     }

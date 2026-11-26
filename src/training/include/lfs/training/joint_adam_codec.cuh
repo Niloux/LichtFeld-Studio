@@ -16,6 +16,17 @@ namespace lfs::training::joint_adam {
     constexpr int kBlockSizeDevice = 256;
     constexpr float kEpsDevice = 1e-15f;
 
+    // Stateless 64-bit SplitMix64-based hash returning uniform float in [0, 1).
+    __device__ __forceinline__ float sr_uniform01(const uint64_t key, const uint32_t seed) {
+        uint64_t x = key ^ (static_cast<uint64_t>(seed) * 0x9e3779b97f4a7c15ull);
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebull;
+        x ^= x >> 31;
+        return static_cast<float>(static_cast<uint32_t>(x >> 40)) * 5.9604644775390625e-8f;
+    }
+
     template <int BITS>
     struct DeviceCodec {
         static_assert(BITS == 8 || BITS == 16, "joint Adam codec supports 8 or 16 bits");
@@ -99,6 +110,37 @@ namespace lfs::training::joint_adam {
             const float inv_u = 1.0f / fmaxf(mm.y - mm.x, kEpsDevice);
             const float inv_s = 1.0f / fmaxf(mm.w - mm.z, kEpsDevice);
             encode_us(packed, idx, u_val, log_s_val, mm.x, mm.z, inv_u, inv_s);
+        }
+
+        // Stochastic rounding variant of encode_us using stateless hash PRNG.
+        // Preserves exact 0 and kQMax endpoints; sr_seed == 0 falls back to round-to-nearest.
+        __device__ static inline void encode_us_sr(uint8_t* __restrict__ packed,
+                                                   const int64_t idx,
+                                                   const float u_val,
+                                                   const float log_s_val,
+                                                   const float umin,
+                                                   const float smin,
+                                                   const float inv_u_range,
+                                                   const float inv_s_range,
+                                                   const uint32_t sr_seed) {
+            if (sr_seed == 0u) {
+                encode_us(packed, idx, u_val, log_s_val, umin, smin, inv_u_range, inv_s_range);
+                return;
+            }
+            const float u_scaled = fminf(fmaxf(kQMax * (u_val - umin) * inv_u_range, 0.0f), kQMax);
+            const float s_scaled = fminf(fmaxf(kQMax * (log_s_val - smin) * inv_s_range, 0.0f), kQMax);
+            const float ru = sr_uniform01(static_cast<uint64_t>(idx) << 1, sr_seed);
+            const float rs = sr_uniform01((static_cast<uint64_t>(idx) << 1) | 1ull, sr_seed);
+            const float u_qf = fminf(floorf(u_scaled + ru), kQMax);
+            const float s_qf = fminf(floorf(s_scaled + rs), kQMax);
+            if constexpr (BITS == 16) {
+                auto* p = reinterpret_cast<uint16_t*>(packed);
+                p[idx * 2 + 0] = static_cast<uint16_t>(u_qf);
+                p[idx * 2 + 1] = static_cast<uint16_t>(s_qf);
+            } else {
+                packed[idx * 2 + 0] = static_cast<uint8_t>(u_qf);
+                packed[idx * 2 + 1] = static_cast<uint8_t>(s_qf);
+            }
         }
     };
 

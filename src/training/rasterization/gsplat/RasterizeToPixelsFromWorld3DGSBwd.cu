@@ -1180,16 +1180,16 @@ namespace gsplat_lfs {
         const ColorVarianceRender color_variance,
         float* __restrict__ blend_peak_out,
         const RenderGradPlanes grad_planes) {
-        const uint32_t cid = blockIdx.x;
         const uint32_t subs = tile_size / kSplatBwdSub;
+        const uint32_t cid = blockIdx.x;
         const uint32_t sub_y = blockIdx.y;
         const uint32_t sub_x = blockIdx.z;
         const uint32_t tile_id = (sub_y / subs) * tile_width + sub_x / subs;
+        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
         if constexpr (kBatched) {
             if (tile_id < tiles.begin || tile_id >= tiles.end)
                 return;
         }
-        const uint32_t sub_bit = (sub_y % subs) * subs + sub_x % subs;
         if (footprint.tile_sub_masks != nullptr && !((footprint.tile_sub_masks[tile_id] >> sub_bit) & 1u))
             return;
 
@@ -1444,7 +1444,9 @@ namespace gsplat_lfs {
                 const int32_t gi = s - static_cast<int32_t>(lane);
                 bool keep = false;
                 if (gi >= range_start) {
-                    if (footprint.tile_keys != nullptr) {
+                    if (footprint.tile_keys32 != nullptr) {
+                        keep = (footprint.tile_keys32[gi] >> sub_bit) & 1u;
+                    } else if (footprint.tile_keys != nullptr) {
                         keep = (static_cast<uint64_t>(footprint.tile_keys[gi]) >> sub_bit) & 1u;
                     } else {
                         keep = !cull || footprint_overlaps_square(
@@ -1529,8 +1531,8 @@ namespace gsplat_lfs {
                         if constexpr (kGlobalShutter) {
                             gro = splat_pos_or_gro;
                         } else {
-                            const uint32_t u = row_shutter ? (static_cast<uint32_t>(p) >> 3)
-                                                           : (static_cast<uint32_t>(p) & 7u);
+                            const int u = static_cast<int>(row_shutter ? (static_cast<uint32_t>(p) >> 3)
+                                                                       : (static_cast<uint32_t>(p) & 7u));
                             const float3 o3 = s_ray_o[u];
                             o_minus_mu = vec3{o3.x, o3.y, o3.z} - splat_pos_or_gro;
                             gro = Mt * o_minus_mu;

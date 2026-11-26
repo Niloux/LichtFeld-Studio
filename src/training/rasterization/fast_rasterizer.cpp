@@ -58,6 +58,7 @@ namespace lfs::training {
             dst.screen_share_n = src.screen_share_n;
             dst.screen_share_limit = src.screen_share_limit;
             dst.screen_share_penalty = src.screen_share_penalty;
+            dst.sr_seed = src.sr_seed;
             return dst;
         };
         fused_adam.enabled = optimizer_fused.enabled;

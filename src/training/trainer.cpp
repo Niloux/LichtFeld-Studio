@@ -7722,7 +7722,9 @@ namespace lfs::training {
                             // the context; only end the arena frame here.
                             auto& arena = lfs::core::GlobalArenaManager::instance().get_arena();
                             gsplat_ctx->isect_ids_ptr = nullptr;
+                            gsplat_ctx->isect_keys32_ptr = nullptr;
                             gsplat_ctx->flatten_ids_ptr = nullptr;
+                            gsplat_ctx->tile_order_ptr = nullptr;
                             arena.end_frame(gsplat_ctx->frame_id, lfs::core::getCurrentCUDAStream());
                             gsplat_ctx.reset();
                         }
@@ -7767,7 +7769,11 @@ namespace lfs::training {
 
                     lfs::core::Tensor roi_weight;
                     lfs::core::Tensor roi_report_weight;
-                    if (strategy_ && (fastgs_path || in_popspa))
+                    const bool fuse_gut_shN = step_params.gut && !fastgs_path && !in_popspa &&
+                                              !in_controller_phase && !in_sparsification &&
+                                              update_gaussians_this_iter && strategy_ &&
+                                              !refining_this_step && !morton_due;
+                    if (strategy_ && (fastgs_path || in_popspa || fuse_gut_shN))
                         install_cropbox_view_damping(strategy_->get_model(), gaussian_optimizer, *cam);
                     const bool roi_loss_weighting = cropbox_ && step_params.cropbox_loss_weight < 1.0f;
                     const bool roi_loss_report = cropbox_ && is_loss_readback_iteration(iter);
@@ -8984,6 +8990,12 @@ namespace lfs::training {
                                                       ? tile_grad_alpha
                                                       : lfs::core::Tensor::zeros_like(output.alpha);
                                 tile_context_guard.release();
+                                if (fuse_gut_shN) {
+                                    gaussian_optimizer.set_sh_rest_regularization(
+                                        strategy_->get_model().get_active_sh_degree() > 0
+                                            ? step_params.sh_rest_reg
+                                            : 0.0f);
+                                }
                                 gsplat_rasterize_backward(*gsplat_ctx, raster_grad, grad_alpha,
                                                           strategy_->get_model(), gaussian_optimizer,
                                                           use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
@@ -8998,7 +9010,8 @@ namespace lfs::training {
                                                               color_variance.weight,
                                                               normal_terms_weight.is_valid() ? normal_terms_weight : color_variance.pixel_weight},
                                                           blend_peak_rows,
-                                                          tile_grad_depth_sq);
+                                                          tile_grad_depth_sq,
+                                                          fuse_gut_shN ? iter : -1);
                                 if (edge_weight_scoring_active_) {
                                     strategy_->on_edge_score_accumulated(iter);
                                 }
@@ -9117,6 +9130,10 @@ namespace lfs::training {
                         }
                         nvtxRangePop();
                     }
+                    const bool fuse_gut_shN_step = step_params.gut && !fastgs_path && !in_popspa &&
+                                                   !in_controller_phase && !in_sparsification &&
+                                                   update_gaussians_this_iter && strategy_ &&
+                                                   !refining_this_step && !morton_due;
                     if (!fastgs_path && !in_popspa) {
                         // GUT's backward leaves plain optimizer gradients: add the per-splat terms FastGS fuses.
                         auto& model = strategy_->get_model();
@@ -9127,52 +9144,66 @@ namespace lfs::training {
                             gut_rendered_only ? step_params.scale_reg_at(iter) * 0.01f / train_frame_scale_ : 0.0f;
                         const float flatten_weight =
                             gut_rendered_only && normal_supervision_started ? step_params.normal_flatten_weight : 0.0f;
+                        const bool can_fold_gut_reg =
+                            step_params.gut && update_gaussians_this_iter && !in_sparsification &&
+                            !refining_this_step && !morton_due && !is_loss_readback_iteration(iter);
                         if (n > 0 && (erank_weight > 0.0f || dc_weight > 0.0f || log_scale_weight > 0.0f || flatten_weight > 0.0f)) {
-                            const auto device_scalar = [](lfs::core::Tensor& t) -> lfs::core::Tensor {
-                                if (!t.is_valid())
-                                    t = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
-                                t.zero_();
-                                return t;
-                            };
-                            if (log_scale_weight > 0.0f)
-                                fused_scale_reg_loss_gpu = device_scalar(fused_scale_reg_loss_);
-                            if (erank_weight > 0.0f)
-                                fused_erank_reg_loss_gpu = device_scalar(fused_erank_reg_loss_);
-                            if (dc_weight > 0.0f)
-                                fused_dc_reg_loss_gpu = device_scalar(fused_dc_reg_loss_);
-                            auto& sh0 = model.sh0();
-                            auto& scaling_grad = gaussian_optimizer.get_grad(ParamType::Scaling);
-                            auto& sh0_grad = gaussian_optimizer.get_grad(ParamType::Sh0);
-                            const cudaStream_t reg_stream = lfs::core::getCurrentCUDAStream();
-                            scaling_grad.sync_to_stream(reg_stream);
-                            sh0_grad.sync_to_stream(reg_stream);
                             const float* blend_peak = gut_rendered_only ? blend_peak_rows.ptr<float>() : nullptr;
-                            lfs::training::kernels::launch_gut_param_regularization(
-                                model.scaling_raw().ptr<float>(),
-                                scaling_grad.ptr<float>(),
-                                sh0.ptr<float>(),
-                                sh0_grad.ptr<float>(),
-                                static_cast<int>(sh0.numel() / static_cast<size_t>(n)), n,
-                                erank_weight, dc_weight,
-                                erank_weight > 0.0f ? fused_erank_reg_loss_gpu.ptr<float>() : nullptr,
-                                dc_weight > 0.0f ? fused_dc_reg_loss_gpu.ptr<float>() : nullptr,
-                                reg_stream,
-                                kernels::GutShapeRegularization{
+                            if (can_fold_gut_reg) {
+                                gaussian_optimizer.set_gut_regularization({
                                     .blend_peak = blend_peak,
                                     .log_scale_weight = log_scale_weight,
-                                    .scale_loss_out = log_scale_weight > 0.0f ? fused_scale_reg_loss_gpu.ptr<float>() : nullptr});
-                            gsplat_lfs::flatten_scale_grad(model.scaling_raw().ptr<float>(), scaling_grad.ptr<float>(),
-                                                           n, flatten_weight, reg_stream, blend_peak);
-                            if (log_scale_weight > 0.0f)
-                                loss_tensor_gpu = loss_tensor_gpu + fused_scale_reg_loss_gpu;
+                                    .erank_weight = erank_weight,
+                                    .flatten_weight = flatten_weight,
+                                    .dc_weight = dc_weight});
+                            } else {
+                                const auto device_scalar = [](lfs::core::Tensor& t) -> lfs::core::Tensor {
+                                    if (!t.is_valid())
+                                        t = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA);
+                                    t.zero_();
+                                    return t;
+                                };
+                                if (log_scale_weight > 0.0f)
+                                    fused_scale_reg_loss_gpu = device_scalar(fused_scale_reg_loss_);
+                                if (erank_weight > 0.0f)
+                                    fused_erank_reg_loss_gpu = device_scalar(fused_erank_reg_loss_);
+                                if (dc_weight > 0.0f)
+                                    fused_dc_reg_loss_gpu = device_scalar(fused_dc_reg_loss_);
+                                auto& sh0 = model.sh0();
+                                auto& scaling_grad = gaussian_optimizer.get_grad(ParamType::Scaling);
+                                auto& sh0_grad = gaussian_optimizer.get_grad(ParamType::Sh0);
+                                const cudaStream_t reg_stream = lfs::core::getCurrentCUDAStream();
+                                scaling_grad.sync_to_stream(reg_stream);
+                                sh0_grad.sync_to_stream(reg_stream);
+                                lfs::training::kernels::launch_gut_param_regularization(
+                                    model.scaling_raw().ptr<float>(),
+                                    scaling_grad.ptr<float>(),
+                                    sh0.ptr<float>(),
+                                    sh0_grad.ptr<float>(),
+                                    static_cast<int>(sh0.numel() / static_cast<size_t>(n)), n,
+                                    erank_weight, dc_weight,
+                                    erank_weight > 0.0f ? fused_erank_reg_loss_gpu.ptr<float>() : nullptr,
+                                    dc_weight > 0.0f ? fused_dc_reg_loss_gpu.ptr<float>() : nullptr,
+                                    reg_stream,
+                                    kernels::GutShapeRegularization{
+                                        .blend_peak = blend_peak,
+                                        .log_scale_weight = log_scale_weight,
+                                        .scale_loss_out = log_scale_weight > 0.0f ? fused_scale_reg_loss_gpu.ptr<float>() : nullptr});
+                                gsplat_lfs::flatten_scale_grad(model.scaling_raw().ptr<float>(), scaling_grad.ptr<float>(),
+                                                               n, flatten_weight, reg_stream, blend_peak);
+                                if (log_scale_weight > 0.0f)
+                                    loss_tensor_gpu = loss_tensor_gpu + fused_scale_reg_loss_gpu;
+                            }
                         }
                     }
                     // The shN step applies SH-rest regularization on the GUT path; its loss is not reported.
-                    gaussian_optimizer.set_sh_rest_regularization(
-                        !fastgs_path && !in_popspa && update_gaussians_this_iter &&
-                                strategy_->get_model().get_active_sh_degree() > 0
-                            ? step_params.sh_rest_reg
-                            : 0.0f);
+                    if (!fuse_gut_shN_step) {
+                        gaussian_optimizer.set_sh_rest_regularization(
+                            !fastgs_path && !in_popspa && update_gaussians_this_iter &&
+                                    strategy_->get_model().get_active_sh_degree() > 0
+                                ? step_params.sh_rest_reg
+                                : 0.0f);
+                    }
                     if (fused_erank_reg_loss_gpu.is_valid())
                         loss_tensor_gpu = loss_tensor_gpu + fused_erank_reg_loss_gpu;
                     if (fused_dc_reg_loss_gpu.is_valid())
@@ -9401,7 +9432,11 @@ namespace lfs::training {
                             post_backward_or_undo(iter, r_output, refine_undone);
                             maybe_morton_reorder(iter);
                         }
-                        if (!fastgs_path && !in_popspa) {
+                        const bool fuse_gut_shN_here =
+                            step_params.gut && !fastgs_path && !in_popspa && !in_controller_phase &&
+                            !in_sparsification && update_gaussians_this_iter && strategy_ &&
+                            !refining && !morton_due;
+                        if (!fastgs_path && !in_popspa && !fuse_gut_shN_here) {
                             // Refine may have changed the rows since the forward pass.
                             install_cropbox_view_damping(model, strategy_->get_optimizer(), *cam);
                         }

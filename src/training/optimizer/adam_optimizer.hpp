@@ -103,6 +103,15 @@ namespace lfs::training {
         int screen_share_n = 0;
         float screen_share_limit = 0.0f;
         float screen_share_penalty = 0.0f;
+        uint32_t sr_seed = 0;
+    };
+
+    struct GutRegularizationConfig {
+        const float* blend_peak = nullptr;
+        float log_scale_weight = 0.0f;
+        float erank_weight = 0.0f;
+        float flatten_weight = 0.0f;
+        float dc_weight = 0.0f;
     };
 
     struct FastGSFusedAdamState {
@@ -145,6 +154,10 @@ namespace lfs::training {
             sh_rest_reg_weight_ = weight;
             sh_rest_reg_loss_out_ = loss_out;
         }
+        [[nodiscard]] bool can_fuse_gut_shN(int iteration) const;
+        bool step_gut_fused_shN(int iteration, const float* v_colors, const float* dirs,
+                                int color_stride, cudaStream_t stream);
+        void set_gut_regularization(const GutRegularizationConfig& cfg) { gut_reg_ = cfg; }
         void set_crop_damping_mask(lfs::core::Tensor mask);
         // Rows whose refine, sampling and keep scores are scaled by cropbox_lr_scale.
         void set_crop_score_mask(lfs::core::Tensor mask);
@@ -279,6 +292,9 @@ namespace lfs::training {
         bool collect_projected_screen_share_ = false;
         int64_t fused_step_iteration_ = -1;
         bool last_step_zeroed_gradients_ = false;
+        int64_t fused_shN_iteration_ = -1;
+        uint8_t zeroed_in_step_mask_ = 0;
+        GutRegularizationConfig gut_reg_{};
 
         lfs::core::Tensor& get_param(ParamType type);
         std::string param_name(ParamType type) const;

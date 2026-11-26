@@ -391,6 +391,8 @@ namespace lfs::training {
             return;
         }
         last_step_zeroed_gradients_ = false;
+        zeroed_in_step_mask_ = 0;
+        const auto gut_cfg = std::exchange(gut_reg_, {});
 
         fast_lfs::optimizer::JointContiguousBatchEntry entries[5];
         int n_entries = 0;
@@ -463,7 +465,16 @@ namespace lfs::training {
             }
             if (type == ParamType::Scaling) {
                 e.apply_screen_share = 1;
+                e.apply_gut_scale_reg = 1;
             }
+            if (type == ParamType::Sh0) {
+                e.apply_gut_dc_reg = 1;
+            }
+            e.zero_grad = 1;
+            e.sr_seed = joint_adam::stochastic_rounding_enabled()
+                            ? static_cast<uint32_t>(state.step_count)
+                            : 0u;
+            zeroed_in_step_mask_ |= static_cast<uint8_t>(1u << static_cast<int>(type));
             param_live.set_stream(batch_stream);
             state.exp_avg.set_stream(batch_stream);
             state.joint_bounds.set_stream(batch_stream);
@@ -521,6 +532,13 @@ namespace lfs::training {
                 fast_lfs::optimizer::ray_depth_propose(ray_depth, batch_stream);
                 ray_depth_proposed = true;
             }
+            const fast_lfs::optimizer::GutRegularizationArgs gut_reg{
+                gut_cfg.blend_peak,
+                gut_cfg.log_scale_weight,
+                gut_cfg.erank_weight,
+                gut_cfg.flatten_weight,
+                gut_cfg.dc_weight,
+                nullptr, nullptr, nullptr};
             fast_lfs::optimizer::adam_step_joint_contiguous_batched(
                 entries, n_entries,
                 frozen_mask_ptr(), frozen_mask_size(), frozen_lr_scale_,
@@ -531,7 +549,8 @@ namespace lfs::training {
                 batch_stream,
                 batch_mean_step_scale_raw, batch_mean_step_scale_n,
                 mean_step_median_extent_, mean_step_far_mask_, mean_step_far_mask_n_,
-                screen_share_max_, screen_share_n_, screen_share_limit_, screen_share_penalty_);
+                screen_share_max_, screen_share_n_, screen_share_limit_, screen_share_penalty_,
+                gut_reg);
             if (ray_depth_proposed)
                 fast_lfs::optimizer::ray_depth_commit(ray_depth, batch_stream);
         }
@@ -615,7 +634,17 @@ namespace lfs::training {
             last_step_zeroed_gradients_ = false;
             return;
         }
-        for (auto& [name, state] : states_) {
+        const uint8_t already_zeroed = std::exchange(zeroed_in_step_mask_, 0);
+        for (const auto type : all_param_types()) {
+            if ((already_zeroed & (1u << static_cast<int>(type))) != 0) {
+                continue;
+            }
+            const auto name = param_name(type);
+            const auto it = states_.find(name);
+            if (it == states_.end()) {
+                continue;
+            }
+            auto& state = it->second;
             if (state.grad.is_valid() && state.grad.numel() > 0) {
                 LFS_ASSERT_MSG(state.size <= state.grad.shape()[0],
                                std::format("AdamOptimizer::zero_grad: {} optimizer state has {} rows "
@@ -853,6 +882,10 @@ namespace lfs::training {
 
     void AdamOptimizer::step_param(ParamType type, const int iteration, const bool apply_sh_warmup) {
         auto& param = get_param(type);
+        if (type == ParamType::ShN && fused_shN_iteration_ == iteration) {
+            zeroed_in_step_mask_ |= static_cast<uint8_t>(1u << static_cast<int>(ParamType::ShN));
+            return;
+        }
         if (!param.is_valid() || param.numel() == 0) {
             return;
         }
@@ -941,6 +974,9 @@ namespace lfs::training {
                         lfs::core::resolve_exportable_device_ptr(param_live));
                 }
 
+                const uint32_t sr_seed = joint_adam::stochastic_rounding_enabled()
+                                             ? static_cast<uint32_t>(state.step_count)
+                                             : 0u;
                 fast_lfs::optimizer::adam_step_shN_joint_from_grad(
                     param_ptr,
                     state.exp_avg.ptr<uint8_t>(),
@@ -965,7 +1001,10 @@ namespace lfs::training {
                     static_cast<float>(bias_correction2_sqrt_rcp),
                     execution_stream,
                     sh_rest_reg_weight_,
-                    sh_rest_reg_loss_out_);
+                    sh_rest_reg_loss_out_,
+                    true,
+                    sr_seed);
+                zeroed_in_step_mask_ |= static_cast<uint8_t>(1u << static_cast<int>(ParamType::ShN));
                 param_live.set_stream(execution_stream);
                 state.exp_avg.set_stream(execution_stream);
                 state.joint_bounds.set_stream(execution_stream);
@@ -990,6 +1029,9 @@ namespace lfs::training {
                 share_limit = screen_share_limit_;
                 share_penalty = screen_share_penalty_;
             }
+            const uint32_t sr_seed = joint_adam::stochastic_rounding_enabled()
+                                         ? static_cast<uint32_t>(state.step_count)
+                                         : 0u;
             fast_lfs::optimizer::adam_step_joint_contiguous_raw(
                 param_live.ptr<float>(),
                 state.exp_avg.ptr<uint8_t>(),
@@ -1014,7 +1056,8 @@ namespace lfs::training {
                 share_max,
                 share_n,
                 share_limit,
-                share_penalty);
+                share_penalty,
+                sr_seed);
             param_live.set_stream(execution_stream);
             state.exp_avg.set_stream(execution_stream);
             state.joint_bounds.set_stream(execution_stream);
@@ -1025,6 +1068,125 @@ namespace lfs::training {
         throw std::runtime_error(
             "AdamOptimizer::step_param: non-joint state is unsupported "
             "(joint (u,log_s) is the only Adam codec)");
+    }
+
+    bool AdamOptimizer::can_fuse_gut_shN(const int iteration) const {
+        if (config_.sh_warmup && iteration <= SH_WARMUP_ITERATIONS) {
+            return false;
+        }
+        if (splat_data_.active_sh_coeffs_rest() <= 0 ||
+            splat_data_.max_sh_coeffs_rest() <= 0) {
+            return false;
+        }
+        const auto& param = const_cast<AdamOptimizer*>(this)->get_param(ParamType::ShN);
+        return param.is_valid() && param.numel() > 0 && splat_data_.size() > 0;
+    }
+
+    bool AdamOptimizer::step_gut_fused_shN(
+        const int iteration,
+        const float* v_colors,
+        const float* dirs,
+        const int color_stride,
+        const cudaStream_t execution_stream) {
+        if (!can_fuse_gut_shN(iteration) || v_colors == nullptr || dirs == nullptr) {
+            return false;
+        }
+        const auto type = ParamType::ShN;
+        const auto name = param_name(type);
+        if (!states_.contains(name)) {
+            init_state(type, false);
+        }
+        auto& state = states_[name];
+        if (!state.exp_avg.is_valid() || state.exp_avg.numel() == 0 ||
+            !state.is_joint() || !state.joint_bounds.is_valid()) {
+            return false;
+        }
+        auto& param_live = get_param(type);
+        const auto layout_rest = static_cast<uint32_t>(splat_data_.max_sh_coeffs_rest());
+        const auto active_rest = static_cast<uint32_t>(splat_data_.active_sh_coeffs_rest());
+        const size_t n_live = static_cast<size_t>(splat_data_.size());
+        const size_t float_layout = lfs::core::sh_swizzled_float_count(n_live, layout_rest);
+        if (state.size != float_layout) {
+            throw std::runtime_error("Optimizer state desync: shN (step_gut_fused_shN)");
+        }
+        const int sh_layout_slots =
+            static_cast<int>(lfs::core::sh_float4_slots_for_rest(layout_rest));
+        const int active_sh_bases = static_cast<int>(active_rest + 1u);
+
+        state.step_count++;
+        const double bias_correction1_rcp = 1.0 / (1.0 - std::pow(config_.beta1, state.step_count));
+        const double bias_correction2_sqrt_rcp = 1.0 / std::sqrt(1.0 - std::pow(config_.beta2, state.step_count));
+        const float param_lr = static_cast<float>(get_param_lr(type));
+        const uint32_t sr_seed = joint_adam::stochastic_rounding_enabled()
+                                     ? static_cast<uint32_t>(state.step_count)
+                                     : 0u;
+
+        lfs::core::waitForCUDAStream(execution_stream, param_live.stream());
+        lfs::core::waitForCUDAStream(execution_stream, state.exp_avg.stream());
+        lfs::core::waitForCUDAStream(execution_stream, state.joint_bounds.stream());
+        if (frozen_mask_.is_valid()) {
+            lfs::core::waitForCUDAStream(execution_stream, frozen_mask_.stream());
+        }
+        if (crop_damping_mask_.is_valid()) {
+            crop_damping_mask_.sync_to_stream(execution_stream);
+        }
+
+        float* param_ptr = nullptr;
+        float* sh_value_bounds = nullptr;
+        int sh_value_bits = 0;
+        int sh_value_n_cells = 0;
+        if (splat_data_.shN_value_quantized() &&
+            splat_data_.shN_value_bounds().is_valid()) {
+            const auto q16 = lfs::core::resolve_q16_bind_ptrs(splat_data_);
+            param_ptr = const_cast<float*>(q16.codes);
+            sh_value_bounds = const_cast<float*>(q16.bounds);
+            sh_value_bits = 16;
+            sh_value_n_cells = static_cast<int>(q16.n_cells_per_prim);
+        } else if (splat_data_.shN_ieee_f16()) {
+            param_ptr = static_cast<float*>(
+                lfs::core::resolve_exportable_device_ptr(param_live));
+            sh_value_bits = 16;
+        } else {
+            param_ptr = static_cast<float*>(
+                lfs::core::resolve_exportable_device_ptr(param_live));
+        }
+
+        fast_lfs::optimizer::adam_step_shN_joint_from_color(
+            param_ptr,
+            state.exp_avg.ptr<uint8_t>(),
+            state.joint_bounds.ptr<float>(),
+            sh_value_bounds,
+            v_colors,
+            dirs,
+            color_stride,
+            frozen_mask_ptr(),
+            frozen_mask_size(),
+            frozen_lr_scale_,
+            crop_damping_mask_ptr(),
+            crop_damping_mask_size(),
+            cropbox_lr_scale_,
+            static_cast<int>(n_live),
+            sh_layout_slots,
+            active_sh_bases,
+            sh_value_bits,
+            sh_value_n_cells,
+            param_lr * static_cast<float>(bias_correction1_rcp),
+            static_cast<float>(config_.beta1),
+            static_cast<float>(config_.beta2),
+            static_cast<float>(config_.eps),
+            static_cast<float>(bias_correction2_sqrt_rcp),
+            execution_stream,
+            sh_rest_reg_weight_,
+            sh_rest_reg_loss_out_,
+            sr_seed);
+
+        param_live.set_stream(execution_stream);
+        state.exp_avg.set_stream(execution_stream);
+        state.joint_bounds.set_stream(execution_stream);
+        sh_rest_reg_weight_ = 0.0f;
+        sh_rest_reg_loss_out_ = nullptr;
+        fused_shN_iteration_ = iteration;
+        return true;
     }
 
     FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(
@@ -1197,6 +1359,9 @@ namespace lfs::training {
             out.n_attributes = n_attributes;
             out.step_size = static_cast<float>(get_param_lr(type) * bias_correction1_rcp);
             out.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            out.sr_seed = joint_adam::stochastic_rounding_enabled()
+                              ? static_cast<uint32_t>(state.step_count + 1)
+                              : 0u;
             out.enabled = true;
             return out;
         };

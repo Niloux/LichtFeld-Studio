@@ -28,6 +28,25 @@ namespace lfs::training::joint_adam {
     inline constexpr int kBlockSize = 256;
     inline constexpr float kEps = 1e-15f;
 
+    [[nodiscard]] inline bool stochastic_rounding_enabled() noexcept {
+        static const bool enabled = [] {
+            const char* v = std::getenv("LFS_ADAM_SR");
+            return v == nullptr || v[0] != '0';
+        }();
+        return enabled;
+    }
+
+    // Host mirror of sr_uniform01 in joint_adam_codec.cuh.
+    [[nodiscard]] inline float host_sr_uniform01(const std::uint64_t key, const std::uint32_t seed) noexcept {
+        std::uint64_t x = key ^ (static_cast<std::uint64_t>(seed) * 0x9e3779b97f4a7c15ull);
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebull;
+        x ^= x >> 31;
+        return static_cast<float>(static_cast<std::uint32_t>(x >> 40)) * 5.9604644775390625e-8f;
+    }
+
     [[nodiscard]] inline std::size_t n_bounds_for_prims(std::size_t n_prims) {
         if (n_prims == 0)
             return 0;
@@ -111,6 +130,39 @@ namespace lfs::training::joint_adam {
             const float inv_s = 1.0f / std::max(smax - smin, kEps);
             const float u_qf = std::min(std::max(std::round(kQMax * (u_val - umin) * inv_u), 0.0f), kQMax);
             const float s_qf = std::min(std::max(std::round(kQMax * (log_s_val - smin) * inv_s), 0.0f), kQMax);
+            if constexpr (BITS == 16) {
+                auto* p = reinterpret_cast<std::uint16_t*>(packed);
+                p[idx * 2 + 0] = static_cast<std::uint16_t>(u_qf);
+                p[idx * 2 + 1] = static_cast<std::uint16_t>(s_qf);
+            } else {
+                packed[idx * 2 + 0] = static_cast<std::uint8_t>(u_qf);
+                packed[idx * 2 + 1] = static_cast<std::uint8_t>(s_qf);
+            }
+        }
+
+        static void encode_us_sr(std::uint8_t* packed, std::size_t idx,
+                                 float u_val, float log_s_val,
+                                 float umin, float umax, float smin, float smax,
+                                 std::uint32_t seed) {
+            if (seed == 0u) {
+                encode_us(packed, idx, u_val, log_s_val, umin, umax, smin, smax);
+                return;
+            }
+            const float inv_u = 1.0f / std::max(umax - umin, kEps);
+            const float inv_s = 1.0f / std::max(smax - smin, kEps);
+            const float nu = kQMax * (u_val - umin) * inv_u;
+            const float ns = kQMax * (log_s_val - smin) * inv_s;
+            auto q_sr = [](const float nval, const float r) -> float {
+                if (nval <= 0.0f)
+                    return 0.0f;
+                if (nval >= kQMax)
+                    return kQMax;
+                return std::min(std::floor(nval + r), kQMax);
+            };
+            const float ru = host_sr_uniform01(static_cast<std::uint64_t>(idx) * 2ull, seed);
+            const float rs = host_sr_uniform01(static_cast<std::uint64_t>(idx) * 2ull + 1ull, seed);
+            const float u_qf = q_sr(nu, ru);
+            const float s_qf = q_sr(ns, rs);
             if constexpr (BITS == 16) {
                 auto* p = reinterpret_cast<std::uint16_t*>(packed);
                 p[idx * 2 + 0] = static_cast<std::uint16_t>(u_qf);

@@ -289,3 +289,95 @@ TEST(JointAdamCodecTest, OptimBpsConstantsMatchFootprint) {
     EXPECT_EQ(kOptimBpsJointSh3, 152u); // LFS swizzled SH pad: 48 cells × 2 B
     EXPECT_LT(kOptimBpsJointSh3, kOptimBpsLegacySh3);
 }
+
+TEST(JointAdamCodecTest, StochasticRoundingTracksDecayAndPreservesEndpoints) {
+    // 8-bit log_s under repeated zero-gradient decay (beta2 = 0.999) stalls under
+    // round-to-nearest once per-step change < 0.5 bin, whereas SR remains unbiased.
+    constexpr int kCells = 256;
+    constexpr int kSteps = 500;
+    constexpr float kBeta1 = 0.9f;
+    constexpr float kBeta2 = 0.999f;
+
+    // Pin the min and max anchor cells so the block bounds stay realistic while
+    // interior decaying cells have per-step deltas smaller than half an 8-bit bin.
+    std::vector<float> ref_m(kCells, 0.0f);
+    std::vector<float> ref_v(kCells, 0.0f);
+    for (int i = 0; i < kCells; ++i) {
+        const float s = 1e-4f + 1e-2f * static_cast<float>(i) / static_cast<float>(kCells - 1);
+        ref_m[i] = (i % 2 == 0 ? 0.02f : -0.02f) * (1.0f + 0.01f * static_cast<float>(i));
+        ref_v[i] = s * s;
+    }
+    auto run_decay_step = [&](std::vector<uint8_t>& packed, float bounds[4],
+                              std::vector<float>& ref_m_local, std::vector<float>& ref_v_local,
+                              const uint32_t seed) {
+        std::vector<float> u(kCells), s(kCells);
+        float umin = 1e30f, umax = -1e30f, smin = 1e30f, smax = -1e30f;
+        for (int i = 0; i < kCells; ++i) {
+            float m = 0.0f, v = 0.0f;
+            Codec8::decode_g1g2(packed.data(), i, bounds[0], bounds[1], bounds[2], bounds[3], m, v);
+            if (i != 0 && i != kCells - 1) {
+                m *= kBeta1;
+                v *= kBeta2;
+            }
+            Codec8::g1g2_to_us(m, v, u[i], s[i]);
+            umin = std::min(umin, u[i]);
+            umax = std::max(umax, u[i]);
+            smin = std::min(smin, s[i]);
+            smax = std::max(smax, s[i]);
+        }
+        bounds[0] = umin;
+        bounds[1] = umax;
+        bounds[2] = smin;
+        bounds[3] = smax;
+        for (int i = 0; i < kCells; ++i) {
+            Codec8::encode_us_sr(packed.data(), i, u[i], s[i], umin, umax, smin, smax, seed);
+            if (i != 0 && i != kCells - 1) {
+                ref_m_local[i] *= kBeta1;
+                ref_v_local[i] *= kBeta2;
+            }
+        }
+    };
+
+    auto init_packed = [&](std::vector<uint8_t>& packed, float bounds[4]) {
+        Codec8::reduce_bounds(ref_m.data(), ref_v.data(), kCells, bounds);
+        packed.assign(kCells * Codec8::kBytesPerCell, 0);
+        for (int i = 0; i < kCells; ++i) {
+            Codec8::encode_g1g2(packed.data(), i, ref_m[i], ref_v[i], bounds[0], bounds[1], bounds[2], bounds[3]);
+        }
+    };
+
+    std::vector<uint8_t> packed_sr, packed_rtn;
+    float bounds_sr[4], bounds_rtn[4];
+    init_packed(packed_sr, bounds_sr);
+    init_packed(packed_rtn, bounds_rtn);
+
+    std::vector<float> ref_m_sr = ref_m, ref_v_sr = ref_v;
+    std::vector<float> ref_m_rtn = ref_m, ref_v_rtn = ref_v;
+    for (int step = 1; step <= kSteps; ++step) {
+        run_decay_step(packed_sr, bounds_sr, ref_m_sr, ref_v_sr, static_cast<uint32_t>(step));
+        run_decay_step(packed_rtn, bounds_rtn, ref_m_rtn, ref_v_rtn, 0u);
+    }
+
+    double sum_ref = 0.0, sum_sr = 0.0, sum_rtn = 0.0;
+    for (int i = 1; i < kCells - 1; ++i) {
+        float m, v;
+        Codec8::decode_g1g2(packed_sr.data(), i, bounds_sr[0], bounds_sr[1], bounds_sr[2], bounds_sr[3], m, v);
+        sum_ref += ref_v_sr[i];
+        sum_sr += v;
+        Codec8::decode_g1g2(packed_rtn.data(), i, bounds_rtn[0], bounds_rtn[1], bounds_rtn[2], bounds_rtn[3], m, v);
+        sum_rtn += v;
+    }
+    const double rel_err_sr = std::abs(sum_sr - sum_ref) / sum_ref;
+    const double rel_err_rtn = std::abs(sum_rtn - sum_ref) / sum_ref;
+    EXPECT_LT(rel_err_sr, 0.08) << "sum_sr=" << sum_sr << " sum_ref=" << sum_ref;
+    EXPECT_LT(rel_err_sr, rel_err_rtn) << "sr_err=" << rel_err_sr << " rtn_err=" << rel_err_rtn;
+
+    // Exact endpoint clamping: lo and hi map to 0 and kQMax regardless of seed.
+    std::vector<uint8_t> endpoint_packed(2 * Codec8::kBytesPerCell, 0);
+    Codec8::encode_us_sr(endpoint_packed.data(), 0, -2.0f, 1.0f, -2.0f, 3.0f, 1.0f, 5.0f, 12345u);
+    Codec8::encode_us_sr(endpoint_packed.data(), 1, 3.0f, 5.0f, -2.0f, 3.0f, 1.0f, 5.0f, 12345u);
+    EXPECT_EQ(endpoint_packed[0], 0u);
+    EXPECT_EQ(endpoint_packed[1], 0u);
+    EXPECT_EQ(endpoint_packed[2], 255u);
+    EXPECT_EQ(endpoint_packed[3], 255u);
+}

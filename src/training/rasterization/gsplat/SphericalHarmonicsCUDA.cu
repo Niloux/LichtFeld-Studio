@@ -902,7 +902,7 @@ namespace gsplat_lfs {
         if (N == 0 || C == 0) {
             return;
         }
-        const uint32_t degree = dirs != nullptr ? degrees_to_use : 0u;
+        const uint32_t degree = (dirs != nullptr && v_shN != nullptr) ? degrees_to_use : 0u;
         const uint32_t blocks = (N + kShStreamThreads - 1) / kShStreamThreads;
         dispatch_sh_degree(degree, [&](auto deg) {
             constexpr uint32_t D = decltype(deg)::value;
