@@ -871,7 +871,7 @@ TEST(ArgumentParserTest, TrainingDefaultsApplyMaxWidthCap) {
     EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_lr_scale, 0.1f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_loss_weight, 0.1f);
     EXPECT_FLOAT_EQ((*parsed)->freeze_lr_scale, 0.0f);
-    EXPECT_EQ((*parsed)->optimization.morton_reorder_interval, 5000u);
+    EXPECT_EQ((*parsed)->optimization.morton_reorder_interval, 1000u);
 }
 
 TEST(ArgumentParserTest, ExposureCorrectionDefaultsOnAndCanBeDisabled) {

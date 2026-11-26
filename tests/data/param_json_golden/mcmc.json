@@ -70,7 +70,7 @@
   "means_noise_weight": 50.0,
   "min_opacity": 0.004999999888241291,
   "mip_filter": false,
-  "morton_reorder_interval": 5000,
+  "morton_reorder_interval": 1000,
   "noise_infill_mesh": "",
   "normal_auto_generate": true,
   "normal_consistency_weight": 0.0010000000474974513,

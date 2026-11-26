@@ -16,6 +16,7 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <functional>
@@ -37,6 +38,36 @@ namespace lfs::training::morton {
             return false;
         }
         return static_cast<std::size_t>(iter) % interval == 0;
+    }
+
+    inline constexpr std::size_t kGrowthMortonMinSplats = 65'536;
+
+    /// Triggers an extra Morton reorder right after a refining step when
+    /// densification has substantially grown the model (or first reached max_cap)
+    /// since the last reorder. Setting `interval == 0` disables it along with
+    /// periodic reorders.
+    [[nodiscard]] inline bool should_reorder_after_refine(
+        const int iter,
+        const std::size_t interval,
+        const std::size_t stop_refine,
+        const std::size_t current_size,
+        const std::size_t last_morton_size,
+        const std::size_t max_cap) noexcept {
+        if (interval == 0 || iter <= 0 || static_cast<std::size_t>(iter) > stop_refine) {
+            return false;
+        }
+        if (current_size < kGrowthMortonMinSplats) {
+            return false;
+        }
+        if (last_morton_size == 0) {
+            return true;
+        }
+        if (max_cap > 0 && current_size >= max_cap && last_morton_size < max_cap) {
+            return true;
+        }
+        const std::size_t threshold =
+            last_morton_size + std::max(kGrowthMortonMinSplats, last_morton_size / 4);
+        return current_size >= threshold;
     }
 
     struct ReorderResult {

@@ -252,6 +252,21 @@ TEST(MortonReorderTest, CadenceMatchesStopRefineAndZeroDisables) {
     EXPECT_FALSE(morton::should_reorder(4999, 5000, 25000));
 }
 
+TEST(MortonReorderTest, GrowthTriggerMatchesThresholdsAndZeroDisables) {
+    EXPECT_FALSE(morton::should_reorder_after_refine(600, 0, 25000, 200000, 0, 1000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(0, 1000, 25000, 200000, 0, 1000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(25001, 1000, 25000, 200000, 0, 1000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(500, 1000, 25000, 65535, 0, 1000000));
+    EXPECT_TRUE(morton::should_reorder_after_refine(500, 1000, 25000, 65536, 0, 1000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(600, 1000, 25000, 124999, 100000, 1000000));
+    EXPECT_TRUE(morton::should_reorder_after_refine(600, 1000, 25000, 165536, 100000, 1000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(700, 1000, 25000, 165535, 100000, 1000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(800, 1000, 25000, 1249999, 1000000, 3000000));
+    EXPECT_TRUE(morton::should_reorder_after_refine(800, 1000, 25000, 1250000, 1000000, 3000000));
+    EXPECT_TRUE(morton::should_reorder_after_refine(2500, 1000, 25000, 3000000, 2800000, 3000000));
+    EXPECT_FALSE(morton::should_reorder_after_refine(2600, 1000, 25000, 3000000, 3000000, 3000000));
+}
+
 // A few splats far outside the scene must not stretch the grid until the rest shares one Morton cell: equal codes
 // would keep the near points in their (random) input order, and neighbouring rows would sit far apart in space.
 TEST(MortonReorderTest, DistantOutliersKeepTheNearPointsSpreadOverManyCells) {

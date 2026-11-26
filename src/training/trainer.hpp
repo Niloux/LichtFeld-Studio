@@ -721,7 +721,7 @@ namespace lfs::training {
         // Whether the camera stands inside the crop box (host pose, no device read).
         [[nodiscard]] bool cropbox_contains_camera(const lfs::core::Camera& camera) const;
         [[nodiscard]] bool morton_reorder_due(int iter) const;
-        void maybe_morton_reorder(int iter);
+        void maybe_morton_reorder(int iter, bool after_refine = false);
         [[nodiscard]] bool normal_supervision_active(int iter) const {
             return params_.optimization.normal_supervision_active(iter);
         }
@@ -1189,6 +1189,7 @@ namespace lfs::training {
         // Monotonic, never rolls back. Incremented at the frozen persistent
         // commit boundaries and embedded in terminal MutationStamp context.
         std::uint64_t mutation_epoch_ = 0;
+        std::size_t last_morton_size_ = 0;
         // Where the last failed train_step stopped.
         MutationStamp failed_step_{};
 

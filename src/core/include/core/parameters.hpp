@@ -278,7 +278,7 @@ namespace lfs::core {
             size_t start_refine = 500;
             size_t stop_refine = 25'000;
             // 0 disables. Applied until stop_refine, at the densify-safe mutation point.
-            size_t morton_reorder_interval = 5'000;
+            size_t morton_reorder_interval = 1'000;
             int sh_degree = 3;
             float opacity_reg = 0.01f;
             float scale_reg = 0.01f;

@@ -1311,6 +1311,7 @@ namespace lfs::training {
         eval_ppisp_exif_.store(0);
         eval_ppisp_nearest_.store(0);
         popspa_controller_.reset();
+        last_morton_size_ = 0;
         popspa_optimizer_.reset();
         popspa_dataset_validated_ = false;
         popspa_completed_iteration_.store(-1);
@@ -2378,14 +2379,31 @@ namespace lfs::training {
             params_.optimization.stop_refine);
     }
 
-    void Trainer::maybe_morton_reorder(const int iter) {
-        if (!morton_reorder_due(iter) || !strategy_) {
+    void Trainer::maybe_morton_reorder(const int iter, const bool after_refine) {
+        if (!strategy_) {
             return;
         }
         auto& model = strategy_->get_model();
-        static_cast<void>(morton::apply_morton_reorder(
+        const size_t current_size = static_cast<size_t>(model.size());
+        const bool periodic_due = morton_reorder_due(iter);
+        const bool growth_due =
+            after_refine &&
+            morton::should_reorder_after_refine(
+                iter,
+                params_.optimization.morton_reorder_interval,
+                params_.optimization.stop_refine,
+                current_size,
+                last_morton_size_,
+                static_cast<size_t>(std::max(0, params_.optimization.max_cap)));
+        if (!periodic_due && !growth_due) {
+            return;
+        }
+        const auto result = morton::apply_morton_reorder(
             model, &strategy_->get_optimizer(), nullptr,
-            [this](const morton::RowVisitor& visit) { strategy_->for_each_gaussian_row(visit); }));
+            [this](const morton::RowVisitor& visit) { strategy_->for_each_gaussian_row(visit); });
+        if (result.applied) {
+            last_morton_size_ = static_cast<size_t>(model.size());
+        }
     }
 
     void Trainer::setCropBoxSnapshot(std::optional<TrainingCropBoxGeometry> geometry) {
@@ -4339,6 +4357,7 @@ namespace lfs::training {
         eval_ppisp_exif_.store(0);
         eval_ppisp_nearest_.store(0);
         popspa_controller_.reset();
+        last_morton_size_ = 0;
         popspa_optimizer_.reset();
         popspa_dataset_validated_ = false;
         popspa_completed_iteration_.store(-1);
@@ -7309,7 +7328,7 @@ namespace lfs::training {
                     ++mutation_epoch_;
                     persistent_commit = true;
                     post_backward_or_undo(iter, r_output, refine_undone);
-                    maybe_morton_reorder(iter);
+                    maybe_morton_reorder(iter, refining);
                     fastgs_strategy_hooks_at_start = true;
 
                     if (static_cast<size_t>(model.size()) != model_size_before) {
@@ -9496,7 +9515,7 @@ namespace lfs::training {
                             ++mutation_epoch_;
                             persistent_commit = true;
                             post_backward_or_undo(iter, r_output, refine_undone);
-                            maybe_morton_reorder(iter);
+                            maybe_morton_reorder(iter, refining);
                         }
                         const bool fuse_gut_shN_here =
                             step_params.gut && !fastgs_path && !in_popspa && !in_controller_phase &&
