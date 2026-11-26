@@ -6,6 +6,8 @@
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "kernels/image_kernels.hpp"
+#include "kernels/thin_structure.hpp"
 #include "lfs/kernels/gut_regularization.cuh"
 #include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/sh_value_codec.hpp"
@@ -568,4 +570,130 @@ TEST(GutJointAdamBatch, FoldedGutRegularizationAndZeroGradMatchUnfused) {
     check_near(splat_fused.rotation_raw(), splat_ref.rotation_raw(), "rotation");
     check_near(splat_fused.opacity_raw(), splat_ref.opacity_raw(), "opacity");
     sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt);
+}
+
+TEST(GutShNJointAdam, ShNGradOnDemandLifecycle) {
+    CodecsOnGuard guard;
+    constexpr size_t n = 256;
+    constexpr size_t n_append = 64;
+    constexpr size_t cap = 512;
+    constexpr int sh_degree = 1;
+    constexpr int past_warmup = 1001;
+
+    AdamOptimizer::reset_slow_path_grow_count();
+    auto splat = make_mixed_splat(n, sh_degree);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(splat));
+    splat.reserve_capacity(cap);
+
+    AdamOptimizer opt(splat, make_cfg(cap));
+    opt.allocate_gradients(cap);
+
+    const auto* st = opt.get_state(ParamType::ShN);
+    ASSERT_NE(st, nullptr);
+    EXPECT_FALSE(st->grad.is_valid());
+
+    const auto layout_rest = static_cast<uint32_t>(splat.max_sh_coeffs_rest());
+    const size_t initial_floats = sh_swizzled_float_count(n, layout_rest);
+    {
+        auto& grad = opt.get_grad(ParamType::ShN);
+        ASSERT_TRUE(grad.is_valid());
+        EXPECT_EQ(grad.numel(), initial_floats);
+        EXPECT_LE(grad.capacity(), initial_floats);
+    }
+
+    opt.add_new_params(ParamType::Means, Tensor::zeros({n_append, size_t{3}}, Device::CUDA));
+    opt.add_new_params(ParamType::Sh0, Tensor::zeros({n_append, size_t{1}, size_t{3}}, Device::CUDA));
+    sh_value::append_canonical_to_shN(
+        splat, Tensor::zeros({n_append, static_cast<size_t>(layout_rest), size_t{3}}, Device::CUDA), n);
+    opt.extend_state_for_new_params(ParamType::ShN, n_append);
+    opt.add_new_params(ParamType::Scaling, Tensor::zeros({n_append, size_t{3}}, Device::CUDA));
+    opt.add_new_params(ParamType::Rotation, Tensor::zeros({n_append, size_t{4}}, Device::CUDA));
+    opt.add_new_params(ParamType::Opacity, Tensor::zeros({n_append, size_t{1}}, Device::CUDA));
+
+    EXPECT_EQ(AdamOptimizer::slow_path_grow_count(), 0u);
+    const size_t grown_floats = sh_swizzled_float_count(n + n_append, layout_rest);
+    st = opt.get_state(ParamType::ShN);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(st->grad.is_valid());
+    EXPECT_EQ(st->grad.numel(), grown_floats);
+
+    opt.release_grad(ParamType::ShN);
+    EXPECT_FALSE(st->grad.is_valid());
+
+    auto v_colors = Tensor::full({n + n_append, size_t{3}}, 0.01f, Device::CUDA);
+    auto dirs = Tensor::full({n + n_append, size_t{3}}, 0.5f, Device::CUDA);
+    EXPECT_TRUE(opt.step_gut_fused_shN(past_warmup, v_colors.ptr<float>(), dirs.ptr<float>(), 3, nullptr));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_FALSE(st->grad.is_valid());
+}
+
+TEST(VramMapCaches, ThinStructureUInt8MatchesFloat32) {
+    constexpr size_t H = 64;
+    constexpr size_t W = 64;
+    std::vector<float> img_h(3 * H * W, 0.1f);
+    for (size_t y = 0; y < H; ++y) {
+        for (size_t x = 0; x < W; ++x) {
+            const float ridge = (x >= 28 && x <= 31) ? 0.85f : 0.1f;
+            const float grad = 0.002f * static_cast<float>(y);
+            for (size_t c = 0; c < 3; ++c) {
+                img_h[c * H * W + y * W + x] = ridge + grad;
+            }
+        }
+    }
+    const auto image = Tensor::from_vector(img_h, {size_t{3}, H, W}, Device::CUDA);
+    auto struct_f32 = Tensor::empty({H, W}, Device::CUDA, DataType::Float32);
+    auto struct_u8 = Tensor::empty({H, W}, Device::CUDA, DataType::UInt8);
+    kernels::RidgeWorkspace ws;
+    kernels::ridge_structure_map(image, struct_f32, ws);
+    kernels::ridge_structure_map(image, struct_u8, ws);
+
+    constexpr float gain = 0.5f;
+    Tensor w_f32, w_u8;
+    kernels::structure_photometric_weight(struct_f32, Tensor{}, w_f32, gain, false);
+    kernels::structure_photometric_weight(struct_u8, Tensor{}, w_u8, gain, false);
+
+    auto err_f32 = Tensor::ones({H, W}, Device::CUDA);
+    auto err_u8 = Tensor::ones({H, W}, Device::CUDA);
+    kernels::structure_densification_weight(err_f32, struct_f32, gain);
+    kernels::structure_densification_weight(err_u8, struct_u8, gain);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    const float tol = gain * (4.0f / 255.0f) + 1e-4f;
+    const auto wf_c = w_f32.cpu();
+    const auto wu_c = w_u8.cpu();
+    const auto ef_c = err_f32.cpu();
+    const auto eu_c = err_u8.cpu();
+    for (size_t i = 0; i < H * W; ++i) {
+        EXPECT_NEAR(wu_c.ptr<float>()[i], wf_c.ptr<float>()[i], tol) << "weight i=" << i;
+        EXPECT_NEAR(eu_c.ptr<float>()[i], ef_c.ptr<float>()[i], tol) << "dens i=" << i;
+    }
+}
+
+TEST(VramMapCaches, EdgeWeightMapFloat16MatchesFloat32) {
+    constexpr size_t H = 64;
+    constexpr size_t W = 64;
+    std::vector<float> img_h(3 * H * W, 0.0f);
+    for (size_t y = 0; y < H; ++y) {
+        for (size_t x = 0; x < W; ++x) {
+            const float val = (x > 20 && x < 44 && y > 20 && y < 44) ? 0.9f : 0.1f;
+            for (size_t c = 0; c < 3; ++c) {
+                img_h[c * H * W + y * W + x] = val + 0.001f * static_cast<float>(x);
+            }
+        }
+    }
+    const auto image = Tensor::from_vector(img_h, {size_t{3}, H, W}, Device::CUDA);
+    auto edge_f32 = Tensor::empty({H, W}, Device::CUDA, DataType::Float32);
+    auto edge_f16 = Tensor::empty({H, W}, Device::CUDA, DataType::Float16);
+    Tensor scratch;
+    kernels::compute_edge_weight_map(image, Tensor{}, kernels::MaskPhotoMode::BinaryGt0, edge_f32, nullptr);
+    kernels::compute_edge_weight_map(image, Tensor{}, kernels::MaskPhotoMode::BinaryGt0, edge_f16, nullptr, &scratch);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    const auto f32_c = edge_f32.cpu();
+    const auto f16_c = edge_f16.to(DataType::Float32).cpu();
+    for (size_t i = 0; i < H * W; ++i) {
+        const float expected = std::clamp(f32_c.ptr<float>()[i], 0.0f, 65504.0f);
+        const float tol = std::max(1e-3f, 5e-3f * expected);
+        EXPECT_NEAR(f16_c.ptr<float>()[i], expected, tol) << "i=" << i;
+    }
 }

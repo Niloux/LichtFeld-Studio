@@ -491,9 +491,10 @@ namespace fast_lfs::rasterization {
         const float* shN_value_bounds_ptr,
         unsigned shN_value_n_cells,
         unsigned shN_value_bits,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
         float* edge_score_out,
-        const ColorVarianceLoss& color_variance) {
+        const ColorVarianceLoss& color_variance,
+        const bool edge_weight_fp16) {
 
         // The forward chose the stream and chained the arena frame on it; the
         // backward shares the same context/arena frame and must match.
@@ -710,7 +711,8 @@ namespace fast_lfs::rasterization {
                 edge_weight_map,
                 edge_score_out,
                 stream,
-                color_variance);
+                color_variance,
+                edge_weight_fp16);
 
             // Mark frame as complete
             release_forward_context(forward_ctx);

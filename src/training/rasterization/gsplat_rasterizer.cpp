@@ -1088,14 +1088,17 @@ namespace lfs::training {
                 edge_weight_map.is_valid() && edge_score_out.is_valid() &&
                 edge_weight_map.device() == core::Device::CUDA &&
                 edge_score_out.device() == core::Device::CUDA &&
-                edge_weight_map.dtype() == core::DataType::Float32 &&
+                (edge_weight_map.dtype() == core::DataType::Float32 ||
+                 edge_weight_map.dtype() == core::DataType::Float16) &&
                 edge_score_out.dtype() == core::DataType::Float32 &&
                 edge_weight_map.ndim() == 2 && edge_score_out.ndim() == 1 &&
                 edge_weight_map.shape()[0] == static_cast<size_t>(H) &&
                 edge_weight_map.shape()[1] == static_cast<size_t>(W) &&
                 edge_score_out.numel() == static_cast<size_t>(N);
-            const float* const edge_weight_map_ptr =
-                edge_scoring ? edge_weight_map.ptr<float>() : nullptr;
+            const void* const edge_weight_map_ptr =
+                edge_scoring ? edge_weight_map.data_ptr() : nullptr;
+            const bool edge_weight_fp16 =
+                edge_scoring && edge_weight_map.dtype() == core::DataType::Float16;
             float* const edge_score_out_ptr =
                 edge_scoring ? edge_score_out.ptr<float>() : nullptr;
 
@@ -1232,7 +1235,8 @@ namespace lfs::training {
                 ctx.unit_rays_ptr,
                 grad_planes,
                 on_sh_colors_ready,
-                ctx.sub_tile_masks ? ctx.isect_keys32_ptr : nullptr);
+                ctx.sub_tile_masks ? ctx.isect_keys32_ptr : nullptr,
+                edge_weight_fp16);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);

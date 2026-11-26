@@ -6,6 +6,7 @@
 #include "lfs/kernels/ssim.cuh"
 #include "normal_loss.hpp"
 #include <algorithm>
+#include <cuda_fp16.h>
 
 namespace lfs::training {
     using namespace core;
@@ -83,18 +84,32 @@ namespace lfs::training {
             const void* mask;
             void* out_mask;
             bool mask_float;
-            const float* structure;
+            const void* structure;
+            bool structure_u8 = false;
             float* out_structure;
-            const float* edge;
+            const void* edge;
+            bool edge_fp16 = false;
             float* out_edge;
             const float *alpha, *background, *stable_background;
             bool background_image;
             float* stable;
         };
-        __device__ float linear(const float* src, Tile t, Source s) {
+        template <typename T>
+        __device__ __forceinline__ float decode_map_tap(const T v) {
+            if constexpr (std::is_same_v<T, __half>)
+                return __half2float(v);
+            else if constexpr (std::is_same_v<T, uint8_t>)
+                return static_cast<float>(v) * (4.0f / 255.0f);
+            else
+                return v;
+        }
+        template <typename T>
+        __device__ float linear(const T* src, Tile t, Source s) {
             const int x1 = column(t, s.x + 1), y1 = line(t, s.y + 1);
-            const float top = (1 - s.u) * src[s.y * t.width + s.x] + s.u * src[s.y * t.width + x1];
-            const float bottom = (1 - s.u) * src[y1 * t.width + s.x] + s.u * src[y1 * t.width + x1];
+            const float top = (1 - s.u) * decode_map_tap(src[s.y * t.width + s.x]) +
+                              s.u * decode_map_tap(src[s.y * t.width + x1]);
+            const float bottom = (1 - s.u) * decode_map_tap(src[y1 * t.width + s.x]) +
+                                 s.u * decode_map_tap(src[y1 * t.width + x1]);
             return (1 - s.v) * top + s.v * bottom;
         }
         // Catmull-Rom through the 4 x 4 taps, clamped to the range of the 2 x 2 cell around the sample: past a hard
@@ -169,9 +184,13 @@ namespace lfs::training {
                     static_cast<uint8_t*>(maps.out_mask)[a] = valid ? static_cast<const uint8_t*>(maps.mask)[q] : 0;
             }
             if (maps.structure)
-                maps.out_structure[a] = valid ? linear(maps.structure, t, s) : 0;
+                maps.out_structure[a] = valid ? (maps.structure_u8 ? linear(static_cast<const uint8_t*>(maps.structure), t, s)
+                                                                   : linear(static_cast<const float*>(maps.structure), t, s))
+                                              : 0;
             if (maps.edge)
-                maps.out_edge[a] = valid ? linear(maps.edge, t, s) : 0;
+                maps.out_edge[a] = valid ? (maps.edge_fp16 ? linear(static_cast<const __half*>(maps.edge), t, s)
+                                                           : linear(static_cast<const float*>(maps.edge), t, s))
+                                         : 0;
         }
 
         __global__ void clear_outside_tile(Tile t, const float2* row, float* grad) {
@@ -437,15 +456,19 @@ namespace lfs::training {
             maps.mask_float = mask.dtype() == DataType::Float32;
         }
         if (structure.is_valid()) {
+            LFS_ASSERT(structure.dtype() == DataType::Float32 || structure.dtype() == DataType::UInt8);
             structure.sync_to_stream(stream);
             reserve(structure_, {h, w});
-            maps.structure = structure.ptr<float>();
+            maps.structure = structure.data_ptr();
+            maps.structure_u8 = structure.dtype() == DataType::UInt8;
             maps.out_structure = structure_.ptr<float>();
         }
         if (edge.is_valid()) {
+            LFS_ASSERT(edge.dtype() == DataType::Float32 || edge.dtype() == DataType::Float16);
             edge.sync_to_stream(stream);
             reserve(edge_, {h, w});
-            maps.edge = edge.ptr<float>();
+            maps.edge = edge.data_ptr();
+            maps.edge_fp16 = edge.dtype() == DataType::Float16;
             maps.out_edge = edge_.ptr<float>();
         }
         const float2* row = reinterpret_cast<const float2*>(field_.ptr<float>()) + slot * points;

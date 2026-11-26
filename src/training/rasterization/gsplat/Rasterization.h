@@ -111,13 +111,14 @@ namespace gsplat_lfs {
         float* densification_weight,          // [N] or nullptr
         float* densification_error,           // [N] or nullptr
         const float* densification_error_map, // [H, W] or nullptr
-        const float* edge_weight_map,         // [H, W] or nullptr
+        const void* edge_weight_map,          // [H, W] Float32 or Float16 or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const ScreenFootprint& footprint = {}, // lets the per-splat backward cull sub-tiles
         const ColorVarianceRender& color_variance = {},
         float* blend_peak_out = nullptr,
-        const RenderGradPlanes& grad_planes = {});
+        const RenderGradPlanes& grad_planes = {},
+        bool edge_weight_fp16 = false);
 
     /////////////////////////////////////////////////
     // rasterize_to_indices_3dgs

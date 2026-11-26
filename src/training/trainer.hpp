@@ -1145,6 +1145,8 @@ namespace lfs::training {
         core::Tensor thin_structure_map_buffer_;
         core::Tensor thin_structure_weight_buffer_;
         size_t map_cache_budget_bytes() const;
+        void evict_map_caches_for_entry(bool for_edge_cache, size_t map_bytes, size_t budget_bytes,
+                                        size_t height, size_t width, core::Tensor& recycled);
 
         // Metrics evaluator - handles all evaluation logic
         std::unique_ptr<lfs::training::MetricsEvaluator> evaluator_;

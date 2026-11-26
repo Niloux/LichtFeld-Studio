@@ -157,6 +157,7 @@ namespace lfs::training {
         // is a median-normalized row-major float32 [H,W], and the destination
         // is a zeroed float32 [N] per-view scratch vector.
         const float* edge_weight_map = nullptr;
+        const void* edge_weight_map_f16 = nullptr;
         float* edge_score_out = nullptr;
         // Optional camera gradient, set together (zeroed by the backward): dL/d(w2c) float32 [4*4], rows 0-2, and
         // dL/d(camera position) float32 [3], the two taken as independent inputs.

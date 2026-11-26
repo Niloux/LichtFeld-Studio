@@ -69,9 +69,10 @@ namespace fast_lfs::rasterization {
         const float2* shN_value_bounds,
         const uint shN_value_n_cells,
         const uint shN_value_bits,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream,
-        const ColorVarianceLoss& color_variance = {});
+        const ColorVarianceLoss& color_variance = {},
+        bool edge_weight_fp16 = false);
 
 } // namespace fast_lfs::rasterization

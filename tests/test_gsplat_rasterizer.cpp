@@ -1126,6 +1126,56 @@ TEST(GsplatRasterizerEdgeScores, GutAndFastGsHavePositiveScoreCorrelation) {
     EXPECT_GT(correlation, 0.75f);
 }
 
+TEST(GsplatRasterizerEdgeScores, Float16EdgeWeightMapMatchesFloat32) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    constexpr int width = 64;
+    constexpr int height = 64;
+    constexpr int count = 32;
+    auto camera = make_camera(width, height);
+
+    std::vector<float> edge_h(width * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            edge_h[y * width + x] = 0.25f + 0.03f * static_cast<float>((x * 7 + y * 13) % 41);
+        }
+    }
+    const auto edge_f32 = Tensor::from_vector(edge_h, {static_cast<size_t>(height), static_cast<size_t>(width)}, Device::CUDA);
+    const auto edge_f16 = edge_f32.to(DataType::Float16);
+    auto background = Tensor::zeros({3}, Device::CUDA);
+
+    auto run_with_map = [&](const Tensor& map) {
+        auto model = make_visible_splat(count);
+        AdamConfig cfg;
+        cfg.lr = 1e-3f;
+        cfg.initial_capacity = 64;
+        AdamOptimizer optimizer(*model, cfg);
+        optimizer.allocate_gradients(64);
+        auto scores = Tensor::zeros({count}, Device::CUDA);
+        auto fwd = gsplat_rasterize_forward(
+            camera, *model, background, 0, 0, 0, 0, 1.0f, false,
+            GsplatRenderMode::RGB, true);
+        EXPECT_TRUE(fwd.has_value());
+        auto output = std::move(fwd->first);
+        auto context = std::move(fwd->second);
+        gsplat_rasterize_backward(
+            context, Tensor::ones_like(output.image), Tensor::zeros_like(output.alpha),
+            *model, optimizer, Tensor{}, map, scores);
+        return scores.cpu();
+    };
+
+    const auto scores_f32 = run_with_map(edge_f32);
+    const auto scores_f16 = run_with_map(edge_f16);
+    for (int i = 0; i < count; ++i) {
+        const float expected = scores_f32.ptr<float>()[i];
+        const float tol = std::max(5e-3f, 1e-3f * std::abs(expected));
+        EXPECT_NEAR(scores_f16.ptr<float>()[i], expected, tol) << "idx=" << i;
+    }
+}
+
 namespace {
     // Splats whose scales lie in [e^log_scale, e^(log_scale + 1.53)], in front of make_camera (f = 500, depth 2.7
     // to 3.3), so their screen sigma is about 167 times the scale.

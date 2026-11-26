@@ -107,7 +107,7 @@ namespace lfs::training {
 
         void grow_grad_rows(lfs::core::Tensor& grad, const std::string& name,
                             const size_t old_rows, const size_t new_rows,
-                            const size_t capacity_rows) {
+                            const size_t capacity_rows, const bool pooled_exact = false) {
             if (!grad.is_valid() || grad.numel() == 0) {
                 return;
             }
@@ -117,6 +117,28 @@ namespace lfs::training {
                                        "already had {} before growing to {}",
                                        name, rows, old_rows, new_rows));
             if (rows >= new_rows) {
+                return;
+            }
+            if (pooled_exact) {
+                auto new_shape = grad.shape();
+                std::vector<size_t> dims = new_shape.dims();
+                dims[0] = new_rows;
+                auto grown = lfs::core::Tensor::zeros(
+                    lfs::core::TensorShape(dims), grad.device(), grad.dtype());
+                const size_t elem_bytes = lfs::core::dtype_size(grad.dtype());
+                if (elem_bytes > 0 && grad.data_ptr() && grown.data_ptr()) {
+                    const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+                    lfs::core::waitForCUDAStream(stream, grad.stream());
+                    lfs::core::waitForCUDAStream(stream, grown.stream());
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(
+                        grown.data_ptr(), grad.data_ptr(),
+                        grad.numel() * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+                    LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+                    grown.set_stream(stream);
+                }
+                if (!grad.name().empty())
+                    grown.set_name(grad.name());
+                grad = std::move(grown);
                 return;
             }
             if (grad.capacity() < new_rows) {
@@ -678,6 +700,13 @@ namespace lfs::training {
         return states_[name].grad;
     }
 
+    void AdamOptimizer::release_grad(ParamType type) {
+        const auto it = states_.find(param_name(type));
+        if (it != states_.end() && it->second.grad.is_valid()) {
+            it->second.grad = {};
+        }
+    }
+
     std::string AdamOptimizer::param_name(ParamType type) const {
         switch (type) {
         case ParamType::Means: return "means";
@@ -806,12 +835,10 @@ namespace lfs::training {
                                        : compute_new_capacity(0, param_size);
 
         if (allocate_grad && (!state.grad.is_valid() || state.grad.numel() == 0)) {
-            // Grad for shN is float-layout sized (fused path rarely needs it).
+            // shN grad stays pooled & exact-sized so GUT steps do not pin max_cap VRAM.
             if (type == ParamType::ShN) {
                 const auto gshape = lfs::core::TensorShape({logical_size});
-                state.grad = (initial_cap > logical_size)
-                                 ? lfs::core::Tensor::zeros_direct(gshape, initial_cap)
-                                 : lfs::core::Tensor::zeros(gshape, param.device());
+                state.grad = lfs::core::Tensor::zeros(gshape, param.device());
             } else {
                 state.grad = (initial_cap > param_size)
                                  ? lfs::core::Tensor::zeros_direct(param.shape(), initial_cap)
@@ -856,17 +883,13 @@ namespace lfs::training {
                 static_cast<uint32_t>(splat_data_.max_sh_coeffs_rest());
             const size_t float_layout = lfs::core::sh_swizzled_float_count(
                 static_cast<size_t>(splat_data_.size()), layout_rest);
-            const size_t alloc_cap =
-                state.capacity > float_layout ? state.capacity : float_layout;
-            const auto gshape = lfs::core::TensorShape({float_layout});
-            state.grad = (alloc_cap > float_layout)
-                             ? lfs::core::Tensor::zeros_direct(gshape, alloc_cap)
-                             : lfs::core::Tensor::zeros(gshape, param.device());
+            // Pooled exact allocation: avoids persistent direct reserve at max_cap for transient shN grads.
+            state.grad = lfs::core::Tensor::zeros(lfs::core::TensorShape({float_layout}), param.device());
             state.grad.set_name("adam." + name + ".grad");
             if (state.size == 0) {
                 state.size = float_layout;
             }
-            state.capacity = std::max(state.capacity, alloc_cap);
+            state.capacity = std::max(state.capacity, float_layout);
             return;
         }
 
@@ -1183,6 +1206,9 @@ namespace lfs::training {
         param_live.set_stream(execution_stream);
         state.exp_avg.set_stream(execution_stream);
         state.joint_bounds.set_stream(execution_stream);
+        if (state.grad.is_valid()) {
+            state.grad = {};
+        }
         sh_rest_reg_weight_ = 0.0f;
         sh_rest_reg_loss_out_ = nullptr;
         fused_shN_iteration_ = iteration;
@@ -1257,7 +1283,7 @@ namespace lfs::training {
                         // already zero-initialized under joint bounds when pre-allocated).
                         state.exp_avg.commit_rows(
                             joint_adam::packed_bytes(float_layout, state.joint_bits));
-                        grow_grad_rows(state.grad, name, state.size, float_layout, moment_cap_floats);
+                        grow_grad_rows(state.grad, name, state.size, float_layout, moment_cap_floats, true);
                         state.size = float_layout;
                     } else if (state.size < float_layout) {
                         // Pad-aware: derive n_new from prim count, not float/N (pad jumps).
@@ -1281,7 +1307,7 @@ namespace lfs::training {
                             if (cap2 >= float_layout && state.size < float_layout) {
                                 state.exp_avg.commit_rows(
                                     joint_adam::packed_bytes(float_layout, state.joint_bits));
-                                grow_grad_rows(state.grad, name, state.size, float_layout, cap2);
+                                grow_grad_rows(state.grad, name, state.size, float_layout, cap2, true);
                                 state.size = float_layout;
                             }
                         }
@@ -1706,9 +1732,9 @@ namespace lfs::training {
                                                : new_size;
             const bool fits = state.exp_avg.capacity() > 0 &&
                               packed_new_rows <= state.exp_avg.capacity() &&
-                              (!state.grad.is_valid() || new_size <= state.grad.capacity());
+                              (!state.grad.is_valid() || type == ParamType::ShN || new_size <= state.grad.capacity());
             if (fits) {
-                grow_grad_rows(state.grad, name, state.size, new_size, new_size);
+                grow_grad_rows(state.grad, name, state.size, new_size, new_size, type == ParamType::ShN);
                 if (type == ParamType::ShN) {
                     state.exp_avg.append_zeros(packed_growth);
                 } else {
@@ -1737,7 +1763,7 @@ namespace lfs::training {
                 if (state.exp_avg.is_valid() && state.exp_avg.capacity() < packed_cap) {
                     state.exp_avg.reserve(packed_cap);
                 }
-                grow_grad_rows(state.grad, name, state.size, new_size, moment_cap);
+                grow_grad_rows(state.grad, name, state.size, new_size, moment_cap, type == ParamType::ShN);
                 if (old_packed.is_valid() && old_packed.numel() > 0 &&
                     state.exp_avg.is_valid() && state.exp_avg.numel() > 0) {
                     const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
@@ -2091,7 +2117,7 @@ namespace lfs::training {
                     }
                     state.capacity = sh_moment_cells(
                         std::max(state.exp_avg.capacity(), state.exp_avg.numel()), state.joint_bits);
-                    grow_grad_rows(state.grad, name, state.size, new_floats, state.capacity);
+                    grow_grad_rows(state.grad, name, state.size, new_floats, state.capacity, true);
                     ensure_joint_bounds_capacity(state.joint_bounds, new_N,
                                                  std::max(new_N, sh_cell_primitives(state.capacity, layout_rest)),
                                                  param_now.device(), /*zero_all=*/false);
@@ -2534,7 +2560,7 @@ namespace lfs::training {
                     if (state.exp_avg.is_valid())
                         reserve_tensor_rows(state.exp_avg, target_capacity);
                 }
-                if (state.grad.is_valid())
+                if (state.grad.is_valid() && !is_shN)
                     reserve_tensor_rows(state.grad, target_capacity);
                 state.capacity = std::max(state.capacity, target_capacity);
             }

@@ -4,6 +4,7 @@
 
 #include <cooperative_groups.h>
 #include <cstdlib>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "Cameras.cuh"
@@ -29,6 +30,21 @@ namespace gsplat_lfs {
     __device__ __forceinline__ void record_blend_peak(float* out, int32_t g, float peak) {
         if (out && peak > 0.0f)
             atomicMax(reinterpret_cast<int*>(out + g), __float_as_int(peak));
+    }
+
+    __device__ __forceinline__ float load_edge_weight(const void* map, const size_t idx, const bool fp16) {
+        return fp16
+                   ? __half2float(static_cast<const __half*>(map)[idx])
+                   : static_cast<const float*>(map)[idx];
+    }
+
+    __device__ __forceinline__ const void* offset_edge_weight_map(
+        const void* map, const size_t elem_offset, const bool fp16) {
+        if (!map)
+            return nullptr;
+        return fp16
+                   ? static_cast<const void*>(static_cast<const __half*>(map) + elem_offset)
+                   : static_cast<const void*>(static_cast<const float*>(map) + elem_offset);
     }
 
     struct PixelBwd {
@@ -128,7 +144,8 @@ namespace gsplat_lfs {
         float& v_opacity,
         float& dens_w,
         float& dens_e,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
+        const bool edge_weight_fp16,
         float& edge_score,
         float& blend_peak,
         mat3& R,
@@ -156,7 +173,7 @@ namespace gsplat_lfs {
         const float fac = alpha * pix.T;
         blend_peak = fmaxf(blend_peak, fac);
         if constexpr (kEdgeScoring) {
-            const float edge_weight = edge_weight_map[pix.pix_id];
+            const float edge_weight = load_edge_weight(edge_weight_map, pix.pix_id, edge_weight_fp16);
             const float edge_contribution = fac * edge_weight;
             if (edge_weight > 0.0f && isfinite(edge_contribution)) {
                 edge_score += edge_contribution;
@@ -224,7 +241,8 @@ namespace gsplat_lfs {
         float& v_opacity,
         float& dens_w,
         float& dens_e,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
+        const bool edge_weight_fp16,
         float& edge_score,
         float& blend_peak,
         bool& hit0,
@@ -249,11 +267,11 @@ namespace gsplat_lfs {
         hit0 = contribute_pixel<kEdgeScoring>(
             pix0, isect_idx, opac, Mt, gro0, o_minus_mu0, scale_act, quat,
             rgb0, rgb1, rgb2, have_bg, do_dens, v_rgb, v_mean, v_scale, v_quat,
-            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, blend_peak, R, have_R);
+            v_opacity, dens_w, dens_e, edge_weight_map, edge_weight_fp16, edge_score, blend_peak, R, have_R);
         hit1 = contribute_pixel<kEdgeScoring>(
             pix1, isect_idx, opac, Mt, gro1, o_minus_mu1, scale_act, quat,
             rgb0, rgb1, rgb2, have_bg, do_dens, v_rgb, v_mean, v_scale, v_quat,
-            v_opacity, dens_w, dens_e, edge_weight_map, edge_score, blend_peak, R, have_R);
+            v_opacity, dens_w, dens_e, edge_weight_map, edge_weight_fp16, edge_score, blend_peak, R, have_R);
     }
 
     __device__ __forceinline__ float reduce_field(float v, const unsigned n_contrib, const int src_lane) {
@@ -366,10 +384,10 @@ namespace gsplat_lfs {
         float* __restrict__ densification_weight,
         float* __restrict__ densification_error,
         const scalar_t* __restrict__ densification_error_map,
-        const float* __restrict__ edge_weight_map,
+        const void* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
         const ColorVarianceRender, float* __restrict__ blend_peak_out,
-        const RenderGradPlanes) {
+        const RenderGradPlanes, const bool edge_weight_fp16) {
         auto block = cg::this_thread_block();
         const uint32_t cid = block.group_index().x;
         const uint32_t tile_id =
@@ -399,7 +417,8 @@ namespace gsplat_lfs {
             masks += cid * tile_height * tile_width;
         }
         if constexpr (kEdgeScoring) {
-            edge_weight_map += cid * image_height * image_width;
+            edge_weight_map = offset_edge_weight_map(
+                edge_weight_map, static_cast<size_t>(cid) * image_height * image_width, edge_weight_fp16);
             edge_score_out += cid * N;
         }
         if (masks != nullptr && !masks[tile_id]) {
@@ -514,7 +533,7 @@ namespace gsplat_lfs {
                     pix0, pix1, isect_idx, xyz_opac, Mt, scale_act, quat, rgb0, rgb1, rgb2,
                     have_bg, do_dens, v_rgb_local, v_mean_local, v_scale_local, v_quat_local,
                     v_opacity_local, densification_weight_local, densification_error_weighted_local,
-                    edge_weight_map, edge_score_local, blend_peak, hit0, hit1);
+                    edge_weight_map, edge_weight_fp16, edge_score_local, blend_peak, hit0, hit1);
 
                 const unsigned valid_mask = __ballot_sync(0xffffffffu, hit0 || hit1);
                 if (valid_mask == 0u) {
@@ -676,10 +695,10 @@ namespace gsplat_lfs {
         float* __restrict__ densification_weight,             // [N] or nullptr
         float* __restrict__ densification_error,              // [N] or nullptr
         const scalar_t* __restrict__ densification_error_map, // [H, W] or nullptr
-        const float* __restrict__ edge_weight_map,
+        const void* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
         const ColorVarianceRender color_variance, float* __restrict__ blend_peak_out,
-        const RenderGradPlanes grad_planes) {
+        const RenderGradPlanes grad_planes, const bool edge_weight_fp16) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
         uint32_t tile_id =
@@ -708,7 +727,8 @@ namespace gsplat_lfs {
             masks += cid * tile_height * tile_width;
         }
         if constexpr (kEdgeScoring) {
-            edge_weight_map += cid * image_height * image_width;
+            edge_weight_map = offset_edge_weight_map(
+                edge_weight_map, static_cast<size_t>(cid) * image_height * image_width, edge_weight_fp16);
             edge_score_out += cid * N;
         }
 
@@ -989,7 +1009,7 @@ namespace gsplat_lfs {
                             densification_error_weighted_local = fac * pixel_error;
                         }
                         if constexpr (kEdgeScoring) {
-                            const float edge_weight = edge_weight_map[pix_id];
+                            const float edge_weight = load_edge_weight(edge_weight_map, pix_id, edge_weight_fp16);
                             const float edge_contribution = fac * edge_weight;
                             if (edge_weight > 0.0f && isfinite(edge_contribution)) {
                                 edge_score_local = edge_contribution;
@@ -1173,13 +1193,14 @@ namespace gsplat_lfs {
         float* __restrict__ densification_weight,
         float* __restrict__ densification_error,
         const float* __restrict__ densification_error_map,
-        const float* __restrict__ edge_weight_map,
+        const void* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out,
         const TileRange tiles,
         const ScreenFootprint footprint,
         const ColorVarianceRender color_variance,
         float* __restrict__ blend_peak_out,
-        const RenderGradPlanes grad_planes) {
+        const RenderGradPlanes grad_planes,
+        const bool edge_weight_fp16) {
         const uint32_t subs = tile_size / kSplatBwdSub;
         const uint32_t cid = blockIdx.x;
         const uint32_t sub_y = blockIdx.y;
@@ -1215,7 +1236,8 @@ namespace gsplat_lfs {
                 return;
         }
         if constexpr (kEdgeScoring) {
-            edge_weight_map += cid * pixels;
+            edge_weight_map = offset_edge_weight_map(
+                edge_weight_map, static_cast<size_t>(cid) * pixels, edge_weight_fp16);
             edge_score_out += cid * N;
         }
         const bool have_bg = bg_images != nullptr || backgrounds != nullptr;
@@ -1389,7 +1411,7 @@ namespace gsplat_lfs {
             s_tail[p] = T_final * (v_a - (have_bg ? bg : 0.f));
             s_error[p] = do_dens ? densification_error_map[pix] : 0.f;
             if constexpr (kEdgeScoring) {
-                s_edge[p] = edge_weight_map[pix];
+                s_edge[p] = load_edge_weight(edge_weight_map, pix, edge_weight_fp16);
             }
             if constexpr (kUseCv) {
                 float4 cv_t = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1789,13 +1811,14 @@ namespace gsplat_lfs {
         float* densification_weight,
         float* densification_error,
         const float* densification_error_map,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
         const ScreenFootprint& footprint,
         const ColorVarianceRender& color_variance,
         float* blend_peak_out,
-        const RenderGradPlanes& grad_planes) {
+        const RenderGradPlanes& grad_planes,
+        const bool edge_weight_fp16) {
         const bool packed = false; // Only support non-packed for now
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
@@ -1856,7 +1879,7 @@ namespace gsplat_lfs {
                 densification_error,
                 densification_error_map,
                 edge_weight_map,
-                edge_score_out, tiles, color_variance, blend_peak_out, grad_planes);
+                edge_score_out, tiles, color_variance, blend_peak_out, grad_planes, edge_weight_fp16);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
         };
 
@@ -1886,7 +1909,7 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec3*>(v_scales),
                             v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
                             edge_weight_map, edge_score_out, tiles, footprint, color_variance, blend_peak_out,
-                            grad_planes);
+                            grad_planes, edge_weight_fp16);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
@@ -2062,13 +2085,14 @@ namespace gsplat_lfs {
         float* densification_weight,                                           \
         float* densification_error,                                            \
         const float* densification_error_map,                                  \
-        const float* edge_weight_map,                                          \
+        const void* edge_weight_map,                                           \
         float* edge_score_out,                                                 \
         cudaStream_t stream, TileRange tiles,                                  \
         const ScreenFootprint& footprint,                                      \
         const ColorVarianceRender& color_variance,                            \
         float* blend_peak_out,                                                 \
-        const RenderGradPlanes& grad_planes);
+        const RenderGradPlanes& grad_planes,                                   \
+        bool edge_weight_fp16);
 
     __INS__(1)
     __INS__(2)

@@ -169,13 +169,14 @@ namespace gsplat_lfs {
         float* densification_weight,
         float* densification_error,
         const float* densification_error_map,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream, TileRange tiles,
         const ScreenFootprint& footprint,
         const ColorVarianceRender& color_variance,
         float* blend_peak_out,
-        const RenderGradPlanes& grad_planes) {
+        const RenderGradPlanes& grad_planes,
+        const bool edge_weight_fp16) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -208,7 +209,7 @@ namespace gsplat_lfs {
             v_means, v_quats, v_scales, v_colors, v_opacities,       \
             densification_weight, densification_error, densification_error_map,    \
             edge_weight_map, edge_score_out, stream, tiles, footprint,             \
-            color_variance, blend_peak_out, grad_planes);                         \
+            color_variance, blend_peak_out, grad_planes, edge_weight_fp16);        \
         break;
 
         switch (channels) {
@@ -490,7 +491,7 @@ namespace gsplat_lfs {
         float* densification_weight,
         float* densification_error,
         const float* densification_error_map,
-        const float* edge_weight_map,
+        const void* edge_weight_map,
         float* edge_score_out,
         cudaStream_t stream,
         const std::vector<TileBatch>& batches, int32_t* tiles_per_gauss,
@@ -504,7 +505,8 @@ namespace gsplat_lfs {
         const float* cached_unit_rays,
         const RenderGradPlanes& grad_planes,
         const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready,
-        const uint32_t* tile_keys32) {
+        const uint32_t* tile_keys32,
+        const bool edge_weight_fp16) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -554,7 +556,7 @@ namespace gsplat_lfs {
                                 .tile_keys32 = tile_keys32_ptr,
                                 .tile_sub_masks = tile_sub_masks,
                                 .unit_rays = cached_unit_rays},
-                color_variance, blend_peak_out, grad_planes);
+                color_variance, blend_peak_out, grad_planes, edge_weight_fp16);
         };
         GutSubstageProfiler::instance().begin_bwd(stream);
         {

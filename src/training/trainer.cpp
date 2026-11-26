@@ -6506,6 +6506,85 @@ namespace lfs::training {
         return std::min(MAP_CACHE_MAX_BUDGET_BYTES, (usable - MAP_CACHE_MIN_FREE_VRAM_BYTES) / 2);
     }
 
+    void Trainer::evict_map_caches_for_entry(const bool for_edge_cache, const size_t map_bytes,
+                                             const size_t budget_bytes, const size_t height, const size_t width,
+                                             core::Tensor& recycled) {
+        const auto evict_thin = [&](const bool try_recycle) {
+            const auto lru = std::min_element(
+                thin_structure_cache_.begin(), thin_structure_cache_.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.last_used < right.second.last_used;
+                });
+            if (try_recycle && !recycled.is_valid() && lru->second.key.height == height &&
+                lru->second.key.width == width &&
+                lru->second.tensor.dtype() == core::DataType::UInt8) {
+                recycled = std::move(lru->second.tensor);
+            }
+            thin_structure_cache_bytes_ -= std::min(thin_structure_cache_bytes_, lru->second.allocation_bytes);
+            thin_structure_cache_.erase(lru);
+        };
+        const auto evict_edge = [&](const bool try_recycle) {
+            const auto lru = std::min_element(
+                edge_weight_cache_.begin(), edge_weight_cache_.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.last_used < right.second.last_used;
+                });
+            if (try_recycle && !recycled.is_valid() && lru->second.height == height &&
+                lru->second.width == width &&
+                lru->second.tensor.dtype() == lfs::core::DataType::Float16) {
+                recycled = std::move(lru->second.tensor);
+            }
+            edge_weight_cache_bytes_ -= std::min(edge_weight_cache_bytes_, lru->second.allocation_bytes);
+            edge_weight_cache_.erase(lru);
+        };
+
+        if (map_bytes > budget_bytes) {
+            if (for_edge_cache) {
+                while (!edge_weight_cache_.empty())
+                    evict_edge(false);
+                while (!thin_structure_cache_.empty() && thin_structure_cache_bytes_ > budget_bytes)
+                    evict_thin(false);
+            } else {
+                while (!thin_structure_cache_.empty())
+                    evict_thin(false);
+                while (!edge_weight_cache_.empty() && edge_weight_cache_bytes_ > budget_bytes)
+                    evict_edge(false);
+            }
+            return;
+        }
+
+        if (for_edge_cache) {
+            while (edge_weight_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES)
+                evict_edge(true);
+        } else {
+            while (thin_structure_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES)
+                evict_thin(true);
+        }
+
+        // Combined cap with 1:2 (thin:edge) fair share matching UInt8 vs Float16 per-pixel footprint.
+        const size_t thin_fair = budget_bytes / 3;
+        const size_t own_fair = for_edge_cache ? (budget_bytes - thin_fair) : thin_fair;
+        auto own_bytes = [&]() { return for_edge_cache ? edge_weight_cache_bytes_ : thin_structure_cache_bytes_; };
+        auto other_empty = [&]() { return for_edge_cache ? thin_structure_cache_.empty() : edge_weight_cache_.empty(); };
+        auto own_empty = [&]() { return for_edge_cache ? edge_weight_cache_.empty() : thin_structure_cache_.empty(); };
+
+        while (edge_weight_cache_bytes_ + thin_structure_cache_bytes_ > budget_bytes - map_bytes) {
+            if (!other_empty() && (own_empty() || own_bytes() + map_bytes <= own_fair)) {
+                if (for_edge_cache)
+                    evict_thin(false);
+                else
+                    evict_edge(false);
+            } else if (!own_empty()) {
+                if (for_edge_cache)
+                    evict_edge(true);
+                else
+                    evict_thin(true);
+            } else {
+                break;
+            }
+        }
+    }
+
     void Trainer::clear_thin_structure_cache() {
         thin_structure_cache_.clear();
         thin_structure_cache_bytes_ = 0;
@@ -6537,7 +6616,7 @@ namespace lfs::training {
                                       masked && params_.optimization.invert_masks};
         if (auto it = thin_structure_cache_.find(camera_uid);
             it != thin_structure_cache_.end() && it->second.key == key &&
-            it->second.tensor.dtype() == DataType::Float32) {
+            it->second.tensor.dtype() == DataType::UInt8) {
             it->second.last_used = ++thin_structure_cache_clock_;
             it->second.tensor.sync_to_stream(image.stream());
             return it->second.tensor;
@@ -6547,36 +6626,25 @@ namespace lfs::training {
             thin_structure_cache_.erase(it);
         }
 
-        const size_t map_bytes = height * width * sizeof(float);
+        const size_t map_bytes = height * width * sizeof(uint8_t);
         const size_t budget_bytes = map_cache_budget_bytes();
         const bool cacheable = map_bytes <= budget_bytes;
         Tensor map;
-        while (!thin_structure_cache_.empty() &&
-               (!cacheable || thin_structure_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES ||
-                thin_structure_cache_bytes_ > budget_bytes - map_bytes)) {
-            const auto lru = std::min_element(
-                thin_structure_cache_.begin(), thin_structure_cache_.end(),
-                [](const auto& left, const auto& right) {
-                    return left.second.last_used < right.second.last_used;
-                });
-            if (cacheable && !map.is_valid() && lru->second.key.height == height && lru->second.key.width == width &&
-                lru->second.tensor.dtype() == DataType::Float32) {
-                map = std::move(lru->second.tensor);
-            }
-            thin_structure_cache_bytes_ -= std::min(thin_structure_cache_bytes_, lru->second.allocation_bytes);
-            thin_structure_cache_.erase(lru);
-        }
+        evict_map_caches_for_entry(/*for_edge_cache=*/false, map_bytes, budget_bytes, height, width, map);
 
         Tensor target;
         if (cacheable) {
             if (!map.is_valid()) {
-                map = Tensor::empty({height, width}, Device::CUDA, DataType::Float32);
+                map = Tensor::empty({height, width}, Device::CUDA, DataType::UInt8);
             }
             map.set_stream(image.stream());
             target = map;
         } else {
-            if (!thin_structure_map_buffer_.is_valid() || thin_structure_map_buffer_.shape() != TensorShape{height, width})
-                thin_structure_map_buffer_ = Tensor::empty({height, width}, Device::CUDA);
+            if (!thin_structure_map_buffer_.is_valid() ||
+                thin_structure_map_buffer_.shape() != TensorShape{height, width} ||
+                thin_structure_map_buffer_.dtype() != DataType::UInt8) {
+                thin_structure_map_buffer_ = Tensor::empty({height, width}, Device::CUDA, DataType::UInt8);
+            }
             thin_structure_map_buffer_.set_stream(image.stream());
             target = thin_structure_map_buffer_;
         }
@@ -6617,17 +6685,17 @@ namespace lfs::training {
 
         const size_t height = gt_image.shape()[1];
         const size_t width = gt_image.shape()[2];
-        LFS_ASSERT_MSG(width == 0 || height <= std::numeric_limits<size_t>::max() / width / sizeof(float),
+        LFS_ASSERT_MSG(width == 0 || height <= std::numeric_limits<size_t>::max() / width / sizeof(uint16_t),
                        "edge-weight map byte size overflow");
         const lfs::core::TensorShape map_shape{height, width};
-        const size_t map_bytes = height * width * sizeof(float);
+        const size_t map_bytes = height * width * sizeof(uint16_t);
         const cudaStream_t stream = gt_image.stream();
 
         if (auto it = edge_weight_cache_.find(camera_uid);
             it != edge_weight_cache_.end() &&
             it->second.height == height && it->second.width == width &&
             it->second.preprocessing_generation == edge_weight_preprocessing_generation_ &&
-            it->second.tensor.dtype() == lfs::core::DataType::Float32) {
+            it->second.tensor.dtype() == lfs::core::DataType::Float16) {
             it->second.last_used = ++edge_weight_cache_clock_;
             it->second.tensor.sync_to_stream(stream);
             return it->second.tensor;
@@ -6641,29 +6709,14 @@ namespace lfs::training {
         const size_t budget_bytes = map_cache_budget_bytes();
         const bool cacheable = map_bytes <= budget_bytes;
         lfs::core::Tensor map;
-        while (!edge_weight_cache_.empty() &&
-               (!cacheable || edge_weight_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES ||
-                edge_weight_cache_bytes_ > budget_bytes - map_bytes)) {
-            const auto lru = std::min_element(
-                edge_weight_cache_.begin(), edge_weight_cache_.end(),
-                [](const auto& left, const auto& right) {
-                    return left.second.last_used < right.second.last_used;
-                });
-            if (cacheable && !map.is_valid() && lru->second.height == height && lru->second.width == width &&
-                lru->second.tensor.dtype() == lfs::core::DataType::Float32) {
-                map = std::move(lru->second.tensor);
-            }
-            edge_weight_cache_bytes_ -= std::min(
-                edge_weight_cache_bytes_, lru->second.allocation_bytes);
-            edge_weight_cache_.erase(lru);
-        }
+        evict_map_caches_for_entry(/*for_edge_cache=*/true, map_bytes, budget_bytes, height, width, map);
 
         lfs::core::Tensor target;
         if (cacheable) {
             if (!map.is_valid()) {
                 // Pooled, not direct: evicting a map of another resolution would
                 // otherwise cudaFree, a device-wide sync that stalls every thread.
-                map = lfs::core::Tensor::empty(map_shape, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                map = lfs::core::Tensor::empty(map_shape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
             }
             map.set_stream(stream);
             target = map;
@@ -6681,7 +6734,7 @@ namespace lfs::training {
             params_.optimization.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore
                 ? kernels::MaskPhotoMode::SegmentAndIgnore
                 : kernels::MaskPhotoMode::BinaryGt0,
-            target, stream);
+            target, stream, cacheable ? &edge_map_buffer_ : nullptr);
 
         if (!cacheable) {
             return target;
@@ -7384,7 +7437,13 @@ namespace lfs::training {
                     auto& model = strategy_->get_model();
                     if (run_fastgs_gaussian_backward) {
                         if (edge_weight_scoring_active_) {
-                            fused_extra_gradients.edge_weight_map = edge_weight_map.ptr<float>();
+                            if (edge_weight_map.dtype() == lfs::core::DataType::Float16) {
+                                fused_extra_gradients.edge_weight_map = nullptr;
+                                fused_extra_gradients.edge_weight_map_f16 = edge_weight_map.data_ptr();
+                            } else {
+                                fused_extra_gradients.edge_weight_map = edge_weight_map.ptr<float>();
+                                fused_extra_gradients.edge_weight_map_f16 = nullptr;
+                            }
                             fused_extra_gradients.edge_score_out = edge_score_scratch.ptr<float>();
                         }
                         const float scale_weight = step_params.scale_reg_at(iter);
@@ -7760,8 +7819,15 @@ namespace lfs::training {
                                             mask, structure, edge_weight_map, tiles_processed == 0,
                                             composited ? &composite : nullptr, lens.wrap);
                         corrected_structure = structure;
-                        if (edge_weight_map.is_valid())
-                            fused_extra_gradients.edge_weight_map = edge_weight_map.ptr<float>();
+                        if (edge_weight_map.is_valid()) {
+                            if (edge_weight_map.dtype() == lfs::core::DataType::Float16) {
+                                fused_extra_gradients.edge_weight_map = nullptr;
+                                fused_extra_gradients.edge_weight_map_f16 = edge_weight_map.data_ptr();
+                            } else {
+                                fused_extra_gradients.edge_weight_map = edge_weight_map.ptr<float>();
+                                fused_extra_gradients.edge_weight_map_f16 = nullptr;
+                            }
+                        }
                         r_output.target_image = gt_tile;
                         r_output.stable_target_image = composited ? stable_gt : gt_tile;
                         return step_params.thin_structure_weight > 0.f ? structure : core::Tensor{};
@@ -9021,7 +9087,8 @@ namespace lfs::training {
                                     if (fused_extra_gradients.edge_score_out != nullptr) {
                                         LFS_ASSERT_MSG(
                                             edge_weight_map.is_valid() && edge_weight_map.ndim() == 2 &&
-                                                edge_weight_map.dtype() == lfs::core::DataType::Float32 &&
+                                                (edge_weight_map.dtype() == lfs::core::DataType::Float32 ||
+                                                 edge_weight_map.dtype() == lfs::core::DataType::Float16) &&
                                                 edge_weight_map.shape()[0] == static_cast<size_t>(fast_ctx->height) &&
                                                 edge_weight_map.shape()[1] == static_cast<size_t>(fast_ctx->width),
                                             "cached edge-weight map dimensions must match FastGS context");
@@ -9457,6 +9524,9 @@ namespace lfs::training {
                                 popspa_completed_iteration_.store(iter, std::memory_order_release);
                             } else {
                                 strategy_->step(iter);
+                                if (step_params.gut) {
+                                    gaussian_optimizer.release_grad(ParamType::ShN);
+                                }
                             }
                         }
 

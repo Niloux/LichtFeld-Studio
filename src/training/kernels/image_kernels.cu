@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <type_traits>
@@ -307,20 +308,59 @@ namespace lfs::training::kernels {
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
+    namespace {
+        __global__ void float_to_half_edge_kernel(
+            const float* __restrict__ src,
+            __half* __restrict__ dst,
+            const std::size_t n) {
+            const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+            for (std::size_t i = idx; i < n; i += stride) {
+                const float v = src[i];
+                const float safe = (isfinite(v) && v > 0.0f) ? fminf(v, 65504.0f) : 0.0f;
+                dst[i] = __float2half_rn(safe);
+            }
+        }
+    } // namespace
+
     void compute_edge_weight_map(
         const lfs::core::Tensor& image,
         const lfs::core::Tensor& photometric_mask,
         const MaskPhotoMode mask_mode,
         lfs::core::Tensor& edges,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        lfs::core::Tensor* float_scratch) {
         LFS_ASSERT_MSG(image.is_valid() && image.device() == lfs::core::Device::CUDA && image.ndim() == 3 &&
                            image.shape()[0] >= 3,
                        "edge-weight input must be CUDA CHW image data");
         const size_t height = image.shape()[1];
         const size_t width = image.shape()[2];
-        LFS_ASSERT_MSG(edges.is_valid() && edges.dtype() == lfs::core::DataType::Float32 && edges.ndim() == 2 &&
+        LFS_ASSERT_MSG(edges.is_valid() &&
+                           (edges.dtype() == lfs::core::DataType::Float32 ||
+                            edges.dtype() == lfs::core::DataType::Float16) &&
+                           edges.ndim() == 2 &&
                            edges.shape()[0] == height && edges.shape()[1] == width,
-                       "edge-weight output must be a Float32 [H,W] map");
+                       "edge-weight output must be a Float32 or Float16 [H,W] map");
+        stream = resolve_stream(stream);
+        const bool fp16_out = edges.dtype() == lfs::core::DataType::Float16;
+        lfs::core::Tensor local_scratch;
+        lfs::core::Tensor* work = &edges;
+        if (fp16_out) {
+            const lfs::core::TensorShape map_shape{height, width};
+            if (float_scratch != nullptr) {
+                if (!float_scratch->is_valid() || float_scratch->shape() != map_shape ||
+                    float_scratch->dtype() != lfs::core::DataType::Float32) {
+                    *float_scratch = lfs::core::Tensor::empty_exact(map_shape, lfs::core::DataType::Float32);
+                }
+                float_scratch->set_stream(stream);
+                work = float_scratch;
+            } else {
+                local_scratch = lfs::core::Tensor::empty(map_shape, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                local_scratch.set_stream(stream);
+                work = &local_scratch;
+            }
+        }
+
         const int h = static_cast<int>(height);
         const int w = static_cast<int>(width);
         const lfs::core::Tensor mask = photometric_mask.is_valid() && photometric_mask.numel() > 0
@@ -333,36 +373,48 @@ namespace lfs::training::kernels {
             mask.sync_to_stream(stream);
         }
 
+        float* const work_ptr = work->ptr<float>();
         if (image.dtype() == lfs::core::DataType::UInt8) {
             if (!mask.is_valid())
-                launch_fused_canny_edge_filter_chw(image.ptr<uint8_t>(), edges.ptr<float>(), h, w, stream);
+                launch_fused_canny_edge_filter_chw(image.ptr<uint8_t>(), work_ptr, h, w, stream);
             else if (mask.dtype() == lfs::core::DataType::Float32)
                 launch_fused_canny_edge_filter_chw_impl<uint8_t, float>(
-                    image.ptr<uint8_t>(), mask.ptr<float>(), edges.ptr<float>(), h, w, mask_mode, stream);
+                    image.ptr<uint8_t>(), mask.ptr<float>(), work_ptr, h, w, mask_mode, stream);
             else
                 launch_fused_canny_edge_filter_chw_impl<uint8_t, uint8_t>(
-                    image.ptr<uint8_t>(), mask.ptr<uint8_t>(), edges.ptr<float>(), h, w, mask_mode, stream);
+                    image.ptr<uint8_t>(), mask.ptr<uint8_t>(), work_ptr, h, w, mask_mode, stream);
         } else {
             LFS_ASSERT_MSG(image.dtype() == lfs::core::DataType::Float32, "edge-weight input must be float32 or uint8");
             if (!mask.is_valid())
-                launch_fused_canny_edge_filter_chw(image.ptr<float>(), edges.ptr<float>(), h, w, stream);
+                launch_fused_canny_edge_filter_chw(image.ptr<float>(), work_ptr, h, w, stream);
             else if (mask.dtype() == lfs::core::DataType::Float32)
                 launch_fused_canny_edge_filter_chw_impl<float, float>(
-                    image.ptr<float>(), mask.ptr<float>(), edges.ptr<float>(), h, w, mask_mode, stream);
+                    image.ptr<float>(), mask.ptr<float>(), work_ptr, h, w, mask_mode, stream);
             else
                 launch_fused_canny_edge_filter_chw_impl<float, uint8_t>(
-                    image.ptr<float>(), mask.ptr<uint8_t>(), edges.ptr<float>(), h, w, mask_mode, stream);
+                    image.ptr<float>(), mask.ptr<uint8_t>(), work_ptr, h, w, mask_mode, stream);
         }
 
         if (mask.is_valid()) {
             if (mask.dtype() == lfs::core::DataType::Float32) {
-                launch_zero_where_photometric_weight_is_zero_f32(edges.ptr<float>(), mask.ptr<float>(), h, w, mask_mode, stream);
+                launch_zero_where_photometric_weight_is_zero_f32(work_ptr, mask.ptr<float>(), h, w, mask_mode, stream);
             } else {
-                launch_zero_where_photometric_weight_is_zero_u8(edges.ptr<float>(), mask.ptr<uint8_t>(), h, w, mask_mode, stream);
+                launch_zero_where_photometric_weight_is_zero_u8(work_ptr, mask.ptr<uint8_t>(), h, w, mask_mode, stream);
             }
         }
 
-        launch_normalize_by_positive_median(edges.ptr<float>(), height * width, stream);
+        launch_normalize_by_positive_median(work_ptr, height * width, stream);
+        if (fp16_out) {
+            edges.set_stream(stream);
+            const std::size_t n = height * width;
+            if (n > 0) {
+                constexpr int block_size = 256;
+                const int grid_size = static_cast<int>(std::min<std::size_t>((n + block_size - 1) / block_size, 4096));
+                float_to_half_edge_kernel<<<grid_size, block_size, 0, stream>>>(
+                    work_ptr, reinterpret_cast<__half*>(edges.data_ptr()), n);
+                LFS_CUDA_LAUNCH_CHECK(stream, "training.image.edge_float_to_half");
+            }
+        }
     }
 
     void launch_normalize_by_device_scalar(

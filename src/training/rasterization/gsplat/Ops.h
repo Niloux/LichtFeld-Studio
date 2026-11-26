@@ -357,13 +357,14 @@ namespace gsplat_lfs {
         float* densification_weight,          // [N] or nullptr
         float* densification_error,           // [N] or nullptr
         const float* densification_error_map, // [H, W] or nullptr
-        const float* edge_weight_map,         // [H, W] or nullptr
+        const void* edge_weight_map,          // [H, W] Float32 or Float16 or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr, TileRange tiles = {},
         const ScreenFootprint& footprint = {},
         const ColorVarianceRender& color_variance = {},
         float* blend_peak_out = nullptr,
-        const RenderGradPlanes& grad_planes = {});
+        const RenderGradPlanes& grad_planes = {},
+        bool edge_weight_fp16 = false);
 
     //=========================================================================
     // High-level API: Fully fused rasterization with SH evaluation
@@ -505,7 +506,7 @@ namespace gsplat_lfs {
         float* densification_weight,          // [N] or nullptr
         float* densification_error,           // [N] or nullptr
         const float* densification_error_map, // [H, W] or nullptr
-        const float* edge_weight_map,         // [H, W] or nullptr
+        const void* edge_weight_map,          // [H, W] Float32 or Float16 or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr,
         const std::vector<TileBatch>& batches = {}, int32_t* tiles_per_gauss = nullptr,
@@ -519,6 +520,7 @@ namespace gsplat_lfs {
         const float* cached_unit_rays = nullptr,
         const RenderGradPlanes& grad_planes = {},
         const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready = {},
-        const uint32_t* tile_keys32 = nullptr);
+        const uint32_t* tile_keys32 = nullptr,
+        bool edge_weight_fp16 = false);
 
 } // namespace gsplat_lfs

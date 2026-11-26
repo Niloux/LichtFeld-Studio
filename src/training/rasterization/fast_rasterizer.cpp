@@ -921,6 +921,12 @@ namespace lfs::training {
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);
 
         const auto shN = backward_shN_bind(gaussian_model, ctx);
+        const void* const fastgs_edge_weight_map =
+            fused_extra_gradients.edge_weight_map_f16
+                ? fused_extra_gradients.edge_weight_map_f16
+                : static_cast<const void*>(fused_extra_gradients.edge_weight_map);
+        const bool fastgs_edge_weight_fp16 =
+            fused_extra_gradients.edge_weight_map_f16 != nullptr;
         auto backward_result = fast_lfs::rasterization::backward_raw(
             densification_rows.weight,
             densification_rows.error,
@@ -957,9 +963,10 @@ namespace lfs::training {
             shN.bounds,
             shN.n_cells,
             shN.bits,
-            fused_extra_gradients.edge_weight_map,
+            fastgs_edge_weight_map,
             fused_extra_gradients.edge_score_out,
-            variance);
+            variance,
+            fastgs_edge_weight_fp16);
 
         ctx.mark_forward_context_released();
         for (size_t i = 0; i < captured_count; ++i)

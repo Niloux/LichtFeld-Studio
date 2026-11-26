@@ -13,6 +13,7 @@ namespace lfs::training::kernels {
     struct LFS_CUDA_API RidgeWorkspace {
         lfs::core::Tensor horizontal;
         lfs::core::Tensor reduction;
+        lfs::core::Tensor scratch;
         size_t band_bytes = size_t{16} << 20;
         [[nodiscard]] size_t band_rows(size_t height, size_t width) const;
         void ensure_size(size_t band_rows, size_t width, bool masked = false);

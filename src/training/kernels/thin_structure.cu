@@ -22,12 +22,23 @@ namespace lfs::training::kernels {
         constexpr int VERTICAL_TILE_HEIGHT = 8;
         constexpr std::array<double, 4> RIDGE_SIGMAS{0.8, 1.2, 1.8, 2.5};
         constexpr float STRUCTURE_RESPONSE_CAP = 4.0f;
+        constexpr float STRUCTURE_U8_SCALE = STRUCTURE_RESPONSE_CAP / 255.0f;
+        constexpr float STRUCTURE_U8_INV_SCALE = 255.0f / STRUCTURE_RESPONSE_CAP;
         constexpr uint32_t INVALID_RESPONSE_BITS = 0x7fc00001u;
 
-        __global__ void densification_weight_kernel(float* error, const float* structure, size_t n, float gain) {
+        template <typename StructT>
+        __device__ __forceinline__ float decode_structure_value(const StructT value) {
+            if constexpr (std::is_same_v<StructT, uint8_t>)
+                return static_cast<float>(value) * STRUCTURE_U8_SCALE;
+            else
+                return fminf(fmaxf(value, 0.0f), STRUCTURE_RESPONSE_CAP);
+        }
+
+        template <typename StructT>
+        __global__ void densification_weight_kernel(float* error, const StructT* structure, size_t n, float gain) {
             const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
             if (i < n)
-                error[i] *= 1.0f + gain * fminf(fmaxf(structure[i], 0.0f), STRUCTURE_RESPONSE_CAP);
+                error[i] *= 1.0f + gain * decode_structure_value(structure[i]);
         }
         struct DerivativeFilter {
             float g[2 * MAX_FILTER_RADIUS + 1];
@@ -201,8 +212,8 @@ namespace lfs::training::kernels {
             }
         }
 
-        template <bool Masked>
-        __global__ void normalize_structure(float* data, const float* partial, const int blocks, const int n) {
+        template <bool Masked, typename OutT>
+        __global__ void normalize_structure(const float* src, OutT* out, const float* partial, const int blocks, const int n) {
             __shared__ float inv_mean;
             float sum = 0.0f, minimum = std::numeric_limits<float>::infinity(), maximum = -std::numeric_limits<float>::infinity();
             float valid_count = 0.0f;
@@ -224,12 +235,19 @@ namespace lfs::training::kernels {
                                : 0.0f;
             __syncthreads();
             const int i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i < n)
-                data[i] *= inv_mean;
+            if (i < n) {
+                const float val = src[i] * inv_mean;
+                if constexpr (std::is_same_v<OutT, uint8_t>) {
+                    const float clamped = fminf(fmaxf(val, 0.0f), STRUCTURE_RESPONSE_CAP);
+                    out[i] = static_cast<uint8_t>(__float2uint_rn(clamped * STRUCTURE_U8_INV_SCALE));
+                } else {
+                    out[i] = val;
+                }
+            }
         }
 
-        template <typename T>
-        __global__ void weight_kernel(const float* structure, const T* base, float* output,
+        template <typename StructT, typename T>
+        __global__ void weight_kernel(const StructT* structure, const T* base, float* output,
                                       const int height, const int width, const float gain,
                                       const bool valid_padding) {
             const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -245,7 +263,7 @@ namespace lfs::training::kernels {
                 else
                     base_value = base[i];
             }
-            output[i] = inside ? base_value * (1.0f + gain * fminf(structure[i], STRUCTURE_RESPONSE_CAP)) : 0.0f;
+            output[i] = inside ? base_value * (1.0f + gain * decode_structure_value(structure[i])) : 0.0f;
         }
     } // namespace
 
@@ -314,13 +332,24 @@ namespace lfs::training::kernels {
         workspace.ensure_size(static_cast<size_t>(band_rows), static_cast<size_t>(width), masked);
         const size_t band_stride = workspace.horizontal.numel() / 3;
         LFS_ASSERT((output.shape() == TensorShape{static_cast<size_t>(height), static_cast<size_t>(width)}));
-        LFS_ASSERT(output.dtype() == DataType::Float32 && output.device() == Device::CUDA);
+        LFS_ASSERT((output.dtype() == DataType::Float32 || output.dtype() == DataType::UInt8) &&
+                   output.device() == Device::CUDA);
         const auto stream = image.stream();
         if (masked)
             mask.sync_to_stream(stream);
         workspace.horizontal.set_stream(stream);
         workspace.reduction.set_stream(stream);
         output.set_stream(stream);
+        const bool output_u8 = output.dtype() == DataType::UInt8;
+        if (output_u8) {
+            const TensorShape out_shape{static_cast<size_t>(height), static_cast<size_t>(width)};
+            if (!workspace.scratch.is_valid() || workspace.scratch.shape() != out_shape ||
+                workspace.scratch.dtype() != DataType::Float32) {
+                workspace.scratch = Tensor::empty(out_shape, Device::CUDA, DataType::Float32);
+            }
+            workspace.scratch.set_stream(stream);
+        }
+        float* const float_buf = output_u8 ? workspace.scratch.ptr<float>() : output.ptr<float>();
         nvtxRangePushA("structure_map");
         const int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
         const int horizontal_tiles = (width + HORIZONTAL_TILE_WIDTH - 1) / HORIZONTAL_TILE_WIDTH;
@@ -382,11 +411,11 @@ namespace lfs::training::kernels {
                 }
                 if (masked) {
                     hessian_vertical<true><<<vertical_tiles*(rows / VERTICAL_TILE_HEIGHT), vertical_threads, 0, stream>>>(
-                        workspace.horizontal.ptr<float>(), output.ptr<float>(), height, width, first_row, band_stride, filter, first_scale);
+                        workspace.horizontal.ptr<float>(), float_buf, height, width, first_row, band_stride, filter, first_scale);
                     LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.hessian_vertical");
                 } else {
                     hessian_vertical<false><<<vertical_tiles*(rows / VERTICAL_TILE_HEIGHT), vertical_threads, 0, stream>>>(
-                        workspace.horizontal.ptr<float>(), output.ptr<float>(), height, width, first_row, band_stride, filter, first_scale);
+                        workspace.horizontal.ptr<float>(), float_buf, height, width, first_row, band_stride, filter, first_scale);
                     LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.hessian_vertical");
                 }
             }
@@ -396,39 +425,49 @@ namespace lfs::training::kernels {
         if (image.dtype() == DataType::UInt8) {
             if (!masked) {
                 structure_sum<uint8_t, void><<<reduction_blocks, BLOCK_SIZE, 0, stream>>>(
-                    output.ptr<float>(), image.ptr<uint8_t>(), nullptr, workspace.reduction.ptr<float>(), n, mask_mode);
+                    float_buf, image.ptr<uint8_t>(), nullptr, workspace.reduction.ptr<float>(), n, mask_mode);
                 LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.sum_u8");
             } else if (mask.dtype() == DataType::Float32) {
                 structure_sum<uint8_t, float><<<reduction_blocks, BLOCK_SIZE, 0, stream>>>(
-                    output.ptr<float>(), image.ptr<uint8_t>(), mask.ptr<float>(), workspace.reduction.ptr<float>(), n, mask_mode);
+                    float_buf, image.ptr<uint8_t>(), mask.ptr<float>(), workspace.reduction.ptr<float>(), n, mask_mode);
                 LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.sum_u8");
             } else {
                 structure_sum<uint8_t, uint8_t><<<reduction_blocks, BLOCK_SIZE, 0, stream>>>(
-                    output.ptr<float>(), image.ptr<uint8_t>(), mask.ptr<uint8_t>(), workspace.reduction.ptr<float>(), n, mask_mode);
+                    float_buf, image.ptr<uint8_t>(), mask.ptr<uint8_t>(), workspace.reduction.ptr<float>(), n, mask_mode);
                 LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.sum_u8");
             }
         } else {
             if (!masked) {
                 structure_sum<float, void><<<reduction_blocks, BLOCK_SIZE, 0, stream>>>(
-                    output.ptr<float>(), image.ptr<float>(), nullptr, workspace.reduction.ptr<float>(), n, mask_mode);
+                    float_buf, image.ptr<float>(), nullptr, workspace.reduction.ptr<float>(), n, mask_mode);
                 LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.sum_f32");
             } else if (mask.dtype() == DataType::Float32) {
                 structure_sum<float, float><<<reduction_blocks, BLOCK_SIZE, 0, stream>>>(
-                    output.ptr<float>(), image.ptr<float>(), mask.ptr<float>(), workspace.reduction.ptr<float>(), n, mask_mode);
+                    float_buf, image.ptr<float>(), mask.ptr<float>(), workspace.reduction.ptr<float>(), n, mask_mode);
                 LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.sum_f32");
             } else {
                 structure_sum<float, uint8_t><<<reduction_blocks, BLOCK_SIZE, 0, stream>>>(
-                    output.ptr<float>(), image.ptr<float>(), mask.ptr<uint8_t>(), workspace.reduction.ptr<float>(), n, mask_mode);
+                    float_buf, image.ptr<float>(), mask.ptr<uint8_t>(), workspace.reduction.ptr<float>(), n, mask_mode);
                 LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.sum_f32");
             }
         }
-        if (masked) {
-            normalize_structure<true><<<blocks, BLOCK_SIZE, 0, stream>>>(
-                output.ptr<float>(), workspace.reduction.ptr<float>(), reduction_blocks, n);
-            LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.ridge");
+        if (output_u8) {
+            if (masked) {
+                normalize_structure<true, uint8_t><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    float_buf, output.ptr<uint8_t>(), workspace.reduction.ptr<float>(), reduction_blocks, n);
+            } else {
+                normalize_structure<false, uint8_t><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    float_buf, output.ptr<uint8_t>(), workspace.reduction.ptr<float>(), reduction_blocks, n);
+            }
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.ridge_u8");
         } else {
-            normalize_structure<false><<<blocks, BLOCK_SIZE, 0, stream>>>(
-                output.ptr<float>(), workspace.reduction.ptr<float>(), reduction_blocks, n);
+            if (masked) {
+                normalize_structure<true, float><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    float_buf, float_buf, workspace.reduction.ptr<float>(), reduction_blocks, n);
+            } else {
+                normalize_structure<false, float><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    float_buf, float_buf, workspace.reduction.ptr<float>(), reduction_blocks, n);
+            }
             LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.ridge");
         }
         nvtxRangePop();
@@ -443,7 +482,8 @@ namespace lfs::training::kernels {
                                       lfs::core::Tensor& output, const float gain,
                                       const bool valid_padding) {
         using namespace lfs::core;
-        LFS_ASSERT(structure.device() == Device::CUDA && structure.ndim() == 2 && structure.dtype() == DataType::Float32);
+        LFS_ASSERT(structure.device() == Device::CUDA && structure.ndim() == 2 &&
+                   (structure.dtype() == DataType::Float32 || structure.dtype() == DataType::UInt8));
         LFS_ASSERT(std::isfinite(gain) && gain >= 0.0f && gain <= 4.0f);
         LFS_ASSERT(!base_weight.is_valid() || (base_weight.device() == Device::CUDA && base_weight.shape() == structure.shape()));
         if (!output.is_valid() || output.shape() != structure.shape())
@@ -453,14 +493,32 @@ namespace lfs::training::kernels {
         const int blocks = (height * width + BLOCK_SIZE - 1) / BLOCK_SIZE;
         const auto stream = structure.stream();
         output.set_stream(stream);
-        if (base_weight.is_valid() && (base_weight.dtype() == DataType::UInt8 || base_weight.dtype() == DataType::Bool)) {
-            weight_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(structure.ptr<float>(), base_weight.ptr<uint8_t>(), output.ptr<float>(),
-                                                             height, width, gain, valid_padding);
-            LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.weight_u8");
-        } else {
+        const bool is_u8_struct = structure.dtype() == DataType::UInt8;
+        const bool is_u8_base = base_weight.is_valid() &&
+                                (base_weight.dtype() == DataType::UInt8 || base_weight.dtype() == DataType::Bool);
+        if (!is_u8_base)
             LFS_ASSERT(!base_weight.is_valid() || base_weight.dtype() == DataType::Float32);
-            weight_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(structure.ptr<float>(), base_weight.is_valid() ? base_weight.ptr<float>() : nullptr,
-                                                             output.ptr<float>(), height, width, gain, valid_padding);
+
+        if (is_u8_struct) {
+            if (is_u8_base) {
+                weight_kernel<uint8_t, uint8_t><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    structure.ptr<uint8_t>(), base_weight.ptr<uint8_t>(), output.ptr<float>(),
+                    height, width, gain, valid_padding);
+            } else {
+                weight_kernel<uint8_t, float><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    structure.ptr<uint8_t>(), base_weight.is_valid() ? base_weight.ptr<float>() : nullptr,
+                    output.ptr<float>(), height, width, gain, valid_padding);
+            }
+        } else {
+            if (is_u8_base) {
+                weight_kernel<float, uint8_t><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    structure.ptr<float>(), base_weight.ptr<uint8_t>(), output.ptr<float>(),
+                    height, width, gain, valid_padding);
+            } else {
+                weight_kernel<float, float><<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    structure.ptr<float>(), base_weight.is_valid() ? base_weight.ptr<float>() : nullptr,
+                    output.ptr<float>(), height, width, gain, valid_padding);
+            }
         }
         LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.weight");
     }
@@ -470,12 +528,20 @@ namespace lfs::training::kernels {
         if (gain == 0.0f)
             return;
         LFS_ASSERT(error.device() == Device::CUDA && error.ndim() == 2 && error.dtype() == DataType::Float32 && error.is_contiguous());
-        LFS_ASSERT(structure.device() == Device::CUDA && structure.shape() == error.shape() && structure.dtype() == DataType::Float32 && structure.is_contiguous());
+        LFS_ASSERT(structure.device() == Device::CUDA && structure.shape() == error.shape() &&
+                   (structure.dtype() == DataType::Float32 || structure.dtype() == DataType::UInt8) &&
+                   structure.is_contiguous());
         const auto stream = error.stream();
         structure.sync_to_stream(stream);
         constexpr int threads = 256;
         const auto blocks = static_cast<unsigned>((error.numel() + threads - 1) / threads);
-        densification_weight_kernel<<<blocks, threads, 0, stream>>>(error.ptr<float>(), structure.ptr<float>(), error.numel(), gain);
+        if (structure.dtype() == DataType::UInt8) {
+            densification_weight_kernel<uint8_t><<<blocks, threads, 0, stream>>>(
+                error.ptr<float>(), structure.ptr<uint8_t>(), error.numel(), gain);
+        } else {
+            densification_weight_kernel<float><<<blocks, threads, 0, stream>>>(
+                error.ptr<float>(), structure.ptr<float>(), error.numel(), gain);
+        }
         LFS_CUDA_LAUNCH_CHECK(stream, "training.structure.densification");
     }
 

@@ -17,6 +17,7 @@
 #include "warp_gradient_reduce.cuh"
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <cuda_fp16.h>
 namespace cg = cooperative_groups;
 
 namespace fast_lfs::rasterization::kernels::backward {
@@ -719,7 +720,7 @@ namespace fast_lfs::rasterization::kernels::backward {
         float* __restrict__ densification_weight,
         float* __restrict__ densification_error,
         const float* __restrict__ densification_error_map,
-        const float* __restrict__ edge_weight_map,
+        const void* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out,
         float* __restrict__ blend_peak_out,
         uint* __restrict__ primitive_touched,
@@ -730,7 +731,8 @@ namespace fast_lfs::rasterization::kernels::backward {
         const uint width,
         const uint height,
         const uint grid_width,
-        const ColorVarianceLoss color_variance = {}) {
+        const ColorVarianceLoss color_variance = {},
+        const bool edge_weight_fp16 = false) {
         static_assert(config::tile_width == 16 && config::tile_height == 16, "quadrant layout assumes 16x16 tiles");
         static_assert(config::block_size_blend_backward == 128, "four warps, one 8x8 quadrant each");
         static_assert(config::warp_subtile_width == 8 && config::warp_subtile_height == 4,
@@ -805,7 +807,11 @@ namespace fast_lfs::rasterization::kernels::backward {
                 if (densification_error_map != nullptr && inside[k])
                     pixel_error[k] = densification_error_map[pixel_idx[k]];
             }
-            edge_weight[k] = (edge_weight_map != nullptr && inside[k]) ? edge_weight_map[pixel_idx[k]] : 0.0f;
+            edge_weight[k] = (edge_weight_map != nullptr && inside[k])
+                                 ? (edge_weight_fp16
+                                        ? __half2float(static_cast<const __half*>(edge_weight_map)[pixel_idx[k]])
+                                        : static_cast<const float*>(edge_weight_map)[pixel_idx[k]])
+                                 : 0.0f;
             target[k] = make_float3(0.0f);
             variance_scale[k] = 0.0f;
         }

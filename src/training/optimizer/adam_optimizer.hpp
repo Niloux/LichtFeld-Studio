@@ -203,6 +203,7 @@ namespace lfs::training {
         void allocate_gradients();
         void allocate_gradients(size_t capacity);
         void zero_grad(int iteration);
+        void release_grad(ParamType type);
         lfs::core::Tensor& get_grad(ParamType type);
 
         // Learning rate

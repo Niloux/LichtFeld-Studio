@@ -36,14 +36,17 @@ namespace lfs::training::kernels {
         cudaStream_t stream = nullptr);
 
     // Edge guidance for one view: Canny edges of a CHW image (uint8 or float32) written to
-    // `edges` [H,W], zeroed where `photometric_mask` gives no photometric weight, then divided
-    // by the median of the remaining positive edges. An invalid mask keeps every pixel.
+    // `edges` [H,W] (Float32 or Float16), zeroed where `photometric_mask` gives no photometric
+    // weight, then divided by the median of the remaining positive edges. An invalid mask keeps
+    // every pixel. When `edges` is Float16, `float_scratch` (if provided) is reused as the
+    // intermediate Float32 [H,W] buffer.
     void compute_edge_weight_map(
         const lfs::core::Tensor& image,
         const lfs::core::Tensor& photometric_mask,
         MaskPhotoMode mask_mode,
         lfs::core::Tensor& edges,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        lfs::core::Tensor* float_scratch = nullptr);
 
     // Rounds float values in [0, 1] to the nearest 8-bit level, as saving and reloading the image would.
     lfs::core::Tensor quantize_to_8bit_grid(const lfs::core::Tensor& image);

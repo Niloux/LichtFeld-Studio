@@ -170,9 +170,10 @@ namespace fast_lfs::rasterization {
         const float* shN_value_bounds_ptr = nullptr,
         unsigned shN_value_n_cells = 0u,
         unsigned shN_value_bits = 0u,
-        const float* edge_weight_map = nullptr,
+        const void* edge_weight_map = nullptr,
         float* edge_score_out = nullptr,
-        const ColorVarianceLoss& color_variance = {});
+        const ColorVarianceLoss& color_variance = {},
+        bool edge_weight_fp16 = false);
 
     // Pre-compile all CUDA kernels to avoid JIT delays during rendering
     void warmup_kernels();
