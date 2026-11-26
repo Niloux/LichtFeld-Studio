@@ -1468,9 +1468,10 @@ namespace gsplat_lfs {
                           footprint.radii != nullptr;
 
         // Nothing past the deepest contributing pair of the sub-tile matters.
-        for (int32_t scan_end = min(range_end - 1, bin_max); scan_end >= range_start;) {
+        int32_t scan_end = min(range_end - 1, bin_max);
+        int count = 0;
+        while (scan_end >= range_start || count > 0) {
             // Compact back-to-front survivors; the loop bounds are warp-uniform.
-            int count = 0;
             int32_t s = scan_end;
             while (s >= range_start && count <= kSplatBwdSurvivors - 32) {
                 const int32_t gi = s - static_cast<int32_t>(lane);
@@ -1496,8 +1497,20 @@ namespace gsplat_lfs {
             scan_end = s;
             __syncwarp();
 
-            for (int base = 0; base < count; base += 32) {
-                const int batch = min(32, count - base);
+            // Carry a partial tail across scans so partial wavefronts only happen once.
+            const int process = (scan_end >= range_start) ? (count & ~31) : count;
+            for (int base = 0; base < process; base += 32) {
+                const int batch = min(32, process - base);
+                const int32_t batch_min_isect = s_scratch.surv[base + batch - 1];
+                const uint32_t m0 = __ballot_sync(0xffffffffu, s_bin[lane] >= batch_min_isect);
+                const uint32_t m1 = __ballot_sync(0xffffffffu, s_bin[lane + 32u] >= batch_min_isect);
+                if ((m0 | m1) == 0u)
+                    continue;
+                const int p_lo = (m0 != 0u) ? (__ffs(static_cast<int>(m0)) - 1)
+                                            : (32 + __ffs(static_cast<int>(m1)) - 1);
+                const int p_hi = (m1 != 0u) ? (63 - __clz(m1)) : (31 - __clz(m0));
+                const int p_span = p_hi - p_lo + 1;
+
                 const bool owns = static_cast<int>(lane) < batch;
                 // Lane 0 owns the back-most splat of the batch.
                 const int32_t isect_idx = owns ? s_scratch.surv[base + lane] : 0;
@@ -1555,9 +1568,10 @@ namespace gsplat_lfs {
                 float blend_peak = 0.f;
                 bool touched = false;
 
-                for (int t = 0; t < batch + static_cast<int>(kSplatBwdPixels) - 1; ++t) {
-                    const int p = t - static_cast<int>(lane);
-                    if (owns && p >= 0 && p < static_cast<int>(kSplatBwdPixels) && isect_idx <= s_bin[p]) {
+                for (int t = 0; t < batch + p_span - 1; ++t) {
+                    const int p = p_lo + t - static_cast<int>(lane);
+                    if (owns && static_cast<uint32_t>(p - p_lo) < static_cast<uint32_t>(p_span) &&
+                        isect_idx <= s_bin[p]) {
                         vec3 o_minus_mu{0.f};
                         vec3 gro;
                         if constexpr (kGlobalShutter) {
@@ -1747,6 +1761,17 @@ namespace gsplat_lfs {
                     }
                 }
             }
+            __syncwarp();
+
+            const int rem = count - process;
+            if (rem > 0) {
+                const int32_t carry = (static_cast<int>(lane) < rem) ? s_scratch.surv[process + lane] : 0;
+                __syncwarp();
+                if (static_cast<int>(lane) < rem) {
+                    s_scratch.surv[lane] = carry;
+                }
+            }
+            count = rem;
             __syncwarp();
         }
         if constexpr (kUseCv) {
