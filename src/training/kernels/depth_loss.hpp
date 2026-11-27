@@ -57,6 +57,7 @@ namespace lfs::training::kernels {
     // depth absolute and multi-view consistent instead of chasing the render.
     struct DepthAnchor {
         bool valid = false;
+        bool metric_exact = false; // True when scale/shift came from exact metric range metadata
         int model = 0; // 0 = disparity-space fit, 1 = depth-space fit
         float scale = 0.0f;
         float shift = 0.0f;
@@ -157,6 +158,44 @@ namespace lfs::training::kernels {
         float gradient_term_weight,
         float prior_quantization_step = 0.0f,
         const DepthAnchor* anchor = nullptr,
+        cudaStream_t stream = nullptr,
+        const float* pixel_weight = nullptr,
+        const DepthRayGrid* ray_grid = nullptr);
+
+    // Deadband-Huber metric depth supervision (expected depth, 4-neighbor log-depth gradient,
+    // and optional median depth) with automatic 4-neighbor target-depth discontinuity masking.
+    void launch_metric_depth_loss(
+        const float* rendered_depth_accum,
+        const float* rendered_alpha_accum,
+        const float* median_depth,
+        const float* target_depth,
+        float* grad_depth,
+        float* grad_alpha,
+        float* grad_median_depth,
+        float* loss_out,
+        float* partial_sums,
+        int width,
+        int height,
+        float weight_expected,
+        float weight_median,
+        float weight_grad,
+        float prior_quantization_step = 0.0f,
+        const DepthAnchor* anchor = nullptr,
+        cudaStream_t stream = nullptr,
+        const float* pixel_weight = nullptr,
+        const DepthRayGrid* ray_grid = nullptr);
+
+    // Builds conservative per-pixel empty-air depth limit (5x5 local min minus max(8cm, 5%*d))
+    // and suppression weight, masking out any pixel whose 5x5 neighborhood touches invalid target.
+    void launch_build_free_space_map(
+        const float* target_depth,
+        int width,
+        int height,
+        float anchor_scale,
+        float anchor_shift,
+        float weight,
+        float* free_space_limit_out,
+        float* free_space_weight_out,
         cudaStream_t stream = nullptr,
         const float* pixel_weight = nullptr,
         const DepthRayGrid* ray_grid = nullptr);

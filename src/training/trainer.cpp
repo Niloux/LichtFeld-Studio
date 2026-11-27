@@ -1217,6 +1217,9 @@ namespace lfs::training {
         normal_loss_grad_ = {};
         normal_loss_partials_ = {};
         depth_distortion_grad_ = {};
+        median_depth_grad_ = {};
+        free_space_limit_ = {};
+        free_space_weight_ = {};
         normal_consistency_scalar_ = {};
         normal_consistency_partials_ = {};
         normal_prior_depth_scalar_ = {};
@@ -3092,6 +3095,69 @@ namespace lfs::training {
             for (const auto& cam : train_dataset_->get_cameras())
                 photographs.push_back({cam, {cam}});
         }
+
+        if (!las_prior_sidecar_ && !params_.dataset.data_path.empty()) {
+            las_prior_sidecar_ = read_las_prior_sidecar(params_.dataset.data_path);
+        }
+        if (las_prior_sidecar_ && las_prior_sidecar_->metric_aligned &&
+            !las_prior_sidecar_->metric_depth_ranges.empty()) {
+            size_t matched_photographs = 0;
+            size_t matched_views = 0;
+            for (const auto& [photograph, drawn] : photographs) {
+                std::string key = photograph->image_name();
+                std::replace(key.begin(), key.end(), '\\', '/');
+                const auto it = las_prior_sidecar_->metric_depth_ranges.find(key);
+                if (it == las_prior_sidecar_->metric_depth_ranges.end()) {
+                    continue;
+                }
+                const float min_d = it->second.min_distance_m;
+                const float max_d = it->second.max_distance_m;
+                if (!(min_d > 0.0f) || !(max_d > min_d + 1.0e-4f)) {
+                    continue;
+                }
+                const float scale = (max_d - min_d) / 0.98f;
+                const float shift = min_d - (0.02f / 0.98f) * (max_d - min_d);
+                lfs::training::kernels::DepthAnchor anchor;
+                anchor.valid = true;
+                anchor.metric_exact = true;
+                anchor.model = 1;
+                anchor.scale = scale;
+                anchor.shift = shift;
+                anchor.floor = std::clamp(
+                    lfs::training::kernels::kDepthLossFloorFraction * std::sqrt(min_d * max_d),
+                    0.05f, 0.25f);
+                anchor.corr = 1.0f;
+                anchor.samples = 1;
+                anchor.depth.valid = true;
+                anchor.depth.scale = scale;
+                anchor.depth.shift = shift;
+                anchor.depth.corr = 1.0f;
+                anchor.depth.samples = 1;
+
+                bool any_view_has_depth = false;
+                for (const auto& cam : drawn) {
+                    if (!cam || !cam->has_depth()) {
+                        continue;
+                    }
+                    depth_anchors_[cam->uid()] = anchor;
+                    ++matched_views;
+                    any_view_has_depth = true;
+                }
+                if (any_view_has_depth) {
+                    ++matched_photographs;
+                }
+            }
+            if (matched_views > 0) {
+                resolved_depth_prior_ = lfs::training::kernels::DepthPriorType::Depth;
+                depth_anchor_fit_attempted_ = true;
+                LOG_INFO("Depth anchors: loaded {}/{} exact metric anchors from supervision.json ({})",
+                         matched_photographs, photographs.size(), las_prior_sidecar_->depth_alignment);
+                nvtxRangePop();
+                return;
+            }
+            depth_anchors_.clear();
+        }
+
         std::vector<std::shared_ptr<lfs::core::Camera>> cameras;
         cameras.reserve(photographs.size());
         for (const auto& group : photographs)
@@ -4402,6 +4468,9 @@ namespace lfs::training {
         normal_loss_grad_ = {};
         normal_loss_partials_ = {};
         depth_distortion_grad_ = {};
+        median_depth_grad_ = {};
+        free_space_limit_ = {};
+        free_space_weight_ = {};
         normal_consistency_scalar_ = {};
         normal_consistency_partials_ = {};
         normal_prior_depth_scalar_ = {};
@@ -7706,7 +7775,9 @@ namespace lfs::training {
                                         (normal_loss_weight_now > 0.f ||
                                          (normal_supervision_started &&
                                           (step_params.normal_consistency_weight > 0.f ||
-                                           step_params.depth_distortion_weight > 0.f)))
+                                           step_params.depth_distortion_weight > 0.f ||
+                                           (las_prior_sidecar_ && las_prior_sidecar_->metric_aligned &&
+                                            step_params.use_depth_loss && step_params.depth_loss_weight > 0.f))))
                                             ? GsplatRenderMode::RGB_D_N
                                         : ((step_params.use_depth_loss && step_params.depth_loss_weight > 0.f) ||
                                            roi_surface_weights)
@@ -8281,7 +8352,14 @@ namespace lfs::training {
                         lfs::core::Tensor tile_grad_alpha;
                         lfs::core::Tensor tile_grad_depth;
                         lfs::core::Tensor tile_grad_depth_sq;
+                        lfs::core::Tensor tile_grad_median_depth;
+                        lfs::core::Tensor tile_free_space_limit;
+                        lfs::core::Tensor tile_free_space_weight;
                         lfs::core::Tensor tile_grad_normal;
+                        lfs::core::Tensor adapted_target_depth;
+                        const lfs::training::kernels::DepthAnchor* active_depth_anchor = nullptr;
+                        std::optional<lfs::training::kernels::DepthRayGrid> active_depth_ray_grid;
+                        bool median_grad_active = false;
                         lfs::core::Tensor tile_error_map;
                         lfs::core::Tensor tile_diffuse_weight;
                         lfs::core::Tensor mask_tile;
@@ -8543,29 +8621,93 @@ namespace lfs::training {
                                         const int depth_width = static_cast<int>(rendered_depth.shape()[1]);
                                         const int depth_height = static_cast<int>(rendered_depth.shape()[0]);
                                         const float depth_prior_qstep = cam->depth_prior_quantization_step();
-                                        const float* const depth_pixel_weight =
-                                            roi_weight_ptr_on_stream(depth_stream);
-                                        lfs::core::pin_operands({&rendered_depth, &rendered_alpha, &target_depth});
                                         const int x0 = fast_ctx ? fast_ctx->tile_x_offset : gsplat_ctx->render_tile_x_offset;
                                         const int y0 = fast_ctx ? fast_ctx->tile_y_offset : gsplat_ctx->render_tile_y_offset;
                                         const auto ray_grid = depth_prior_ray_grid(*cam, x0, y0);
-                                        lfs::training::kernels::launch_depth_loss(
-                                            rendered_depth.ptr<float>(),
-                                            rendered_alpha.ptr<float>(),
-                                            target_depth.ptr<float>(),
-                                            depth_loss_grad_.ptr<float>(),
-                                            depth_loss_grad_alpha_.ptr<float>(),
-                                            depth_loss_scalar_.ptr<float>(),
-                                            depth_loss_partials_.ptr<float>(),
-                                            depth_width,
-                                            depth_height,
-                                            depth_weight_now,
-                                            kDepthLossGradientTermWeight,
-                                            depth_prior_qstep,
-                                            depth_anchor,
-                                            depth_stream,
-                                            depth_pixel_weight,
-                                            ray_grid ? &*ray_grid : nullptr);
+                                        adapted_target_depth = target_depth;
+                                        active_depth_anchor = depth_anchor;
+                                        active_depth_ray_grid = ray_grid;
+                                        lfs::core::pin_operands({&rendered_depth, &rendered_alpha, &target_depth});
+
+                                        if (depth_anchor->metric_exact) {
+                                            const bool use_median_sup =
+                                                gsplat_ctx && normal_supervision_started &&
+                                                output.median_depth.is_valid() && output.median_depth.numel() > 0;
+                                            lfs::core::Tensor median_depth_tensor;
+                                            float* median_depth_ptr = nullptr;
+                                            float* median_grad_ptr = nullptr;
+                                            if (use_median_sup) {
+                                                median_depth_tensor = output.median_depth;
+                                                if (median_depth_tensor.ndim() == 3 &&
+                                                    median_depth_tensor.shape()[0] == 1) {
+                                                    median_depth_tensor = median_depth_tensor.squeeze(0);
+                                                }
+                                                if (!median_depth_tensor.is_contiguous()) {
+                                                    median_depth_tensor = median_depth_tensor.contiguous();
+                                                }
+                                                median_depth_tensor.sync_to_stream(depth_stream);
+                                                if (!median_depth_grad_.is_valid() ||
+                                                    median_depth_grad_.shape() != rendered_depth.shape()) {
+                                                    median_depth_grad_ = lfs::core::Tensor::empty(
+                                                        rendered_depth.shape(), lfs::core::Device::CUDA);
+                                                }
+                                                median_depth_grad_.set_stream(depth_stream);
+                                                lfs::core::pin_operands({&median_depth_tensor, &median_depth_grad_});
+                                                median_depth_ptr = median_depth_tensor.ptr<float>();
+                                                median_grad_ptr = median_depth_grad_.ptr<float>();
+                                                median_grad_active = true;
+                                                tile_grad_median_depth = median_depth_grad_;
+                                            }
+                                            const float metric_decay = std::pow(0.05f, depth_progress);
+                                            const float w_expected = 0.10f * step_params.depth_loss_weight * metric_decay;
+                                            const float w_grad = 0.08f * step_params.depth_loss_weight * metric_decay;
+                                            const float w_median =
+                                                use_median_sup
+                                                    ? (0.08f * step_params.depth_loss_weight * metric_decay)
+                                                    : 0.0f;
+                                            const float* const metric_pixel_weight =
+                                                normal_weight_ptr_on_stream(depth_stream);
+                                            lfs::training::kernels::launch_metric_depth_loss(
+                                                rendered_depth.ptr<float>(),
+                                                rendered_alpha.ptr<float>(),
+                                                median_depth_ptr,
+                                                target_depth.ptr<float>(),
+                                                depth_loss_grad_.ptr<float>(),
+                                                depth_loss_grad_alpha_.ptr<float>(),
+                                                median_grad_ptr,
+                                                depth_loss_scalar_.ptr<float>(),
+                                                depth_loss_partials_.ptr<float>(),
+                                                depth_width,
+                                                depth_height,
+                                                w_expected,
+                                                w_median,
+                                                w_grad,
+                                                depth_prior_qstep,
+                                                depth_anchor,
+                                                depth_stream,
+                                                metric_pixel_weight,
+                                                ray_grid ? &*ray_grid : nullptr);
+                                        } else {
+                                            const float* const depth_pixel_weight =
+                                                roi_weight_ptr_on_stream(depth_stream);
+                                            lfs::training::kernels::launch_depth_loss(
+                                                rendered_depth.ptr<float>(),
+                                                rendered_alpha.ptr<float>(),
+                                                target_depth.ptr<float>(),
+                                                depth_loss_grad_.ptr<float>(),
+                                                depth_loss_grad_alpha_.ptr<float>(),
+                                                depth_loss_scalar_.ptr<float>(),
+                                                depth_loss_partials_.ptr<float>(),
+                                                depth_width,
+                                                depth_height,
+                                                depth_weight_now,
+                                                kDepthLossGradientTermWeight,
+                                                depth_prior_qstep,
+                                                depth_anchor,
+                                                depth_stream,
+                                                depth_pixel_weight,
+                                                ray_grid ? &*ray_grid : nullptr);
+                                        }
 
                                         tile_loss = tile_loss + depth_loss_scalar_;
                                         // Rendered against an external depth target, the loss changes along the
@@ -8890,26 +9032,129 @@ namespace lfs::training {
                             lfs::core::Tensor rendered_depth_sq = output.depth_sq.squeeze(0).contiguous();
                             lfs::core::Tensor rendered_alpha = output.alpha.squeeze(0).contiguous();
                             const cudaStream_t distortion_stream = rendered_depth.stream();
-                            ensure_depth_grad_buffers(rendered_depth, distortion_stream, !depth_grad_buffers_active);
-                            if (!depth_distortion_grad_.is_valid() ||
-                                depth_distortion_grad_.shape() != rendered_depth.shape()) {
-                                depth_distortion_grad_ = lfs::core::Tensor::empty(rendered_depth.shape(), lfs::core::Device::CUDA);
+                            const float progress = std::clamp(
+                                static_cast<float>(iter) /
+                                    static_cast<float>(std::max(1, step_params.resolved_total_iterations())),
+                                0.0f, 1.0f);
+                            const float dist_span = std::max(0.08f, 0.20f - step_params.normal_start_fraction);
+                            const float ramp_dist = std::clamp(
+                                (progress - step_params.normal_start_fraction) / dist_span, 0.0f, 1.0f);
+                            const float dist_weight_now = 6.0f * step_params.depth_distortion_weight * ramp_dist;
+                            const float mm_weight_now = 1.5f * step_params.depth_distortion_weight * ramp_dist;
+                            const float* const dist_pixel_weight = normal_weight_ptr_on_stream(distortion_stream);
+                            const int dist_w = static_cast<int>(rendered_depth.shape()[1]);
+                            const int dist_h = static_cast<int>(rendered_depth.shape()[0]);
+
+                            if (ramp_dist > 0.0f) {
+                                ensure_depth_grad_buffers(rendered_depth, distortion_stream, !depth_grad_buffers_active);
+                                if (!depth_distortion_grad_.is_valid() ||
+                                    depth_distortion_grad_.shape() != rendered_depth.shape()) {
+                                    depth_distortion_grad_ = lfs::core::Tensor::empty(rendered_depth.shape(), lfs::core::Device::CUDA);
+                                }
+                                depth_distortion_grad_.set_stream(distortion_stream);
+
+                                lfs::core::Tensor median_depth_tensor;
+                                float* median_depth_ptr = nullptr;
+                                float* median_grad_ptr = nullptr;
+                                if (output.median_depth.is_valid() && output.median_depth.numel() > 0) {
+                                    median_depth_tensor = output.median_depth;
+                                    if (median_depth_tensor.ndim() == 3 && median_depth_tensor.shape()[0] == 1) {
+                                        median_depth_tensor = median_depth_tensor.squeeze(0);
+                                    }
+                                    if (!median_depth_tensor.is_contiguous()) {
+                                        median_depth_tensor = median_depth_tensor.contiguous();
+                                    }
+                                    median_depth_tensor.sync_to_stream(distortion_stream);
+                                    if (!median_depth_grad_.is_valid() ||
+                                        median_depth_grad_.shape() != rendered_depth.shape()) {
+                                        median_depth_grad_ = lfs::core::Tensor::empty(
+                                            rendered_depth.shape(), lfs::core::Device::CUDA);
+                                    }
+                                    if (!median_grad_active) {
+                                        median_depth_grad_.set_stream(distortion_stream);
+                                        median_depth_grad_.zero_();
+                                        median_grad_active = true;
+                                        tile_grad_median_depth = median_depth_grad_;
+                                    } else {
+                                        median_depth_grad_.sync_to_stream(distortion_stream);
+                                    }
+                                    lfs::core::pin_operands({&median_depth_tensor, &median_depth_grad_});
+                                    median_depth_ptr = median_depth_tensor.ptr<float>();
+                                    median_grad_ptr = median_depth_grad_.ptr<float>();
+                                }
+
+                                const float* dist_target_ptr = nullptr;
+                                float dist_anchor_scale = 0.0f;
+                                float dist_anchor_shift = 0.0f;
+                                if (active_depth_anchor && active_depth_anchor->metric_exact &&
+                                    adapted_target_depth.is_valid() && adapted_target_depth.numel() > 0) {
+                                    adapted_target_depth.sync_to_stream(distortion_stream);
+                                    lfs::core::pin_operands({&adapted_target_depth});
+                                    dist_target_ptr = adapted_target_depth.ptr<float>();
+                                    dist_anchor_scale = active_depth_anchor->scale;
+                                    dist_anchor_shift = active_depth_anchor->shift;
+                                }
+
+                                lfs::core::pin_operands({&rendered_depth, &rendered_depth_sq, &rendered_alpha});
+                                lfs::training::kernels::launch_depth_distortion_loss(
+                                    rendered_depth.ptr<float>(),
+                                    rendered_depth_sq.ptr<float>(),
+                                    rendered_alpha.ptr<float>(),
+                                    depth_loss_grad_.ptr<float>(),
+                                    depth_distortion_grad_.ptr<float>(),
+                                    depth_loss_grad_alpha_.ptr<float>(),
+                                    dist_w,
+                                    dist_h,
+                                    dist_weight_now,
+                                    distortion_stream,
+                                    dist_pixel_weight,
+                                    median_depth_ptr,
+                                    median_grad_ptr,
+                                    mm_weight_now,
+                                    dist_target_ptr,
+                                    dist_anchor_scale,
+                                    dist_anchor_shift);
+                                tile_grad_depth_sq = depth_distortion_grad_;
                             }
-                            depth_distortion_grad_.set_stream(distortion_stream);
-                            lfs::core::pin_operands({&rendered_depth, &rendered_depth_sq, &rendered_alpha});
-                            lfs::training::kernels::launch_depth_distortion_loss(
-                                rendered_depth.ptr<float>(),
-                                rendered_depth_sq.ptr<float>(),
-                                rendered_alpha.ptr<float>(),
-                                depth_loss_grad_.ptr<float>(),
-                                depth_distortion_grad_.ptr<float>(),
-                                depth_loss_grad_alpha_.ptr<float>(),
-                                static_cast<int>(rendered_depth.shape()[1]),
-                                static_cast<int>(rendered_depth.shape()[0]),
-                                step_params.depth_distortion_weight,
-                                distortion_stream,
-                                normal_weight_ptr_on_stream(distortion_stream));
-                            tile_grad_depth_sq = depth_distortion_grad_;
+
+                            if (active_depth_anchor && active_depth_anchor->metric_exact &&
+                                adapted_target_depth.is_valid() && adapted_target_depth.numel() > 0 &&
+                                progress >= 0.12f) {
+                                const float ramp_fs = std::clamp((progress - 0.12f) / 0.18f, 0.0f, 1.0f);
+                                const float free_weight =
+                                    0.08f * std::min(step_params.depth_distortion_weight / 0.05f, 2.0f) *
+                                    ramp_fs;
+                                if (free_weight > 0.0f) {
+                                    adapted_target_depth.sync_to_stream(distortion_stream);
+                                    if (!free_space_limit_.is_valid() ||
+                                        free_space_limit_.shape() != rendered_depth.shape()) {
+                                        free_space_limit_ = lfs::core::Tensor::empty(
+                                            rendered_depth.shape(), lfs::core::Device::CUDA);
+                                    }
+                                    free_space_limit_.set_stream(distortion_stream);
+                                    if (!free_space_weight_.is_valid() ||
+                                        free_space_weight_.shape() != rendered_depth.shape()) {
+                                        free_space_weight_ = lfs::core::Tensor::empty(
+                                            rendered_depth.shape(), lfs::core::Device::CUDA);
+                                    }
+                                    free_space_weight_.set_stream(distortion_stream);
+                                    lfs::core::pin_operands({&adapted_target_depth, &free_space_limit_, &free_space_weight_});
+                                    lfs::training::kernels::launch_build_free_space_map(
+                                        adapted_target_depth.ptr<float>(),
+                                        dist_w,
+                                        dist_h,
+                                        active_depth_anchor->scale,
+                                        active_depth_anchor->shift,
+                                        free_weight,
+                                        free_space_limit_.ptr<float>(),
+                                        free_space_weight_.ptr<float>(),
+                                        distortion_stream,
+                                        dist_pixel_weight,
+                                        active_depth_ray_grid ? &*active_depth_ray_grid : nullptr);
+                                    tile_free_space_limit = free_space_limit_;
+                                    tile_free_space_weight = free_space_weight_;
+                                }
+                            }
                         }
 
                         merge_depth_grad_buffers();
@@ -9220,7 +9465,10 @@ namespace lfs::training {
                                                               normal_terms_weight.is_valid() ? normal_terms_weight : color_variance.pixel_weight},
                                                           blend_peak_rows,
                                                           tile_grad_depth_sq,
-                                                          fuse_gut_shN ? iter : -1);
+                                                          fuse_gut_shN ? iter : -1,
+                                                          tile_grad_median_depth,
+                                                          tile_free_space_limit,
+                                                          tile_free_space_weight);
                                 if (edge_weight_scoring_active_) {
                                     strategy_->on_edge_score_accumulated(iter);
                                 }
@@ -10310,11 +10558,12 @@ namespace lfs::training {
             }
 
             const bool alpha_available = scene_ && scene_->imagesHaveAlpha();
-            if (const auto las_priors = read_las_prior_sidecar(params_.dataset.data_path)) {
-                for (const auto& change : apply_las_prior_defaults(params_.optimization, *las_priors)) {
+            las_prior_sidecar_ = read_las_prior_sidecar(params_.dataset.data_path);
+            if (las_prior_sidecar_) {
+                for (const auto& change : apply_las_prior_defaults(params_.optimization, *las_prior_sidecar_)) {
                     LOG_INFO("Supervision priors (supervision.json): {}", change);
                 }
-                if (las_priors->ray_distance && !params_.optimization.gut) {
+                if (las_prior_sidecar_->ray_distance && !params_.optimization.gut) {
                     LOG_WARN("Depth maps (supervision.json) hold ray distance, which only the GUT rasterizer renders for "
                              "fisheye cameras; enable --gut or depth supervision will be biased off-axis");
                 }

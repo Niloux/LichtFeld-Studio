@@ -2887,13 +2887,25 @@ namespace {
         const auto s2 = output.depth_sq.cpu().contiguous();
         const auto alpha = output.alpha.cpu().contiguous();
         double sum = 0.0;
+        const double eps2 = std::pow(double(lfs::training::kernels::kDepthDistortionRelEpsilon), 2);
+        const double tau = double(lfs::training::kernels::kDepthDistortionRelSaturation);
+        const double floor_d = double(lfs::training::kernels::kDepthDistortionDepthFloor);
         for (size_t i = 0; i < alpha.numel(); ++i) {
             const double a = alpha.ptr<float>()[i];
-            if (a <= lfs::training::kernels::kDepthDistortionMinAlpha)
+            const double s1v = s1.ptr<float>()[i];
+            if (a <= lfs::training::kernels::kDepthDistortionMinAlpha || s1v <= 0.0)
                 continue;
-            const double e = s1.ptr<float>()[i] / a;
-            const double variance = std::max(s2.ptr<float>()[i] / a - e * e, 0.0);
-            sum += std::sqrt(variance + std::pow(double(lfs::training::kernels::kDepthDistortionEpsilon), 2));
+            const double e = s1v / a;
+            if (e <= lfs::training::kernels::kDepthDistortionMinExpectedDepth)
+                continue;
+            const double s2v = s2.ptr<float>()[i];
+            const double r2 = (e >= floor_d)
+                                  ? std::max(s2v * a / (s1v * s1v) - 1.0, 0.0)
+                                  : std::max(s2v / a - e * e, 0.0) / (floor_d * floor_d);
+            if (r2 > 0.0) {
+                const double rho = std::sqrt(r2 + eps2);
+                sum += tau * std::log(1.0 + rho / tau);
+            }
         }
         return sum / static_cast<double>(alpha.numel());
     }
@@ -2990,10 +3002,242 @@ TEST_F(GsplatRasterizerTest, DepthDistortionSkipsDepthEdgesAndThinAlpha) {
     launch_depth_distortion_loss(s1.ptr<float>(), s2.ptr<float>(), alpha.ptr<float>(), gd.ptr<float>(), gs.ptr<float>(), ga.ptr<float>(), 4, 1, 4.f);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     const auto g = gs.cpu().contiguous();
+    EXPECT_EQ(g.ptr<float>()[0], 0.f) << "a single thin layer has zero variance";
     EXPECT_GT(g.ptr<float>()[1], 0.f) << "a stack on a surface must be penalized";
-    EXPECT_LT(g.ptr<float>()[1], g.ptr<float>()[0]) << "the slope falls as the stack grows, so outliers do not dominate";
-    EXPECT_EQ(g.ptr<float>()[2], 0.f) << "two surfaces at a depth edge are not a stack";
+    EXPECT_GT(g.ptr<float>()[2], 0.f) << "smooth saturation keeps gradient nonzero even at 1 m separation";
+    EXPECT_LT(g.ptr<float>()[2], g.ptr<float>()[1]) << "saturation tapers the slope at large separation";
     EXPECT_EQ(g.ptr<float>()[3], 0.f) << "a transparent pixel has no surface to thin";
+
+    // Target-depth discontinuities mask distortion around edges.
+    auto target = Tensor::from_vector({0.3f, 0.3f, 0.3f, 0.5f}, {1, 4}, Device::CUDA);
+    gd.zero_();
+    ga.zero_();
+    launch_depth_distortion_loss(
+        s1.ptr<float>(), s2.ptr<float>(), alpha.ptr<float>(), gd.ptr<float>(), gs.ptr<float>(), ga.ptr<float>(),
+        4, 1, 4.f, nullptr, nullptr, nullptr, nullptr, 0.f, target.ptr<float>(), 10.f, 0.f);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const auto g_edge = gs.cpu().contiguous();
+    EXPECT_GT(g_edge.ptr<float>()[1], 0.f) << "interior pixel with smooth target depth stays active";
+    EXPECT_EQ(g_edge.ptr<float>()[2], 0.f) << "neighboring >3.5% target depth jump must mask distortion";
+}
+
+TEST_F(GsplatRasterizerTest, MedianDepthAndMeanMedianGradientsMatchFiniteDifferences) {
+    using lfs::training::kernels::launch_depth_distortion_loss;
+    auto camera = make_camera(96, 64);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+    constexpr float near_depth = 3.0f;
+    constexpr float far_depth = 3.4f;
+    // logit = -0.2 => sigmoid = 0.4502: T drops below 0.5 at the second (far) splat.
+    constexpr float logit = -0.2f;
+
+    const auto mean_median_loss_at = [&](const float a, const float b) {
+        auto model = make_stacked_splats(a, b, logit);
+        auto r = gsplat_rasterize_forward(camera, *model, bg, 0, 0, 0, 0, 1.0f, false, GsplatRenderMode::RGB_D_N, true);
+        EXPECT_TRUE(r.has_value());
+        EXPECT_TRUE(r->first.median_depth.is_valid());
+        AdamConfig config;
+        config.initial_capacity = 2;
+        AdamOptimizer optimizer(*model, config);
+        optimizer.allocate_gradients(2);
+        gsplat_rasterize_backward(r->second, Tensor::zeros_like(r->first.image), Tensor::zeros_like(r->first.alpha), *model, optimizer);
+
+        const auto s1 = r->first.depth.cpu().contiguous();
+        const auto alpha = r->first.alpha.cpu().contiguous();
+        const auto med = r->first.median_depth.cpu().contiguous();
+        const double eps = double(lfs::training::kernels::kDepthDistortionMeanMedianEpsilon);
+        double sum = 0.0;
+        for (size_t i = 0; i < alpha.numel(); ++i) {
+            const double av = alpha.ptr<float>()[i];
+            const double s1v = s1.ptr<float>()[i];
+            const double mv = med.ptr<float>()[i];
+            if (av <= lfs::training::kernels::kDepthDistortionMinAlpha || s1v <= 0.0 || mv <= 1.0e-4)
+                continue;
+            const double e = s1v / av;
+            if (e <= lfs::training::kernels::kDepthDistortionMinExpectedDepth)
+                continue;
+            const double u = std::log(e) - std::log(mv);
+            sum += std::sqrt(u * u + eps * eps) - eps;
+        }
+        return sum / static_cast<double>(alpha.numel());
+    };
+
+    auto run_bwd = [&](const bool force_dual) {
+        auto splat = make_stacked_splats(near_depth, far_depth, logit);
+        auto r = gsplat_rasterize_forward(camera, *splat, bg, 0, 0, 0, 0, 1.0f, false, GsplatRenderMode::RGB_D_N, true);
+        EXPECT_TRUE(r.has_value());
+        if (force_dual) {
+            r->second.conics_ptr = nullptr;
+        }
+        auto depth = r->first.depth.squeeze(0).contiguous();
+        auto depth_sq = r->first.depth_sq.squeeze(0).contiguous();
+        auto alpha = r->first.alpha.squeeze(0).contiguous();
+        auto median = r->first.median_depth.squeeze(0).contiguous();
+        auto grad_depth = Tensor::zeros(depth.shape(), Device::CUDA);
+        auto grad_alpha = Tensor::zeros(depth.shape(), Device::CUDA);
+        auto grad_depth_sq = Tensor::empty(depth.shape(), Device::CUDA);
+        auto grad_median = Tensor::zeros(depth.shape(), Device::CUDA);
+        launch_depth_distortion_loss(
+            depth.ptr<float>(), depth_sq.ptr<float>(), alpha.ptr<float>(),
+            grad_depth.ptr<float>(), grad_depth_sq.ptr<float>(), grad_alpha.ptr<float>(),
+            96, 64, 0.f, nullptr, nullptr, median.ptr<float>(), grad_median.ptr<float>(), 1.f);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        AdamConfig config;
+        config.initial_capacity = 2;
+        AdamOptimizer optimizer(*splat, config);
+        optimizer.allocate_gradients(2);
+        gsplat_rasterize_backward(
+            r->second, Tensor::zeros_like(r->first.image), grad_alpha, *splat, optimizer,
+            {}, {}, {}, grad_depth, {}, 0.f, {}, {}, grad_depth_sq, -1, grad_median);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        return optimizer.get_grad(ParamType::Means).cpu().contiguous();
+    };
+
+    const auto splat_means = run_bwd(false);
+    const auto dual_means = run_bwd(true);
+    constexpr float step = 0.002f;
+    const double near_num = (mean_median_loss_at(near_depth + step, far_depth) - mean_median_loss_at(near_depth - step, far_depth)) / (2.0 * step);
+    const double far_num = (mean_median_loss_at(near_depth, far_depth + step) - mean_median_loss_at(near_depth, far_depth - step)) / (2.0 * step);
+
+    EXPECT_NEAR(splat_means.ptr<float>()[2], near_num, 0.1 * std::abs(near_num));
+    EXPECT_NEAR(splat_means.ptr<float>()[5], far_num, 0.1 * std::abs(far_num));
+    EXPECT_NEAR(dual_means.ptr<float>()[2], splat_means.ptr<float>()[2], 1e-4f);
+    EXPECT_NEAR(dual_means.ptr<float>()[5], splat_means.ptr<float>()[5], 1e-4f);
+    // Moving near closer (or far farther) increases |log(mean) - log(median)|.
+    EXPECT_LT(splat_means.ptr<float>()[2], 0.f);
+    EXPECT_GT(splat_means.ptr<float>()[5], 0.f);
+}
+
+TEST_F(GsplatRasterizerTest, FreeSpaceOpacityGradientsMatchFiniteDifferences) {
+    auto camera = make_camera(96, 64);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+    constexpr float floater_z = 2.0f;
+    constexpr float surface_z = 3.0f;
+    constexpr float fs_limit = 2.8f;
+    constexpr float fs_weight = 1.0f;
+
+    auto run_free_space = [&](const float floater_logit, const bool force_dual) {
+        auto splat = make_stacked_splats(floater_z, surface_z, floater_logit);
+        auto r = gsplat_rasterize_forward(camera, *splat, bg, 0, 0, 0, 0, 1.0f, false, GsplatRenderMode::RGB_D_N, true);
+        EXPECT_TRUE(r.has_value());
+        if (force_dual) {
+            r->second.conics_ptr = nullptr;
+        }
+        auto lim = Tensor::full({64, 96}, fs_limit, Device::CUDA);
+        auto w = Tensor::full({64, 96}, fs_weight / float(96 * 64), Device::CUDA);
+        AdamConfig config;
+        config.initial_capacity = 2;
+        AdamOptimizer optimizer(*splat, config);
+        optimizer.allocate_gradients(2);
+        gsplat_rasterize_backward(
+            r->second, Tensor::zeros_like(r->first.image), Tensor::zeros_like(r->first.alpha),
+            *splat, optimizer, {}, {}, {}, {}, {}, 0.f, {}, {}, {}, -1, {}, lim, w);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        return optimizer.get_grad(ParamType::Opacity).cpu().contiguous();
+    };
+
+    // Analytical vs FD for non-saturated floater (logit = 0 => sigmoid = 0.5):
+    // L_fs(logit) = sum_{pix} (opac(logit) * vis_pix) * (fs_weight / Npix).
+    const auto splat_opac_0 = run_free_space(0.0f, false);
+    const auto dual_opac_0 = run_free_space(0.0f, true);
+    EXPECT_GT(splat_opac_0.ptr<float>()[0], 0.f) << "floater inside free space must get positive opacity grad";
+    EXPECT_EQ(splat_opac_0.ptr<float>()[1], 0.f) << "surface beyond free_space_limit must get zero grad";
+    EXPECT_NEAR(dual_opac_0.ptr<float>()[0], splat_opac_0.ptr<float>()[0], 1e-5f);
+    EXPECT_EQ(dual_opac_0.ptr<float>()[1], 0.f);
+
+    // Check against finite differences using an independent forward pass with splat 0 alone.
+    auto single_vis_sum = [&](const float logit) {
+        auto one = make_single_splat({0.f, 0.f, floater_z - 3.f}, {std::log(0.05f), std::log(0.05f), std::log(0.001f)}, {1.f, 0.f, 0.f, 0.f});
+        EXPECT_EQ(cudaMemcpy(one.opacity_raw().ptr<float>(), &logit, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+        auto out = gsplat_rasterize(camera, one, bg, 1.f, false, GsplatRenderMode::RGB, true);
+        const auto a = out.alpha.cpu().contiguous();
+        double sum = 0.0;
+        for (size_t i = 0; i < a.numel(); ++i)
+            sum += a.ptr<float>()[i];
+        return sum * double(fs_weight) / double(96 * 64);
+    };
+    constexpr float dl = 0.01f;
+    const double fd_opac = (single_vis_sum(dl) - single_vis_sum(-dl)) / (2.0 * dl);
+    EXPECT_NEAR(splat_opac_0.ptr<float>()[0], fd_opac, 0.05 * std::abs(fd_opac) + 1e-6);
+
+    // Saturated floater (logit = 10 => opac * vis > 0.999) must still receive suppression gradient.
+    const auto splat_sat = run_free_space(10.0f, false);
+    const auto dual_sat = run_free_space(10.0f, true);
+    EXPECT_GT(splat_sat.ptr<float>()[0], 0.f);
+    EXPECT_NEAR(dual_sat.ptr<float>()[0], splat_sat.ptr<float>()[0], 1e-7f);
+}
+
+TEST_F(GsplatRasterizerTest, MetricDepthLossDeadbandHuberAndEdges) {
+    using lfs::training::kernels::DepthAnchor;
+    using lfs::training::kernels::depth_loss_partial_count;
+    using lfs::training::kernels::launch_build_free_space_map;
+    using lfs::training::kernels::launch_metric_depth_loss;
+
+    constexpr int W = 16, H = 16;
+    DepthAnchor anchor{};
+    anchor.valid = true;
+    anchor.metric_exact = true;
+    anchor.model = 1;
+    anchor.scale = 10.0f;
+    anchor.shift = 0.0f;
+
+    std::vector<float> target_h(W * H, 0.30f); // 3.0 m
+    for (int y = 0; y < H; ++y)
+        for (int x = 10; x < W; ++x)
+            target_h[y * W + x] = 0.50f; // 5.0 m step at x=10
+
+    auto target = Tensor::from_vector(target_h, {H, W}, Device::CUDA);
+    auto alpha = Tensor::full({H, W}, 0.95f, Device::CUDA);
+    auto grad_d = Tensor::empty({H, W}, Device::CUDA);
+    auto grad_a = Tensor::empty({H, W}, Device::CUDA);
+    auto grad_m = Tensor::empty({H, W}, Device::CUDA);
+    auto loss_out = Tensor::zeros({1}, Device::CUDA);
+    auto partials = Tensor::empty({depth_loss_partial_count(W * H)}, Device::CUDA);
+
+    // 1) Deadband: e = 3.01 m / 5.02 m (within max(1.5cm, 0.8%*d) deadband) => zero gradient everywhere.
+    std::vector<float> med_db_h(W * H, 3.01f);
+    std::vector<float> depth_db_h(W * H, 3.01f * 0.95f);
+    for (int y = 0; y < H; ++y) {
+        for (int x = 10; x < W; ++x) {
+            med_db_h[y * W + x] = 5.02f;
+            depth_db_h[y * W + x] = 5.02f * 0.95f;
+        }
+    }
+    auto depth_db = Tensor::from_vector(depth_db_h, {H, W}, Device::CUDA);
+    auto med_db = Tensor::from_vector(med_db_h, {H, W}, Device::CUDA);
+    launch_metric_depth_loss(
+        depth_db.ptr<float>(), alpha.ptr<float>(), med_db.ptr<float>(), target.ptr<float>(),
+        grad_d.ptr<float>(), grad_a.ptr<float>(), grad_m.ptr<float>(), loss_out.ptr<float>(),
+        partials.ptr<float>(), W, H, 1.f, 1.f, 0.f, 0.f, &anchor);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_FLOAT_EQ(loss_out.cpu().ptr<float>()[0], 0.f);
+    EXPECT_FLOAT_EQ(grad_d.cpu().ptr<float>()[5 * W + 5], 0.f);
+    EXPECT_FLOAT_EQ(grad_m.cpu().ptr<float>()[5 * W + 5], 0.f);
+
+    // 2) Outside deadband (e = 3.50 m, med = 3.50 m): nonzero gradient in interior, zero at edge x=9.
+    auto depth_hi = Tensor::full({H, W}, 3.50f * 0.95f, Device::CUDA);
+    auto med_hi = Tensor::full({H, W}, 3.50f, Device::CUDA);
+    launch_metric_depth_loss(
+        depth_hi.ptr<float>(), alpha.ptr<float>(), med_hi.ptr<float>(), target.ptr<float>(),
+        grad_d.ptr<float>(), grad_a.ptr<float>(), grad_m.ptr<float>(), loss_out.ptr<float>(),
+        partials.ptr<float>(), W, H, 1.f, 1.f, 1.f, 0.f, &anchor);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const auto gd_h = grad_d.cpu().to_vector();
+    const auto gm_h = grad_m.cpu().to_vector();
+    EXPECT_GT(gd_h[5 * W + 5], 0.f);
+    EXPECT_GT(gm_h[5 * W + 5], 0.f);
+    EXPECT_FLOAT_EQ(gd_h[5 * W + 9], 0.f) << "depth edge pixel x=9 must not be pulled";
+    EXPECT_FLOAT_EQ(gm_h[5 * W + 9], 0.f) << "depth edge pixel x=9 must not be pulled on median";
+
+    // 3) Free-space map: 5x5 local min masks border [0,1] and drops near step; interior gets 3.0 - max(0.06, 0.04*3)=2.88 m.
+    auto fs_lim = Tensor::empty({H, W}, Device::CUDA);
+    auto fs_w = Tensor::empty({H, W}, Device::CUDA);
+    launch_build_free_space_map(target.ptr<float>(), W, H, 10.f, 0.f, 1.f, fs_lim.ptr<float>(), fs_w.ptr<float>());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const auto lim_h = fs_lim.cpu().to_vector();
+    EXPECT_FLOAT_EQ(lim_h[0], 0.f);
+    EXPECT_NEAR(lim_h[5 * W + 5], 2.88f, 1e-4f);
+    EXPECT_NEAR(lim_h[5 * W + 12], 4.80f, 1e-4f);
 }
 
 TEST_F(GsplatRasterizerTest, ExpectedRadialDepthBehindCameraHasCorrectGradients) {

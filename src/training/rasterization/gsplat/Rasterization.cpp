@@ -72,7 +72,8 @@ namespace gsplat_lfs {
         int32_t* last_ids,
         cudaStream_t stream, TileRange tiles,
         float* median_depth,
-        const ScreenFootprint& footprint) {
+        const ScreenFootprint& footprint,
+        int32_t* median_ids) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -94,7 +95,7 @@ namespace gsplat_lfs {
             radial_coeffs, tangential_coeffs, thin_prism_coeffs,     \
             tile_offsets, flatten_ids,                               \
             renders, alphas, last_ids, stream, tiles, median_depth,  \
-            footprint);                                              \
+            footprint, median_ids);                                  \
         break;
 
         switch (channels) {
@@ -176,7 +177,8 @@ namespace gsplat_lfs {
         const ColorVarianceRender& color_variance,
         float* blend_peak_out,
         const RenderGradPlanes& grad_planes,
-        const bool edge_weight_fp16) {
+        const bool edge_weight_fp16,
+        const ExtraDepthBwd& extra_depth) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -193,23 +195,24 @@ namespace gsplat_lfs {
             return;
         }
 
-#define __LAUNCH_KERNEL__(CDIM)                                      \
-    case CDIM:                                                       \
-        launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM>( \
-            means, quats, scales, colors, opacities,                 \
-            backgrounds, bg_images, masks, compensations, dilations, \
-            C, N, n_isects,                                          \
-            image_width, image_height, tile_size,                    \
-            viewmats0, viewmats1, Ks, camera_model,                  \
-            ut_params, rs_type,                                      \
-            radial_coeffs, tangential_coeffs, thin_prism_coeffs,     \
-            tile_offsets, flatten_ids,                               \
-            render_alphas, last_ids,                                 \
-            v_render_colors, v_render_alphas,                        \
-            v_means, v_quats, v_scales, v_colors, v_opacities,       \
-            densification_weight, densification_error, densification_error_map,    \
-            edge_weight_map, edge_score_out, stream, tiles, footprint,             \
-            color_variance, blend_peak_out, grad_planes, edge_weight_fp16);        \
+#define __LAUNCH_KERNEL__(CDIM)                                                     \
+    case CDIM:                                                                      \
+        launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM>(                \
+            means, quats, scales, colors, opacities,                                \
+            backgrounds, bg_images, masks, compensations, dilations,                \
+            C, N, n_isects,                                                         \
+            image_width, image_height, tile_size,                                   \
+            viewmats0, viewmats1, Ks, camera_model,                                 \
+            ut_params, rs_type,                                                     \
+            radial_coeffs, tangential_coeffs, thin_prism_coeffs,                    \
+            tile_offsets, flatten_ids,                                              \
+            render_alphas, last_ids,                                                \
+            v_render_colors, v_render_alphas,                                       \
+            v_means, v_quats, v_scales, v_colors, v_opacities,                      \
+            densification_weight, densification_error, densification_error_map,     \
+            edge_weight_map, edge_score_out, stream, tiles, footprint,              \
+            color_variance, blend_peak_out, grad_planes, edge_weight_fp16,          \
+            extra_depth);                                                           \
         break;
 
         switch (channels) {
@@ -282,7 +285,8 @@ namespace gsplat_lfs {
         const float* reference_viewmats,
         float* median_depth,
         const uint32_t* tile_sub_masks,
-        const float* cached_unit_rays) {
+        const float* cached_unit_rays,
+        int32_t* median_ids) {
         gsplat_lfs::debug_validate_cuda_pointer(means, "means");
         gsplat_lfs::debug_validate_cuda_pointer(quats, "quats");
         gsplat_lfs::debug_validate_cuda_pointer(scales, "scales");
@@ -378,7 +382,8 @@ namespace gsplat_lfs {
                                 .prune_tile_keys32 = (use_keys32 && prune) ? batch.isect_keys32 : nullptr,
                                 .tile_sub_masks = tile_sub_masks,
                                 .unit_rays = cached_unit_rays,
-                                .tile_order = micro_ok ? batch.tile_order : nullptr});
+                                .tile_order = micro_ok ? batch.tile_order : nullptr},
+                median_ids);
         };
 
         // Step 3: Tile intersection. The first call retains the existing speculative warm-cache path.
@@ -507,7 +512,8 @@ namespace gsplat_lfs {
         const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready,
         const uint32_t* tile_keys32,
         const bool edge_weight_fp16,
-        const int32_t* tile_order) {
+        const int32_t* tile_order,
+        const ExtraDepthBwd& extra_depth) {
         // Determine output channels
         uint32_t channels = 3;
         if (render_mode == 1 || render_mode == 2) {
@@ -558,7 +564,7 @@ namespace gsplat_lfs {
                                 .tile_sub_masks = tile_sub_masks,
                                 .unit_rays = cached_unit_rays,
                                 .tile_order = (batches.empty() && C == 1) ? tile_order : nullptr},
-                color_variance, blend_peak_out, grad_planes, edge_weight_fp16);
+                color_variance, blend_peak_out, grad_planes, edge_weight_fp16, extra_depth);
         };
         GutSubstageProfiler::instance().begin_bwd(stream);
         {

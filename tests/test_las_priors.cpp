@@ -119,6 +119,45 @@ TEST(LasPriorSidecar, IgnoresUnrelatedOrBrokenJson) {
     EXPECT_FALSE(lfs::training::read_las_prior_sidecar(dir.path()).has_value());
 }
 
+TEST(LasPriorSidecar, ParsesExactMetricDepthRangesWhenLasAligned) {
+    TempDir dir;
+    write_text(dir.path() / "supervision.json",
+               R"({
+                   "depth_alignment": "las_face_bilateral_v1",
+                   "depth_encoding": "linear_[min_d,max_d]_to_[0.02,1.0]*65535",
+                   "depth_format": "uint16_png_ssi",
+                   "depth_source": "moge2_ssi",
+                   "depth_type": "ray_distance",
+                   "normal_frame": "opencv_camera",
+                   "images": [
+                       {"name": "L\\frame_001.JPG", "monocular": {"min_distance_m": 0.4, "max_distance_m": 10.2}},
+                       {"name": "R/frame_002.JPG", "monocular": {"min_distance_m": 1.0, "max_distance_m": 5.0}},
+                       {"name": "bad.JPG", "monocular": {"min_distance_m": 0.0, "max_distance_m": 5.0}}
+                   ]
+               })");
+    const auto sidecar = lfs::training::read_las_prior_sidecar(dir.path());
+    ASSERT_TRUE(sidecar.has_value());
+    EXPECT_TRUE(sidecar->metric_aligned);
+    EXPECT_EQ(sidecar->depth_alignment, "las_face_bilateral_v1");
+    ASSERT_EQ(sidecar->metric_depth_ranges.size(), 2u);
+    EXPECT_FLOAT_EQ(sidecar->metric_depth_ranges.at("L/frame_001.JPG").min_distance_m, 0.4f);
+    EXPECT_FLOAT_EQ(sidecar->metric_depth_ranges.at("L/frame_001.JPG").max_distance_m, 10.2f);
+    EXPECT_FLOAT_EQ(sidecar->metric_depth_ranges.at("R/frame_002.JPG").min_distance_m, 1.0f);
+    EXPECT_FLOAT_EQ(sidecar->metric_depth_ranges.at("R/frame_002.JPG").max_distance_m, 5.0f);
+
+    // Without depth_alignment starting with "las_", metric_aligned stays false.
+    write_text(dir.path() / "supervision.json",
+               R"({
+                   "depth_encoding": "linear_[min_d,max_d]_to_[0.02,1.0]*65535",
+                   "depth_format": "uint16_png_ssi",
+                   "images": [{"name": "L/frame_001.JPG", "monocular": {"min_distance_m": 0.4, "max_distance_m": 10.2}}]
+               })");
+    const auto non_las = lfs::training::read_las_prior_sidecar(dir.path());
+    ASSERT_TRUE(non_las.has_value());
+    EXPECT_FALSE(non_las->metric_aligned);
+    EXPECT_TRUE(non_las->metric_depth_ranges.empty());
+}
+
 TEST(NormalPriorBlank, ZeroRgbDecodesToZeroVector) {
     if (!cuda_available()) {
         GTEST_SKIP() << "No CUDA device available";

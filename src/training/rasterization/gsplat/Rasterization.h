@@ -56,7 +56,8 @@ namespace gsplat_lfs {
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
         float* median_depth = nullptr,
-        const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
+        const ScreenFootprint& footprint = {},
+        int32_t* median_ids = nullptr); // lets the micro-tile forward cull sub-tiles
 
     /////////////////////////////////////////////////
     // rasterize_to_pixels_from_world_3dgs - Backward
@@ -118,7 +119,8 @@ namespace gsplat_lfs {
         const ColorVarianceRender& color_variance = {},
         float* blend_peak_out = nullptr,
         const RenderGradPlanes& grad_planes = {},
-        bool edge_weight_fp16 = false);
+        bool edge_weight_fp16 = false,
+        const ExtraDepthBwd& extra_depth = {});
 
     /////////////////////////////////////////////////
     // rasterize_to_indices_3dgs

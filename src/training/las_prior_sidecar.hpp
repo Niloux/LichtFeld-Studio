@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lfs::training {
@@ -17,9 +18,17 @@ namespace lfs::training {
     // GeosunPre (MoGe-2 SSI depth + normals). Only the fields that change how
     // training configures prior loading and rasterization are kept.
     struct LasPriorSidecar {
+        struct MetricDepthRange {
+            float min_distance_m = 0.0f;
+            float max_distance_m = 0.0f;
+        };
+
         bool ssi_depth = false;             // depth_format "uint16_png_ssi" or MoGe-2 SSI metadata
         bool ray_distance = false;          // depth_type "ray_distance", as GUT renders non-pinhole depth
         bool normals_camera_opencv = false; // normal_frame "opencv_camera..."
+        bool metric_aligned = false;        // exact per-image metric [min_d, max_d] ranges present
+        std::string depth_alignment;
+        std::unordered_map<std::string, MetricDepthRange> metric_depth_ranges;
     };
 
     [[nodiscard]] std::optional<LasPriorSidecar> read_las_prior_sidecar(

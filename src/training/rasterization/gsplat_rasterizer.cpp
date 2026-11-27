@@ -130,6 +130,8 @@ namespace lfs::training {
             core::Tensor image_chw;
             core::Tensor alpha_chw;
             core::Tensor depth_chw;
+            core::Tensor median_depth_chw;
+            core::Tensor median_ids_hw;
             core::Tensor camera_rays;
             core::Tensor geometry_bg;
             core::Tensor tile_sub_masks;
@@ -485,10 +487,38 @@ namespace lfs::training {
             }
 
             // Median depth needs the splat depth channel and the whole image.
-            float* const median_depth =
+            core::Tensor median_depth_tensor;
+            core::Tensor median_ids_tensor;
+            float* median_depth =
                 (median_depth_in != nullptr && channels != 3 && tile_width == 0 && tile_height == 0)
                     ? median_depth_in
                     : nullptr;
+            if (median_depth == nullptr && render_mode == GsplatRenderMode::RGB_D_N &&
+                tile_width == 0 && tile_height == 0) {
+                auto& cached_median = gsplat_thread_caches.median_depth_chw;
+                const core::TensorShape median_shape = {1UL, static_cast<size_t>(H), static_cast<size_t>(W)};
+                if (!cached_median.is_valid() || cached_median.shape() != median_shape) {
+                    cached_median = core::Tensor::empty(median_shape, core::Device::CUDA, core::DataType::Float32);
+                }
+                if (cached_median.stream() != fwd_stream) {
+                    cached_median.set_stream(fwd_stream);
+                }
+                median_depth_tensor = cached_median;
+                median_depth = cached_median.ptr<float>();
+            }
+            int32_t* median_ids_ptr = nullptr;
+            if (median_depth != nullptr) {
+                auto& cached_ids = gsplat_thread_caches.median_ids_hw;
+                const core::TensorShape ids_shape = {static_cast<size_t>(H), static_cast<size_t>(W)};
+                if (!cached_ids.is_valid() || cached_ids.shape() != ids_shape) {
+                    cached_ids = core::Tensor::empty(ids_shape, core::Device::CUDA, core::DataType::Int32);
+                }
+                if (cached_ids.stream() != fwd_stream) {
+                    cached_ids.set_stream(fwd_stream);
+                }
+                median_ids_tensor = cached_ids;
+                median_ids_ptr = cached_ids.ptr<int32_t>();
+            }
 
             // Weighted pixels decide which sub-tiles get pairs; only whole-frame renders.
             core::Tensor tile_sub_masks;
@@ -716,12 +746,16 @@ namespace lfs::training {
                 viewmat_ptr,
                 median_depth,
                 tile_sub_masks_ptr,
-                cached_unit_rays_ptr);
+                cached_unit_rays_ptr,
+                median_ids_ptr);
             // isect_ids / flatten_ids are borrowed from the TLS VMM cache —
             // never transfer ownership or free on error paths.
 
             RenderOutput render_output;
             render_output.alpha = cached_alpha_chw;
+            if (median_depth_tensor.is_valid()) {
+                render_output.median_depth = median_depth_tensor;
+            }
 
             switch (render_mode) {
             case GsplatRenderMode::RGB:
@@ -860,6 +894,8 @@ namespace lfs::training {
             ctx.render_tile_width = tile_width;
             ctx.render_tile_height = tile_height;
             ctx.tile_sub_masks = tile_sub_masks;
+            ctx.median_ids_ptr = median_ids_ptr;
+            ctx.median_ids = std::move(median_ids_tensor);
 
             return std::pair{render_output, ctx};
         } catch (const lfs::Exception& exception) {
@@ -902,7 +938,10 @@ namespace lfs::training {
         const GsplatColorVarianceLoss& color_variance,
         core::Tensor blend_peak_out,
         const core::Tensor& grad_depth_sq,
-        int fuse_shN_iteration) {
+        int fuse_shN_iteration,
+        const core::Tensor& grad_median_depth,
+        const core::Tensor& free_space_limit,
+        const core::Tensor& free_space_weight) {
 
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -923,7 +962,9 @@ namespace lfs::training {
             }
             // A caller may produce loss gradients on a different stream from
             // the saved forward context. Order every raw-pointer read explicitly.
-            for (const auto* gradient : {&grad_image, &grad_alpha, &grad_depth, &grad_normal, &grad_depth_sq}) {
+            for (const auto* gradient :
+                 {&grad_image, &grad_alpha, &grad_depth, &grad_normal, &grad_depth_sq,
+                  &grad_median_depth, &free_space_limit, &free_space_weight}) {
                 if (gradient->is_valid() && gradient->numel() > 0) {
                     gradient->sync_to_stream(stream);
                 }
@@ -1166,6 +1207,32 @@ namespace lfs::training {
                 blend_peak_out.sync_to_stream(stream);
                 blend_peak_out.set_stream(stream);
             }
+            gsplat_lfs::ExtraDepthBwd extra_depth{};
+            if (channels == 4 || channels == 8) {
+                if (ctx.median_ids_ptr != nullptr && grad_median_depth.is_valid() && grad_median_depth.numel() > 0) {
+                    LFS_ASSERT_MSG(grad_median_depth.numel() == static_cast<size_t>(H) * W &&
+                                       grad_median_depth.is_contiguous() &&
+                                       grad_median_depth.device() == core::Device::CUDA &&
+                                       grad_median_depth.dtype() == core::DataType::Float32,
+                                   "GUT median depth gradient shape/type mismatch");
+                    core::pin_operands({&grad_median_depth});
+                    extra_depth.v_median_depth = grad_median_depth.ptr<float>();
+                    extra_depth.median_ids = ctx.median_ids_ptr;
+                }
+                if (free_space_limit.is_valid() && free_space_limit.numel() > 0 &&
+                    free_space_weight.is_valid() && free_space_weight.numel() > 0) {
+                    LFS_ASSERT_MSG(free_space_limit.numel() == static_cast<size_t>(H) * W &&
+                                       free_space_weight.numel() == static_cast<size_t>(H) * W &&
+                                       free_space_limit.is_contiguous() && free_space_weight.is_contiguous() &&
+                                       free_space_limit.device() == core::Device::CUDA &&
+                                       free_space_weight.device() == core::Device::CUDA,
+                                   "GUT free-space buffer shape/device mismatch");
+                    core::pin_operands({&free_space_limit, &free_space_weight});
+                    extra_depth.free_space_limit = free_space_limit.ptr<float>();
+                    extra_depth.free_space_weight = free_space_weight.ptr<float>();
+                }
+            }
+
             // Call backward with raw pointers
             gsplat_lfs::rasterize_from_world_with_sh_bwd(
                 ctx.means.ptr<float>(),
@@ -1237,7 +1304,8 @@ namespace lfs::training {
                 on_sh_colors_ready,
                 ctx.sub_tile_masks ? ctx.isect_keys32_ptr : nullptr,
                 edge_weight_fp16,
-                ctx.tile_order_ptr);
+                ctx.tile_order_ptr,
+                extra_depth);
 
             gsplat_lfs::flatten_scale_grad(ctx.scales.ptr<float>(), v_scales_ptr, N, flatten_weight, stream);
             optimizer.set_ray_depth_view(ctx.cam_position_ptr, ctx.far_plane);
@@ -1283,6 +1351,8 @@ namespace lfs::training {
         gsplat_thread_caches.image_chw = {};
         gsplat_thread_caches.alpha_chw = {};
         gsplat_thread_caches.depth_chw = {};
+        gsplat_thread_caches.median_depth_chw = {};
+        gsplat_thread_caches.median_ids_hw = {};
         gsplat_thread_caches.camera_rays = {};
         gsplat_thread_caches.geometry_bg = {};
         gsplat_thread_caches.tile_sub_masks = {};

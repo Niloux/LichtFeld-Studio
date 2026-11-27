@@ -387,7 +387,8 @@ namespace gsplat_lfs {
         const void* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
         const ColorVarianceRender, float* __restrict__ blend_peak_out,
-        const RenderGradPlanes, const bool edge_weight_fp16) {
+        const RenderGradPlanes, const bool edge_weight_fp16,
+        const ExtraDepthBwd) {
         auto block = cg::this_thread_block();
         const uint32_t cid = block.group_index().x;
         const uint32_t tile_id =
@@ -698,7 +699,8 @@ namespace gsplat_lfs {
         const void* __restrict__ edge_weight_map,
         float* __restrict__ edge_score_out, const TileRange tiles,
         const ColorVarianceRender color_variance, float* __restrict__ blend_peak_out,
-        const RenderGradPlanes grad_planes, const bool edge_weight_fp16) {
+        const RenderGradPlanes grad_planes, const bool edge_weight_fp16,
+        const ExtraDepthBwd extra_depth) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
         uint32_t tile_id =
@@ -822,6 +824,19 @@ namespace gsplat_lfs {
         }
         const bool do_dens = densification_error != nullptr && densification_error_map != nullptr;
         const float pixel_error = do_dens ? densification_error_map[pix_id] : 0.f;
+        const uint32_t bwd_pixels = image_width * image_height;
+        const int32_t med_id =
+            (kHasRayDepth && extra_depth.has_median() && active)
+                ? extra_depth.median_ids[static_cast<size_t>(cid) * bwd_pixels + pix_id]
+                : -1;
+        const float v_med =
+            (med_id >= 0) ? extra_depth.v_median_depth[static_cast<size_t>(cid) * bwd_pixels + pix_id] : 0.f;
+        const float fs_lim =
+            (kHasRayDepth && extra_depth.has_free_space() && active)
+                ? extra_depth.free_space_limit[static_cast<size_t>(cid) * bwd_pixels + pix_id]
+                : 0.f;
+        const float fs_w =
+            (fs_lim > 0.f) ? extra_depth.free_space_weight[static_cast<size_t>(cid) * bwd_pixels + pix_id] : 0.f;
 
         const bool do_cv = (CDIM >= 3) && color_variance.enabled();
         float4 cv_target = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -972,6 +987,7 @@ namespace gsplat_lfs {
                 if (valid_mask != 0u) {
                     const float ra = 1.0f / (1.0f - alpha);
                     if (valid) {
+                        const int32_t isect_idx = batch_end - static_cast<int32_t>(t);
                         T *= ra;
                         const float fac = alpha * T;
                         blend_peak = fac;
@@ -1019,6 +1035,11 @@ namespace gsplat_lfs {
                         if (have_bg) {
                             v_alpha += -T_final * ra * bg_accum;
                         }
+                        if constexpr (kHasRayDepth) {
+                            if (med_id >= 0 && isect_idx == med_id) {
+                                v_depth += v_med;
+                            }
+                        }
                         if constexpr (CDIM >= 3) {
                             if (cv_target.w > 0.f) {
                                 const float r0 = rgbs_batch[t * CDIM + 0] - cv_target.x;
@@ -1047,7 +1068,7 @@ namespace gsplat_lfs {
                                 const vec3 v_grd_n = -glm::cross(v_gcrod, gro);
                                 v_gro = glm::cross(v_gcrod, grd_n);
                                 v_grd = safe_normalize_bw(grd, v_grd_n);
-                                v_opacity_local = vis * v_alpha;
+                                v_opacity_local += vis * v_alpha;
                             }
                             if constexpr (kHasRayDepth) {
                                 if (depth_grad) {
@@ -1064,6 +1085,11 @@ namespace gsplat_lfs {
                             const mat3 R = quat_to_rotmat(quat);
                             quat_scale_to_preci_half_vjp(
                                 quat, scale_act, R, glm::transpose(v_Mt), v_quat_local, v_scale_local);
+                        }
+                        if constexpr (kHasRayDepth) {
+                            if (fs_lim > 0.f && depth > 0.f && depth < fs_lim && fs_w > 0.f) {
+                                v_opacity_local += vis * fs_w;
+                            }
                         }
                     }
                     warpSum<CDIM>(v_rgb_local, warp);
@@ -1152,7 +1178,8 @@ namespace gsplat_lfs {
     constexpr int kSplatBwdSurvivors = 96;
 
     template <uint32_t CDIM, bool kPerfectPinhole, bool kEdgeScoring, bool kBatched,
-              bool kColorVariance = false, bool kCachedRays = false, bool kGlobalShutter = false>
+              bool kColorVariance = false, bool kCachedRays = false, bool kGlobalShutter = false,
+              bool kExtraDepth = false>
     __global__ void __launch_bounds__(32, 20) rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel(
         const uint32_t C,
         const uint32_t N,
@@ -1200,7 +1227,8 @@ namespace gsplat_lfs {
         const ColorVarianceRender color_variance,
         float* __restrict__ blend_peak_out,
         const RenderGradPlanes grad_planes,
-        const bool edge_weight_fp16) {
+        const bool edge_weight_fp16,
+        const ExtraDepthBwd extra_depth) {
         const uint32_t subs = tile_size / kSplatBwdSub;
         uint32_t cid = 0, tile_id = 0, sub_bit = 0, sub_y = 0, sub_x = 0;
         if (footprint.tile_order != nullptr) {
@@ -1271,6 +1299,9 @@ namespace gsplat_lfs {
         __shared__ float s_edge[kEdgeScoring ? kSplatBwdPixels : 1];
         __shared__ float4 s_cv_target[kUseCv ? kSplatBwdPixels : 1];
         __shared__ float s_cv_buf[kUseCv ? kSplatBwdPixels : 1];
+        __shared__ int32_t s_median_id[kExtraDepth ? kSplatBwdPixels : 1];
+        __shared__ float s_v_median[kExtraDepth ? kSplatBwdPixels : 1];
+        __shared__ float2 s_free[kExtraDepth ? kSplatBwdPixels : 1];
         __shared__ float3 s_ray_o[kSplatBwdSub];
         __shared__ float s_ray_dx[kSplatBwdPixels];
         __shared__ float s_ray_dy[kSplatBwdPixels];
@@ -1353,6 +1384,11 @@ namespace gsplat_lfs {
             s_bin[p] = -1;
             if constexpr (kUseCv)
                 s_cv_buf[p] = 0.f;
+            if constexpr (kExtraDepth) {
+                s_median_id[p] = -1;
+                s_v_median[p] = 0.f;
+                s_free[p] = make_float2(0.f, 0.f);
+            }
             if (x >= image_width || y >= image_height)
                 continue;
 
@@ -1370,6 +1406,27 @@ namespace gsplat_lfs {
                 v_color[k] = load_grad_plane<CDIM>(
                     grad_planes, v_render_colors, cid, k, pix, image_height, image_width);
                 has_gradient |= v_color[k] != 0.f;
+            }
+            int32_t med_id = -1;
+            float v_med = 0.f;
+            float fs_lim = 0.f;
+            float fs_w = 0.f;
+            if constexpr (kExtraDepth && kHasRayDepth) {
+                const size_t epix = static_cast<size_t>(cid) * pixels + pix;
+                if (extra_depth.has_median()) {
+                    med_id = extra_depth.median_ids[epix];
+                    if (med_id >= 0) {
+                        v_med = extra_depth.v_median_depth[epix];
+                        has_gradient |= (v_med != 0.f);
+                    }
+                }
+                if (extra_depth.has_free_space()) {
+                    fs_lim = extra_depth.free_space_limit[epix];
+                    if (fs_lim > 0.f) {
+                        fs_w = extra_depth.free_space_weight[epix];
+                        has_gradient |= (fs_w != 0.f);
+                    }
+                }
             }
             // These auxiliary paths can contribute even when the image loss has no gradient.
             if constexpr (!kUseCv && !kEdgeScoring) {
@@ -1420,6 +1477,11 @@ namespace gsplat_lfs {
             }
             s_tail[p] = T_final * (v_a - (have_bg ? bg : 0.f));
             s_error[p] = do_dens ? densification_error_map[pix] : 0.f;
+            if constexpr (kExtraDepth) {
+                s_median_id[p] = med_id;
+                s_v_median[p] = v_med;
+                s_free[p] = make_float2(fs_lim, fs_w);
+            }
             if constexpr (kEdgeScoring) {
                 s_edge[p] = load_edge_weight(edge_weight_map, pix, edge_weight_fp16);
             }
@@ -1628,6 +1690,15 @@ namespace gsplat_lfs {
                                         const float v_d2 = s_v_c[kDepthSqChannel][p];
                                         color_dot += (depth * depth) * v_d2;
                                         v_depth += fac * (2.0f * depth) * v_d2;
+                                    }
+                                    if constexpr (kExtraDepth) {
+                                        if (isect_idx == s_median_id[p]) {
+                                            v_depth += s_v_median[p];
+                                        }
+                                        const float2 fs = s_free[p];
+                                        if (fs.x > 0.f && depth > 0.f && depth < fs.x && fs.y > 0.f) {
+                                            v_opacity += vis * fs.y;
+                                        }
                                     }
                                 }
                                 const float buffer_dot = s_buffer_dot[p];
@@ -1853,7 +1924,8 @@ namespace gsplat_lfs {
         const ColorVarianceRender& color_variance,
         float* blend_peak_out,
         const RenderGradPlanes& grad_planes,
-        const bool edge_weight_fp16) {
+        const bool edge_weight_fp16,
+        const ExtraDepthBwd& extra_depth) {
         const bool packed = false; // Only support non-packed for now
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
@@ -1914,7 +1986,7 @@ namespace gsplat_lfs {
                 densification_error,
                 densification_error_map,
                 edge_weight_map,
-                edge_score_out, tiles, color_variance, blend_peak_out, grad_planes, edge_weight_fp16);
+                edge_score_out, tiles, color_variance, blend_peak_out, grad_planes, edge_weight_fp16, extra_depth);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
         };
 
@@ -1946,44 +2018,53 @@ namespace gsplat_lfs {
                             reinterpret_cast<vec3*>(v_scales),
                             v_colors, v_opacities, densification_weight, densification_error, densification_error_map,
                             edge_weight_map, edge_score_out, tiles, footprint, color_variance, blend_peak_out,
-                            grad_planes, edge_weight_fp16);
+                            grad_planes, edge_weight_fp16, extra_depth);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd_splat");
                     };
                     const bool edges = edge_weight_map != nullptr && edge_score_out != nullptr;
                     const bool cached_rays = !perfect_pinhole && footprint.unit_rays != nullptr &&
                                              camera_model != CameraModelType::PINHOLE;
-                    auto dispatch_splat = [&]<bool kUseCv>() {
+                    auto dispatch_splat = [&]<bool kUseCv, bool kExtra>() {
                         if (global_shutter && perfect_pinhole) {
                             if (edges)
-                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched, kUseCv, false, true>);
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, true, kBatched, kUseCv, false, true, kExtra>);
                             else
-                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched, kUseCv, false, true>);
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, true, false, kBatched, kUseCv, false, true, kExtra>);
                         } else if (cached_rays) {
                             if (global_shutter) {
                                 if (edges)
-                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv, true, true>);
+                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv, true, true, kExtra>);
                                 else
-                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv, true, true>);
+                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv, true, true, kExtra>);
                             } else {
                                 if (edges)
-                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv, true, false>);
+                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv, true, false, kExtra>);
                                 else
-                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv, true, false>);
+                                    launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv, true, false, kExtra>);
                             }
                         } else {
                             if (edges)
-                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv, false, false>);
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, true, kBatched, kUseCv, false, false, kExtra>);
                             else
-                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv, false, false>);
+                                launch_splat(rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel<CDIM, false, false, kBatched, kUseCv, false, false, kExtra>);
                         }
+                    };
+                    auto dispatch_extra = [&]<bool kUseCv>() {
+                        if constexpr (CDIM == 4 || CDIM == 8) {
+                            if (extra_depth.enabled()) {
+                                dispatch_splat.template operator()<kUseCv, true>();
+                                return;
+                            }
+                        }
+                        dispatch_splat.template operator()<kUseCv, false>();
                     };
                     if constexpr (CDIM >= 3) {
                         if (color_variance.enabled()) {
-                            dispatch_splat.template operator()<true>();
+                            dispatch_extra.template operator()<true>();
                             return;
                         }
                     }
-                    dispatch_splat.template operator()<false>();
+                    dispatch_extra.template operator()<false>();
                     return;
                 }
             }
@@ -2129,7 +2210,8 @@ namespace gsplat_lfs {
         const ColorVarianceRender& color_variance,                            \
         float* blend_peak_out,                                                 \
         const RenderGradPlanes& grad_planes,                                   \
-        bool edge_weight_fp16);
+        bool edge_weight_fp16,                                                 \
+        const ExtraDepthBwd& extra_depth);
 
     __INS__(1)
     __INS__(2)

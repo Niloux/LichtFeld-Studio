@@ -275,7 +275,8 @@ namespace gsplat_lfs {
         int32_t* last_ids, // [C, image_height, image_width]
         cudaStream_t stream = nullptr, TileRange tiles = {},
         float* median_depth = nullptr,
-        const ScreenFootprint& footprint = {}); // lets the micro-tile forward cull sub-tiles
+        const ScreenFootprint& footprint = {},
+        int32_t* median_ids = nullptr); // lets the micro-tile forward cull sub-tiles
 
     //=========================================================================
     // Rasterization - Backward
@@ -306,6 +307,28 @@ namespace gsplat_lfs {
         [[nodiscard]] bool enabled() const {
             return v_rgb != nullptr || v_depth != nullptr || v_normal != nullptr || v_depth_sq != nullptr;
         }
+    };
+
+    struct ExtraDepthBwd {
+        const float* v_median_depth = nullptr;    // [C, H, W]
+        const int32_t* median_ids = nullptr;      // [C, H, W] isect_idx from forward (-1 if none)
+        const float* free_space_limit = nullptr;  // [C, H, W] conservative max empty-air depth (>0 active)
+        const float* free_space_weight = nullptr; // [C, H, W] per-pixel opacity suppression weight
+
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        [[nodiscard]] bool has_median() const { return v_median_depth != nullptr && median_ids != nullptr; }
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        [[nodiscard]] bool has_free_space() const {
+            return free_space_limit != nullptr && free_space_weight != nullptr;
+        }
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        [[nodiscard]] bool enabled() const { return has_median() || has_free_space(); }
     };
 
     void rasterize_to_pixels_from_world_3dgs_bwd(
@@ -364,7 +387,8 @@ namespace gsplat_lfs {
         const ColorVarianceRender& color_variance = {},
         float* blend_peak_out = nullptr,
         const RenderGradPlanes& grad_planes = {},
-        bool edge_weight_fp16 = false);
+        bool edge_weight_fp16 = false,
+        const ExtraDepthBwd& extra_depth = {});
 
     //=========================================================================
     // High-level API: Fully fused rasterization with SH evaluation
@@ -443,7 +467,8 @@ namespace gsplat_lfs {
         float* median_depth = nullptr,
         // [C, tile_height, tile_width] live sub-tile bits; pairs only reach those sub-tiles.
         const uint32_t* tile_sub_masks = nullptr,
-        const float* cached_unit_rays = nullptr);
+        const float* cached_unit_rays = nullptr,
+        int32_t* median_ids = nullptr);
 
     void rasterize_from_world_with_sh_bwd(
         // Gaussian parameters
@@ -522,6 +547,7 @@ namespace gsplat_lfs {
         const std::function<void(const float*, const float*, uint32_t, cudaStream_t)>& on_sh_colors_ready = {},
         const uint32_t* tile_keys32 = nullptr,
         bool edge_weight_fp16 = false,
-        const int32_t* tile_order = nullptr);
+        const int32_t* tile_order = nullptr,
+        const ExtraDepthBwd& extra_depth = {});
 
 } // namespace gsplat_lfs

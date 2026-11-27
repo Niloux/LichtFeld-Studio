@@ -999,6 +999,381 @@ namespace lfs::training::kernels {
                 gradient_term_weight);
             LFS_CUDA_LAUNCH_CHECK(stream, "training.depth.finalize_loss");
         }
+        constexpr float kMetricMinTargetCode = 0.018f;
+        constexpr float kMetricMinTargetDepth = 0.05f;
+        constexpr float kMetricEdgeRelJump = 0.035f;
+        constexpr float kMetricDeadbandAbsM = 0.015f;
+        constexpr float kMetricDeadbandRel = 0.008f;
+        constexpr float kMetricHuberDelta = 0.05f;
+        constexpr float kMetricGradHuberDelta = 0.03f;
+        constexpr float kMetricMedianMinAlpha = 0.5f;
+        constexpr float kFreeSpaceAbsMarginM = 0.06f;
+        constexpr float kFreeSpaceRelMargin = 0.04f;
+        constexpr float kFreeSpaceMinLimitM = 0.15f;
+
+        __device__ __forceinline__ float deadband_huber_val(
+            const float r,
+            const float deadband,
+            const float kappa) {
+            const float ar = fabsf(r) - deadband;
+            if (ar <= 0.0f) {
+                return 0.0f;
+            }
+            return ar <= kappa ? (0.5f * ar * ar / kappa) : (ar - 0.5f * kappa);
+        }
+
+        __device__ __forceinline__ float deadband_huber_grad(
+            const float r,
+            const float deadband,
+            const float kappa) {
+            const float ar = fabsf(r) - deadband;
+            if (ar <= 0.0f) {
+                return 0.0f;
+            }
+            const float s = r > 0.0f ? 1.0f : -1.0f;
+            return s * (ar <= kappa ? (ar / kappa) : 1.0f);
+        }
+
+        struct MetricSample {
+            bool ok;
+            bool interior;
+            float alpha;
+            float aw;
+            float e;
+            float d_gt;
+        };
+
+        template <bool Weighted, typename Depth>
+        __device__ __forceinline__ MetricSample load_metric_sample(
+            const int x,
+            const int y,
+            const int width,
+            const int height,
+            const Depth rendered_depth_accum,
+            const float* __restrict__ rendered_alpha_accum,
+            const float* __restrict__ target_depth,
+            const float* __restrict__ pixel_weight,
+            const float a,
+            const float b) {
+            MetricSample s{};
+            const size_t idx = static_cast<size_t>(y) * width + x;
+            const float t = target_depth[idx];
+            const float d_raw = rendered_depth_accum[idx];
+            const float alpha = rendered_alpha_accum[idx];
+            if (!(t >= kMetricMinTargetCode) || !isfinite(t) ||
+                !(alpha > kDepthLossMinAlpha) || !(d_raw > 0.0f) ||
+                !isfinite(d_raw) || !isfinite(alpha)) {
+                return s;
+            }
+            const float d_gt = a * t + b;
+            if (!(d_gt >= kMetricMinTargetDepth) || !isfinite(d_gt)) {
+                return s;
+            }
+            const float w = load_pixel_weight<Weighted>(pixel_weight, idx);
+            if (!(w > 0.0f)) {
+                return s;
+            }
+            s.ok = true;
+            s.alpha = alpha;
+            s.aw = alpha * w;
+            s.e = fmaxf(d_raw / alpha, 1.0e-4f);
+            s.d_gt = d_gt;
+            if (x > 0 && x + 1 < width && y > 0 && y + 1 < height) {
+                const size_t n_idx[4] = {idx - 1, idx + 1, idx - width, idx + width};
+                bool smooth = true;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float tn = target_depth[n_idx[k]];
+                    if (!(tn >= kMetricMinTargetCode) || !isfinite(tn)) {
+                        smooth = false;
+                        break;
+                    }
+                    const float dn = a * tn + b;
+                    if (!(dn >= kMetricMinTargetDepth) || !isfinite(dn) ||
+                        fabsf(dn - d_gt) > kMetricEdgeRelJump * fminf(dn, d_gt)) {
+                        smooth = false;
+                        break;
+                    }
+                }
+                s.interior = smooth;
+            }
+            return s;
+        }
+
+        template <bool Weighted, typename Depth>
+        __global__ void metric_depth_stats_kernel(
+            const Depth rendered_depth_accum,
+            const float* __restrict__ rendered_alpha_accum,
+            const float* __restrict__ target_depth,
+            const float* __restrict__ pixel_weight,
+            double* __restrict__ block_partials,
+            const size_t num_pixels,
+            const int num_blocks,
+            const float a,
+            const float b) {
+            double sums[1] = {};
+            for (size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+                 idx < num_pixels;
+                 idx += static_cast<size_t>(blockDim.x) * gridDim.x) {
+                const float t = target_depth[idx];
+                const float d_raw = rendered_depth_accum[idx];
+                const float alpha = rendered_alpha_accum[idx];
+                if (!(t >= kMetricMinTargetCode) || !isfinite(t) ||
+                    !(alpha > kDepthLossMinAlpha) || !(d_raw > 0.0f) ||
+                    !isfinite(d_raw) || !isfinite(alpha)) {
+                    continue;
+                }
+                const float d_gt = a * t + b;
+                if (!(d_gt >= kMetricMinTargetDepth) || !isfinite(d_gt)) {
+                    continue;
+                }
+                const float w = load_pixel_weight<Weighted>(pixel_weight, idx);
+                if (w > 0.0f) {
+                    sums[0] += static_cast<double>(alpha) * w;
+                }
+            }
+            reduce_and_store(sums, block_partials, num_blocks);
+        }
+
+        __global__ void metric_depth_finalize_stats_kernel(
+            const double* __restrict__ block_partials,
+            float* __restrict__ finals,
+            const int num_blocks,
+            const bool anchor_valid,
+            const float a,
+            const float b) {
+            double sums[1] = {};
+            reduce_block_partials(block_partials, sums, num_blocks);
+            if (threadIdx.x != 0) {
+                return;
+            }
+            const double sum_aw = sums[0];
+            const bool valid = anchor_valid && (a > 0.0f) && isfinite(a) && isfinite(b) && sum_aw > 0.0;
+            finals[slots::kValid] = valid ? 1.0f : 0.0f;
+            finals[slots::kScale] = a;
+            finals[slots::kShift] = b;
+            finals[slots::kSumAlpha] = static_cast<float>(sum_aw);
+            finals[slots::kInvNorm] = valid ? static_cast<float>(1.0 / sum_aw) : 0.0f;
+        }
+
+        template <bool Weighted, typename Depth>
+        __global__ void metric_depth_grad_kernel(
+            const Depth rendered_depth_accum,
+            const float* __restrict__ rendered_alpha_accum,
+            const float* __restrict__ median_depth,
+            const float* __restrict__ target_depth,
+            const float* __restrict__ pixel_weight,
+            float* __restrict__ grad_depth,
+            float* __restrict__ grad_alpha,
+            float* __restrict__ grad_median_depth,
+            const float* __restrict__ finals,
+            double* __restrict__ block_partials,
+            const int width,
+            const int height,
+            const float weight_expected,
+            const float weight_median,
+            const float weight_grad,
+            const float quantization_step,
+            const int num_blocks) {
+            const bool valid = finals[slots::kValid] > 0.5f;
+            const float a = finals[slots::kScale];
+            const float b = finals[slots::kShift];
+            const float inv_norm = finals[slots::kInvNorm];
+            const float half_q_step = 0.5f * quantization_step * fabsf(a);
+            const size_t num_pixels = static_cast<size_t>(width) * height;
+
+            double sums[3] = {};
+            for (size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+                 idx < num_pixels;
+                 idx += static_cast<size_t>(blockDim.x) * gridDim.x) {
+                if (!valid) {
+                    grad_depth[idx] = 0.0f;
+                    grad_alpha[idx] = 0.0f;
+                    if (grad_median_depth) {
+                        grad_median_depth[idx] = 0.0f;
+                    }
+                    continue;
+                }
+                const int x = static_cast<int>(idx % width);
+                const int y = static_cast<int>(idx / width);
+                const MetricSample c = load_metric_sample<Weighted>(
+                    x, y, width, height, rendered_depth_accum, rendered_alpha_accum,
+                    target_depth, pixel_weight, a, b);
+
+                float g_e = 0.0f;
+                float g_med = 0.0f;
+                if (c.ok) {
+                    const float deadband = fmaxf(kMetricDeadbandAbsM / c.d_gt, kMetricDeadbandRel);
+                    if (c.interior && weight_expected > 0.0f) {
+                        const float r = logf(c.e) - logf(c.d_gt);
+                        const float val = deadband_huber_val(r, deadband, kMetricHuberDelta);
+                        if (val > 0.0f) {
+                            sums[0] += static_cast<double>(c.aw) * val;
+                            g_e += weight_expected * inv_norm * c.aw *
+                                   deadband_huber_grad(r, deadband, kMetricHuberDelta) / c.e;
+                        }
+                    }
+
+                    if (weight_grad > 0.0f) {
+                        float g_log_e = 0.0f;
+                        const float log_ec = logf(c.e);
+                        const float log_dc = logf(c.d_gt);
+                        auto accum_pair = [&](const int nx, const int ny, const bool forward_pair) {
+                            const MetricSample n = load_metric_sample<Weighted>(
+                                nx, ny, width, height, rendered_depth_accum, rendered_alpha_accum,
+                                target_depth, pixel_weight, a, b);
+                            if (!n.ok || fabsf(n.d_gt - c.d_gt) > kMetricEdgeRelJump * fminf(n.d_gt, c.d_gt)) {
+                                return;
+                            }
+                            const float w2 = fminf(c.aw, n.aw);
+                            const float q_band = fmaxf(half_q_step * (1.0f / c.d_gt + 1.0f / n.d_gt), 1.0e-5f);
+                            const float diff = forward_pair
+                                                   ? ((logf(n.e) - log_ec) - (logf(n.d_gt) - log_dc))
+                                                   : ((log_ec - logf(n.e)) - (log_dc - logf(n.d_gt)));
+                            const float val = deadband_huber_val(diff, q_band, kMetricGradHuberDelta);
+                            if (val > 0.0f) {
+                                if (forward_pair) {
+                                    sums[1] += static_cast<double>(w2) * val;
+                                    g_log_e -= w2 * deadband_huber_grad(diff, q_band, kMetricGradHuberDelta);
+                                } else {
+                                    g_log_e += w2 * deadband_huber_grad(diff, q_band, kMetricGradHuberDelta);
+                                }
+                            }
+                        };
+                        if (x + 1 < width)
+                            accum_pair(x + 1, y, true);
+                        if (y + 1 < height)
+                            accum_pair(x, y + 1, true);
+                        if (x > 0)
+                            accum_pair(x - 1, y, false);
+                        if (y > 0)
+                            accum_pair(x, y - 1, false);
+                        if (g_log_e != 0.0f) {
+                            g_e += weight_grad * inv_norm * g_log_e / c.e;
+                        }
+                    }
+
+                    if (median_depth && grad_median_depth && weight_median > 0.0f &&
+                        c.interior && c.alpha > kMetricMedianMinAlpha) {
+                        const float d_med = [&]() {
+                            if constexpr (std::is_same_v<Depth, RayDistanceDepth>)
+                                return rendered_depth_accum.scale_for_ray(median_depth[idx], idx);
+                            else
+                                return median_depth[idx];
+                        }();
+                        if (d_med > 1.0e-4f && isfinite(d_med)) {
+                            const float r_m = logf(d_med) - logf(c.d_gt);
+                            const float val_m = deadband_huber_val(r_m, deadband, kMetricHuberDelta);
+                            if (val_m > 0.0f) {
+                                sums[2] += static_cast<double>(c.aw) * val_m;
+                                float gm = weight_median * inv_norm * c.aw *
+                                           deadband_huber_grad(r_m, deadband, kMetricHuberDelta) / d_med;
+                                if constexpr (std::is_same_v<Depth, RayDistanceDepth>)
+                                    gm = rendered_depth_accum.scale_for_ray(gm, idx);
+                                g_med = gm;
+                            }
+                        }
+                    }
+                }
+
+                if (c.ok && g_e != 0.0f) {
+                    float dz = g_e / c.alpha;
+                    if constexpr (std::is_same_v<Depth, RayDistanceDepth>)
+                        dz = rendered_depth_accum.scale_for_ray(dz, idx);
+                    grad_depth[idx] = dz;
+                    grad_alpha[idx] = -g_e * c.e / c.alpha;
+                } else {
+                    grad_depth[idx] = 0.0f;
+                    grad_alpha[idx] = 0.0f;
+                }
+                if (grad_median_depth) {
+                    grad_median_depth[idx] = g_med;
+                }
+            }
+            reduce_and_store(sums, block_partials, num_blocks);
+        }
+
+        __global__ void metric_depth_finalize_loss_kernel(
+            const double* __restrict__ block_partials,
+            const float* __restrict__ finals,
+            float* __restrict__ loss_out,
+            const int num_blocks,
+            const float weight_expected,
+            const float weight_median,
+            const float weight_grad) {
+            double sums[3] = {};
+            reduce_block_partials(block_partials, sums, num_blocks);
+            if (threadIdx.x == 0) {
+                const bool valid = finals[slots::kValid] > 0.5f;
+                const float inv_norm = finals[slots::kInvNorm];
+                loss_out[0] = valid
+                                  ? inv_norm * static_cast<float>(
+                                                   weight_expected * sums[0] +
+                                                   weight_grad * sums[1] +
+                                                   weight_median * sums[2])
+                                  : 0.0f;
+            }
+        }
+
+        template <bool Weighted, bool HasRayGrid>
+        __global__ void build_free_space_map_kernel(
+            const float* __restrict__ target_depth,
+            const float* __restrict__ pixel_weight,
+            float* __restrict__ free_space_limit_out,
+            float* __restrict__ free_space_weight_out,
+            const int width,
+            const int height,
+            const float a,
+            const float b,
+            const float base_weight,
+            const DepthRayGrid ray_grid) {
+            const size_t num_pixels = static_cast<size_t>(width) * height;
+            const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            if (idx >= num_pixels) {
+                return;
+            }
+            float limit_out = 0.0f;
+            float weight_out = 0.0f;
+            const int x = static_cast<int>(idx % width);
+            const int y = static_cast<int>(idx / width);
+            const float w = load_pixel_weight<Weighted>(pixel_weight, idx);
+            if (w > 0.0f && a > 0.0f && base_weight > 0.0f &&
+                x >= 2 && x + 2 < width && y >= 2 && y + 2 < height) {
+                float d_min = 1.0e30f;
+                bool all_valid = true;
+                for (int dy = -2; dy <= 2 && all_valid; ++dy) {
+                    const int ny = y + dy;
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        const float tn = target_depth[static_cast<size_t>(ny) * width + (x + dx)];
+                        if (!(tn >= kMetricMinTargetCode) || !isfinite(tn)) {
+                            all_valid = false;
+                            break;
+                        }
+                        const float dn = a * tn + b;
+                        if (!(dn >= kMetricMinTargetDepth) || !isfinite(dn)) {
+                            all_valid = false;
+                            break;
+                        }
+                        d_min = fminf(d_min, dn);
+                    }
+                }
+                if (all_valid) {
+                    float d_free = d_min - fmaxf(kFreeSpaceAbsMarginM, kFreeSpaceRelMargin * d_min);
+                    if constexpr (HasRayGrid) {
+                        const float ray_len = ray_grid.ray_length(x, y);
+                        if (ray_len > 0.0f) {
+                            d_free /= ray_len;
+                        }
+                    }
+                    if (d_free > kFreeSpaceMinLimitM) {
+                        limit_out = d_free;
+                        weight_out = base_weight * w;
+                    }
+                }
+            }
+            free_space_limit_out[idx] = limit_out;
+            free_space_weight_out[idx] = weight_out;
+        }
     } // namespace
 
     void launch_depth_loss(
@@ -1036,6 +1411,174 @@ namespace lfs::training::kernels {
             launch(RayDistanceDepth{rendered_depth_accum, *ray_grid, width});
         else
             launch(rendered_depth_accum);
+    }
+
+    namespace {
+        template <bool Weighted, typename Depth>
+        void launch_metric_depth_loss_impl(
+            const Depth rendered_depth_accum,
+            const float* rendered_alpha_accum,
+            const float* median_depth,
+            const float* target_depth,
+            float* grad_depth,
+            float* grad_alpha,
+            float* grad_median_depth,
+            float* loss_out,
+            float* partial_sums,
+            const int width,
+            const int height,
+            const float weight_expected,
+            const float weight_median,
+            const float weight_grad,
+            const float prior_quantization_step,
+            const DepthAnchor* anchor,
+            const float* pixel_weight,
+            const cudaStream_t stream) {
+            const size_t num_pixels = static_cast<size_t>(width) * height;
+            if (num_pixels == 0) {
+                return;
+            }
+            const int num_blocks = static_cast<int>(depth_loss_block_count(num_pixels));
+            float* finals = partial_sums;
+            double* block_partials = reinterpret_cast<double*>(partial_sums + slots::kSlotCount);
+            const bool anchor_valid = anchor != nullptr && anchor->valid && anchor->model == 1;
+            const float a = anchor_valid ? anchor->scale : 0.0f;
+            const float b = anchor_valid ? anchor->shift : 0.0f;
+
+            metric_depth_stats_kernel<Weighted><<<num_blocks, kThreadsPerBlock, 0, stream>>>(
+                rendered_depth_accum,
+                rendered_alpha_accum,
+                target_depth,
+                pixel_weight,
+                block_partials,
+                num_pixels,
+                num_blocks,
+                a,
+                b);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.metric_depth.stats");
+            metric_depth_finalize_stats_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
+                block_partials,
+                finals,
+                num_blocks,
+                anchor_valid,
+                a,
+                b);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.metric_depth.finalize_stats");
+            metric_depth_grad_kernel<Weighted><<<num_blocks, kThreadsPerBlock, 0, stream>>>(
+                rendered_depth_accum,
+                rendered_alpha_accum,
+                median_depth,
+                target_depth,
+                pixel_weight,
+                grad_depth,
+                grad_alpha,
+                grad_median_depth,
+                finals,
+                block_partials,
+                width,
+                height,
+                weight_expected,
+                weight_median,
+                weight_grad,
+                fmaxf(prior_quantization_step, 0.0f),
+                num_blocks);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.metric_depth.grad");
+            metric_depth_finalize_loss_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
+                block_partials,
+                finals,
+                loss_out,
+                num_blocks,
+                weight_expected,
+                weight_median,
+                weight_grad);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.metric_depth.finalize_loss");
+        }
+    } // namespace
+
+    void launch_metric_depth_loss(
+        const float* rendered_depth_accum,
+        const float* rendered_alpha_accum,
+        const float* median_depth,
+        const float* target_depth,
+        float* grad_depth,
+        float* grad_alpha,
+        float* grad_median_depth,
+        float* loss_out,
+        float* partial_sums,
+        const int width,
+        const int height,
+        const float weight_expected,
+        const float weight_median,
+        const float weight_grad,
+        const float prior_quantization_step,
+        const DepthAnchor* anchor,
+        cudaStream_t stream,
+        const float* pixel_weight,
+        const DepthRayGrid* ray_grid) {
+        stream = resolve_stream(stream);
+        const auto launch = [&](const auto depth) {
+            if (pixel_weight) {
+                launch_metric_depth_loss_impl<true>(
+                    depth, rendered_alpha_accum, median_depth, target_depth,
+                    grad_depth, grad_alpha, grad_median_depth, loss_out, partial_sums,
+                    width, height, weight_expected, weight_median, weight_grad,
+                    prior_quantization_step, anchor, pixel_weight, stream);
+            } else {
+                launch_metric_depth_loss_impl<false>(
+                    depth, rendered_alpha_accum, median_depth, target_depth,
+                    grad_depth, grad_alpha, grad_median_depth, loss_out, partial_sums,
+                    width, height, weight_expected, weight_median, weight_grad,
+                    prior_quantization_step, anchor, nullptr, stream);
+            }
+        };
+        if (ray_grid)
+            launch(RayDistanceDepth{rendered_depth_accum, *ray_grid, width});
+        else
+            launch(rendered_depth_accum);
+    }
+
+    void launch_build_free_space_map(
+        const float* target_depth,
+        const int width,
+        const int height,
+        const float anchor_scale,
+        const float anchor_shift,
+        const float weight,
+        float* free_space_limit_out,
+        float* free_space_weight_out,
+        cudaStream_t stream,
+        const float* pixel_weight,
+        const DepthRayGrid* ray_grid) {
+        stream = resolve_stream(stream);
+        const size_t num_pixels = static_cast<size_t>(width) * height;
+        if (num_pixels == 0) {
+            return;
+        }
+        const int blocks = static_cast<int>((num_pixels + kThreadsPerBlock - 1) / kThreadsPerBlock);
+        const float base_weight = weight / static_cast<float>(num_pixels);
+        const DepthRayGrid grid = ray_grid ? *ray_grid : DepthRayGrid{};
+        if (pixel_weight) {
+            if (ray_grid) {
+                build_free_space_map_kernel<true, true><<<blocks, kThreadsPerBlock, 0, stream>>>(
+                    target_depth, pixel_weight, free_space_limit_out, free_space_weight_out,
+                    width, height, anchor_scale, anchor_shift, base_weight, grid);
+            } else {
+                build_free_space_map_kernel<true, false><<<blocks, kThreadsPerBlock, 0, stream>>>(
+                    target_depth, pixel_weight, free_space_limit_out, free_space_weight_out,
+                    width, height, anchor_scale, anchor_shift, base_weight, grid);
+            }
+        } else {
+            if (ray_grid) {
+                build_free_space_map_kernel<false, true><<<blocks, kThreadsPerBlock, 0, stream>>>(
+                    target_depth, nullptr, free_space_limit_out, free_space_weight_out,
+                    width, height, anchor_scale, anchor_shift, base_weight, grid);
+            } else {
+                build_free_space_map_kernel<false, false><<<blocks, kThreadsPerBlock, 0, stream>>>(
+                    target_depth, nullptr, free_space_limit_out, free_space_weight_out,
+                    width, height, anchor_scale, anchor_shift, base_weight, grid);
+            }
+        }
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.build_free_space_map");
     }
 
 } // namespace lfs::training::kernels

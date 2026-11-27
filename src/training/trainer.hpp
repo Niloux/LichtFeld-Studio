@@ -21,6 +21,7 @@
 #include "kernels/gradient_residual.hpp"
 #include "kernels/photometric_robust_weight.hpp"
 #include "kernels/thin_structure.hpp"
+#include "las_prior_sidecar.hpp"
 #include "lfs/kernels/ssim.cuh"
 #include "losses/mask_loss.hpp"
 #include "losses/photometric_loss.hpp"
@@ -1064,6 +1065,9 @@ namespace lfs::training {
         core::Tensor normal_loss_grad_;
         core::Tensor normal_loss_partials_;
         core::Tensor depth_distortion_grad_;
+        core::Tensor median_depth_grad_;
+        core::Tensor free_space_limit_;
+        core::Tensor free_space_weight_;
         core::Tensor normal_consistency_scalar_;
         core::Tensor normal_consistency_partials_;
         core::Tensor normal_prior_depth_scalar_;
@@ -1084,6 +1088,7 @@ namespace lfs::training {
         // for camera-space priors.
         std::array<float, 9> normal_prior_world_rotation_{1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
         std::unordered_map<int, lfs::training::kernels::DepthAnchor> depth_anchors_;
+        std::optional<LasPriorSidecar> las_prior_sidecar_;
         // View uid -> the uid earlier versions gave that view, for views whose uid changed.
         std::unordered_map<int, int> legacy_view_uids_;
         bool depth_anchor_fit_attempted_ = false;

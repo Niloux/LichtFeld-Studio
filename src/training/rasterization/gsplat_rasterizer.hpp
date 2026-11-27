@@ -132,6 +132,8 @@ namespace lfs::training {
 
         lfs::core::Tensor tile_sub_masks; // [tile_height, tile_width] live sub-tiles, or empty for all
         const float* unit_rays_ptr = nullptr;
+        int32_t* median_ids_ptr = nullptr;
+        lfs::core::Tensor median_ids; // Keeps median_ids_ptr alive when allocated internally
     };
 
     // Accumulates FP64 removal energy into aligned CUDA UInt8 [N, sizeof(double)] storage.
@@ -185,7 +187,10 @@ namespace lfs::training {
         const GsplatColorVarianceLoss& color_variance = {},
         core::Tensor blend_peak_out = {}, // [N], raised to max(alpha * T) across the view's tiles
         const lfs::core::Tensor& grad_depth_sq = {},
-        int fuse_shN_iteration = -1);
+        int fuse_shN_iteration = -1,
+        const lfs::core::Tensor& grad_median_depth = {},
+        const lfs::core::Tensor& free_space_limit = {},
+        const lfs::core::Tensor& free_space_weight = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;

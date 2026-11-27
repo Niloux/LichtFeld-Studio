@@ -60,7 +60,8 @@ namespace gsplat_lfs {
         scalar_t* __restrict__ render_alphas,     // [C, image_height, image_width, 1]
         int32_t* __restrict__ last_ids,           // [C, image_height, image_width]
         const TileRange tiles,
-        float* __restrict__ median_depth) {
+        float* __restrict__ median_depth,
+        int32_t* __restrict__ median_ids) {
         // each thread draws one pixel, but also timeshares caching gaussians in a
         // shared tile
 
@@ -81,6 +82,8 @@ namespace gsplat_lfs {
         last_ids += cid * image_height * image_width;
         float* const median_out =
             median_depth != nullptr ? median_depth + cid * image_height * image_width : nullptr;
+        int32_t* const median_ids_out =
+            median_ids != nullptr ? median_ids + cid * image_height * image_width : nullptr;
         if (backgrounds != nullptr) {
             backgrounds += cid * CDIM;
         }
@@ -129,6 +132,8 @@ namespace gsplat_lfs {
             }
             if (median_out != nullptr)
                 median_out[pix_id] = 0.0f;
+            if (median_ids_out != nullptr)
+                median_ids_out[pix_id] = -1;
             return;
         }
 
@@ -158,6 +163,7 @@ namespace gsplat_lfs {
         // index of most recent gaussian to write to this thread's pixel
         uint32_t cur_idx = 0;
         float median = 0.0f;
+        int32_t median_id = -1;
 
         // collect and process batches of gaussians
         // each thread loads one gaussian at a time before rasterizing its
@@ -259,8 +265,9 @@ namespace gsplat_lfs {
                 }
 
                 const float splat_depth = kHasRayDepth ? depth : 0.0f;
-                if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
+                if ((median_out != nullptr || median_ids_out != nullptr) && T >= 0.5f && next_T < 0.5f) {
                     median = splat_depth;
+                    median_id = static_cast<int32_t>(batch_start + t);
                 }
 
                 const float vis = alpha * T;
@@ -314,6 +321,8 @@ namespace gsplat_lfs {
             last_ids[pix_id] = static_cast<int32_t>(cur_idx);
             if (median_out != nullptr)
                 median_out[pix_id] = median;
+            if (median_ids_out != nullptr)
+                median_ids_out[pix_id] = median_id;
         }
     }
 
@@ -395,7 +404,8 @@ namespace gsplat_lfs {
         int32_t* __restrict__ last_ids,
         const TileRange tiles,
         float* __restrict__ median_depth,
-        const ScreenFootprint footprint) {
+        const ScreenFootprint footprint,
+        int32_t* __restrict__ median_ids) {
         const uint32_t subs = tile_size / kMicroSub;
         uint32_t cid = 0, tile_id = 0, sub_bit = 0, sub_y = 0, sub_x = 0;
         if (footprint.tile_order != nullptr) {
@@ -428,6 +438,8 @@ namespace gsplat_lfs {
         last_ids += cid * image_height * image_width;
         float* const median_out =
             median_depth != nullptr ? median_depth + cid * image_height * image_width : nullptr;
+        int32_t* const median_ids_out =
+            median_ids != nullptr ? median_ids + cid * image_height * image_width : nullptr;
         if (backgrounds != nullptr) {
             backgrounds += cid * CDIM;
         }
@@ -460,6 +472,8 @@ namespace gsplat_lfs {
             last_ids[pix_id] = 0;
             if (median_out != nullptr)
                 median_out[pix_id] = 0.0f;
+            if (median_ids_out != nullptr)
+                median_ids_out[pix_id] = -1;
             return;
         }
 
@@ -568,6 +582,7 @@ namespace gsplat_lfs {
         float T = 1.0f;
         uint32_t cur_idx = 0;
         float median = 0.0f;
+        int32_t median_id = -1;
         float pix_out[CDIM] = {0.f};
 
         // The trip counts below depend only on shared values, so the loops are
@@ -663,8 +678,9 @@ namespace gsplat_lfs {
                     depth = t_hit > 0.0f ? t_hit * depth_scale : 0.0f;
                 }
                 const float splat_depth = kHasRayDepth ? depth : 0.0f;
-                if (median_out != nullptr && T >= 0.5f && next_T < 0.5f) {
+                if ((median_out != nullptr || median_ids_out != nullptr) && T >= 0.5f && next_T < 0.5f) {
                     median = splat_depth;
+                    median_id = s_bin[t];
                 }
                 const float vis = alpha * T;
 #pragma unroll
@@ -723,6 +739,8 @@ namespace gsplat_lfs {
             last_ids[pix_id] = static_cast<int32_t>(cur_idx);
             if (median_out != nullptr)
                 median_out[pix_id] = median;
+            if (median_ids_out != nullptr)
+                median_ids_out[pix_id] = median_id;
         }
     }
 
@@ -764,7 +782,8 @@ namespace gsplat_lfs {
         int32_t* last_ids,
         cudaStream_t stream, TileRange tiles,
         float* median_depth,
-        const ScreenFootprint& footprint) {
+        const ScreenFootprint& footprint,
+        int32_t* median_ids) {
         const bool packed = false; // Only support non-packed for now
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
@@ -806,6 +825,12 @@ namespace gsplat_lfs {
                                     C * image_height * image_width * sizeof(float), stream),
                     "gsplat empty-forward median depth clear");
             }
+            if (median_ids != nullptr) {
+                LFS_CUDA_CHECK_MSG(
+                    cudaMemsetAsync(median_ids, 0xff,
+                                    C * image_height * image_width * sizeof(int32_t), stream),
+                    "gsplat empty-forward median ids clear");
+            }
             return;
         }
 
@@ -845,7 +870,7 @@ namespace gsplat_lfs {
                 flatten_ids,
                 renders,
                 alphas,
-                last_ids, tiles, median_depth);
+                last_ids, tiles, median_depth, median_ids);
             LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd");
         };
 
@@ -870,7 +895,7 @@ namespace gsplat_lfs {
                             viewmats0, viewmats1, Ks, camera_model, rs_type,
                             radial_coeffs, tangential_coeffs, thin_prism_coeffs,
                             tile_offsets, flatten_ids, renders, alphas, last_ids,
-                            tiles, median_depth, footprint);
+                            tiles, median_depth, footprint, median_ids);
                         LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_fwd_micro");
                     };
                     if (global_shutter && perfect_pinhole)
@@ -944,7 +969,8 @@ namespace gsplat_lfs {
         int32_t* last_ids,                                                     \
         cudaStream_t stream, TileRange tiles,                                  \
         float* median_depth,                                                   \
-        const ScreenFootprint& footprint);
+        const ScreenFootprint& footprint,                                      \
+        int32_t* median_ids);
 
     __INS__(1)
     __INS__(2)
