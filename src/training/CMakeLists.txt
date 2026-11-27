@@ -39,6 +39,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/normal_consistency_loss.cu
     kernels/depth_distortion_loss.cu
     kernels/roi_weight_map.cu
+    kernels/photometric_robust_weight.cu
     kernels/image_kernels.cu
     kernels/mask_preprocess.cu
     kernels/calibration_correction.cu
@@ -147,6 +148,7 @@ set(TRAINING_NEW_SOURCES
         noise_infill.cpp
         normal_auto_generate.cpp
         las_prior_sidecar.cpp
+        photometric_weights_sidecar.cpp
         roi_sidecar.cpp
         vram_ledger.cpp
         perf_bench.cpp

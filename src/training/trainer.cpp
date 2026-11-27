@@ -1227,6 +1227,7 @@ namespace lfs::training {
         clear_thin_structure_cache();
         gradient_residual_workspace_ = {};
         mask_preprocess_workspace_ = {};
+        photometric_robust_workspace_ = {};
     }
 
     std::optional<lfs::Error> Trainer::check_invisible_iteration(const int iter) {
@@ -1306,7 +1307,11 @@ namespace lfs::training {
         ppisp_controller_pool_.reset();
         pose_refinement_.reset();
         calibration_correction_.reset();
+        photometric_weights_.clear();
         ppisp_exif_exposure_mean_.reset();
+        cached_dc_max_rgb_ = 1.0f;
+        train_exif_ev_by_uid_.clear();
+        train_exif_ev_populated_ = false;
         eval_ppisp_applied_.store(0);
         eval_ppisp_exif_.store(0);
         eval_ppisp_nearest_.store(0);
@@ -1531,6 +1536,46 @@ namespace lfs::training {
         return {};
     }
 
+    namespace {
+        std::vector<std::pair<int, float>> collect_ppisp_exif_evs(
+            const CameraDataset& dataset,
+            const PPISP& ppisp,
+            const std::filesystem::path& data_path,
+            std::unordered_map<int, float>& by_uid) {
+            std::vector<int> uids;
+            std::vector<std::filesystem::path> paths;
+            for (const auto& cam : dataset.get_cameras()) {
+                if (cam && ppisp.is_known_frame(cam->uid())) {
+                    uids.push_back(cam->uid());
+                    paths.push_back(cam->image_path());
+                }
+            }
+            const auto evs = lfs::core::exif_exposure_ev_for_training_images(paths, data_path);
+            std::vector<std::pair<int, float>> uid_ev;
+            by_uid.clear();
+            uid_ev.reserve(evs.size());
+            for (size_t i = 0; i < evs.size(); ++i) {
+                if (evs[i]) {
+                    const float ev = static_cast<float>(*evs[i]);
+                    uid_ev.emplace_back(uids[i], ev);
+                    by_uid[uids[i]] = ev;
+                }
+            }
+            return uid_ev;
+        }
+    } // namespace
+
+    void Trainer::refresh_dc_max_rgb() {
+        if (ppisp_ && params_.optimization.ppisp_active() && ppisp_->isFinalized()) {
+            const float min_exp = ppisp_->min_exposure_ev();
+            cached_dc_max_rgb_ = std::isfinite(min_exp)
+                                     ? std::clamp(std::exp2(-min_exp) * 1.15f, 1.0f, 8.0f)
+                                     : 1.0f;
+        } else {
+            cached_dc_max_rgb_ = 1.0f;
+        }
+    }
+
     std::expected<void, std::string> Trainer::initialize_ppisp() {
         if (!params_.optimization.ppisp_active()) {
             return {};
@@ -1549,6 +1594,9 @@ namespace lfs::training {
                 config.vig_center = 0.02f;
                 config.vig_non_pos = 0.01f;
                 config.vig_channel = 0.1f;
+                config.vig_alpha_l2 = 0.5f;
+                config.exposure_prior = params_.optimization.ppisp_exposure_from_exif ? 0.5f : 0.0f;
+                config.color_l2 = 0.05f;
             } else {
                 const float reg_weight = params_.optimization.ppisp_reg_weight;
                 config.exposure_mean *= reg_weight;
@@ -1573,21 +1621,9 @@ namespace lfs::training {
 
             const bool resume = params_.resume_checkpoint.has_value() || params_.resume_project.has_value();
             if (params_.optimization.ppisp_exposure_from_exif && !resume) {
-                std::vector<int> uids;
-                std::vector<std::filesystem::path> paths;
-                for (const auto& cam : train_dataset_->get_cameras()) {
-                    if (cam && ppisp_->is_known_frame(cam->uid())) {
-                        uids.push_back(cam->uid());
-                        paths.push_back(cam->image_path());
-                    }
-                }
-                const auto evs = lfs::core::exif_exposure_ev_for_training_images(paths, params_.dataset.data_path);
-                std::vector<std::pair<int, float>> uid_ev;
-                for (size_t i = 0; i < evs.size(); ++i) {
-                    if (evs[i]) {
-                        uid_ev.emplace_back(uids[i], static_cast<float>(*evs[i]));
-                    }
-                }
+                const auto uid_ev = collect_ppisp_exif_evs(
+                    *train_dataset_, *ppisp_, params_.dataset.data_path, train_exif_ev_by_uid_);
+                train_exif_ev_populated_ = true;
                 const int n = static_cast<int>(uid_ev.size());
                 const int m = ppisp_->num_frames();
                 if (n == 0) {
@@ -1609,6 +1645,7 @@ namespace lfs::training {
             if (auto result = apply_ppisp_sidecar_if_configured(); !result) {
                 return result;
             }
+            refresh_dc_max_rgb();
 
             return {};
         } catch (const std::exception& e) {
@@ -2168,7 +2205,8 @@ namespace lfs::training {
         const lfs::core::Tensor& alpha,
         const lfs::core::param::OptimizationParameters& opt_params,
         const lfs::core::Tensor& raw_rendered,
-        const lfs::core::Tensor& structure_map, const int iteration, CalibrationCorrection* fit) {
+        const lfs::core::Tensor& structure_map, const int iteration, CalibrationCorrection* fit,
+        const lfs::core::Tensor& diffuse_weight_sidecar) {
 
         using namespace lfs::core;
         constexpr float ALPHA_CONSISTENCY_WEIGHT = 10.0f;
@@ -2176,6 +2214,7 @@ namespace lfs::training {
         const auto mode = opt_params.mask_mode;
         const bool has_user_mask = mask.is_valid() && mask.numel() > 0;
         const bool has_roi_weight = roi_weight.is_valid() && roi_weight.numel() > 0;
+        const bool has_diffuse_sidecar = diffuse_weight_sidecar.is_valid() && diffuse_weight_sidecar.numel() > 0;
         const Tensor mask_2d =
             has_user_mask && mask.ndim() == 3 ? mask.squeeze(0) : mask;
 
@@ -2204,23 +2243,44 @@ namespace lfs::training {
             user_masks_photometric ? mask_2d : Tensor{},
             roi_weight,
             mode == param::MaskMode::SegmentAndIgnore,
-            user_masks_photometric && normal_terms_on);
+            user_masks_photometric && (normal_terms_on || has_diffuse_sidecar));
 
-        Tensor photometric_weight = base_photometric_weight;
+        Tensor effective_base_weight = base_photometric_weight;
+        Tensor diffuse_weight;
+        if (has_diffuse_sidecar) {
+            const int grid_warm =
+                (opt_params.use_exposure_correction && bilateral_grid_ && opt_params.bilateral_grid_active())
+                    ? (opt_params.exposure_correction_grid_start_iter + 1000)
+                    : 0;
+            const int warmup_iters = std::max({3000, get_total_iterations() / 6, grid_warm});
+            const bool online_suppress = iteration >= warmup_iters;
+            const auto robust = kernels::compute_photometric_robust_weight(
+                base_photometric_weight,
+                diffuse_weight_sidecar,
+                corrected,
+                gt_image,
+                online_suppress,
+                photometric_robust_workspace_,
+                corrected.stream());
+            effective_base_weight = robust.loss_weight;
+            diffuse_weight = robust.static_weight;
+        }
+
+        Tensor photometric_weight = effective_base_weight;
         float base_denominator = 0.0f;
         Tensor base_denominator_weight;
         if (structure_map.is_valid()) {
             kernels::structure_photometric_weight(
-                structure_map, base_photometric_weight, thin_structure_weight_buffer_,
+                structure_map, effective_base_weight, thin_structure_weight_buffer_,
                 opt_params.thin_structure_weight,
-                !base_photometric_weight.is_valid() && opt_params.lambda_dssim > 0.0f);
+                !effective_base_weight.is_valid() && opt_params.lambda_dssim > 0.0f);
             photometric_weight = thin_structure_weight_buffer_;
             // Float base weights normalize the structure-weighted loss on the device.
-            if (is_device_denominator_weight(base_photometric_weight))
-                base_denominator_weight = base_photometric_weight;
+            if (is_device_denominator_weight(effective_base_weight))
+                base_denominator_weight = effective_base_weight;
             else
                 base_denominator = kernels::structure_base_denominator(
-                    base_photometric_weight, static_cast<int>(gt_image.shape()[1]),
+                    effective_base_weight, static_cast<int>(gt_image.shape()[1]),
                     static_cast<int>(gt_image.shape()[2]), opt_params.lambda_dssim > 0.0f);
         }
 
@@ -2341,7 +2401,7 @@ namespace lfs::training {
         }
 
         if (photometric_weight.is_valid())
-            add_gradient_residual(corrected, gt_image, raw_rendered, base_photometric_weight,
+            add_gradient_residual(corrected, gt_image, raw_rendered, effective_base_weight,
                                   opt_params, iteration, loss, grad_corrected, raw_residual);
 
         return MaskLossResult{
@@ -2351,7 +2411,8 @@ namespace lfs::training {
             .raw_residual = raw_residual,
             .grad_alpha = grad_alpha,
             .normal_pixel_weight = user_masks_photometric && normal_terms_on ? base_photometric_weight : Tensor{},
-            .mask_regularization_loss = mask_regularization_loss};
+            .mask_regularization_loss = mask_regularization_loss,
+            .diffuse_weight = diffuse_weight};
     }
 
     // Returns GPU tensor for loss - NO SYNC!
@@ -3683,6 +3744,8 @@ namespace lfs::training {
                 return std::unexpected(result.error());
             }
 
+            photometric_weights_.load(params_.dataset.data_path, train_dataset_->get_cameras());
+
             // Apply undistortion to camera intrinsics (params already precomputed at load time)
             if (params.optimization.undistort) {
                 int prepared = 0;
@@ -4354,6 +4417,9 @@ namespace lfs::training {
         pose_refinement_.reset();
         calibration_correction_.reset();
         ppisp_exif_exposure_mean_.reset();
+        cached_dc_max_rgb_ = 1.0f;
+        train_exif_ev_by_uid_.clear();
+        train_exif_ev_populated_ = false;
         eval_ppisp_applied_.store(0);
         eval_ppisp_exif_.store(0);
         eval_ppisp_nearest_.store(0);
@@ -7478,6 +7544,7 @@ namespace lfs::training {
                             log_scale_reg ? train_frame_scale_ : 1.0f;
                         fused_extra_gradients.erank_reg_weight = step_params.erank_reg;
                         fused_extra_gradients.dc_reg_weight = step_params.dc_reg;
+                        fused_extra_gradients.dc_reg_max_rgb = cached_dc_max_rgb_;
                         fused_extra_gradients.sh_rest_reg_weight = step_params.sh_rest_reg;
                         // Fused path shares the configured opacity_reg weight between gradient and loss accumulation.
                         fused_extra_gradients.opacity_reg_weight =
@@ -8029,13 +8096,18 @@ namespace lfs::training {
                                 }
                             }
                             const auto structure_map = prepare_target(corrected_image, mask, use_mask);
-                            if (use_mask || roi_weight.is_valid() || structure_map.is_valid()) {
+                            const auto diffuse_sidecar =
+                                (cam && !cam->is_undistort_prepared())
+                                    ? photometric_weights_.weight_for_camera(cam->uid())
+                                    : lfs::core::Tensor{};
+                            if (use_mask || roi_weight.is_valid() || structure_map.is_valid() || diffuse_sidecar.is_valid()) {
 
                                 lfs::core::Tensor mask_tile = mask;
 
                                 auto result = compute_photometric_loss_with_mask(
                                     corrected_image, gt_tile, mask_tile, roi_weight, output.alpha,
-                                    step_params, raw_loss_input, structure_map, iter, learning_fit);
+                                    step_params, raw_loss_input, structure_map, iter, learning_fit,
+                                    diffuse_sidecar);
                                 if (!result) {
                                     nvtxRangePop();
                                     nvtxRangePop();
@@ -8130,6 +8202,8 @@ namespace lfs::training {
 
                         lfs::core::Tensor corrected_image = output.image;
                         lfs::core::Tensor ppisp_input;
+                        lfs::core::Tensor ppisp_unclamped;
+                        lfs::core::Tensor raw_loss_input;
                         // Until a correction writes a new image, corrected_image is the raw render,
                         // which the color variance backward still reads: clamp a copy of it then.
                         const auto clamp_corrected = [&]() {
@@ -8144,11 +8218,20 @@ namespace lfs::training {
                                 nvtxRangePush("ppisp_forward");
                                 LFS_VRAM_SCOPE("train.ppisp.forward");
                                 LOG_VRAM_DIFF("train.ppisp.forward");
-                                corrected_image = ppisp_->apply(
+                                ppisp_unclamped = ppisp_->apply(
                                     output.image, cam->camera_id(), cam->uid());
+                                corrected_image = ppisp_unclamped;
                                 nvtxRangePop();
                             }
                             if (grid_active_this_iter) {
+                                if (ppisp_on) {
+                                    // Keep raw structure/Sobel terms in PPISP-aligned exposure/WB space,
+                                    // decoupling only the spatial bilateral grid.
+                                    raw_loss_input = ppisp_unclamped.clamp(0.0f, 1.0f);
+                                    corrected_image = ppisp_unclamped.clone();
+                                } else {
+                                    raw_loss_input = output.image;
+                                }
                                 nvtxRangePush("bilateral_grid_forward");
                                 LFS_VRAM_SCOPE("train.bilateral_grid.forward");
                                 LOG_VRAM_DIFF("train.bilateral_grid.forward");
@@ -8184,11 +8267,9 @@ namespace lfs::training {
                             if (!ppisp_on) {
                                 clamp_corrected();
                             }
+                            if (grid_on || ppisp_on)
+                                raw_loss_input = output.image;
                         }
-                        // For decoupled D-SSIM, the active appearance model provides the corrected image
-                        // for the L1/luminance terms, while contrast/structure still use the raw render.
-                        const lfs::core::Tensor raw_loss_input =
-                            (grid_on || ppisp_on) ? output.image : lfs::core::Tensor{};
 
                         nvtxRangePush("compute_photometric_loss");
                         PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::LossBegin, iter);
@@ -8202,6 +8283,7 @@ namespace lfs::training {
                         lfs::core::Tensor tile_grad_depth_sq;
                         lfs::core::Tensor tile_grad_normal;
                         lfs::core::Tensor tile_error_map;
+                        lfs::core::Tensor tile_diffuse_weight;
                         lfs::core::Tensor mask_tile;
                         // Retain the photometric workspace view through all normal terms.
                         lfs::core::Tensor normal_terms_weight;
@@ -8265,8 +8347,13 @@ namespace lfs::training {
                         // 1) Compute photometric loss (populates ssim_map in workspace)
                         const bool use_mask = step_params.mask_mode != lfs::core::param::MaskMode::None &&
                                               (cam->has_mask() || (step_params.use_alpha_as_mask && cam->has_alpha()));
+                        const auto diffuse_sidecar =
+                            (cam && !cam->is_undistort_prepared())
+                                ? photometric_weights_.weight_for_camera(cam->uid())
+                                : lfs::core::Tensor{};
                         const bool used_masked_fused =
                             (step_params.thin_structure_weight > 0.0f || roi_weight.is_valid() ||
+                             diffuse_sidecar.is_valid() ||
                              (use_mask &&
                               (step_params.mask_mode == lfs::core::param::MaskMode::Segment ||
                                step_params.mask_mode == lfs::core::param::MaskMode::Ignore ||
@@ -8289,11 +8376,12 @@ namespace lfs::training {
                                 }
                             }
                             const auto structure_map = prepare_target(corrected_image, mask_tile, use_mask);
-                            if (use_mask || roi_weight.is_valid() || structure_map.is_valid()) {
+                            if (use_mask || roi_weight.is_valid() || structure_map.is_valid() || diffuse_sidecar.is_valid()) {
 
                                 auto result = compute_photometric_loss_with_mask(
                                     corrected_image, gt_tile, mask_tile, roi_weight, output.alpha,
-                                    step_params, raw_loss_input, structure_map, iter, learning_fit);
+                                    step_params, raw_loss_input, structure_map, iter, learning_fit,
+                                    diffuse_sidecar);
                                 if (!result) {
                                     nvtxRangePop();
                                     nvtxRangePop();
@@ -8314,6 +8402,7 @@ namespace lfs::training {
                                 tile_grad_alpha = result->grad_alpha;
                                 tile_mask_regularization_loss = result->mask_regularization_loss;
                                 normal_terms_weight = result->normal_pixel_weight;
+                                tile_diffuse_weight = result->diffuse_weight;
                             } else {
                                 auto result = compute_photometric_loss_with_gradient(
                                     corrected_image, gt_tile, step_params, raw_loss_input, iter, learning_fit);
@@ -8934,6 +9023,11 @@ namespace lfs::training {
                             }
                         }
 
+                        if (tile_error_map.is_valid() && tile_diffuse_weight.is_valid() &&
+                            tile_error_map.numel() == tile_diffuse_weight.numel()) {
+                            tile_error_map.mul_(tile_diffuse_weight.reshape(tile_error_map.shape()));
+                        }
+
                         // Growth credit follows the ROI pixel weights, so splats grow where the crop
                         // box is seen, including the background behind it, not where pixels are ignored.
                         if (tile_error_map.is_valid() && roi_weight.is_valid() &&
@@ -9008,14 +9102,14 @@ namespace lfs::training {
                         // consumed input keeps one fewer full-resolution image live per stage.
                         corrected_image = {};
                         lfs::core::Tensor raster_grad = tile_grad;
+                        const bool had_raw_terms = tile_raw_gradient.has_value() || tile_raw_residual.has_value();
                         if (exposure_correction) {
                             if (grid_active_this_iter) {
                                 nvtxRangePush("bilateral_grid_backward");
                                 LFS_VRAM_SCOPE("train.bilateral_grid.backward");
                                 LOG_VRAM_DIFF("train.bilateral_grid.backward");
                                 const lfs::core::Tensor grid_input =
-                                    ppisp_on ? ppisp_->apply(output.image, cam->camera_id(), cam->uid())
-                                             : output.image;
+                                    ppisp_on ? ppisp_unclamped : output.image;
                                 bilateral_grid_->backward_in_place(grid_input, raster_grad, cam->uid());
                                 nvtxRangePop();
                             }
@@ -9028,6 +9122,32 @@ namespace lfs::training {
                                     ppisp_->zero_grad();
                                 }
                                 nvtxRangePop();
+                            }
+                            if (ppisp_on && grid_active_this_iter && had_raw_terms) {
+                                auto raw_ppisp_grad = lfs::core::Tensor::zeros_like(output.image);
+                                if (tile_raw_gradient) {
+                                    lfs::training::kernels::accumulate_decoupled_raw_gradient(*tile_raw_gradient, raw_ppisp_grad);
+                                    tile_raw_gradient.reset();
+                                }
+                                if (tile_raw_residual) {
+                                    const auto residual_loss = kernels::gradient_residual_loss_gradient(
+                                        tile_raw_residual->raw, tile_raw_residual->target,
+                                        tile_raw_residual->pixel_weight, raw_ppisp_grad,
+                                        step_params.gradient_loss_weight,
+                                        gradient_residual_workspace_);
+                                    loss_tensor_gpu = loss_tensor_gpu + residual_loss;
+                                    if (reported_image_loss.is_valid())
+                                        reported_image_loss = reported_image_loss + residual_loss;
+                                    tile_raw_residual.reset();
+                                }
+                                if (ppisp_unclamped.is_valid()) {
+                                    const auto in_range = (ppisp_unclamped >= 0.0f && ppisp_unclamped <= 1.0f)
+                                                              .to(lfs::core::DataType::Float32);
+                                    raw_ppisp_grad.mul_(in_range);
+                                }
+                                ppisp_->backward_rgb_only_in_place(
+                                    output.image, raw_ppisp_grad, cam->camera_id(), cam->uid());
+                                raster_grad.add_(raw_ppisp_grad);
                             }
                         } else {
                             if (ppisp_on) {
@@ -9064,7 +9184,7 @@ namespace lfs::training {
                             if (reported_image_loss.is_valid())
                                 reported_image_loss = reported_image_loss + residual_loss;
                         }
-                        if (fit && (tile_raw_gradient || tile_raw_residual))
+                        if (fit && had_raw_terms)
                             fit->clear_outside(raster_grad);
                         release_loss_scratch();
 
@@ -9245,7 +9365,8 @@ namespace lfs::training {
                                     .log_scale_weight = log_scale_weight,
                                     .erank_weight = erank_weight,
                                     .flatten_weight = flatten_weight,
-                                    .dc_weight = dc_weight});
+                                    .dc_weight = dc_weight,
+                                    .dc_max_rgb = cached_dc_max_rgb_});
                             } else {
                                 const auto device_scalar = [](lfs::core::Tensor& t) -> lfs::core::Tensor {
                                     if (!t.is_valid())
@@ -9278,7 +9399,8 @@ namespace lfs::training {
                                     kernels::GutShapeRegularization{
                                         .blend_peak = blend_peak,
                                         .log_scale_weight = log_scale_weight,
-                                        .scale_loss_out = log_scale_weight > 0.0f ? fused_scale_reg_loss_gpu.ptr<float>() : nullptr});
+                                        .scale_loss_out = log_scale_weight > 0.0f ? fused_scale_reg_loss_gpu.ptr<float>() : nullptr,
+                                        .dc_max_rgb = cached_dc_max_rgb_});
                                 gsplat_lfs::flatten_scale_grad(model.scaling_raw().ptr<float>(), scaling_grad.ptr<float>(),
                                                                n, flatten_weight, reg_stream, blend_peak);
                                 if (log_scale_weight > 0.0f)
@@ -9362,6 +9484,8 @@ namespace lfs::training {
                             nvtxRangePush("ppisp_project_mean");
                             ppisp_->project_mean();
                             nvtxRangePop();
+                            if (iter % 250 == 0)
+                                refresh_dc_max_rgb();
                         }
                         ppisp_->zero_grad();
                         ppisp_->scheduler_step();
@@ -11305,8 +11429,28 @@ namespace lfs::training {
                     capture.push_back({frame.get(), false});
             if (const auto selection = select_holdout_appearance(std::move(capture), cam)) {
                 eval_ppisp_nearest_.fetch_add(1, std::memory_order_relaxed);
+                float exposure_offset = 0.0f;
+                if (params.optimization.ppisp_exposure_from_exif) {
+                    if (!train_exif_ev_populated_) {
+                        (void)collect_ppisp_exif_evs(
+                            *train_dataset_, *ppisp_, params.dataset.data_path, train_exif_ev_by_uid_);
+                        train_exif_ev_populated_ = true;
+                    }
+                    const auto left_it = train_exif_ev_by_uid_.find(selection->left_uid);
+                    const auto right_it = train_exif_ev_by_uid_.find(selection->right_uid);
+                    if (left_it != train_exif_ev_by_uid_.end() && right_it != train_exif_ev_by_uid_.end()) {
+                        const auto eval_ev = lfs::core::exif_exposure_ev_for_training_image(
+                            cam.image_path(), params.dataset.data_path);
+                        if (eval_ev && std::isfinite(*eval_ev)) {
+                            const float interp_ev = (1.0f - selection->fraction) * left_it->second +
+                                                    selection->fraction * right_it->second;
+                            exposure_offset = ppisp_->exposure_prior_slope() * (static_cast<float>(*eval_ev) - interp_ev);
+                        }
+                    }
+                }
                 return ppisp_->apply_interpolated_frames(rgb_chw, selection->camera_id,
-                                                         selection->left_uid, selection->right_uid, selection->fraction);
+                                                         selection->left_uid, selection->right_uid,
+                                                         selection->fraction, exposure_offset);
             }
         }
 
@@ -11532,8 +11676,15 @@ namespace lfs::training {
         if (ppisp_) {
             if (params_.optimization.use_exposure_correction) {
                 ppisp_->set_train_crf(false);
+                if (params_.optimization.ppisp_exposure_from_exif && train_dataset_) {
+                    const auto uid_ev = collect_ppisp_exif_evs(
+                        *train_dataset_, *ppisp_, params_.dataset.data_path, train_exif_ev_by_uid_);
+                    train_exif_ev_populated_ = true;
+                    ppisp_->set_exposure_prior(uid_ev);
+                }
             }
             ppisp_exif_exposure_mean_ = ppisp_->exif_exposure_mean();
+            refresh_dc_max_rgb();
         }
         if (params_.resume_project && scene_) {
             const auto disabled =

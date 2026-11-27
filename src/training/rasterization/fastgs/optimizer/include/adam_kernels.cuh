@@ -328,11 +328,12 @@ namespace fast_lfs::optimizer::kernels::adam {
             }
             if (!flush_only && ent.apply_gut_dc_reg && n_attr == 3 && gut_reg.dc_weight > 0.0f) {
                 constexpr float kSh0 = 0.28209479177387814f;
-                const float limit = 0.5f / kSh0;
+                const float lo_limit = -0.5f / kSh0;
+                const float hi_limit = (fmaxf(gut_reg.dc_max_rgb, 1.0f) - 0.5f) / kSh0;
                 const float dc_scale = 2.0f * gut_reg.dc_weight / 3.0f;
                 for (int c = 0; c < 3; ++c) {
                     const float v = param[3 * prim + c];
-                    const float delta = v > limit ? (v - limit) : (v < -limit ? (v + limit) : 0.0f);
+                    const float delta = v > hi_limit ? (v - hi_limit) : (v < lo_limit ? (v - lo_limit) : 0.0f);
                     extra_grad[c] += dc_scale * delta;
                 }
             }

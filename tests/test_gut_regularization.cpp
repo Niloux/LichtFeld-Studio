@@ -233,3 +233,46 @@ TEST_F(GutRegularizationTest, ShRestRegularizerEqualsItsGradientInTheShNStep) {
     EXPECT_GT(moved, a.size() / 2);
     EXPECT_NEAR(loss.item<float>(), expected_loss, 1.0e-6 * expected_loss + 1.0e-9);
 }
+
+TEST_F(GutRegularizationTest, ColourRangeRespectsHdrDcMaxRgbHeadroom) {
+    constexpr float kC0 = 0.28209479177387814f;
+    constexpr float kWeight = 0.3f;
+    constexpr float kMaxRgb = 1.8f;
+    constexpr int kCount = 4;
+    // Per-element RGB values: {-0.2 (below 0), 0.7 (in-range), 1.4 (above 1.0 but <= 1.8), 2.0 (above 1.8)}.
+    const std::vector<float> rgb_vals = {
+        -0.2f, 0.7f, 1.4f,
+        2.0f, 1.0f, 0.0f,
+        1.8f, 1.5f, -0.05f,
+        0.5f, 1.9f, 1.3f,
+    };
+    std::vector<float> sh0_vals(rgb_vals.size());
+    for (size_t i = 0; i < rgb_vals.size(); ++i)
+        sh0_vals[i] = (rgb_vals[i] - 0.5f) / kC0;
+
+    const auto scales = Tensor::zeros({kCount, 3}, Device::CUDA);
+    const auto sh0 = Tensor::from_vector(sh0_vals, {kCount, 1, 3}, Device::CUDA);
+    auto scales_grad = Tensor::zeros({kCount, 3}, Device::CUDA);
+    auto sh0_grad = Tensor::zeros({kCount, 1, 3}, Device::CUDA);
+    auto dc_loss = Tensor::zeros({1}, Device::CUDA);
+
+    kernels::launch_gut_param_regularization(
+        scales.ptr<float>(), scales_grad.ptr<float>(), sh0.ptr<float>(), sh0_grad.ptr<float>(),
+        3, kCount, 0.0f, kWeight, nullptr, dc_loss.ptr<float>(), nullptr,
+        {.dc_max_rgb = kMaxRgb});
+
+    const auto grads = sh0_grad.cpu().to_vector();
+    const float lo_limit = -0.5f / kC0;
+    const float hi_limit = (kMaxRgb - 0.5f) / kC0;
+    double expected_loss = 0.0;
+    for (size_t i = 0; i < sh0_vals.size(); ++i) {
+        const float v = sh0_vals[i];
+        const float delta = v > hi_limit ? (v - hi_limit) : (v < lo_limit ? (v - lo_limit) : 0.0f);
+        EXPECT_NEAR(grads[i], (2.0f * kWeight / 3.0f) * delta, 1.0e-6f) << i;
+        expected_loss += static_cast<double>(kWeight) / (3.0 * kCount) * delta * delta;
+    }
+    EXPECT_EQ(grads[2], 0.0f);  // rawRGB = 1.4 inside [0, 1.8]
+    EXPECT_GT(grads[3], 0.0f);  // rawRGB = 2.0 above 1.8
+    EXPECT_LT(grads[0], 0.0f);  // rawRGB = -0.2 below 0
+    EXPECT_NEAR(dc_loss.item<float>(), expected_loss, 1.0e-6 + 1.0e-5 * expected_loss);
+}

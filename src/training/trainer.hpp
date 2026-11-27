@@ -19,12 +19,14 @@
 #include "io/project_recovery.hpp"
 #include "kernels/depth_loss.hpp"
 #include "kernels/gradient_residual.hpp"
+#include "kernels/photometric_robust_weight.hpp"
 #include "kernels/thin_structure.hpp"
 #include "lfs/kernels/ssim.cuh"
 #include "losses/mask_loss.hpp"
 #include "losses/photometric_loss.hpp"
 #include "metrics/metrics.hpp"
 #include "optimizer/scheduler.hpp"
+#include "photometric_weights_sidecar.hpp"
 #include "progress.hpp"
 #include "project_snapshot_chapters.hpp"
 #include "strategies/istrategy.hpp"
@@ -671,6 +673,9 @@ namespace lfs::training {
             lfs::core::Tensor normal_pixel_weight;
             // Already included in loss; retain it when replacing only the image terms for ROI reporting.
             lfs::core::Tensor mask_regularization_loss;
+            // Offline static confidence weight (base * sidecar only, excluding online residual suppression)
+            // for densify error map.
+            lfs::core::Tensor diffuse_weight;
         };
 
         // Masked photometric loss with optional alpha gradient
@@ -683,7 +688,8 @@ namespace lfs::training {
             const lfs::core::param::OptimizationParameters& opt_params,
             const lfs::core::Tensor& raw_rendered,
             const lfs::core::Tensor& structure_map = {},
-            int iteration = 0, CalibrationCorrection* fit = nullptr);
+            int iteration = 0, CalibrationCorrection* fit = nullptr,
+            const lfs::core::Tensor& diffuse_weight_sidecar = {});
 
         // Validate masks exist for all cameras when mask mode is enabled
         std::expected<void, std::string> validate_masks();
@@ -763,6 +769,7 @@ namespace lfs::training {
                    !params.optimization.ppisp_sidecar_path.empty();
         }
         [[nodiscard]] PPISPControllerPool* controller_pool_for_save(int iteration) const;
+        void refresh_dc_max_rgb();
         lfs::core::Tensor applyPPISPForEval(const lfs::core::Tensor& rgb, const lfs::core::Camera& cam) const;
         // PPISP camera index of a view: its training frame's camera, else its own camera when PPISP knows it, else 0.
         [[nodiscard]] int ppisp_camera_index(int camera_uid, int camera_id) const;
@@ -922,6 +929,9 @@ namespace lfs::training {
         // Train-set EXIF EV mean used by seed_exposure (0.5 * (ev - mean)). Unset
         // when the seed was skipped or disabled; eval then uses exposure 0.
         std::optional<float> ppisp_exif_exposure_mean_;
+        float cached_dc_max_rgb_ = 1.0f;
+        mutable std::unordered_map<int, float> train_exif_ev_by_uid_;
+        mutable bool train_exif_ev_populated_ = false;
         mutable std::atomic<int> eval_ppisp_applied_{0};
         mutable std::atomic<int> eval_ppisp_exif_{0};
         mutable std::atomic<int> eval_ppisp_nearest_{0};
@@ -1088,6 +1098,8 @@ namespace lfs::training {
         // Mask preprocess workspace: photometric weight / opacity penalty / alpha-consistent
         // (fused kernels; grow-only for allocation-free steady state when masks/ROI on).
         lfs::training::losses::MaskPreprocessWorkspace mask_preprocess_workspace_;
+        PhotometricWeightsSidecar photometric_weights_;
+        kernels::PhotometricRobustWorkspace photometric_robust_workspace_;
         bool empty_ignore_mask_warned_ = false;
         // The ignore-mask warning reads a view's loss normalization through this pinned slot
         // on a later step, so the loss never waits for it.

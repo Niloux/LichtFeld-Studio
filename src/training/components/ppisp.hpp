@@ -63,6 +63,9 @@ namespace lfs::training {
         float color_mean = 1.0f;    // Encourage color correction mean ~ 0
         float crf_channel = 0.1f;   // Encourage similar CRF across RGB channels
         bool train_crf = true;      // When false, CRF stays at identity and is not stepped
+        float vig_alpha_l2 = 0.0f;   // L2 penalty on vignetting alpha coefficients
+        float exposure_prior = 0.0f; // Affine-invariant L2 anchor to EXIF relative EV prior
+        float color_l2 = 0.0f;       // Per-frame L2 penalty on ZCA color latents
     };
 
     /// Full-width row band of a larger image: vignetting is evaluated in full-image
@@ -89,6 +92,9 @@ namespace lfs::training {
         /// Write 0.5 * (ev - mean) into exposure_params_ for known UIDs. Moments unchanged.
         void seed_exposure(const std::vector<std::pair<int, float>>& uid_ev);
 
+        /// Install zero-centered per-frame EXIF prior without modifying exposure_params_.
+        void set_exposure_prior(const std::vector<std::pair<int, float>>& uid_ev);
+
         void set_exif_exposure_mean(std::optional<float> mean) { exif_exposure_mean_ = mean; }
         [[nodiscard]] std::optional<float> exif_exposure_mean() const { return exif_exposure_mean_; }
         void set_train_crf(bool train) { config_.train_crf = train; }
@@ -97,10 +103,14 @@ namespace lfs::training {
         /// Per-frame exposure in EV (same units as the optimiser).
         [[nodiscard]] lfs::core::Tensor& exposure_params() { return exposure_params_; }
         [[nodiscard]] const lfs::core::Tensor& exposure_params() const { return exposure_params_; }
+        [[nodiscard]] lfs::core::Tensor& vignetting_params() { return vignetting_params_; }
+        [[nodiscard]] const lfs::core::Tensor& vignetting_params() const { return vignetting_params_; }
         [[nodiscard]] lfs::core::Tensor& color_params() { return color_params_; }
         [[nodiscard]] const lfs::core::Tensor& color_params() const { return color_params_; }
-        [[nodiscard]] const lfs::core::Tensor& vignetting_params() const { return vignetting_params_; }
         [[nodiscard]] const lfs::core::Tensor& crf_params() const { return crf_params_; }
+        [[nodiscard]] const lfs::core::Tensor& exposure_grad() const { return exposure_grad_; }
+        [[nodiscard]] const lfs::core::Tensor& vignetting_grad() const { return vignetting_grad_; }
+        [[nodiscard]] const lfs::core::Tensor& color_grad() const { return color_grad_; }
 
         /// Check if a frame UID is registered
         bool is_known_frame(int uid) const;
@@ -129,7 +139,8 @@ namespace lfs::training {
         lfs::core::Tensor invert(const lfs::core::Tensor& photo, int camera_id, int uid, cudaStream_t stream = nullptr) const;
 
         lfs::core::Tensor apply_interpolated_frames(const lfs::core::Tensor& rgb, int camera_id,
-                                                    int left_uid, int right_uid, float fraction);
+                                                    int left_uid, int right_uid, float fraction,
+                                                    float exposure_offset = 0.0f);
 
         /// Same as apply(), but exposure comes from the argument instead of
         /// exposure_params_[frame]. Camera-level vignetting/CRF come from camera_id;
@@ -174,6 +185,8 @@ namespace lfs::training {
                                    int uid);
         /// Backward pass that overwrites the contiguous grad with the gradient with respect to rgb.
         void backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int camera_id, int uid);
+        /// Backward pass w.r.t. rgb only, leaving exposure/color/vignetting/CRF parameter gradients untouched.
+        void backward_rgb_only_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int camera_id, int uid);
 
         /// Backward pass through ISP using controller-predicted params.
         /// Returns gradient w.r.t. controller_params [1,9] for controller backward.
@@ -207,6 +220,14 @@ namespace lfs::training {
 
         /// Mean per-frame exposure EV (CPU; for eval diagnostics).
         [[nodiscard]] float mean_exposure_ev() const;
+        /// Minimum per-frame exposure EV across finalized frames (CPU).
+        [[nodiscard]] float min_exposure_ev() const;
+        /// Fitted affine EXIF prior slope clamped to [0.30, 0.60], or 0.5f when unavailable (CPU).
+        [[nodiscard]] float exposure_prior_slope() const;
+        /// RMS residual of exposure_params_ against the affine EXIF prior over valid frames (CPU).
+        [[nodiscard]] float exposure_prior_rms() const;
+        /// RMS of per-frame ZCA color latents (CPU).
+        [[nodiscard]] float color_latent_rms() const;
         /// Max absolute mean of the 8 colour offsets after ZCA (CPU; for eval diagnostics).
         [[nodiscard]] float max_abs_color_offset_mean() const;
         void log_eval_diagnostics() const;
@@ -313,6 +334,12 @@ namespace lfs::training {
         size_t ctrl_bwd_rgb_h_ = 0;
         size_t ctrl_bwd_rgb_w_ = 0;
 
+        // Throwaway parameter-grad scratch for backward_rgb_only_in_place
+        lfs::core::Tensor rgb_only_bwd_exposure_;
+        lfs::core::Tensor rgb_only_bwd_color_;
+        lfs::core::Tensor rgb_only_bwd_vignetting_;
+        lfs::core::Tensor rgb_only_bwd_crf_;
+
         // Persistent GPU scalar for the fused vignetting regulariser (EC path).
         lfs::core::Tensor vig_reg_loss_;
 
@@ -333,6 +360,13 @@ namespace lfs::training {
 
         // ZCA pinv block-diagonal matrix for color mean regularization [8x8]
         lfs::core::Tensor color_pinv_block_diag_;
+
+        // EXIF relative exposure prior over training frames [num_frames]
+        lfs::core::Tensor exif_ev_centered_;
+        lfs::core::Tensor exif_ev_valid_;
+        int exif_ev_count_ = 0;
+        float exif_ev_ss_ = 0.0f;
+        bool has_exif_prior_ = false;
     };
 
 } // namespace lfs::training

@@ -17,6 +17,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <memory>
+#include <tuple>
 #include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <unordered_set>
@@ -410,4 +411,62 @@ TEST(PPISPHoldoutAppearanceTest, HeldOutViewUsesItsOwnCameraController) {
                             .to_vector();
     ASSERT_EQ(actual.size(), own.size());
     EXPECT_EQ(std::memcmp(actual.data(), own.data(), own.size() * sizeof(float)), 0);
+}
+
+TEST(PPISPExposureSeedTest, ExposurePriorSlopeDefaultsAndFitsAffineRelation) {
+    PPISP ppisp(100);
+    ppisp.register_frame(10, 0);
+    ppisp.register_frame(20, 0);
+    ppisp.register_frame(30, 0);
+    ppisp.register_frame(40, 0);
+    ppisp.finalize();
+
+    // Without an EXIF prior, slope defaults to 0.5.
+    EXPECT_FLOAT_EQ(ppisp.exposure_prior_slope(), 0.5f);
+
+    // Zero-variance EXIF EVs also keep the 0.5 default.
+    ppisp.set_exposure_prior({{10, 1.0f}, {20, 1.0f}, {30, 1.0f}});
+    EXPECT_FLOAT_EQ(ppisp.exposure_prior_slope(), 0.5f);
+
+    // Install real EVs and verify fitted slope in [0.30, 0.60] without mutating exposure_params_.
+    const std::vector<float> custom_exp{-0.44f, 0.0f, 0.44f, 0.22f};
+    ppisp.exposure_params().copy_from(lfs::core::Tensor::from_vector(custom_exp, {4}, Device::CUDA));
+    ppisp.set_exposure_prior({{10, -1.0f}, {20, 0.0f}, {30, 1.0f}});
+    const auto after = exposure_host(ppisp);
+    EXPECT_EQ(after, custom_exp);
+    EXPECT_NEAR(ppisp.exposure_prior_slope(), 0.44f, 1e-4f);
+    EXPECT_NEAR(ppisp.exposure_prior_rms(), 0.0f, 1e-5f);
+}
+
+TEST(PPISPExposureSeedTest, MinExposureEvAndInterpolatedOffsetMatchExplicitParameters) {
+    PPISP ppisp(100);
+    ppisp.register_frame(10, 7);
+    ppisp.register_frame(20, 7);
+    ppisp.register_frame(30, 7);
+    ppisp.finalize();
+    ppisp.exposure_params().copy_from(
+        lfs::core::Tensor::from_vector({-0.65f, 0.25f, 0.90f}, {3}, Device::CUDA));
+    EXPECT_FLOAT_EQ(ppisp.min_exposure_ev(), -0.65f);
+
+    std::vector<float> pixels(3 * 8 * 8);
+    for (size_t i = 0; i < pixels.size(); ++i)
+        pixels[i] = 0.15f + 0.004f * static_cast<float>(i % 128);
+    const auto rgb = lfs::core::Tensor::from_vector(pixels, {3, 8, 8}, Device::CUDA);
+
+    // Both interpolated pair and same-frame boundary (left == right) with nonzero offset.
+    for (const auto& [left, right, t, offset] : std::vector<std::tuple<int, int, float, float>>{
+             {10, 20, 0.4f, 0.25f},
+             {10, 10, 0.0f, 0.35f},
+         }) {
+        const float left_exp = left == 10 ? -0.65f : 0.25f;
+        const float right_exp = right == 10 ? -0.65f : 0.25f;
+        std::vector<float> values(9, 0.0f);
+        values[0] = left_exp * (1.0f - t) + right_exp * t + offset;
+        const auto explicit_params = lfs::core::Tensor::from_vector(values, {1, 9}, Device::CUDA);
+        const auto expected = ppisp.apply_with_controller_params(rgb, explicit_params, ppisp.camera_index(7)).cpu().to_vector();
+        const auto actual = ppisp.apply_interpolated_frames(rgb, 7, left, right, t, offset).cpu().to_vector();
+        ASSERT_EQ(expected.size(), actual.size());
+        for (size_t i = 0; i < actual.size(); ++i)
+            EXPECT_NEAR(actual[i], expected[i], 2e-6f);
+    }
 }

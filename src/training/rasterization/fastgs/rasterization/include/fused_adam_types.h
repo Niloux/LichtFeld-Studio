@@ -53,6 +53,7 @@ namespace fast_lfs::rasterization {
         float scale_reg_normalizer = 1.0f;
         float erank_reg_weight = 0.0f;
         float dc_reg_weight = 0.0f;
+        float dc_reg_max_rgb = 1.0f;
         float sh_rest_reg_weight = 0.0f;
         float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;

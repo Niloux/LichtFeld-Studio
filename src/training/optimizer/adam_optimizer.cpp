@@ -658,7 +658,8 @@ namespace lfs::training {
                 gut_cfg.erank_weight,
                 gut_cfg.flatten_weight,
                 gut_cfg.dc_weight,
-                nullptr, nullptr, nullptr};
+                nullptr, nullptr, nullptr,
+                gut_cfg.dc_max_rgb};
             fast_lfs::optimizer::adam_step_joint_contiguous_batched(
                 entries, n_entries,
                 frozen_mask_ptr(), frozen_mask_size(), frozen_lr_scale_,

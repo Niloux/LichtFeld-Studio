@@ -42,7 +42,7 @@ namespace {
     constexpr uint32_t PPISP_LEGACY_VERSION = 2;
     constexpr uint32_t PPISP_VERSION = 4;
     constexpr size_t PPISP_CONFIG_OFFSET = 16;
-    constexpr size_t PPISP_CONFIG_BLOCK_BYTES = 88;
+    constexpr size_t PPISP_CONFIG_BLOCK_BYTES = 100;
 
     constexpr uint32_t CONTROLLER_POOL_MAGIC = 0x4C465043;
     constexpr uint32_t CONTROLLER_POOL_LEGACY_VERSION = 1;
@@ -52,8 +52,8 @@ namespace {
 
     constexpr uint32_t CONFIG_SCHEMA_VERSION = 1;
     constexpr uint32_t OPTIMIZER_CONFIG_V1_BYTES = 52;
-    constexpr uint32_t PPISP_CONFIG_SCHEMA_VERSION = 2;
-    constexpr uint32_t PPISP_CONFIG_V2_BYTES = 80;
+    constexpr uint32_t PPISP_CONFIG_SCHEMA_VERSION = 3;
+    constexpr uint32_t PPISP_CONFIG_V3_BYTES = 92;
 
     struct LegacyBilateralConfigV1 {
         double lr;
@@ -184,6 +184,9 @@ namespace {
             .color_mean = 0.29f,
             .crf_channel = 0.23f,
             .train_crf = false,
+            .vig_alpha_l2 = 0.47f,
+            .exposure_prior = 0.53f,
+            .color_l2 = 0.09f,
         };
     }
 
@@ -221,6 +224,9 @@ namespace {
         EXPECT_FLOAT_EQ(actual.color_mean, expected.color_mean);
         EXPECT_FLOAT_EQ(actual.crf_channel, expected.crf_channel);
         EXPECT_EQ(actual.train_crf, expected.train_crf);
+        EXPECT_FLOAT_EQ(actual.vig_alpha_l2, expected.vig_alpha_l2);
+        EXPECT_FLOAT_EQ(actual.exposure_prior, expected.exposure_prior);
+        EXPECT_FLOAT_EQ(actual.color_l2, expected.color_l2);
     }
 
     template <typename Config>
@@ -253,7 +259,7 @@ namespace {
         const lfs::training::PPISP::Config& config) {
         EXPECT_EQ(read_little_endian<uint32_t>(bytes, offset), PPISP_CONFIG_SCHEMA_VERSION);
         offset += sizeof(uint32_t);
-        EXPECT_EQ(read_little_endian<uint32_t>(bytes, offset), PPISP_CONFIG_V2_BYTES);
+        EXPECT_EQ(read_little_endian<uint32_t>(bytes, offset), PPISP_CONFIG_V3_BYTES);
         offset += sizeof(uint32_t);
         EXPECT_DOUBLE_EQ(read_little_endian<double>(bytes, offset), config.lr);
         offset += sizeof(double);
@@ -282,6 +288,12 @@ namespace {
         EXPECT_FLOAT_EQ(read_little_endian<float>(bytes, offset), config.crf_channel);
         offset += sizeof(float);
         EXPECT_EQ(read_little_endian<int32_t>(bytes, offset), config.train_crf ? 1 : 0);
+        offset += sizeof(int32_t);
+        EXPECT_FLOAT_EQ(read_little_endian<float>(bytes, offset), config.vig_alpha_l2);
+        offset += sizeof(float);
+        EXPECT_FLOAT_EQ(read_little_endian<float>(bytes, offset), config.exposure_prior);
+        offset += sizeof(float);
+        EXPECT_FLOAT_EQ(read_little_endian<float>(bytes, offset), config.color_l2);
     }
 
     template <typename Load>
@@ -474,6 +486,9 @@ namespace {
         loaded.deserialize(stream);
         auto expected = config;
         expected.train_crf = true; // v2 blobs predate the field; default is identity-trainable
+        expected.vig_alpha_l2 = 0.0f;
+        expected.exposure_prior = 0.0f;
+        expected.color_l2 = 0.0f;
         expect_ppisp_config_eq(expected, loaded.get_config());
     }
 

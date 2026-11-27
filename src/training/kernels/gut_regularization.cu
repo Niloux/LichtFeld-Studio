@@ -43,16 +43,17 @@ namespace lfs::training::kernels {
                 }
                 if (dc_weight > 0.0f) {
                     constexpr float kSh0 = 0.28209479177387814f;
-                    const float limit = 0.5f / kSh0;
+                    const float lo_limit = -0.5f / kSh0;
+                    const float hi_limit = (fmaxf(shape.dc_max_rgb, 1.0f) - 0.5f) / kSh0;
                     // The gradient stays per splat; the reported loss is the mean over splats.
                     const float reported_loss_weight = dc_weight / (3.0f * static_cast<float>(n));
                     const float* coeff = sh0 + i * sh0_stride;
                     for (int c = 0; c < 3; ++c) {
                         float delta = 0.0f;
-                        if (coeff[c] > limit)
-                            delta = coeff[c] - limit;
-                        else if (coeff[c] < -limit)
-                            delta = coeff[c] + limit;
+                        if (coeff[c] > hi_limit)
+                            delta = coeff[c] - hi_limit;
+                        else if (coeff[c] < lo_limit)
+                            delta = coeff[c] - lo_limit;
                         sh0_grad[i * sh0_stride + c] += (2.0f * dc_weight / 3.0f) * delta;
                         dc_loss += reported_loss_weight * delta * delta;
                     }

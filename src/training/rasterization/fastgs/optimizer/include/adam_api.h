@@ -46,6 +46,7 @@ namespace fast_lfs::optimizer {
         float* scale_loss_out = nullptr;
         float* erank_loss_out = nullptr;
         float* dc_loss_out = nullptr;
+        float dc_max_rgb = 1.0f;
     };
 
     // Ray-depth coordinate around the unfused Adam step (lfs/training/ray_depth_step.cuh).

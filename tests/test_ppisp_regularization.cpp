@@ -747,4 +747,216 @@ namespace {
         ppisp.scheduler_step();
     }
 
+    TEST_F(PPISPRegularizationTest, BackwardRgbOnlyMatchesFiniteDiffAndLeavesParamsUntouched) {
+        auto ppisp_ptr = create_test_ppisp(1, 2, 1000, {});
+        auto& ppisp = *ppisp_ptr;
+        ppisp.seed_exposure({{0, 0.7f}, {1, -0.4f}});
+        const auto exp_before = ppisp.exposure_params().cpu().to_vector();
+        const auto col_before = ppisp.color_params().cpu().to_vector();
+
+        constexpr int H = 4;
+        constexpr int W = 4;
+        constexpr int N = H * W;
+        std::vector<float> rgb_h(3 * N);
+        std::vector<float> grad_h(3 * N);
+        for (int i = 0; i < 3 * N; ++i) {
+            rgb_h[i] = 0.15f + 0.01f * static_cast<float>(i % 29);
+            grad_h[i] = 0.2f + 0.05f * static_cast<float>(i % 7);
+        }
+        const auto rgb = lfs::core::Tensor::from_vector(rgb_h, {3, H, W}, lfs::core::Device::CUDA);
+        const auto grad_out = lfs::core::Tensor::from_vector(grad_h, {3, H, W}, lfs::core::Device::CUDA);
+
+        ppisp.zero_grad();
+        auto grad_rgb = grad_out.clone();
+        ppisp.backward_rgb_only_in_place(rgb, grad_rgb, 0, 1);
+        const auto analytical = grad_rgb.cpu().to_vector();
+
+        constexpr float eps = 1e-3f;
+        for (const int idx : {0, 5, N + 7, 2 * N + 11}) {
+            auto plus_h = rgb_h;
+            auto minus_h = rgb_h;
+            plus_h[idx] += eps;
+            minus_h[idx] -= eps;
+            const auto out_plus = ppisp.apply(
+                lfs::core::Tensor::from_vector(plus_h, {3, H, W}, lfs::core::Device::CUDA), 0, 1);
+            const auto out_minus = ppisp.apply(
+                lfs::core::Tensor::from_vector(minus_h, {3, H, W}, lfs::core::Device::CUDA), 0, 1);
+            const float loss_plus = (out_plus * grad_out).sum().cpu().item<float>();
+            const float loss_minus = (out_minus * grad_out).sum().cpu().item<float>();
+            const float numerical = (loss_plus - loss_minus) / (2.0f * eps);
+            EXPECT_NEAR(analytical[idx], numerical, 1e-4f);
+        }
+
+        // Verify parameter gradients remained zero by stepping the optimizer and checking params.
+        ppisp.optimizer_step();
+        const auto exp_after = ppisp.exposure_params().cpu().to_vector();
+        const auto col_after = ppisp.color_params().cpu().to_vector();
+        ASSERT_EQ(exp_before.size(), exp_after.size());
+        for (size_t i = 0; i < exp_before.size(); ++i)
+            EXPECT_FLOAT_EQ(exp_before[i], exp_after[i]);
+        for (size_t i = 0; i < col_before.size(); ++i)
+            EXPECT_FLOAT_EQ(col_before[i], col_after[i]);
+    }
+
+    TEST_F(PPISPRegularizationTest, VignettingAlphaL2MatchesFiniteDiff) {
+        for (const bool gpu_fast_path : {true, false}) {
+            SCOPED_TRACE(gpu_fast_path ? "gpu_fast_path" : "cpu_fallback");
+            lfs::training::PPISPConfig config;
+            config.train_crf = !gpu_fast_path;
+            config.exposure_mean = gpu_fast_path ? 0.0f : 0.0f;
+            config.color_mean = gpu_fast_path ? 0.0f : 1e-6f;
+            config.crf_channel = gpu_fast_path ? 0.0f : 1e-6f;
+            config.vig_center = 0.0f;
+            config.vig_channel = 0.0f;
+            config.vig_non_pos = 0.0f;
+            config.vig_alpha_l2 = 0.75f;
+
+            auto ppisp_ptr = create_test_ppisp(2, 4, 1000, config);
+            auto& ppisp = *ppisp_ptr;
+            std::vector<float> vig(2 * 15, 0.0f);
+            for (size_t i = 0; i < vig.size(); ++i)
+                vig[i] = ((i % 2 == 0) ? -0.35f : 0.25f) * (1.0f + 0.1f * static_cast<float>(i % 5));
+            ppisp.vignetting_params().copy_from(
+                lfs::core::Tensor::from_vector(vig, {vig.size()}, lfs::core::Device::CUDA));
+
+            ppisp.zero_grad();
+            const float loss0 = ppisp.reg_loss_gpu().cpu().item<float>();
+            EXPECT_GT(loss0, 0.0f);
+            ppisp.reg_backward();
+            const auto grad = ppisp.vignetting_grad().cpu().to_vector();
+
+            constexpr float eps = 1e-3f;
+            for (size_t i = 0; i < vig.size(); ++i) {
+                auto plus = vig;
+                auto minus = vig;
+                plus[i] += eps;
+                minus[i] -= eps;
+                ppisp.vignetting_params().copy_from(
+                    lfs::core::Tensor::from_vector(plus, {plus.size()}, lfs::core::Device::CUDA));
+                const float l_plus = ppisp.reg_loss_gpu().cpu().item<float>();
+                ppisp.vignetting_params().copy_from(
+                    lfs::core::Tensor::from_vector(minus, {minus.size()}, lfs::core::Device::CUDA));
+                const float l_minus = ppisp.reg_loss_gpu().cpu().item<float>();
+                const float fd = (l_plus - l_minus) / (2.0f * eps);
+                EXPECT_NEAR(grad[i], fd, 5e-4f) << "index=" << i;
+            }
+        }
+    }
+
+    TEST_F(PPISPRegularizationTest, ExposurePriorAffineInvariantMatchesFiniteDiff) {
+        const std::vector<std::tuple<const char*, std::vector<float>, std::vector<float>, float>> cases{
+            {"interior_slope", {0.0f, 1.0f, 2.0f, 3.0f, 4.0f}, {-0.90f, -0.40f, 0.02f, 0.50f, 0.88f}, 0.44f},
+            {"clamped_low_slope", {0.0f, 1.0f, 2.0f, 3.0f, 4.0f}, {-0.20f, -0.05f, 0.0f, 0.15f, 0.25f}, 0.30f},
+            {"clamped_high_slope", {0.0f, 1.0f, 2.0f, 3.0f, 4.0f}, {-1.60f, -0.80f, 0.05f, 0.75f, 1.65f}, 0.60f},
+            {"flat_exif", {2.0f, 2.0f, 2.0f, 2.0f, 2.0f}, {-0.3f, 0.1f, 0.0f, 0.4f, -0.2f}, 0.50f},
+        };
+
+        for (const auto& [name, evs, exp_vals, expected_slope] : cases) {
+            for (const bool gpu_fast_path : {true, false}) {
+                SCOPED_TRACE(std::string(name) + (gpu_fast_path ? "_gpu" : "_cpu"));
+                lfs::training::PPISPConfig config;
+                config.train_crf = !gpu_fast_path;
+                config.exposure_mean = 0.0f;
+                config.color_mean = gpu_fast_path ? 0.0f : 1e-6f;
+                config.crf_channel = gpu_fast_path ? 0.0f : 1e-6f;
+                config.vig_center = 0.0f;
+                config.vig_channel = 0.0f;
+                config.vig_non_pos = 0.0f;
+                config.exposure_prior = 0.8f;
+
+                auto ppisp_ptr = create_test_ppisp(1, 5, 1000, config);
+                auto& ppisp = *ppisp_ptr;
+                std::vector<std::pair<int, float>> prior;
+                for (int i = 0; i < 5; ++i)
+                    prior.emplace_back(i, evs[static_cast<size_t>(i)]);
+                ppisp.set_exposure_prior(prior);
+                ppisp.exposure_params().copy_from(
+                    lfs::core::Tensor::from_vector(exp_vals, {5}, lfs::core::Device::CUDA));
+
+                if (std::string_view(name) != "flat_exif") {
+                    EXPECT_NEAR(ppisp.exposure_prior_slope(), expected_slope, 0.03f);
+                } else {
+                    EXPECT_FLOAT_EQ(ppisp.exposure_prior_slope(), 0.5f);
+                }
+
+                // Shift invariance: adding any global EV shift leaves loss unchanged.
+                const float loss0 = ppisp.reg_loss_gpu().cpu().item<float>();
+                auto shifted = exp_vals;
+                for (float& v : shifted)
+                    v += 0.65f;
+                ppisp.exposure_params().copy_from(
+                    lfs::core::Tensor::from_vector(shifted, {5}, lfs::core::Device::CUDA));
+                EXPECT_NEAR(ppisp.reg_loss_gpu().cpu().item<float>(), loss0, 1e-5f);
+
+                // Restore and verify finite-diff gradients.
+                ppisp.exposure_params().copy_from(
+                    lfs::core::Tensor::from_vector(exp_vals, {5}, lfs::core::Device::CUDA));
+                ppisp.zero_grad();
+                ppisp.reg_backward();
+                const auto grad = ppisp.exposure_grad().cpu().to_vector();
+
+                constexpr float eps = 1e-3f;
+                for (size_t i = 0; i < exp_vals.size(); ++i) {
+                    auto plus = exp_vals;
+                    auto minus = exp_vals;
+                    plus[i] += eps;
+                    minus[i] -= eps;
+                    ppisp.exposure_params().copy_from(
+                        lfs::core::Tensor::from_vector(plus, {5}, lfs::core::Device::CUDA));
+                    const float l_plus = ppisp.reg_loss_gpu().cpu().item<float>();
+                    ppisp.exposure_params().copy_from(
+                        lfs::core::Tensor::from_vector(minus, {5}, lfs::core::Device::CUDA));
+                    const float l_minus = ppisp.reg_loss_gpu().cpu().item<float>();
+                    const float fd = (l_plus - l_minus) / (2.0f * eps);
+                    EXPECT_NEAR(grad[i], fd, 5e-4f) << "index=" << i;
+                }
+            }
+        }
+    }
+
+    TEST_F(PPISPRegularizationTest, ColorLatentL2MatchesFiniteDiff) {
+        for (const bool gpu_fast_path : {true, false}) {
+            SCOPED_TRACE(gpu_fast_path ? "gpu_fast_path" : "cpu_fallback");
+            lfs::training::PPISPConfig config;
+            config.train_crf = !gpu_fast_path;
+            config.exposure_mean = 0.0f;
+            config.color_mean = gpu_fast_path ? 0.0f : 1e-6f;
+            config.crf_channel = gpu_fast_path ? 0.0f : 1e-6f;
+            config.vig_center = 0.0f;
+            config.vig_channel = 0.0f;
+            config.vig_non_pos = 0.0f;
+            config.color_l2 = 0.25f;
+
+            auto ppisp_ptr = create_test_ppisp(1, 3, 1000, config);
+            auto& ppisp = *ppisp_ptr;
+            std::vector<float> col(24);
+            for (size_t i = 0; i < col.size(); ++i)
+                col[i] = 0.3f * std::sin(0.5f * static_cast<float>(i) + 0.2f);
+            ppisp.color_params().copy_from(
+                lfs::core::Tensor::from_vector(col, {col.size()}, lfs::core::Device::CUDA));
+
+            ppisp.zero_grad();
+            const float loss0 = ppisp.reg_loss_gpu().cpu().item<float>();
+            EXPECT_GT(loss0, 0.0f);
+            ppisp.reg_backward();
+            const auto grad = ppisp.color_grad().cpu().to_vector();
+
+            constexpr float eps = 1e-3f;
+            for (size_t i = 0; i < col.size(); ++i) {
+                auto plus = col;
+                auto minus = col;
+                plus[i] += eps;
+                minus[i] -= eps;
+                ppisp.color_params().copy_from(
+                    lfs::core::Tensor::from_vector(plus, {plus.size()}, lfs::core::Device::CUDA));
+                const float l_plus = ppisp.reg_loss_gpu().cpu().item<float>();
+                ppisp.color_params().copy_from(
+                    lfs::core::Tensor::from_vector(minus, {minus.size()}, lfs::core::Device::CUDA));
+                const float l_minus = ppisp.reg_loss_gpu().cpu().item<float>();
+                const float fd = (l_plus - l_minus) / (2.0f * eps);
+                EXPECT_NEAR(grad[i], fd, 5e-4f) << "index=" << i;
+            }
+        }
+    }
+
 } // namespace

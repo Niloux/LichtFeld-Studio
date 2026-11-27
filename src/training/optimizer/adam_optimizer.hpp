@@ -113,6 +113,7 @@ namespace lfs::training {
         float erank_weight = 0.0f;
         float flatten_weight = 0.0f;
         float dc_weight = 0.0f;
+        float dc_max_rgb = 1.0f;
     };
 
     struct FastGSFusedAdamState {

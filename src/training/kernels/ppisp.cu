@@ -347,7 +347,7 @@ namespace lfs::training::kernels {
     // One thread owns one camera's 15 vignetting params so grad += needs no atomics.
     __global__ void ppisp_vignetting_reg_kernel(const float* __restrict__ vig, float* __restrict__ grad,
                                                 float* __restrict__ loss, int num_cameras, float w_center,
-                                                float w_channel, float w_non_pos) {
+                                                float w_channel, float w_non_pos, float w_alpha_l2) {
         using BlockReduce = cub::BlockReduce<float, PPISP_BLOCK_SIZE>;
         __shared__ typename BlockReduce::TempStorage temp;
 
@@ -372,14 +372,20 @@ namespace lfs::training::kernels {
                     }
                 }
             }
-            if (w_non_pos != 0.0f) {
+            if (w_non_pos != 0.0f || w_alpha_l2 != 0.0f) {
+                const float s_l2 = w_alpha_l2 * 2.0f * inv_non_pos;
                 for (int ch = 0; ch < 3; ++ch) {
                     for (int a = 0; a < 3; ++a) {
                         const float alpha = p[ch * 5 + 2 + a];
-                        if (alpha > 0.0f) {
+                        if (w_non_pos != 0.0f && alpha > 0.0f) {
                             local_loss += w_non_pos * alpha * inv_non_pos;
                             if (g)
                                 g[ch * 5 + 2 + a] += w_non_pos * inv_non_pos;
+                        }
+                        if (w_alpha_l2 != 0.0f) {
+                            local_loss += w_alpha_l2 * alpha * alpha * inv_non_pos;
+                            if (g)
+                                g[ch * 5 + 2 + a] += s_l2 * alpha;
                         }
                     }
                 }
@@ -407,6 +413,88 @@ namespace lfs::training::kernels {
         const float block_loss = BlockReduce(temp).Sum(local_loss);
         if (loss && threadIdx.x == 0 && block_loss != 0.0f)
             atomicAdd(loss, block_loss);
+    }
+
+    // Block 0: affine-invariant EXIF exposure prior L2.
+    // Block 1: per-frame ZCA color latent L2.
+    __global__ void ppisp_frame_reg_kernel(const float* __restrict__ exposure_params,
+                                           float* __restrict__ exposure_grad,
+                                           const float* __restrict__ color_params,
+                                           float* __restrict__ color_grad,
+                                           const float* __restrict__ exif_ev_centered,
+                                           const float* __restrict__ exif_ev_valid,
+                                           const int exif_ev_count,
+                                           const float exif_ev_ss,
+                                           float* __restrict__ loss,
+                                           const int num_frames,
+                                           const float w_exposure_prior,
+                                           const float w_color_l2) {
+        using BlockReduce = cub::BlockReduce<float, PPISP_BLOCK_SIZE>;
+        __shared__ typename BlockReduce::TempStorage temp;
+        __shared__ float s_mean_e;
+        __shared__ float s_slope;
+
+        if (blockIdx.x == 0) {
+            if (w_exposure_prior <= 0.0f || !exposure_params || !exif_ev_centered || !exif_ev_valid ||
+                exif_ev_count <= 0 || num_frames <= 0)
+                return;
+
+            float local_e = 0.0f;
+            float local_xe = 0.0f;
+            for (int f = static_cast<int>(threadIdx.x); f < num_frames; f += PPISP_BLOCK_SIZE) {
+                if (exif_ev_valid[f] > 0.0f) {
+                    const float e = ppisp_finite_or_zero(exposure_params[f]);
+                    local_e += e;
+                    local_xe += ppisp_finite_or_zero(exif_ev_centered[f]) * e;
+                }
+            }
+            const float sum_e = BlockReduce(temp).Sum(local_e);
+            __syncthreads();
+            const float sum_xe = BlockReduce(temp).Sum(local_xe);
+            if (threadIdx.x == 0) {
+                s_mean_e = sum_e / static_cast<float>(exif_ev_count);
+                s_slope = (exif_ev_ss > 1.0e-4f)
+                              ? fminf(0.60f, fmaxf(0.30f, sum_xe / exif_ev_ss))
+                              : 0.0f;
+            }
+            __syncthreads();
+
+            const float mean_e = s_mean_e;
+            const float slope = s_slope;
+            const float inv_count = 1.0f / static_cast<float>(exif_ev_count);
+            const float g_scale = 2.0f * w_exposure_prior * inv_count;
+            float local_loss = 0.0f;
+            for (int f = static_cast<int>(threadIdx.x); f < num_frames; f += PPISP_BLOCK_SIZE) {
+                if (exif_ev_valid[f] > 0.0f) {
+                    const float e = ppisp_finite_or_zero(exposure_params[f]);
+                    const float x = ppisp_finite_or_zero(exif_ev_centered[f]);
+                    const float r = e - (mean_e + slope * x);
+                    local_loss += w_exposure_prior * r * r * inv_count;
+                    if (exposure_grad)
+                        exposure_grad[f] += g_scale * r;
+                }
+            }
+            __syncthreads();
+            const float block_loss = BlockReduce(temp).Sum(local_loss);
+            if (loss && threadIdx.x == 0 && block_loss != 0.0f)
+                atomicAdd(loss, block_loss);
+        } else {
+            if (w_color_l2 <= 0.0f || !color_params || num_frames <= 0)
+                return;
+            const int total = num_frames * 8;
+            const float inv_total = 1.0f / static_cast<float>(total);
+            const float g_scale = 2.0f * w_color_l2 * inv_total;
+            float local_loss = 0.0f;
+            for (int i = static_cast<int>(threadIdx.x); i < total; i += PPISP_BLOCK_SIZE) {
+                const float c = ppisp_finite_or_zero(color_params[i]);
+                local_loss += w_color_l2 * c * c * inv_total;
+                if (color_grad)
+                    color_grad[i] += g_scale * c;
+            }
+            const float block_loss = BlockReduce(temp).Sum(local_loss);
+            if (loss && threadIdx.x == 0 && block_loss != 0.0f)
+                atomicAdd(loss, block_loss);
+        }
     }
 
     __global__ void ppisp_project_mean_kernel(float* __restrict__ exposure, float* __restrict__ color, int n) {
@@ -593,15 +681,33 @@ namespace lfs::training::kernels {
 
     void launch_ppisp_vignetting_reg(const float* vignetting_params, float* vignetting_grad, float* loss,
                                      int num_cameras, float vig_center, float vig_channel, float vig_non_pos,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, float vig_alpha_l2) {
         if (num_cameras <= 0)
             return;
         stream = resolve_stream(stream);
         const int threads = PPISP_BLOCK_SIZE;
         const int blocks = divUp(num_cameras, threads);
         ppisp_vignetting_reg_kernel<<<blocks, threads, 0, stream>>>(
-            vignetting_params, vignetting_grad, loss, num_cameras, vig_center, vig_channel, vig_non_pos);
+            vignetting_params, vignetting_grad, loss, num_cameras, vig_center, vig_channel, vig_non_pos,
+            vig_alpha_l2);
         LFS_CUDA_CHECK_MSG(cudaGetLastError(), "PPISP vignetting reg kernel launch failed");
+    }
+
+    void launch_ppisp_frame_reg(const float* exposure_params, float* exposure_grad,
+                                const float* color_params, float* color_grad,
+                                const float* exif_ev_centered, const float* exif_ev_valid,
+                                int exif_ev_count, float exif_ev_ss,
+                                float* loss, int num_frames,
+                                float exposure_prior_weight, float color_l2_weight,
+                                cudaStream_t stream) {
+        if (num_frames <= 0 || (exposure_prior_weight <= 0.0f && color_l2_weight <= 0.0f))
+            return;
+        stream = resolve_stream(stream);
+        ppisp_frame_reg_kernel<<<2, PPISP_BLOCK_SIZE, 0, stream>>>(
+            exposure_params, exposure_grad, color_params, color_grad,
+            exif_ev_centered, exif_ev_valid, exif_ev_count, exif_ev_ss,
+            loss, num_frames, exposure_prior_weight, color_l2_weight);
+        LFS_CUDA_CHECK_MSG(cudaGetLastError(), "PPISP frame reg kernel launch failed");
     }
 
     void launch_ppisp_project_mean(float* exposure_params, float* color_params, int num_frames, cudaStream_t stream) {

@@ -4,6 +4,7 @@
 #include "core/alloc_counter.hpp"
 #include "core/tensor.hpp"
 #include "mask_loss_reference.hpp"
+#include "training/kernels/photometric_robust_weight.hpp"
 #include "training/losses/mask_loss.hpp"
 
 #include <algorithm>
@@ -306,4 +307,104 @@ TEST(MaskPreprocessFusionTest, BinaryGt0PhotoWithRoiMatchesCompose) {
     const auto fused = fuse_photometric_mask_weight(ws, mask, roi, /*segment_and_ignore=*/false);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     expect_near_vec(fused, ref, 1e-6f, "photo_bin_roi");
+}
+
+TEST(MaskPreprocessFusionTest, PhotometricRobustWeightProtectsFineTextAndSuppressesGlareAndShadows) {
+    constexpr int H = 96;
+    constexpr int W = 96;
+    constexpr int N = H * W;
+
+    std::vector<float> corr_h(3 * N, 0.25f);
+    std::vector<float> gt_h(3 * N, 0.25f);
+
+    // 2 px wide crisp white text stroke on dark background: rendered already fits crisp text (or small stroke).
+    // Even if gt has a 2 px bright line at y=[42..43], x=[4..40) while rendered matches background,
+    // low-frequency 8x8 + 3x3 average dilutes thin text below kOutlierTau.
+    for (int y = 42; y <= 43; ++y) {
+        for (int x = 4; x < 40; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                gt_h[c * N + y * W + x] = 0.85f;
+            }
+        }
+    }
+
+    // Moderate +0.15 bright-underfit patch at y=[56..88), x=[56..88): below kOutlierTau=0.18, must stay >= 0.99
+    // so temporarily dark patches are never self-locked.
+    for (int y = 56; y < 88; ++y) {
+        for (int x = 56; x < 88; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                corr_h[c * N + y * W + x] = 0.45f;
+                gt_h[c * N + y * W + x] = 0.60f;
+            }
+        }
+    }
+
+    // Symmetric +0.45 gross glare patch (32x32) at y=[16..48), x=[48..80)
+    for (int y = 16; y < 48; ++y) {
+        for (int x = 48; x < 80; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                gt_h[c * N + y * W + x] = 0.70f;
+            }
+        }
+    }
+
+    // Symmetric -0.45 gross moving shadow patch (32x32) at y=[56..88), x=[8..40)
+    for (int y = 56; y < 88; ++y) {
+        for (int x = 8; x < 40; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                corr_h[c * N + y * W + x] = 0.60f;
+                gt_h[c * N + y * W + x] = 0.15f;
+            }
+        }
+    }
+
+    // Sidecar map [24, 24] with top-left quadrant 128 (~0.502) and remaining 255.
+    constexpr int SH = 24;
+    constexpr int SW = 24;
+    std::vector<uint8_t> sidecar_h(SH * SW, 255);
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            sidecar_h[y * SW + x] = 128;
+        }
+    }
+    auto sidecar = Tensor::empty({SH, SW}, Device::CPU, DataType::UInt8);
+    std::copy(sidecar_h.begin(), sidecar_h.end(), sidecar.ptr<uint8_t>());
+    sidecar = sidecar.to(Device::CUDA);
+
+    const auto base = Tensor::full({H, W}, 1.0f, Device::CUDA);
+    const auto corr = Tensor::from_vector(corr_h, {3, H, W}, Device::CUDA);
+    const auto gt = Tensor::from_vector(gt_h, {3, H, W}, Device::CUDA);
+
+    lfs::training::kernels::PhotometricRobustWorkspace rws;
+    const auto out = lfs::training::kernels::compute_photometric_robust_weight(
+        base, sidecar, corr, gt, /*online_suppress=*/true, rws);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    const auto loss_cpu = out.loss_weight.to(Device::CPU);
+    const auto static_cpu = out.static_weight.to(Device::CPU);
+    const float* p = loss_cpu.ptr<float>();
+    const float* ps = static_cpu.ptr<float>();
+
+    // Sidecar bilinear check in interior of [0..8) scaled block -> 128/255 ~= 0.50196.
+    EXPECT_NEAR(p[8 * W + 8], 128.0f / 255.0f, 0.02f);
+    EXPECT_NEAR(ps[8 * W + 8], 128.0f / 255.0f, 0.02f);
+
+    // Fine 2 px text stroke must stay high weight (>= 0.95).
+    EXPECT_GE(p[42 * W + 20], 0.95f);
+
+    // Moderate +0.15 bright-underfit patch must not be suppressed (>= 0.99).
+    EXPECT_GE(p[72 * W + 72], 0.99f);
+
+    // Symmetric +/-0.45 gross outliers must both be suppressed (< 0.30, >= 0.19) and symmetric.
+    const float w_glare = p[32 * W + 64];
+    const float w_shadow = p[72 * W + 24];
+    EXPECT_LT(w_glare, 0.30f);
+    EXPECT_GE(w_glare, 0.19f);
+    EXPECT_LT(w_shadow, 0.30f);
+    EXPECT_GE(w_shadow, 0.19f);
+    EXPECT_NEAR(w_glare, w_shadow, 1e-3f);
+
+    // Static weight (for densification error map) must ignore online residual suppression.
+    EXPECT_GE(ps[32 * W + 64], 0.99f);
+    EXPECT_GE(ps[72 * W + 24], 0.99f);
 }

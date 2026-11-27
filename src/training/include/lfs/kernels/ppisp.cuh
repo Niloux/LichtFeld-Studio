@@ -57,7 +57,17 @@ namespace lfs::training::kernels {
     // skips that output. Grad is accumulated (+=). Caller zeros *loss if writing it.
     void launch_ppisp_vignetting_reg(const float* vignetting_params, float* vignetting_grad, float* loss,
                                      int num_cameras, float vig_center, float vig_channel, float vig_non_pos,
-                                     cudaStream_t stream = nullptr);
+                                     cudaStream_t stream = nullptr, float vig_alpha_l2 = 0.0f);
+
+    // Fused per-frame regulariser for affine-invariant EXIF exposure prior and ZCA color latent L2.
+    // Null grad or loss skips that output. Grads are accumulated (+=). Caller zeros *loss if writing it.
+    void launch_ppisp_frame_reg(const float* exposure_params, float* exposure_grad,
+                                const float* color_params, float* color_grad,
+                                const float* exif_ev_centered, const float* exif_ev_valid,
+                                int exif_ev_count, float exif_ev_ss,
+                                float* loss, int num_frames,
+                                float exposure_prior_weight, float color_l2_weight,
+                                cudaStream_t stream = nullptr);
 
     // Subtract per-vector mean of exposure [N] and colour [N, 8] in one launch.
     void launch_ppisp_project_mean(float* exposure_params, float* color_params, int num_frames,

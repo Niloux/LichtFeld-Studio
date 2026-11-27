@@ -12,6 +12,7 @@ namespace lfs::training::kernels {
         const float* blend_peak = nullptr; // [N], zero for splats absent from the view
         float log_scale_weight = 0.0f;
         float* scale_loss_out = nullptr;
+        float dc_max_rgb = 1.0f;
     };
 
     // The per-splat regularizers that FastGS folds into its fused Adam, for the GUT path, whose backward leaves
