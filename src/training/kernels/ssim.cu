@@ -2784,7 +2784,77 @@ namespace lfs::training::kernels {
             if (idx < n)
                 dst[idx] += src[idx];
         }
+
+        template <bool Accumulate>
+        void dispatch_decoupled_raw_gradient(const DecoupledRawGradient& raw, lfs::core::Tensor& grad_image) {
+            validate_loss_context_images(raw.raw_img, raw.gt_img, raw.H, raw.W);
+
+            constexpr float C1 = 0.01f * 0.01f;
+            constexpr float C2 = 0.03f * 0.03f;
+
+            const size_t N = raw.raw_img.shape()[0];
+            const size_t C = raw.raw_img.shape()[1];
+            const dim3 grid((raw.W + BLOCK_X - 1) / BLOCK_X, (raw.H + BLOCK_Y - 1) / BLOCK_Y, N);
+            const dim3 block(BLOCK_X, BLOCK_Y);
+
+            if (raw.mask.is_valid()) {
+                const auto [inv_mask_sum, mask_sum_device] = loss_normalization(raw.mask_sum_value, raw.mask_sum);
+                const auto mask = prepare_loss_mask(raw.mask, raw.raw_img);
+                dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
+                    using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
+                    dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
+                        using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
+                        maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/true, Accumulate, /*ScaledMeanPartial=*/true>
+                            <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                                1.0f, inv_mask_sum, mask_sum_device, raw.H, raw.W, static_cast<int>(C), C1, C2,
+                                raw.raw_img.ptr<float>(), gt_ptr, mask_ptr,
+                                grad_image.ptr<float>(),
+                                raw.raw_dm_dmu1.ptr<__half>(),
+                                raw.raw_dm_dsigma1_sq.ptr<__half>(),
+                                raw.raw_dm_dsigma12.ptr<__half>());
+                        LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_decoupled_raw_backward");
+                    });
+                });
+                return;
+            }
+
+            int grad_h = raw.H;
+            int grad_w = raw.W;
+            if (raw.apply_valid_padding) {
+                grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
+                grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
+            }
+            const size_t numel = N * C * grad_h * grad_w;
+            const float grad_per_pixel = 1.0f / static_cast<float>(numel);
+
+            dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
+                using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
+                fusedL1SSIMBackwardCUDA<TargetT, /*HasSigmaPartials=*/true, Accumulate>
+                    <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                        1.0f, raw.H, raw.W, static_cast<int>(C), C1, C2,
+                        grad_per_pixel, raw.apply_valid_padding,
+                        raw.raw_img.ptr<float>(), gt_ptr,
+                        grad_image.ptr<float>(),
+                        raw.raw_dm_dmu1.ptr<__half>(),
+                        raw.raw_dm_dsigma1_sq.ptr<__half>(),
+                        raw.raw_dm_dsigma12.ptr<__half>());
+                LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_raw_backward");
+            });
+        }
     } // namespace
+
+    void compute_decoupled_raw_gradient(const DecoupledRawGradient& raw, lfs::core::Tensor& grad_out) {
+        LFS_ASSERT(grad_out.is_contiguous() && grad_out.dtype() == lfs::core::DataType::Float32 &&
+                   grad_out.numel() == raw.raw_img.numel());
+        if (raw.precomputed.is_valid()) {
+            LFS_ASSERT(raw.precomputed.is_contiguous() && raw.precomputed.dtype() == lfs::core::DataType::Float32 &&
+                       raw.precomputed.numel() == grad_out.numel() &&
+                       raw.precomputed.data_ptr() != grad_out.data_ptr());
+            grad_out.copy_from(raw.precomputed);
+            return;
+        }
+        dispatch_decoupled_raw_gradient</*Accumulate=*/false>(raw, grad_out);
+    }
 
     void accumulate_decoupled_raw_gradient(const DecoupledRawGradient& raw, lfs::core::Tensor& grad_image) {
         LFS_ASSERT(grad_image.is_contiguous() && grad_image.dtype() == lfs::core::DataType::Float32 &&
@@ -2799,59 +2869,7 @@ namespace lfs::training::kernels {
             LFS_CUDA_LAUNCH_CHECK(stream, "training.ssim.decoupled_raw_precomputed");
             return;
         }
-        validate_loss_context_images(raw.raw_img, raw.gt_img, raw.H, raw.W);
-
-        constexpr float C1 = 0.01f * 0.01f;
-        constexpr float C2 = 0.03f * 0.03f;
-
-        const size_t N = raw.raw_img.shape()[0];
-        const size_t C = raw.raw_img.shape()[1];
-        const dim3 grid((raw.W + BLOCK_X - 1) / BLOCK_X, (raw.H + BLOCK_Y - 1) / BLOCK_Y, N);
-        const dim3 block(BLOCK_X, BLOCK_Y);
-
-        if (raw.mask.is_valid()) {
-            const auto [inv_mask_sum, mask_sum_device] = loss_normalization(raw.mask_sum_value, raw.mask_sum);
-            const auto mask = prepare_loss_mask(raw.mask, raw.raw_img);
-            dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
-                using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-                dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
-                    using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
-                    maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/true, /*Accumulate=*/true, /*ScaledMeanPartial=*/true>
-                        <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                            1.0f, inv_mask_sum, mask_sum_device, raw.H, raw.W, static_cast<int>(C), C1, C2,
-                            raw.raw_img.ptr<float>(), gt_ptr, mask_ptr,
-                            grad_image.ptr<float>(),
-                            raw.raw_dm_dmu1.ptr<__half>(),
-                            raw.raw_dm_dsigma1_sq.ptr<__half>(),
-                            raw.raw_dm_dsigma12.ptr<__half>());
-                    LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_decoupled_raw_backward");
-                });
-            });
-            return;
-        }
-
-        int grad_h = raw.H;
-        int grad_w = raw.W;
-        if (raw.apply_valid_padding) {
-            grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
-            grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
-        }
-        const size_t numel = N * C * grad_h * grad_w;
-        const float grad_per_pixel = 1.0f / static_cast<float>(numel);
-
-        dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
-            using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            fusedL1SSIMBackwardCUDA<TargetT, /*HasSigmaPartials=*/true, /*Accumulate=*/true>
-                <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                    1.0f, raw.H, raw.W, static_cast<int>(C), C1, C2,
-                    grad_per_pixel, raw.apply_valid_padding,
-                    raw.raw_img.ptr<float>(), gt_ptr,
-                    grad_image.ptr<float>(),
-                    raw.raw_dm_dmu1.ptr<__half>(),
-                    raw.raw_dm_dsigma1_sq.ptr<__half>(),
-                    raw.raw_dm_dsigma12.ptr<__half>());
-            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_raw_backward");
-        });
+        dispatch_decoupled_raw_gradient</*Accumulate=*/true>(raw, grad_image);
     }
 
     // ============================================================================

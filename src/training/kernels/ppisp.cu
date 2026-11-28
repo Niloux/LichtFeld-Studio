@@ -181,7 +181,10 @@ namespace lfs::training::kernels {
             }
 
             if (frame_idx != -1) {
-                ppisp_apply_exposure_bwd(rgb_input, exposure_params[frame_idx], grad_rgb, grad_rgb, grad_exposure_local);
+                // ppisp_apply_exposure_bwd assigns (does not +=) its output scalar.
+                float grad_exp_px = 0.0f;
+                ppisp_apply_exposure_bwd(rgb_input, exposure_params[frame_idx], grad_rgb, grad_rgb, grad_exp_px);
+                grad_exposure_local += grad_exp_px;
             }
 
             // Store RGB input gradient (CHW)

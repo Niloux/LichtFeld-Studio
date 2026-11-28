@@ -2102,10 +2102,22 @@ namespace lfs::training {
             }
 
             std::optional<RawGradientResidual> raw_residual;
-            const auto raw_gradient = lfs::training::kernels::decoupled_raw_gradient(ctx);
-            if (fit)
+            auto raw_gradient = lfs::training::kernels::decoupled_raw_gradient(ctx);
+            if (fit) {
+                if (!raw_gradient.precomputed.is_valid() && loss_step_scratch_ && grads.grad_corrected.is_valid()) {
+                    const size_t bytes = grads.grad_corrected.numel() * sizeof(float);
+                    if (char* const memory = loss_step_scratch_(bytes)) {
+                        auto precomputed = lfs::core::Tensor::from_blob(
+                            memory, grads.grad_corrected.shape(), lfs::core::Device::CUDA,
+                            lfs::core::DataType::Float32, lfs::core::getCurrentCUDAStream());
+                        lfs::training::kernels::compute_decoupled_raw_gradient(
+                            raw_gradient, precomputed);
+                        raw_gradient.precomputed = std::move(precomputed);
+                    }
+                }
                 fit->accumulate(corrected, grads.grad_corrected, {}, photometric_value_count(),
                                 photometric_valid_padding, &raw_gradient, nullptr, loss_step_scratch_);
+            }
             add_gradient_residual(corrected, gt_image, raw_rendered, {}, opt_params, iteration,
                                   loss_tensor, grads.grad_corrected, raw_residual);
             return PhotometricLossResult{
@@ -2343,9 +2355,22 @@ namespace lfs::training {
                 }
             }
 
-            if (fit)
+            if (fit) {
+                if (raw_gradient && !raw_gradient->precomputed.is_valid() && loss_step_scratch_ &&
+                    grad_corrected.is_valid()) {
+                    const size_t bytes = grad_corrected.numel() * sizeof(float);
+                    if (char* const memory = loss_step_scratch_(bytes)) {
+                        auto precomputed = lfs::core::Tensor::from_blob(
+                            memory, grad_corrected.shape(), lfs::core::Device::CUDA,
+                            lfs::core::DataType::Float32, lfs::core::getCurrentCUDAStream());
+                        lfs::training::kernels::compute_decoupled_raw_gradient(
+                            *raw_gradient, precomputed);
+                        raw_gradient->precomputed = std::move(precomputed);
+                    }
+                }
                 fit->accumulate(corrected, grad_corrected, photometric_weight, mask_normalization, 0,
                                 raw_gradient ? &*raw_gradient : nullptr, &mask_normalization_device, loss_step_scratch_);
+            }
 
             if (has_user_mask && mode == param::MaskMode::Ignore)
                 check_empty_ignore_mask(mask_normalization, mask_normalization_device);
